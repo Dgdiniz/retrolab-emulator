@@ -1,0 +1,1587 @@
+/* ===== Global Styles ===== */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-size: 14px;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Selection color */
+::selection {
+    background: #264f78;
+    color: #ffffff;
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #3c3c3c;
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #4a4a4a;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+/* ===== Toolbar ===== */
+.toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: #252526;
+    border-bottom: 1px solid #3c3c3c;
+    gap: 12px;
+}
+
+.toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.toolbar-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #cccccc;
+    padding: 4px 8px;
+    border-radius: 3px;
+    background: #333333;
+    user-select: none;
+}
+
+.toolbar-toggle:hover {
+    background: #404040;
+}
+
+.toolbar-toggle input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: #0e639c;
+}
+
+.toolbar-toggle input[type="checkbox"]:checked+span {
+    color: #4ec9b0;
+}
+
+#rom-file {
+    display: none;
+}
+
+.file-btn {
+    padding: 6px 12px;
+    background: #0e639c;
+    color: #fff;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.file-btn:hover {
+    background: #1177bb;
+}
+
+button {
+    padding: 6px 12px;
+    background: #0e639c;
+    color: #fff;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s, transform 0.1s;
+}
+
+button:hover:not(:disabled) {
+    background: #1177bb;
+    transform: translateY(-1px);
+}
+
+button:active:not(:disabled) {
+    transform: translateY(0);
+}
+
+button:disabled {
+    background: #3c3c3c;
+    color: #808080;
+    cursor: not-allowed;
+}
+
+/* Tooltip styling */
+button[title],
+input[title],
+.tooltip {
+    position: relative;
+}
+
+#rom-name {
+    color: #cccccc;
+    font-size: 13px;
+}
+
+.status {
+    padding: 4px 8px;
+    background: #333;
+    border-radius: 3px;
+}
+
+#fps {
+    color: #4ec9b0;
+    font-weight: bold;
+}
+
+/* ===== Tracing Controls ===== */
+.tracing-controls {
+    border-left: 1px solid #3c3c3c;
+    padding-left: 12px;
+}
+
+.tracing-controls button {
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.tracing-controls button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+#trace-start-btn {
+    background: #3d5a3d;
+    color: #98c379;
+}
+
+#trace-start-btn:hover:not(:disabled) {
+    background: #4a6f4a;
+}
+
+#trace-start-btn.recording {
+    background: #5a3d3d;
+    color: #e06c75;
+    animation: pulse-recording 1s infinite;
+}
+
+@keyframes pulse-recording {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.7;
+    }
+}
+
+#trace-stop-btn {
+    background: #5a3d3d;
+    color: #e06c75;
+}
+
+#trace-stop-btn:hover:not(:disabled) {
+    background: #6f4a4a;
+}
+
+.save-state-info {
+    font-size: 11px;
+    color: #888;
+    padding: 2px 6px;
+    white-space: nowrap;
+}
+
+.save-state-info.saved {
+    color: #98c379;
+}
+
+.save-state-info.error {
+    color: #e06c75;
+}
+
+.trace-stats {
+    font-size: 11px;
+    color: #888;
+    padding: 2px 6px;
+    background: #2d2d2d;
+    border-radius: 3px;
+    min-width: 80px;
+    text-align: center;
+}
+
+.trace-stats.recording {
+    color: #e06c75;
+    background: #3d2d2d;
+}
+
+#trace-export-btn {
+    background: #3d4a5a;
+    color: #61afef;
+}
+
+#trace-export-btn:hover:not(:disabled) {
+    background: #4a5a6f;
+}
+
+#trace-clear-btn {
+    background: #4a3d3d;
+    color: #d19a66;
+}
+
+#trace-clear-btn:hover:not(:disabled) {
+    background: #5a4a4a;
+}
+
+/* ===== Main Layout ===== */
+.main-layout {
+    display: grid;
+    grid-template-columns: 1fr 2fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    height: 50vh;
+    background: #1e1e1e;
+}
+
+.bottom-layout {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    height: calc(50vh - 45px);
+    background: #1e1e1e;
+}
+
+/* ===== Panels ===== */
+.panel {
+    background: #252526;
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: #2d2d30;
+    border-bottom: 1px solid #3c3c3c;
+}
+
+.panel-header h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: #cccccc;
+}
+
+.panel-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+}
+
+/* ===== Disassembly View ===== */
+.disassembly-view {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/*
+ * Fixed column grid. Each cell sets `min-width: 0` so the natural
+ * `text-overflow: ellipsis` truncates long bytes / operands instead
+ * of pushing the next column right. `tabular-nums` keeps the address
+ * column digit-aligned across hex letters (A vs B vs F render at the
+ * same width). Row height + padding are fixed so spacer rows match
+ * instruction rows exactly, the panel never grows / shrinks as the
+ * user steps through code.
+ */
+.disasm-line {
+    display: grid;
+    grid-template-columns: 20px 80px 160px 90px 1fr auto;
+    column-gap: 8px;
+    padding: 2px 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    align-items: baseline;
+    line-height: 1.4;
+    min-height: 1.5em;
+    font-variant-numeric: tabular-nums;
+}
+
+.disasm-line > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.disasm-line:hover {
+    background: #2a2d2e;
+}
+
+.disasm-line.spacer {
+    cursor: default;
+    pointer-events: none;
+}
+.disasm-line.spacer:hover {
+    background: transparent;
+}
+
+/*
+ * `unknown` rows mark addresses the CPU has never executed (data
+ * regions, never-visited code, gaps between basic blocks). Dimmed and
+ * non-clickable so they read as "no instruction here" rather than a
+ * decoded `ori #$xxxx,Dn` that came from interpreting raw data bytes.
+ */
+.disasm-line.unknown {
+    cursor: default;
+    opacity: 0.45;
+}
+.disasm-line.unknown:hover {
+    background: transparent;
+}
+
+.disasm-line.current {
+    background: #094771;
+}
+
+.disasm-line.breakpoint {
+    background: #5a1d1d;
+}
+
+.disasm-line.breakpoint.current {
+    background: #6b3030;
+}
+
+.disasm-bp-gutter {
+    text-align: center;
+    color: #f48771;
+    font-weight: bold;
+}
+
+.disasm-address {
+    color: #858585;
+}
+
+.disasm-bytes {
+    color: #6a9955;
+}
+
+.disasm-instruction {
+    color: #dcdcaa;
+}
+
+.disasm-operands {
+    color: #9cdcfe;
+}
+
+.disasm-comment {
+    color: #6a9955;
+    opacity: 0.9;
+}
+
+#goto-address {
+    width: 120px;
+    padding: 4px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+}
+
+#shader-select {
+    padding: 4px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+#shader-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.display-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Fullscreen button */
+.fullscreen-btn {
+    background: transparent;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #ccc;
+    cursor: pointer;
+    padding: 3px 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+}
+
+.fullscreen-btn:hover {
+    background: #007acc;
+    border-color: #007acc;
+    color: #fff;
+}
+
+.fullscreen-btn:active {
+    transform: scale(0.92);
+}
+
+/* ===== Canvas ===== */
+.canvas-content {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: #000;
+    overflow: hidden;
+    /* Ensure the container has a measurable size for ResizeObserver */
+    min-width: 320px;
+    min-height: 224px;
+}
+
+#display {
+    /* WebGL NEAREST filtering handles pixel-perfect scaling on GPU.
+       image-rendering kept as fallback for Canvas2D path. */
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+/* ===== Fullscreen Mode ===== */
+.canvas-panel:fullscreen,
+.canvas-panel:-webkit-full-screen {
+    background: #000;
+    display: flex;
+    flex-direction: column;
+}
+
+.canvas-panel:fullscreen .panel-header,
+.canvas-panel:-webkit-full-screen .panel-header {
+    display: none;
+}
+
+.canvas-panel:fullscreen .canvas-content,
+.canvas-panel:-webkit-full-screen .canvas-content {
+    flex: 1;
+    min-width: unset;
+    min-height: unset;
+    width: 100vw;
+    height: 100vh;
+}
+
+.canvas-panel:fullscreen .fs-enter,
+.canvas-panel:-webkit-full-screen .fs-enter {
+    display: none;
+}
+
+.canvas-panel:fullscreen .fs-exit,
+.canvas-panel:-webkit-full-screen .fs-exit {
+    display: inline !important;
+}
+
+/* ===== Registers View ===== */
+.registers-view {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+}
+
+.register-group {
+    margin-bottom: 12px;
+}
+
+.register-group-title {
+    font-weight: bold;
+    color: #4fc1ff;
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.register-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 4px;
+    border-radius: 2px;
+}
+
+.register-row.changed {
+    background: #1e3a1e;
+}
+
+.register-name {
+    color: #dcdcaa;
+    font-weight: 600;
+}
+
+.register-value {
+    color: #b5cea8;
+    font-family: 'Consolas', monospace;
+}
+
+/* ===== Memory View ===== */
+.memory-tabs {
+    display: flex;
+    gap: 4px;
+}
+
+.tab-btn {
+    padding: 4px 12px;
+    background: #3c3c3c;
+    font-size: 12px;
+}
+
+.tab-btn.active {
+    background: #0e639c;
+}
+
+#memory-address {
+    width: 100px;
+    padding: 4px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+}
+
+.memory-view {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Memory panel body: hex editor (flex:1) plus an optional
+ * interpretation pane on the right. The pane is `hidden` by default;
+ * the toggle in the header flips that attribute on/off and the body's
+ * flex-row layout takes care of the rest. */
+.memory-body {
+    display: flex;
+    flex-direction: row;
+    height: 100%;
+    min-height: 0;
+}
+
+.memory-hex-container {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+}
+
+.memory-interp-container {
+    flex: 0 0 auto;
+    height: 100%;
+    min-width: 200px;
+}
+
+.memory-interp-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #cccccc;
+    cursor: pointer;
+    user-select: none;
+}
+.memory-interp-toggle input { margin: 0; cursor: pointer; }
+
+.memory-download-btn {
+    padding: 2px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-size: 12px;
+    cursor: pointer;
+}
+.memory-download-btn:hover { background: #4a4a4a; }
+
+/* HexEditor row layout, mirrors the platform's `.hex-row` so both
+ * shells render identically. */
+.hex-editor .hex-row {
+    display: flex;
+    gap: 8px;
+    padding: 0 6px;
+    white-space: nowrap;
+    font-family: inherit;
+}
+.hex-editor .hex-row:hover { background: rgba(255, 255, 255, 0.04); }
+
+.hex-editor .hex-address {
+    color: #858585;
+    min-width: 64px;
+}
+
+.hex-editor .hex-bytes {
+    display: inline-flex;
+    /* Internal padding on `.hex-byte` provides the visual breathing
+     * room AND a proper click hit-area; a positive flex gap here would
+     * recreate "dead pixels between bytes" that swallow clicks. */
+    gap: 0;
+    color: #b5cea8;
+}
+
+.hex-editor .hex-ascii {
+    display: inline-flex;
+    color: #6a9955;
+    margin-left: 8px;
+    letter-spacing: 0;
+}
+
+.hex-editor .hex-byte {
+    min-width: 22px;
+    padding: 0 3px;
+    text-align: center;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background-color 80ms ease, box-shadow 80ms ease;
+}
+.hex-editor .hex-byte:hover { background: rgba(76, 208, 255, 0.18); }
+
+.hex-editor .hex-char {
+    display: inline-block;
+    min-width: 10px;
+    padding: 0 1px;
+    text-align: center;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background-color 80ms ease, box-shadow 80ms ease;
+}
+.hex-editor .hex-char:hover { background: rgba(76, 208, 255, 0.10); }
+
+/* Single-byte selection highlight, applied symmetrically across the
+ * hex and ASCII columns so clicking either side keeps both visually
+ * aligned. Distinct from `.editing` (solid blue), `.selected` is a
+ * gentler tint that survives the user stepping the emulator. The CRT
+ * halo makes the selected cell read as a "lit" pixel. */
+.hex-editor .hex-byte.selected,
+.hex-editor .hex-char.selected {
+    background: rgba(0, 122, 204, 0.28);
+    outline: 1px solid rgba(76, 208, 255, 0.7);
+    outline-offset: -1px;
+    box-shadow:
+        0 0 4px rgba(76, 208, 255, 0.55),
+        inset 0 0 4px rgba(76, 208, 255, 0.25);
+}
+
+.hex-editor .hex-byte.editing {
+    background: #007acc;
+    color: #ffffff;
+    outline: 1px solid #4cd0ff;
+    outline-offset: -1px;
+    /* Stronger neon halo + glyph glow for the active edit cell so it
+     * pops out from the rest of the row at a glance. */
+    box-shadow:
+        0 0 6px rgba(76, 208, 255, 0.9),
+        0 0 12px rgba(76, 208, 255, 0.55),
+        inset 0 0 4px rgba(255, 255, 255, 0.35);
+    text-shadow: 0 0 4px rgba(255, 255, 255, 0.65);
+}
+/* Old-byte preview while editing: the previous hex digits stay
+ * visible underneath the typed digits so the user can still see what
+ * they're overwriting. Toggled by the `showOldByteOnEdit` option. */
+.hex-editor .hex-byte.editing .faint { opacity: 0.45; }
+.hex-editor .hex-byte.editing .typed { font-weight: 700; }
+
+/*
+ * Blinking caret marker under the digit slot that will receive the
+ * next keystroke. Sits inside `.hex-byte.editing` so the underline
+ * inherits the editing cell's foreground colour and disappears the
+ * moment the byte commits.
+ */
+.hex-editor .hex-byte.editing .caret { position: relative; }
+.hex-editor .hex-byte.editing .caret::after {
+    content: '';
+    position: absolute;
+    left: 1px;
+    right: 1px;
+    bottom: 0;
+    height: 1.5px;
+    background: currentColor;
+    border-radius: 1px;
+    animation: hex-caret-blink 1s steps(2, jump-none) infinite;
+    pointer-events: none;
+}
+@keyframes hex-caret-blink {
+    0%, 49%   { opacity: 1; }
+    50%, 100% { opacity: 0; }
+}
+
+.hex-editor .hex-byte.modified {
+    background: rgba(232, 158, 100, 0.18);
+    border-bottom: 2px solid #e89e64;
+    border-radius: 2px 2px 0 0;
+}
+.hex-editor .hex-char.modified {
+    border-bottom: 2px solid #e89e64;
+    border-radius: 2px 2px 0 0;
+}
+
+/* Cursor-address readout in the memory panel header. Sits next to
+ * the goto input + interpretation toggle so the user always knows
+ * which byte they last clicked, even when the interp pane is off. */
+.memory-cursor-addr {
+    font-family: var(--font-mono, 'Cascadia Code', 'JetBrains Mono', monospace);
+    font-size: 11px;
+    color: #4cd0ff;
+    opacity: 0.85;
+    padding: 0 6px;
+    white-space: nowrap;
+}
+.memory-cursor-addr:empty { display: none; }
+
+/* Interpretation pane, vanilla counterpart to RetroLab's interpretation pane. */
+.interpretation-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.18);
+    border-left: 1px solid #3c3c3c;
+    overflow-y: auto;
+    box-sizing: border-box;
+}
+
+.interpretation-pane .interp-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #3c3c3c;
+}
+
+.interpretation-pane .interp-title {
+    font-weight: 600;
+    color: #858585;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 10px;
+}
+
+.interpretation-pane .interp-offset {
+    color: #4cd0ff;
+    font-size: 11px;
+}
+
+.interpretation-pane .interp-grid {
+    display: grid;
+    grid-template-columns: minmax(56px, auto) 1fr;
+    column-gap: 10px;
+    row-gap: 2px;
+    margin: 0;
+    font-size: 12px;
+}
+
+.interpretation-pane .interp-grid dt {
+    color: #858585;
+    text-align: right;
+}
+
+.interpretation-pane .interp-grid dd {
+    margin: 0;
+    color: #eeeeee;
+}
+
+/* ===== Info Tabs ===== */
+.tabs-header {
+    display: flex;
+    gap: 4px;
+    border-bottom: none;
+}
+
+.info-tab {
+    padding: 6px 12px;
+    background: #3c3c3c;
+    border: 1px solid #3c3c3c;
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.info-tab.active {
+    background: #252526;
+    color: #4fc1ff;
+}
+
+.info-tab-content {
+    display: none;
+}
+
+.info-tab-content.active {
+    display: block;
+}
+
+/* ===== Breakpoints ===== */
+.breakpoint-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 8px;
+    background: #2d2d30;
+    border-radius: 4px;
+}
+
+#bp-address {
+    flex: 1;
+    padding: 6px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+}
+
+#bp-type {
+    padding: 6px 8px;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #cccccc;
+    font-size: 12px;
+}
+
+.breakpoints-list {
+    font-size: 13px;
+}
+
+.breakpoint-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    background: #2d2d30;
+    border-radius: 3px;
+}
+
+.breakpoint-info {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.breakpoint-address {
+    color: #4fc1ff;
+    font-family: 'Consolas', monospace;
+}
+
+.breakpoint-type {
+    color: #ce9178;
+    font-size: 11px;
+}
+
+.breakpoint-access {
+    display: inline-flex;
+    gap: 8px;
+}
+
+.breakpoint-access .bp-flag {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    color: #858585;
+    font-size: 11px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.breakpoint-access .bp-flag input {
+    margin: 0;
+    cursor: pointer;
+}
+
+.breakpoint-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.breakpoint-actions button {
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+.btn-remove {
+    background: transparent;
+    color: #c94c4c;
+    font-size: 14px;
+    padding: 2px 6px;
+    min-width: unset;
+    border: none;
+    cursor: pointer;
+}
+
+.btn-remove:hover {
+    color: #e51400;
+}
+
+.breakpoint-item.disabled {
+    opacity: 0.55;
+}
+
+.breakpoint-item.disabled .breakpoint-address {
+    text-decoration: line-through;
+}
+
+.bp-toggle {
+    user-select: none;
+}
+
+/* -- Watchpoints panel ------------------------------------------- */
+.wp-value-input {
+    width: 70px;
+}
+
+.wp-size-select {
+    flex: 0 0 auto;
+    min-width: 0;
+}
+
+.wp-event-select {
+    flex: 1;
+    min-width: 0;
+}
+
+.wp-error {
+    color: #c94c4c;
+    font-size: 11px;
+    min-height: 0;
+    padding: 2px 0;
+}
+
+.wp-error:empty {
+    display: none;
+}
+
+.watchpoint-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    background: #2d2d30;
+    border-radius: 3px;
+}
+
+.watchpoint-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+}
+
+.watchpoint-label {
+    color: #4fc1ff;
+    font-family: 'Consolas', monospace;
+}
+
+.wp-kind {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 1px 4px;
+    border-radius: 2px;
+    color: #1e1e1e;
+}
+
+.wp-kind--memory {
+    background: #4fc1ff;
+}
+
+.wp-kind--event {
+    background: #dcb152;
+}
+
+.watchpoint-access {
+    display: inline-flex;
+    gap: 8px;
+}
+
+.watchpoint-access .bp-flag {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    color: #858585;
+    font-size: 11px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.watchpoint-access .bp-flag input {
+    margin: 0;
+    cursor: pointer;
+}
+
+.wp-summary {
+    color: #b5cea8;
+    font-size: 11px;
+    font-family: 'Consolas', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 40%;
+}
+
+.watchpoint-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.watchpoint-item.disabled {
+    opacity: 0.55;
+}
+
+.watchpoint-item.disabled .watchpoint-label {
+    text-decoration: line-through;
+}
+
+.btn-edit {
+    background: transparent;
+    /* Reuse the panel's existing yellow accent (same hue as register
+     * names / address labels) so the conditions-editor gear reads as a
+     * primary action instead of dim decoration. */
+    color: #dcdcaa;
+    font-size: 14px;
+    padding: 2px 6px;
+    min-width: unset;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.btn-edit:hover {
+    color: #f0f0c8;
+    background: rgba(220, 220, 170, 0.16);
+}
+
+.wp-toggle {
+    user-select: none;
+}
+
+/* Inline advanced-conditions editor */
+.watchpoint-editor {
+    margin: -2px 0 6px;
+    padding: 8px;
+    background: #252526;
+    border: 1px solid #3c3c3c;
+    border-radius: 3px;
+}
+
+.wp-edit-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px 10px;
+}
+
+.wp-edit-field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    font-size: 11px;
+    color: #858585;
+}
+
+.wp-edit-field > span {
+    white-space: nowrap;
+}
+
+.wp-edit-field input,
+.wp-edit-field select {
+    width: 92px;
+}
+
+/*
+ * The condition expression spans the full editor width (expressions get
+ * long) and sits above the compact grid. Its input flexes to fill.
+ */
+.wp-edit-field--full {
+    margin-bottom: 8px;
+    gap: 8px;
+}
+
+.wp-edit-field--full .wp-edit-expr {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+}
+
+.wp-edit-check {
+    justify-content: flex-start;
+}
+
+.wp-edit-check input {
+    width: auto;
+}
+
+.wp-edit-errors {
+    color: #c94c4c;
+    font-size: 11px;
+    margin-top: 6px;
+}
+
+.wp-edit-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.wp-edit-actions button {
+    padding: 4px 10px;
+    font-size: 11px;
+}
+
+/* Disabled breakpoint in disassembly gutter */
+.disasm-line.bp-disabled .disasm-bp-gutter {
+    color: #666;
+}
+
+.disasm-line.bp-disabled {
+    background: #2a2a2a;
+}
+
+/* ===== History ===== */
+.history-list {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.history-item {
+    padding: 4px 8px;
+    margin-bottom: 2px;
+    background: #2d2d30;
+    border-radius: 2px;
+    display: flex;
+    gap: 12px;
+}
+
+.history-address {
+    color: #858585;
+    min-width: 70px;
+}
+
+.history-instruction {
+    color: #dcdcaa;
+    flex: 1;
+}
+
+.history-cycles {
+    color: #6a9955;
+    font-size: 11px;
+}
+
+/* ===== Call Stack ===== */
+.callstack-list {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+}
+
+.callstack-item {
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    background: #2d2d30;
+    border-radius: 3px;
+}
+
+.callstack-address {
+    color: #4fc1ff;
+    font-family: 'Consolas', monospace;
+}
+
+.callstack-function {
+    color: #dcdcaa;
+    margin-left: 12px;
+}
+
+/* ===== VDP Debugger ===== */
+.vdp-subtabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid #3c3c3c;
+    padding-bottom: 4px;
+}
+
+.vdp-subtab {
+    padding: 4px 12px;
+    background: #2d2d30;
+    color: #cccccc;
+    border: none;
+    border-radius: 3px 3px 0 0;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.vdp-subtab:hover {
+    background: #3e3e42;
+}
+
+.vdp-subtab.active {
+    background: #0e639c;
+    color: #fff;
+}
+
+.vdp-subtab-content {
+    display: none;
+}
+
+.vdp-subtab-content.active {
+    display: block;
+}
+
+.vdp-controls {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+
+.vdp-controls label {
+    font-size: 12px;
+    color: #cccccc;
+}
+
+.vdp-controls select,
+.vdp-controls input[type="number"],
+.vdp-controls input[type="text"] {
+    padding: 4px 8px;
+    background: #3c3c3c;
+    color: #cccccc;
+    border: 1px solid #555;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.vdp-controls input[type="number"] {
+    width: 80px;
+}
+
+.vdp-controls input[type="text"] {
+    width: 60px;
+}
+
+#tile-viewer-canvas {
+    border: 1px solid #3c3c3c;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    cursor: crosshair;
+}
+
+#palette-viewer {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.palette-group {
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+    padding: 8px;
+}
+
+.palette-title {
+    font-size: 12px;
+    color: #4ec9b0;
+    margin-bottom: 6px;
+    font-weight: 600;
+}
+
+.palette-colors {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+}
+
+.palette-color {
+    width: 100%;
+    aspect-ratio: 1;
+    border: 1px solid #555;
+    border-radius: 2px;
+    cursor: pointer;
+    position: relative;
+}
+
+.palette-color:hover {
+    border-color: #0e639c;
+    box-shadow: 0 0 4px rgba(14, 99, 156, 0.5);
+}
+
+.palette-color-info {
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #2d2d30;
+    border: 1px solid #0e639c;
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.palette-color:hover .palette-color-info {
+    opacity: 1;
+}
+
+#vram-viewer {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.vram-row {
+    display: flex;
+    gap: 12px;
+    padding: 2px 4px;
+}
+
+.vram-row:hover {
+    background: #2a2d2e;
+}
+
+.vram-address {
+    color: #858585;
+    min-width: 50px;
+}
+
+.vram-hex {
+    color: #6a9955;
+    flex: 1;
+}
+
+.vram-ascii {
+    color: #ce9178;
+    min-width: 80px;
+}
+
+/* ===== Scrollbar Styling ===== */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #424242;
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #4e4e4e;
+}
+
+/* ===== VDP Sprite-Table Viewer ===== */
+#sprite-table-viewer {
+    height: 100%;
+    overflow: auto;
+    padding: 4px 8px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px;
+}
+
+#sprite-table-viewer .sprite-table-empty {
+    padding: 16px;
+    text-align: center;
+    color: #858585;
+}
+
+#sprite-table-viewer .sprite-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+#sprite-table-viewer .sprite-table th {
+    position: sticky;
+    top: 0;
+    background: #2d2d30;
+    color: #b0b0b0;
+    font-weight: 600;
+    text-align: left;
+    padding: 4px 6px;
+    border-bottom: 1px solid #3e3e42;
+}
+
+#sprite-table-viewer .sprite-table tr.sprite-row:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+#sprite-table-viewer .sprite-table tr.sprite-row:hover {
+    background: rgba(14, 99, 156, 0.18);
+}
+
+#sprite-table-viewer .sprite-table td {
+    padding: 2px 6px;
+    border-bottom: 1px solid #2a2a2a;
+}
+
+#sprite-table-viewer .col-index,
+#sprite-table-viewer .col-link {
+    color: #858585;
+    text-align: right;
+}
+
+#sprite-table-viewer .col-pos,
+#sprite-table-viewer .col-size,
+#sprite-table-viewer .col-tile,
+#sprite-table-viewer .col-palette {
+    text-align: right;
+}
+
+#sprite-table-viewer .col-priority.is-high-priority {
+    color: #4ec9b0;
+    font-weight: 600;
+}
+
+#sprite-table-viewer .col-flips {
+    text-align: center;
+}
+
+/* ===== VDP State viewer (layer toggles + registers) ===== */
+#vdp-state-viewer .vdp-state-empty {
+    padding: 16px;
+    text-align: center;
+    color: #858585;
+}
+
+#vdp-state-viewer .vdp-state-section-title {
+    margin: 8px 0 4px;
+    color: #858585;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+#vdp-state-viewer .vdp-layers {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+#vdp-state-viewer .vdp-layer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+#vdp-state-viewer .vdp-layer-name {
+    min-width: 64px;
+    color: #d7ba7d;
+    font-family: var(--font-mono, monospace);
+}
+
+#vdp-state-viewer .vdp-layer-meta {
+    color: #858585;
+}
+
+#vdp-state-viewer .vdp-reg-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+#vdp-state-viewer .vdp-reg-table th {
+    text-align: left;
+    color: #858585;
+    border-bottom: 1px solid #3e3e42;
+    padding: 2px 6px;
+}
+
+#vdp-state-viewer .vdp-reg-table td {
+    padding: 2px 6px;
+    border-bottom: 1px solid #2a2a2a;
+}
+
+#vdp-state-viewer .vdp-reg-table .col-index,
+#vdp-state-viewer .vdp-reg-table .col-value {
+    text-align: right;
+    font-family: var(--font-mono, monospace);
+}
+
+/* ===== Drag-and-drop ROM Overlay ===== */
+.canvas-panel {
+    position: relative;
+}
+
+.canvas-panel.dragover::before {
+    content: "Drop ROM (.bin / .gen / .md)";
+    position: absolute;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(48, 160, 64, 0.12);
+    border: 3px dashed var(--accent, #30a040);
+    color: var(--text-accent, #e0ffe0);
+    font-size: 16px;
+    font-weight: 600;
+    pointer-events: none;
+    text-align: center;
+    text-shadow: 0 0 6px rgba(48, 160, 64, 0.8);
+}
+
+/* ===== Responsive ===== */
+@media (max-width: 1400px) {
+    .main-layout {
+        grid-template-columns: 1fr 1.5fr 1fr;
+    }
+}
+
+@media (max-width: 1024px) {
+    .main-layout {
+        grid-template-columns: 1fr;
+        height: auto;
+    }
+
+    .bottom-layout {
+        grid-template-columns: 1fr;
+        height: auto;
+    }
+}

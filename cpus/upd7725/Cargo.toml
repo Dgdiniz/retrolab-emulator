@@ -1,0 +1,11 @@
+[package]
+name = "upd7725"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NEC uPD7725 DSP core (SNES DSP-1/2/3/4 coprocessor)"
+
+[dependencies]
+retro-core = { path = "../../retro-core" }

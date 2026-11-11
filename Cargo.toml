@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "retro-core",
+    "cores/sg1/core",
+    "cores/sg1/wasm",
+    "cores/sg1/cli",
+    "cpus/mos6502",
+    "cpus/wdc65816",
+    "cpus/spc700",
+    "cpus/upd7725",
+    "cpus/ssp1601",
+    "cpus/superfx-gsu",
+    "cores/snes1/core",
+    "cores/snes1/wasm",
+    "cores/snes1/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RetroLab Contributors"]
+# The emulator's license (the text is in `LICENSE`), which every crate
+# inherits; `sg1-core` and `ssp1601` say in their own manifests what they
+# add to it.
+license = "ISC"
+repository = "https://github.com/dgdiniz/retrolab-emulator"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[profile.release]
+# 2, not 3: from rustc 1.95 (LLVM 22) on, level 3 vectorizes the scanline
+# loop in `Vdp::dma_busy_master_clocks` into code that reports DMA busy
+# for good on x86-64, and a game that polls the bit hangs on a black
+# screen. The WebAssembly build is not affected. Try 3 again on a newer rustc.
+opt-level = 2
+lto = true
+codegen-units = 1
+# Drop symbol tables from the cdylib. Combined with wasm-pack's own
+# wasm-opt pass this keeps the shipped `*_bg.wasm` modules small; the
+# WASM cores are loaded over the network so binary size is user-facing.
+strip = true
+

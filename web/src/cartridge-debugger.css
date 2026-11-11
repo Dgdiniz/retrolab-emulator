@@ -1,0 +1,913 @@
+/* Cartridge Debugger Styles, companion CSS for `cartridge-debugger.js`. */
+
+/* Cartridge Subtabs */
+.cartridge-subtabs {
+    display: flex;
+    gap: 5px;
+    padding: 10px;
+    background: #252526;
+    border-bottom: 1px solid #3e3e42;
+}
+
+.cartridge-subtab {
+    padding: 6px 12px;
+    background: #2d2d30;
+    border: 1px solid #3e3e42;
+    color: #cccccc;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.2s;
+}
+
+.cartridge-subtab:hover {
+    background: #37373d;
+    color: #ffffff;
+}
+
+.cartridge-subtab.active {
+    background: #0e639c;
+    border-color: #0e639c;
+    color: #ffffff;
+}
+
+.cartridge-subtab-content {
+    display: none;
+    padding: 15px;
+    overflow-y: auto;
+    max-height: 400px;
+}
+
+.cartridge-subtab-content.active {
+    display: block;
+}
+
+/* Cartridge Info Grid */
+.cartridge-info-section h4 {
+    color: #4ec9b0;
+    margin-bottom: 10px;
+    font-size: 14px;
+}
+
+.info-grid {
+    display: grid;
+    gap: 8px;
+}
+
+.info-row {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 10px;
+    padding: 5px;
+    background: #2d2d30;
+    border-radius: 3px;
+}
+
+.info-row .label {
+    color: #9cdcfe;
+    font-weight: bold;
+}
+
+.info-row span:not(.label) {
+    color: #ce9178;
+}
+
+.info-row .mono {
+    font-family: 'Consolas', monospace;
+    font-size: 11px;
+    word-break: break-all;
+}
+
+/* Upload Zone (Compact) */
+.upload-zone-compact {
+    padding: 20px;
+    border: 2px dashed #3e3e42;
+    border-radius: 4px;
+    text-align: center;
+    background: #252526;
+    margin-bottom: 15px;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+
+.upload-zone-compact:hover,
+.upload-zone-compact.drag-over {
+    border-color: #0e639c;
+    background: #2d2d30;
+}
+
+.upload-text {
+    color: #cccccc;
+    font-size: 13px;
+}
+
+.link-btn {
+    background: none;
+    border: none;
+    color: #4ec9b0;
+    cursor: pointer;
+    text-decoration: underline;
+    font-size: 13px;
+    padding: 0;
+}
+
+.link-btn:hover {
+    color: #6fdcbf;
+}
+
+/* ROM List (Compact) */
+.rom-list-header-compact {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.rom-list-header-compact input {
+    flex: 1;
+    background: #3c3c3c;
+    border: 1px solid #3e3e42;
+    color: #cccccc;
+    padding: 6px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.rom-list-header-compact select {
+    background: #3c3c3c;
+    border: 1px solid #3e3e42;
+    color: #cccccc;
+    padding: 6px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.rom-list-compact {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.rom-item-compact {
+    display: flex;
+    align-items: center;
+    padding: 8px;
+    background: #2d2d30;
+    border: 1px solid #3e3e42;
+    border-radius: 3px;
+    margin-bottom: 5px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.rom-item-compact:hover {
+    background: #37373d;
+}
+
+.rom-item-compact .title {
+    flex: 1;
+    color: #dcdcaa;
+    font-size: 12px;
+}
+
+.rom-item-compact .info {
+    color: #858585;
+    font-size: 11px;
+    margin-right: 10px;
+}
+
+.rom-item-compact .actions {
+    display: flex;
+    gap: 5px;
+}
+
+.rom-item-compact button {
+    padding: 4px 8px;
+    background: #0e639c;
+    border: none;
+    color: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+}
+
+.rom-item-compact button:hover {
+    background: #1177bb;
+}
+
+.rom-item-compact button.delete {
+    background: #d16969;
+}
+
+.rom-item-compact button.delete:hover {
+    background: #e07979;
+}
+
+/* Memory Map Canvas */
+.memory-map-container {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+#memory-map-canvas {
+    width: 100%;
+    height: auto;
+    background: #1e1e1e;
+    border: 1px solid #3e3e42;
+    border-radius: 3px;
+}
+
+.legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    padding: 10px;
+    background: #252526;
+    border-radius: 3px;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+}
+
+.legend-color {
+    width: 20px;
+    height: 12px;
+    border: 1px solid #3e3e42;
+}
+
+/* Mapper State */
+#mapper-state-section h4 {
+    color: #4ec9b0;
+    margin: 15px 0 10px 0;
+    font-size: 14px;
+}
+
+#mapper-state-section h4:first-child {
+    margin-top: 0;
+}
+
+.register-list {
+    display: grid;
+    gap: 5px;
+}
+
+.register-item {
+    display: grid;
+    grid-template-columns: 100px 80px 1fr;
+    gap: 10px;
+    padding: 5px;
+    background: #2d2d30;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.register-item .name {
+    color: #9cdcfe;
+}
+
+.register-item .value {
+    color: #b5cea8;
+    font-family: 'Consolas', monospace;
+}
+
+.register-item .desc {
+    color: #858585;
+}
+
+.bank-table {
+    overflow-x: auto;
+}
+
+.bank-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.bank-table th {
+    background: #0e639c;
+    color: #ffffff;
+    padding: 6px;
+    text-align: left;
+    font-weight: normal;
+}
+
+.bank-table td {
+    background: #2d2d30;
+    color: #cccccc;
+    padding: 6px;
+    border-bottom: 1px solid #3e3e42;
+}
+
+.bank-table td.mono {
+    font-family: 'Consolas', monospace;
+    color: #b5cea8;
+}
+
+/* SRAM Controls */
+.sram-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.sram-controls button {
+    padding: 6px 12px;
+    background: #0e639c;
+    border: none;
+    color: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.2s;
+}
+
+.sram-controls button:hover {
+    background: #1177bb;
+}
+
+.sram-controls button:disabled {
+    background: #555;
+    cursor: not-allowed;
+}
+
+/* Hexdump View */
+.hexdump-view {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    background: #1e1e1e;
+    padding: 10px;
+    border: 1px solid #3e3e42;
+    border-radius: 3px;
+    overflow-y: auto;
+    max-height: 400px;
+}
+
+.hexdump-line {
+    display: grid;
+    grid-template-columns: 80px 1fr 200px;
+    gap: 15px;
+    padding: 2px 0;
+}
+
+.hexdump-line:hover {
+    background: #2d2d30;
+}
+
+.hexdump-address {
+    color: #858585;
+}
+
+.hexdump-bytes {
+    color: #b5cea8;
+    letter-spacing: 1px;
+}
+
+.hexdump-ascii {
+    color: #ce9178;
+}
+
+.hexdump-byte-changed {
+    color: #dcdcaa;
+    background: #3e3e42;
+    padding: 0 2px;
+}
+
+/* Empty states */
+.empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: #858585;
+    font-style: italic;
+}
+
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: bold;
+    margin-left: 5px;
+}
+
+.badge-mapper {
+    background: #673ab7;
+    color: #ffffff;
+}
+
+.badge-chip {
+    background: #e91e63;
+    color: #ffffff;
+}
+
+.badge-detection {
+    background: #4caf50;
+    color: #ffffff;
+}
+
+.badge-warning {
+    background: #ff9800;
+    color: #000000;
+}
+
+.badge-error {
+    background: #f44336;
+    color: #ffffff;
+}
+
+/* ==================== Manifest Editor ==================== */
+
+.manifest-editor {
+    padding: 16px;
+}
+
+.manifest-header {
+    margin-bottom: 24px;
+}
+
+.manifest-header h4 {
+    margin: 0 0 8px 0;
+    color: var(--text-primary);
+}
+
+.manifest-description {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.manifest-form {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.form-section {
+    background: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 16px;
+}
+
+.form-section h5 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 8px;
+}
+
+.form-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.form-row:last-child {
+    margin-bottom: 0;
+}
+
+.form-row label {
+    min-width: 120px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.form-row input[type="text"],
+.form-row select {
+    flex: 1;
+    padding: 6px 10px;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.form-row input[type="text"]:focus,
+.form-row select:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.form-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+}
+
+.read-only-value {
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    color: var(--text-primary);
+    background: var(--bg-dark);
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.checkbox-group {
+    display: flex;
+    gap: 16px;
+    flex: 1;
+}
+
+.checkbox-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text-primary);
+    min-width: auto;
+}
+
+.sram-config {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-color);
+}
+
+.manifest-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+    padding-top: 16px;
+    border-top: 2px solid var(--border-color);
+}
+
+.manifest-actions button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: var(--accent-blue);
+    color: white;
+}
+
+.btn-primary:hover {
+    background: #0066cc;
+    transform: translateY(-1px);
+}
+
+.btn-secondary {
+    background: var(--panel-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+}
+
+.btn-secondary:hover {
+    background: var(--bg-dark);
+    border-color: var(--accent-blue);
+}
+
+.btn-danger {
+    background: #dc3545;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #c82333;
+}
+
+.manifest-preview {
+    margin-top: 24px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 16px;
+}
+
+.manifest-preview h5 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.json-preview {
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 12px;
+    margin: 0;
+    max-height: 300px;
+    overflow: auto;
+    color: var(--text-primary);
+    line-height: 1.5;
+}
+
+/* ==================== Memory Map & Mapper State ==================== */
+
+.memory-map-container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px;
+}
+
+#memory-map-canvas {
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: #1e1e1e;
+}
+
+.legend {
+    background: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 16px;
+}
+
+.legend h5 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.legend-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+}
+
+.legend-color {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+
+.legend-label {
+    color: var(--text-primary);
+}
+
+/* Mapper State Styling */
+#mapper-state-section {
+    padding: 16px;
+}
+
+#mapper-state-section h4 {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 2px solid var(--border-color);
+    padding-bottom: 8px;
+}
+
+.register-table,
+.bank-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    background: var(--panel-bg);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 16px;
+}
+
+.register-table thead,
+.bank-table thead {
+    background: var(--bg-dark);
+}
+
+.register-table th,
+.bank-table th {
+    padding: 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 2px solid var(--border-color);
+}
+
+.register-table td,
+.bank-table td {
+    padding: 10px 12px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.register-table tbody tr:last-child td,
+.bank-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.register-table tbody tr:hover,
+.bank-table tbody tr:hover {
+    background: var(--bg-dark);
+}
+
+.register-table .mono,
+.bank-table .mono {
+    font-family: 'Courier New', monospace;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.register-table .desc {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.info-message {
+    text-align: center;
+    padding: 32px;
+    color: var(--text-secondary);
+    font-size: 14px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    margin: 16px 0;
+}
+
+/* Chip State Styling */
+#chip-info h5 {
+    margin: 0 0 12px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+#chip-info p {
+    margin: 8px 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+/* SRAM Hexdump Enhanced */
+.hexdump-view {
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 12px;
+    max-height: 500px;
+    overflow-y: auto;
+    white-space: pre;
+    line-height: 1.6;
+}
+
+.hexdump-line {
+    display: flex;
+    gap: 8px;
+}
+
+.hexdump-address {
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.hexdump-hex {
+    color: var(--text-primary);
+}
+
+.hexdump-ascii {
+    color: var(--text-secondary);
+    margin-left: 8px;
+}
+
+.hexdump-byte {
+    display: inline-block;
+    padding: 0 2px;
+}
+
+.hexdump-byte-modified {
+    background: #ff9800;
+    color: #000;
+    font-weight: bold;
+}
+
+/* ===== snes1 Cartridge / Manifest panel ===== */
+.snes-manifest {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+    font-size: 13px;
+}
+.snes-manifest-detected {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.snes-manifest-title {
+    font-family: 'Consolas', 'Monaco', monospace;
+    color: #d4d4d4;
+}
+.snes-manifest-tag {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 6px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #9aa0a6;
+}
+.snes-manifest-tag--mod {
+    background: var(--accent, #30a040);
+    color: #061a06;
+}
+.snes-manifest-warn {
+    color: #9aa0a6;
+    line-height: 1.5;
+}
+.snes-manifest-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.snes-manifest-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.snes-manifest-label {
+    color: #e0a020;
+    font-weight: 600;
+    min-width: 120px;
+}
+.snes-manifest-row select {
+    flex: 1;
+    max-width: 280px;
+    background: #2a2a2a;
+    border: 1px solid #3c3c3c;
+    color: #d4d4d4;
+    padding: 4px 8px;
+    border-radius: 2px;
+    font-family: inherit;
+}
+.snes-manifest-raw {
+    width: 100%;
+    min-height: 220px;
+    max-height: 45vh;
+    background: #2a2a2a;
+    border: 1px solid #3c3c3c;
+    color: #d4d4d4;
+    padding: 8px 10px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    border-radius: 2px;
+    resize: vertical;
+}
+.snes-manifest-errors {
+    margin: 0;
+    padding-left: 18px;
+    color: #f48771;
+}
+.snes-manifest-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.snes-manifest-spacer { flex: 1; }
+.snes-manifest-check {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #9aa0a6;
+    cursor: pointer;
+}
+.snes-manifest-btn {
+    background: #3a3a3a;
+    color: #d4d4d4;
+    border: 1px solid #4a4a4a;
+    padding: 6px 14px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+}
+.snes-manifest-btn:hover:not(:disabled) { background: #454545; }
+.snes-manifest-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.snes-manifest-notice {
+    color: #e0a020;
+    font-size: 12px;
+}

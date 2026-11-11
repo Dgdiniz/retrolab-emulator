@@ -1,0 +1,25 @@
+[package]
+name = "retro-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Common traits and types for retro console emulators"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bincode = "1.3"
+sha2 = "0.10"
+zstd = "0.13"  # Savestate envelope compression
+
+# WASM-specific: js_sys::Date::now() in GenericInputManager::current_time_ms
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+bincode = "1.3"
+

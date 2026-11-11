@@ -1,0 +1,20 @@
+{
+  "name": "@retrolab/debugger-core",
+  "private": true,
+  "license": "ISC",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The debugger's pure TypeScript modules: formatting, the hex editor, disassembly, registers, breakpoints, traces and the per-console profiles.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
+    "fast-check": "^4.7.0",
+    "typescript": "~5.7.3",
+    "vitest": "^4.1.4"
+  }
+}

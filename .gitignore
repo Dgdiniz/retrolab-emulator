@@ -1,0 +1,28 @@
+# Builds
+/target/
+pkg/
+node_modules/
+dist/
+coverage/
+*.log
+
+# Test data this repository does not hold: the ROMs, and the CPU test
+# vectors the README says how to download
+/tests/roms/
+/tests/tom_harte_repo/
+/tests/singlesteptests/
+
+# Local links and agent notes
+/private
+CLAUDE.md
+.claude/
+
+# Editors and systems
+.vscode/
+.idea/
+*.swp
+*.bak
+.DS_Store
+
+# Cargo.lock is committed
+!Cargo.lock

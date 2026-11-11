@@ -1,0 +1,222 @@
+/**
+ * Performance Overlay Styles, companion CSS for `perf-overlay.js`.
+ */
+
+.perf-overlay {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background: rgba(0, 0, 0, 0.85);
+    color: #0f0;
+    padding: 12px 16px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 13px;
+    border-radius: 6px;
+    z-index: 9999;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    min-width: 220px;
+    backdrop-filter: blur(4px);
+    transition: opacity 0.2s;
+}
+
+.perf-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.perf-overlay-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(0, 255, 0, 0.3);
+}
+
+.perf-overlay-title {
+    color: #0f0;
+    font-weight: bold;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.perf-toggle-btn {
+    background: none;
+    border: none;
+    color: #0f0;
+    font-size: 16px;
+    cursor: pointer;
+    padding: 0 4px;
+    opacity: 0.7;
+    transition: opacity 0.2s;
+}
+
+.perf-toggle-btn:hover {
+    opacity: 1;
+}
+
+.perf-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 6px;
+    line-height: 1.4;
+}
+
+.perf-item:last-child {
+    margin-bottom: 0;
+}
+
+.perf-label {
+    color: #888;
+    font-size: 12px;
+    min-width: 90px;
+}
+
+.perf-value {
+    color: #0f0;
+    font-weight: bold;
+    font-size: 14px;
+    text-align: right;
+    flex: 1;
+    font-variant-numeric: tabular-nums;
+}
+
+.perf-value.mono {
+    font-family: 'Courier New', monospace;
+    letter-spacing: 1px;
+}
+
+.perf-value.warning {
+    color: #ff9800;
+}
+
+.perf-value.error {
+    color: #f44336;
+}
+
+.perf-value.good {
+    color: #4caf50;
+}
+
+/* FPS color coding */
+.perf-value.fps-excellent {
+    color: #4caf50;
+    /* Green: 55+ FPS */
+}
+
+.perf-value.fps-good {
+    color: #8bc34a;
+    /* Light green: 45-55 FPS */
+}
+
+.perf-value.fps-fair {
+    color: #ff9800;
+    /* Orange: 30-45 FPS */
+}
+
+.perf-value.fps-poor {
+    color: #f44336;
+    /* Red: < 30 FPS */
+}
+
+/* CPU usage color coding */
+.perf-value.cpu-low {
+    color: #4caf50;
+    /* Green: 0-50% */
+}
+
+.perf-value.cpu-medium {
+    color: #ff9800;
+    /* Orange: 50-80% */
+}
+
+.perf-value.cpu-high {
+    color: #f44336;
+    /* Red: 80-100% */
+}
+
+/* Frame time color coding */
+.perf-value.frametime-good {
+    color: #4caf50;
+    /* Green: <= 16.67ms (60 FPS) */
+}
+
+.perf-value.frametime-fair {
+    color: #ff9800;
+    /* Orange: 16.67-33ms (30-60 FPS) */
+}
+
+.perf-value.frametime-poor {
+    color: #f44336;
+    /* Red: > 33ms (< 30 FPS) */
+}
+
+/* Separator */
+.perf-separator {
+    height: 1px;
+    background: rgba(0, 255, 0, 0.2);
+    margin: 8px 0;
+}
+
+/* Collapsible state */
+.perf-overlay.collapsed {
+    padding: 8px 12px;
+}
+
+.perf-overlay.collapsed .perf-item,
+.perf-overlay.collapsed .perf-separator {
+    display: none;
+}
+
+.perf-overlay.collapsed .perf-toggle-btn::before {
+    content: '▶';
+}
+
+.perf-overlay:not(.collapsed) .perf-toggle-btn::before {
+    content: '▼';
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .perf-overlay {
+        top: 5px;
+        right: 5px;
+        font-size: 11px;
+        padding: 8px 12px;
+        min-width: 180px;
+    }
+
+    .perf-label {
+        font-size: 11px;
+        min-width: 70px;
+    }
+
+    .perf-value {
+        font-size: 12px;
+    }
+}
+
+/* Dark mode variant (if needed) */
+.perf-overlay.light-mode {
+    background: rgba(255, 255, 255, 0.95);
+    color: #000;
+    border-color: rgba(0, 0, 0, 0.3);
+}
+
+.perf-overlay.light-mode .perf-label {
+    color: #666;
+}
+
+.perf-overlay.light-mode .perf-overlay-title,
+.perf-overlay.light-mode .perf-toggle-btn {
+    color: #000;
+}
+
+.perf-overlay.light-mode .perf-overlay-header,
+.perf-overlay.light-mode .perf-separator {
+    border-color: rgba(0, 0, 0, 0.2);
+}

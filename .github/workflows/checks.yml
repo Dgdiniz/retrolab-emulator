@@ -1,0 +1,46 @@
+name: Checks
+
+# Runs check.sh, every check a change should pass, on each push and pull
+# request. It runs only in Dgdiniz/retrolab-emulator: a push to a fork or a
+# copy of the repository starts nothing, and a pull request from a fork runs
+# here.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.repository == 'Dgdiniz/retrolab-emulator'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Install wasm-pack and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack,cargo-deny
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-checks-${{ hashFiles('Cargo.lock') }}
+
+      - name: Every check
+        run: ./check.sh

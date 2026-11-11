@@ -1,0 +1,24 @@
+[package]
+name = "spc700"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sony SPC700 CPU emulation (SNES audio CPU)"
+
+[dependencies]
+retro-core = { path = "../../retro-core" }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Compiles the `singlestep` module (SingleStepTests runner) and pulls in
+# serde/serde_json. Off by default so the core/WASM builds stay lean.
+singlestep = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+# Self dev-dependency that turns on `singlestep` whenever the crate's own
+# tests build, so `cargo test -p spc700` keeps working without an extra
+# `--features` flag.
+spc700 = { path = ".", features = ["singlestep"] }

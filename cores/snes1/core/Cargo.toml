@@ -1,0 +1,70 @@
+[package]
+name = "snes1-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Super Nintendo (SNES / Super Famicom) emulator core"
+
+[dependencies]
+retro-core = { path = "../../../retro-core" }
+wdc65816 = { path = "../../../cpus/wdc65816" }
+spc700 = { path = "../../../cpus/spc700" }
+# The NEC uPD7725 core that runs a DSP-1 firmware dump (low-level
+# emulation); only built with the `nec-lle` feature below.
+upd7725 = { path = "../../../cpus/upd7725", optional = true }
+# The Super FX's GSU core; only built with the `chip-superfx` feature below.
+superfx-gsu = { path = "../../../cpus/superfx-gsu", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bincode = "1.3"
+zstd = "0.13"
+sha2 = "0.10"
+
+[features]
+default = ["chip-sa1", "chip-superfx", "chip-cx4", "nec-lle"]
+# Three coprocessors, each behind a feature so a build can leave its module
+# out. All three modules are this tree's own; the SA-1's and the Super FX's
+# follow ares (ISC) where ares holds the same code. With a feature off, a
+# cartridge that needs the chip is refused at load with
+# `BuildError::UnsupportedChip` naming it (`cartridge/chip_support.rs`),
+# and the host picks another core.
+chip-sa1 = []
+chip-superfx = ["dep:superfx-gsu"]
+chip-cx4 = []
+# Low-level emulation of the DSP-1: the `upd7725` crate running a firmware
+# dump. On by default, like the three chips; the crate is this tree's own
+# and follows ares (ISC) where ares holds the same code, as the SA-1's
+# and the Super FX's modules do. Off, a DSP-1 game runs on the
+# firmware-free HLE (`cartridge/dsp1_hle/`), a staged firmware is ignored,
+# and a forced `CoprocessorMode::Lle` installs an idle stub whose label
+# says the emulation is not built.
+nec-lle = ["dep:upd7725"]
+
+# The SPC7110 RTC-4513 reads the host wall clock; on wasm `std::time`
+# panics ("time not implemented on this platform"), so the RTC clock uses
+# `js_sys::Date::now()` there (mirrors `retro-core`'s input timestamps).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "ppu_render"
+harness = false
+
+[[bench]]
+name = "ppu_sprites"
+harness = false
+
+[[bench]]
+name = "ppu_colormath"
+harness = false
+
+[[bench]]
+name = "dma"
+harness = false

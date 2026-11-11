@@ -1,0 +1,15 @@
+[package]
+name = "ssp1601"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+# ISC for this crate, and BSD 3-Clause for what it is a translation of:
+# the SSP1601 interpreter Gražvydas "notaz" Ignotas wrote for PicoDrive.
+# The notice is at the end of `LICENSE`.
+license = "ISC AND BSD-3-Clause"
+repository.workspace = true
+description = "Samsung SSP1601 DSP interpreter (Sega Virtua Processor / SVP)"
+
+[dependencies]
+
+[dev-dependencies]

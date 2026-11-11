@@ -1,0 +1,38 @@
+[package]
+name = "snes1-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command-line interface for the SNES1 emulator"
+
+[[bin]]
+name = "snes1-cli"
+path = "src/main.rs"
+
+[dependencies]
+snes1-core = { path = "../core", default-features = false }
+retro-core = { path = "../../../retro-core" }
+# CPU crates with the SingleStepTests runner enabled, so `singlestep-65816`
+# / `singlestep-spc700` share one harness with `cargo test -p {wdc65816,spc700}`.
+wdc65816 = { path = "../../../cpus/wdc65816", features = ["singlestep"] }
+spc700 = { path = "../../../cpus/spc700", features = ["singlestep"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+indicatif = "0.17"
+# PNG-only (see sg1-core): avoids the avif/rav1e subtree.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = ["chip-sa1", "chip-superfx", "chip-cx4", "nec-lle"]
+# The coprocessors `snes1-core` builds, passed through to the core's feature
+# of the same name; a CLI without a chip is `--no-default-features` away.
+# Off, `--cpu gsu` / `--cpu cx4` tracing reports the chip as not built.
+chip-sa1 = ["snes1-core/chip-sa1"]
+chip-superfx = ["snes1-core/chip-superfx"]
+chip-cx4 = ["snes1-core/chip-cx4"]
+# Low-level emulation of the DSP-1 (a firmware dump on the `upd7725` core),
+# on by default. A CLI built with `--no-default-features` leaves it out, and
+# then refuses `--coprocessor-mode lle` and warns that `--dsp1-firmware` is
+# ignored.
+nec-lle = ["snes1-core/nec-lle"]

@@ -1,0 +1,46 @@
+[package]
+name = "snes1-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for the SNES1 emulator"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+retro-core = { path = "../../../retro-core" }
+snes1-core = { path = "../core", default-features = false }
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[features]
+default = ["chip-sa1", "chip-superfx", "chip-cx4", "nec-lle"]
+# The coprocessors `snes1-core` builds, passed through. Off, a cartridge that
+# needs the chip makes `loadRom` throw an `Error` named `UnsupportedChip`
+# (with a `chip` property), which the platform maps to another core.
+chip-sa1 = ["snes1-core/chip-sa1"]
+chip-superfx = ["snes1-core/chip-superfx"]
+chip-cx4 = ["snes1-core/chip-cx4"]
+# The DSP-1's low-level emulation, passed through: with it a firmware dump
+# staged by `setCoprocessorFirmware` runs on the `upd7725` core; without it
+# the dump is kept but ignored and the firmware-free HLE runs.
+nec-lle = ["snes1-core/nec-lle"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[package.metadata.wasm-pack.profile.release]
+# Rust/LLVM emit bulk-memory + non-trapping float-to-int ops by default
+# for wasm32, but the wasm-opt that wasm-pack vendors validates against
+# the MVP feature set and aborts. Enable the features the codegen
+# actually uses (all are baseline in every browser we target) so the -O
+# size pass runs instead of failing the build.
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals']

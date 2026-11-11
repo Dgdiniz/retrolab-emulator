@@ -1,0 +1,36 @@
+[package]
+name = "sg1-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for SG1 emulator"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+retro-core = { path = "../../../retro-core" }
+sg1-core = { path = "../core" }
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[package.metadata.wasm-pack.profile.release]
+# Rust/LLVM emit bulk-memory + non-trapping float-to-int ops by default
+# for wasm32, but the wasm-opt that wasm-pack vendors validates against
+# the MVP feature set and aborts. Enable the features the codegen
+# actually uses (all are baseline in every browser we target) so the -O
+# size pass runs instead of failing the build. Profile knobs (opt-level,
+# lto, codegen-units, strip) live in the workspace root Cargo.toml; a
+# package-level [profile.release] here would be silently ignored.
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals']
+

@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RetroLab - Debugger</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="./src/debug.css">
+    <link rel="stylesheet" href="./src/cartridge-debugger.css">
+    <link rel="stylesheet" href="./src/settings-modal.css">
+</head>
+
+<body>
+    <div class="container">
+        <!-- Top Toolbar -->
+        <div class="toolbar">
+            <div class="toolbar-group">
+                <label class="file-btn" for="rom-file">Load ROM</label>
+                <input type="file" id="rom-file" accept=".bin,.gen,.md,.smd,.sfc,.smc,.fig,.swc" />
+                <span id="rom-name">No ROM loaded</span>
+            </div>
+
+            <div class="toolbar-group">
+                <button id="run-btn" disabled title="Run emulator (F9)">Run</button>
+                <button id="pause-btn" disabled title="Pause emulator (F9)">Pause</button>
+                <button id="step-btn" disabled title="Step one instruction (F10)">Step</button>
+                <button id="reset-btn" disabled title="Reset emulator (Ctrl+R)">Reset</button>
+            </div>
+
+            <div class="toolbar-group">
+                <label title="CPU focus for debug views">CPU:</label>
+                <select id="cpu-select" disabled>
+                    <option value="0">68000</option>
+                    <option value="1">Z80</option>
+                </select>
+            </div>
+
+            <div class="toolbar-group">
+                <label class="toolbar-toggle" title="Enable/disable audio generation">
+                    <input type="checkbox" id="audio-enabled" checked>
+                    <span>Audio</span>
+                </label>
+            </div>
+
+            <!-- Save State Controls -->
+            <div class="toolbar-group">
+                <button id="save-state-btn" disabled title="Save state to the selected slot">💾 Save</button>
+                <button id="load-state-btn" disabled title="Load state from the selected slot">📂 Load</button>
+                <select id="save-slot-select" title="Save state slot">
+                    <option value="1">Slot 1</option>
+                    <option value="2">Slot 2</option>
+                    <option value="3">Slot 3</option>
+                    <option value="4">Slot 4</option>
+                    <option value="5">Slot 5</option>
+                </select>
+                <span id="save-state-info" class="save-state-info"></span>
+            </div>
+
+            <!-- Tracing Controls -->
+            <div class="toolbar-group tracing-controls">
+                <button id="trace-start-btn" disabled title="Start recording execution trace">⏺ Record</button>
+                <button id="trace-stop-btn" disabled title="Stop recording trace">⏹ Stop</button>
+                <span id="trace-stats" class="trace-stats" title="Trace statistics">0 entries</span>
+                <button id="trace-export-btn" disabled title="Export trace as text file">💾 Export</button>
+                <button id="trace-clear-btn" disabled title="Delete trace file">🗑 Clear</button>
+            </div>
+
+            <div class="toolbar-group">
+                <span id="status" class="status">Idle</span>
+                <span id="fps">FPS: 0</span>
+            </div>
+        </div>
+
+        <!-- Main Layout -->
+        <div class="main-layout">
+            <!-- Left Panel: Disassembly -->
+            <div class="panel disassembly-panel">
+                <div class="panel-header">
+                    <h3>Disassembly</h3>
+                    <input type="text" id="goto-address" placeholder="Go to addr (hex)" />
+                </div>
+                <div class="panel-content">
+                    <div id="disassembly-view" class="disassembly-view" tabindex="-1"></div>
+                </div>
+            </div>
+
+            <!-- Center Panel: Canvas -->
+            <div class="panel canvas-panel" id="canvas-panel">
+                <div class="panel-header">
+                    <h3>Display</h3>
+                    <div class="display-controls">
+                        <select id="shader-select" title="Display shader">
+                            <option value="none">No Shader</option>
+                        </select>
+                        <button id="fullscreen-btn" class="fullscreen-btn" title="Fullscreen (F11)">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                                <path class="fs-enter"
+                                    d="M2 2h4v1.5H3.5V6H2V2zm8 0h4v4h-1.5V3.5H10V2zM2 10h1.5v2.5H6V14H2v-4zm10 2.5V10h1.5v4H10v-1.5h2.5z" />
+                                <path class="fs-exit"
+                                    d="M5 2v3H2v1.5h4.5V2H5zm6 0v4.5H15.5V5H12V2h-1.5zM2 10.5V12h3v3h1.5v-4.5H2zM11 12h3v-1.5h-4.5V15H11v-3z"
+                                    style="display:none" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="panel-content canvas-content">
+                    <canvas id="display" width="320" height="224"></canvas>
+                </div>
+            </div>
+
+            <!-- Right Panel: Registers -->
+            <div class="panel registers-panel">
+                <div class="panel-header">
+                    <h3>Registers</h3>
+                </div>
+                <div class="panel-content">
+                    <div id="registers-view" class="registers-view"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bottom Layout -->
+        <div class="bottom-layout">
+            <!-- Memory Viewer -->
+            <div class="panel memory-panel">
+                <div class="panel-header">
+                    <h3>Memory Viewer</h3>
+                    <div class="memory-tabs">
+                        <button class="tab-btn active" data-region="ram">Work RAM</button>
+                        <button class="tab-btn" data-region="rom">ROM</button>
+                        <button class="tab-btn" data-region="vram">VRAM</button>
+                        <button class="tab-btn" data-region="z80">Z80 RAM</button>
+                    </div>
+                    <input type="text" id="memory-address" placeholder="Address (hex)" />
+                    <span id="memory-cursor-addr" class="memory-cursor-addr" title="Address of the currently-selected byte"></span>
+                    <label class="memory-interp-toggle" title="Show byte interpretation pane">
+                        <input type="checkbox" id="memory-interp-toggle" />
+                        <span>Interp</span>
+                    </label>
+                    <button id="memory-download-rom" class="memory-download-btn" title="Download ROM (with your edits)">⬇ ROM</button>
+                </div>
+                <div class="panel-content">
+                    <div class="memory-body">
+                        <div id="memory-view" class="memory-view memory-hex-container"></div>
+                        <div id="memory-interp" class="memory-interp-container" hidden></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Debug Info Tabs -->
+            <div class="panel info-panel">
+                <div class="panel-header tabs-header">
+                    <button class="info-tab active" data-tab="breakpoints">Breakpoints</button>
+                    <button class="info-tab" data-tab="watchpoints">Watchpoints</button>
+                    <button class="info-tab" data-tab="history">History</button>
+                    <button class="info-tab" data-tab="callstack">Call Stack</button>
+                    <button class="info-tab" data-tab="cartridge">Cartridge</button>
+                    <button class="info-tab" data-tab="snes-cartridge">Cartridge</button>
+                    <button class="info-tab" data-tab="vdp">VDP</button>
+                    <button class="info-tab" data-tab="audio">Audio</button>
+                    <button class="info-tab" data-tab="input">Input</button>
+                </div>
+                <div class="panel-content">
+                    <!-- Breakpoints Tab -->
+                    <div id="breakpoints-tab" class="info-tab-content active">
+                        <div class="breakpoint-controls">
+                            <input type="text" id="bp-address" placeholder="Address (hex)" />
+                            <select id="bp-type">
+                                <option value="execute">Execute</option>
+                                <option value="read">Read</option>
+                                <option value="write">Write</option>
+                                <option value="readwrite">Read/Write</option>
+                            </select>
+                            <button id="add-bp-btn">Add</button>
+                        </div>
+                        <div id="breakpoints-list" class="breakpoints-list"></div>
+                    </div>
+
+                    <!-- Watchpoints Tab -->
+                    <div id="watchpoints-tab" class="info-tab-content">
+                        <div class="breakpoint-controls">
+                            <input type="text" id="wp-address" placeholder="Address (hex)" />
+                            <label class="bp-flag" title="Break on read"><input type="checkbox" id="wp-read" checked />R</label>
+                            <label class="bp-flag" title="Break on write"><input type="checkbox" id="wp-write" checked />W</label>
+                            <input type="text" id="wp-value" class="wp-value-input" placeholder="value" title="Optional value to match (hex). Leave blank to break on any access." />
+                            <select id="wp-value-size" class="wp-size-select" title="Value width. Widths > 8 bits watch the consecutive bytes too (big-endian).">
+                                <option value="1">8b</option>
+                                <option value="2">16b</option>
+                                <option value="4">32b</option>
+                            </select>
+                            <button id="add-wp-btn">Add</button>
+                        </div>
+                        <div id="wp-add-error" class="wp-error" role="alert"></div>
+                        <div id="wp-event-add" class="breakpoint-controls" style="display: none;">
+                            <select id="wp-event-select" class="wp-event-select" aria-label="Event class"></select>
+                            <input type="text" id="wp-event-param" class="wp-value-input" placeholder="param (any)" title="Event parameter: 'any' or a hex value." />
+                            <button id="add-wp-event-btn">Add</button>
+                        </div>
+                        <div id="wp-event-error" class="wp-error" role="alert"></div>
+                        <div id="watchpoints-list" class="breakpoints-list"></div>
+                    </div>
+
+                    <!-- History Tab -->
+                    <div id="history-tab" class="info-tab-content">
+                        <div id="history-list" class="history-list"></div>
+                    </div>
+
+                    <!-- Call Stack Tab -->
+                    <div id="callstack-tab" class="info-tab-content">
+                        <div id="callstack-list" class="callstack-list"></div>
+                    </div>
+
+                    <!-- Cartridge Tab -->
+                    <div id="cartridge-tab" class="info-tab-content">
+                        <div class="cartridge-subtabs">
+                            <button class="cartridge-subtab active" data-cart-tab="info">Info</button>
+                            <button class="cartridge-subtab" data-cart-tab="library">ROM Library</button>
+                            <button class="cartridge-subtab" data-cart-tab="manifest">Manifest</button>
+                            <button class="cartridge-subtab" data-cart-tab="memmap">Memory Map</button>
+                            <button class="cartridge-subtab" data-cart-tab="mapper">Mapper</button>
+                            <button class="cartridge-subtab" data-cart-tab="sram">SRAM</button>
+                        </div>
+
+                        <!-- Cartridge Info -->
+                        <div id="cart-info-tab" class="cartridge-subtab-content active">
+                            <div class="cartridge-info-section">
+                                <h4>Cartridge Information</h4>
+                                <div id="cartridge-info" class="info-grid">
+                                    <div class="info-row">
+                                        <span class="label">Title:</span>
+                                        <span id="cart-title">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">System:</span>
+                                        <span id="cart-system">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">ROM Size:</span>
+                                        <span id="cart-rom-size">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">SRAM Size:</span>
+                                        <span id="cart-sram-size">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Mapper:</span>
+                                        <span id="cart-mapper">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Expansion Chip:</span>
+                                        <span id="cart-chip">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Regions:</span>
+                                        <span id="cart-regions">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Detection:</span>
+                                        <span id="cart-detection">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Checksum:</span>
+                                        <span id="cart-checksum">-</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">ROM Hash:</span>
+                                        <span id="cart-hash" class="mono">-</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- ROM Library -->
+                        <div id="cart-library-tab" class="cartridge-subtab-content">
+                            <!-- Upload Zone -->
+                            <div id="rom-upload-zone" class="upload-zone-compact">
+                                <div class="upload-text">📁 Drag & Drop ROM or <button id="rom-browse-btn-debug"
+                                        class="link-btn">Browse</button></div>
+                                <input type="file" id="rom-file-input-debug" accept=".bin,.gen,.md,.smd" multiple
+                                    hidden>
+                            </div>
+
+                            <!-- ROM List -->
+                            <div class="rom-list-header-compact">
+                                <input type="text" id="rom-search-debug" placeholder="Search..." />
+                                <select id="rom-filter-debug">
+                                    <option value="all">All</option>
+                                    <option value="Genesis">Genesis</option>
+                                </select>
+                            </div>
+                            <div id="rom-list-debug" class="rom-list-compact"></div>
+                        </div>
+
+                        <!-- Manifest Editor -->
+                        <div id="cart-manifest-tab" class="cartridge-subtab-content">
+                            <div class="manifest-editor">
+                                <div class="manifest-header">
+                                    <h4>Cartridge Manifest Editor</h4>
+                                    <p class="manifest-description">
+                                        Override auto-detection or fix incorrectly detected ROM properties.
+                                        Manifests are stored with the ROM and automatically loaded.
+                                    </p>
+                                </div>
+
+                                <form id="manifest-form" class="manifest-form">
+                                    <!-- Detection Source (Read-only) -->
+                                    <div class="form-section">
+                                        <h5>Detection Info</h5>
+                                        <div class="form-row">
+                                            <label>Detected via:</label>
+                                            <span id="manifest-detection-source" class="read-only-value">N/A</span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Basic Info -->
+                                    <div class="form-section">
+                                        <h5>Basic Information</h5>
+                                        <div class="form-row">
+                                            <label for="manifest-title">Title:</label>
+                                            <input type="text" id="manifest-title" placeholder="ROM Title">
+                                        </div>
+                                        <div class="form-row">
+                                            <label for="manifest-region">Regions:</label>
+                                            <div class="checkbox-group">
+                                                <label><input type="checkbox" id="region-j" value="J"> Japan</label>
+                                                <label><input type="checkbox" id="region-u" value="U"> USA</label>
+                                                <label><input type="checkbox" id="region-e" value="E"> Europe</label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Mapper Override -->
+                                    <div class="form-section">
+                                        <h5>Mapper Configuration</h5>
+                                        <div class="form-row">
+                                            <label for="manifest-mapper">Mapper Type:</label>
+                                            <select id="manifest-mapper">
+                                                <option value="None">None (Direct)</option>
+                                                <option value="Sega">SEGA (Standard Banking)</option>
+                                                <option value="SSF2">SSF2 (Super Street Fighter II)</option>
+                                                <option value="Codemasters">Codemasters</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <!-- SRAM Configuration -->
+                                    <div class="form-section">
+                                        <h5>SRAM Configuration</h5>
+                                        <div class="form-row">
+                                            <label><input type="checkbox" id="manifest-has-sram"> Has SRAM</label>
+                                        </div>
+                                        <div id="sram-config" class="sram-config" style="display: none;">
+                                            <div class="form-row">
+                                                <label for="manifest-sram-start">Start Address:</label>
+                                                <input type="text" id="manifest-sram-start" placeholder="0x200000"
+                                                    pattern="0x[0-9A-Fa-f]+">
+                                            </div>
+                                            <div class="form-row">
+                                                <label for="manifest-sram-end">End Address:</label>
+                                                <input type="text" id="manifest-sram-end" placeholder="0x200FFF"
+                                                    pattern="0x[0-9A-Fa-f]+">
+                                            </div>
+                                            <div class="form-row">
+                                                <label><input type="checkbox" id="manifest-sram-odd-only"> Odd Bytes
+                                                    Only</label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Expansion Chip -->
+                                    <div class="form-section">
+                                        <h5>Expansion Chip</h5>
+                                        <div class="form-row">
+                                            <label for="manifest-chip">Chip Type:</label>
+                                            <select id="manifest-chip">
+                                                <option value="None">None</option>
+                                                <option value="SVP">SVP (Sega Virtua Processor)</option>
+                                                <option value="JCart">J-Cart (Team Player in Cart)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <!-- EEPROM -->
+                                    <div class="form-section">
+                                        <h5>EEPROM Configuration</h5>
+                                        <div class="form-row">
+                                            <label for="manifest-eeprom">EEPROM Type:</label>
+                                            <select id="manifest-eeprom">
+                                                <option value="None">None</option>
+                                                <option value="I2C">I2C EEPROM</option>
+                                                <option value="SPI">SPI EEPROM</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <!-- Actions -->
+                                    <div class="manifest-actions">
+                                        <button type="button" id="load-manifest-btn" class="btn-secondary">📂 Load
+                                            JSON</button>
+                                        <button type="button" id="save-manifest-btn" class="btn-secondary">💾 Export
+                                            JSON</button>
+                                        <button type="button" id="apply-manifest-btn" class="btn-primary">✓ Apply to
+                                            ROM</button>
+                                        <button type="button" id="reset-manifest-btn" class="btn-danger">↻ Reset to
+                                            Auto-Detect</button>
+                                    </div>
+                                </form>
+
+                                <input type="file" id="manifest-file-input" accept=".json" hidden>
+
+                                <!-- Preview JSON -->
+                                <div class="manifest-preview">
+                                    <h5>Manifest JSON Preview</h5>
+                                    <pre id="manifest-json-preview" class="json-preview">{}</pre>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Memory Map Visualizer -->
+                        <div id="cart-memmap-tab" class="cartridge-subtab-content">
+                            <div class="memory-map-container">
+                                <canvas id="memory-map-canvas" width="800" height="400"></canvas>
+                                <div id="memory-map-legend" class="legend"></div>
+                            </div>
+                        </div>
+
+                        <!-- Mapper State -->
+                        <div id="cart-mapper-tab" class="cartridge-subtab-content">
+                            <div id="mapper-state-section">
+                                <h4>Mapper Registers</h4>
+                                <div id="mapper-registers" class="register-list"></div>
+
+                                <h4>Bank Configuration</h4>
+                                <div id="bank-configuration" class="bank-table"></div>
+                            </div>
+                        </div>
+
+                        <!-- SRAM Viewer -->
+                        <div id="cart-sram-tab" class="cartridge-subtab-content">
+                            <div class="sram-controls">
+                                <button id="export-sram-btn">💾 Export .srm</button>
+                                <button id="import-sram-btn">📂 Import .srm</button>
+                                <button id="clear-sram-btn">🗑️ Clear SRAM</button>
+                                <input type="file" id="sram-file-input" accept=".srm" hidden>
+                            </div>
+                            <div id="sram-hexdump" class="hexdump-view"></div>
+                        </div>
+                    </div>
+
+                    <!-- SNES Cartridge / Manifest Tab (snes1 only) -->
+                    <div id="snes-cartridge-tab" class="info-tab-content">
+                        <div id="snes-manifest-root"></div>
+                    </div>
+
+                    <!-- VDP Tab -->
+                    <div id="vdp-tab" class="info-tab-content">
+                        <div class="vdp-subtabs">
+                            <button class="vdp-subtab active" data-vdp-tab="state">State</button>
+                            <button class="vdp-subtab" data-vdp-tab="tiles">Tiles</button>
+                            <button class="vdp-subtab" data-vdp-tab="palettes">Palettes</button>
+                            <button class="vdp-subtab" data-vdp-tab="vram">VRAM</button>
+                            <button class="vdp-subtab" data-vdp-tab="sprites">Sprites</button>
+                        </div>
+
+                        <!-- State Sub-tab: layer toggles + VDP registers -->
+                        <div id="vdp-state-tab" class="vdp-subtab-content active">
+                            <div id="vdp-state-viewer"></div>
+                        </div>
+
+                        <!-- Tiles Sub-tab -->
+                        <div id="vdp-tiles-tab" class="vdp-subtab-content">
+                            <div class="vdp-controls">
+                                <label>Palette:
+                                    <select id="tile-palette-select">
+                                        <option value="0">0</option>
+                                        <option value="1">1</option>
+                                        <option value="2">2</option>
+                                        <option value="3">3</option>
+                                    </select>
+                                </label>
+                                <label>Tile:
+                                    <input type="number" id="tile-index-input" min="0" max="2047" value="0" />
+                                </label>
+                            </div>
+                            <canvas id="tile-viewer-canvas" width="512" height="512"></canvas>
+                        </div>
+
+                        <!-- Palettes Sub-tab -->
+                        <div id="vdp-palettes-tab" class="vdp-subtab-content">
+                            <div id="palette-viewer"></div>
+                        </div>
+
+                        <!-- VRAM Sub-tab -->
+                        <div id="vdp-vram-tab" class="vdp-subtab-content">
+                            <div class="vdp-controls">
+                                <label>Address:
+                                    <input type="text" id="vram-address-input" placeholder="0000" maxlength="4" />
+                                </label>
+                                <button id="vram-goto-btn">Go</button>
+                            </div>
+                            <div id="vram-viewer"></div>
+                        </div>
+
+                        <!-- Sprites Sub-tab -->
+                        <div id="vdp-sprites-tab" class="vdp-subtab-content">
+                            <div id="sprite-table-viewer"></div>
+                        </div>
+                    </div>
+
+                    <!-- Audio Tab (Generic for any audio chip) -->
+                    <div id="audio-tab" class="info-tab-content">
+                        <div id="audio-debugger-container"></div>
+                    </div>
+
+                    <!-- Input Tab -->
+                    <div id="input-tab" class="info-tab-content">
+                        <!-- Controller Ports -->
+                        <div class="controller-ports">
+                            <!-- Port 1 -->
+                            <div class="controller-port">
+                                <div class="port-header">
+                                    <h4>Port 1</h4>
+                                    <select id="port1-provider-select" class="port-provider-select"
+                                        title="Assign input provider to Port 1">
+                                        <option value="">(none)</option>
+                                    </select>
+                                </div>
+                                <div id="port1-assignment" class="port-assignment">No provider assigned</div>
+                                <div id="port1-visual" class="controller-visual"></div>
+                                <div id="port1-buttons" class="button-list">No input</div>
+                                <div id="port1-raw-state" class="raw-state">Raw: 0x0000</div>
+                            </div>
+
+                            <!-- Port 2 -->
+                            <div class="controller-port">
+                                <div class="port-header">
+                                    <h4>Port 2</h4>
+                                    <select id="port2-provider-select" class="port-provider-select"
+                                        title="Assign input provider to Port 2">
+                                        <option value="">(none)</option>
+                                    </select>
+                                </div>
+                                <div id="port2-assignment" class="port-assignment">No provider assigned</div>
+                                <div id="port2-visual" class="controller-visual"></div>
+                                <div id="port2-buttons" class="button-list">No input</div>
+                                <div id="port2-raw-state" class="raw-state">Raw: 0x0000</div>
+                            </div>
+                        </div>
+
+                        <!-- Swap Button -->
+                        <div class="swap-ports-container">
+                            <button id="swap-ports-btn" class="swap-ports-btn" title="Swap port assignments">⇄ Swap
+                                Ports</button>
+                        </div>
+
+                        <!-- Input Providers -->
+                        <div class="provider-section">
+                            <h4>Input Providers</h4>
+                            <div id="provider-list" class="provider-list"></div>
+                        </div>
+
+                        <!-- Input History -->
+                        <div class="input-history-section">
+                            <h4>Input History (Last 10 Frames)</h4>
+                            <div id="input-history-list" class="input-history-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <link rel="stylesheet" href="./src/audio-debugger.css">
+    <link rel="stylesheet" href="./src/input-debugger.css">
+
+    <link rel="stylesheet" href="./src/help-modal.css">
+    <link rel="stylesheet" href="./src/perf-overlay.css">
+
+    <script type="module" src="./src/main.ts"></script>
+</body>
+
+</html>

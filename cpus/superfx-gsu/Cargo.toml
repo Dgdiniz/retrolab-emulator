@@ -1,0 +1,11 @@
+[package]
+name = "superfx-gsu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Super FX GSU (Graphics Support Unit) RISC CPU emulation (SNES coprocessor)"
+
+[dependencies]
+retro-core = { path = "../../retro-core" }

@@ -1,0 +1,43 @@
+[package]
+name = "sg1-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+# ISC for this crate, and BSD 3-Clause for two things inside it: the three
+# FM tables generated from ymfm's data, and the SVP's 68000-side handlers,
+# which follow the ones written for PicoDrive. Both notices are at the end
+# of `LICENSE`.
+license = "ISC AND BSD-3-Clause"
+repository.workspace = true
+description = "Sega Genesis (Mega Drive) emulator core"
+
+[dependencies]
+retro-core = { path = "../../../retro-core" }
+ssp1601 = { path = "../../../cpus/ssp1601" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bincode = "1.3"
+chrono = { version = "0.4", features = ["serde"] }
+zstd = "0.13"  # Compression for save states
+# PNG-only: every image path here encodes/decodes PNG, and the default
+# feature set drags in the avif encoder stack (ravif -> rav1e -> pulp),
+# whose const asserts fail to compile under -Clink-dead-code coverage
+# builds.
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"  # Canonical ROM digest for cartridge manifests
+
+# WASM-specific dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+flate2 = "1.0"
+criterion = "0.5"
+paste = "1.0"
+
+[[bench]]
+name = "cartridge_performance"
+harness = false
+

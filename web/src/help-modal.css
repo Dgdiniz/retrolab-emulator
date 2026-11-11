@@ -1,0 +1,263 @@
+/**
+ * Help Modal Styles, companion CSS for `help-modal.js`.
+ */
+
+/* Help Modal */
+.help-modal {
+    display: none;
+    position: fixed;
+    z-index: 10000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+}
+
+.help-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.help-content {
+    background-color: #1e1e1e;
+    border: 1px solid #333;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 900px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.help-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid #333;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: linear-gradient(135deg, #252525 0%, #1e1e1e 100%);
+}
+
+.help-header h2 {
+    margin: 0;
+    color: #fff;
+    font-size: 24px;
+    font-weight: 600;
+}
+
+.help-close-btn {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 28px;
+    cursor: pointer;
+    padding: 0;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.help-close-btn:hover {
+    background-color: #333;
+    color: #fff;
+}
+
+.help-body {
+    padding: 24px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.help-section {
+    margin-bottom: 32px;
+}
+
+.help-section:last-child {
+    margin-bottom: 0;
+}
+
+.help-section h3 {
+    color: #fff;
+    font-size: 18px;
+    font-weight: 600;
+    margin: 0 0 16px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #333;
+}
+
+.keybindings-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.keybindings-table tr {
+    border-bottom: 1px solid #2a2a2a;
+}
+
+.keybindings-table tr:last-child {
+    border-bottom: none;
+}
+
+.keybindings-table tr:hover {
+    background-color: #252525;
+}
+
+.keybindings-table td {
+    padding: 12px 16px;
+    color: #ccc;
+    font-size: 14px;
+}
+
+.keybindings-table td:first-child {
+    width: 200px;
+    font-weight: 500;
+}
+
+.keybindings-table td:last-child {
+    color: #999;
+}
+
+/* A binding whose action is not available yet: its key is left to the
+   browser, so the row is dimmed and marked. */
+.keybindings-table tr.keybinding-unavailable td {
+    color: #666;
+}
+
+.keybinding-mark {
+    font-style: italic;
+}
+
+/* Keyboard key style */
+kbd {
+    display: inline-block;
+    padding: 4px 8px;
+    margin: 0 2px;
+    font-size: 12px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-weight: 600;
+    line-height: 1;
+    color: #fff;
+    background-color: #333;
+    border: 1px solid #444;
+    border-radius: 4px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    text-transform: uppercase;
+}
+
+kbd+kbd {
+    margin-left: 2px;
+}
+
+.key-combo {
+    white-space: nowrap;
+}
+
+.help-footer {
+    padding: 16px 24px;
+    border-top: 1px solid #333;
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    background-color: #1a1a1a;
+}
+
+.help-footer button {
+    padding: 8px 20px;
+    border: 1px solid #444;
+    background-color: #2a2a2a;
+    color: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+}
+
+.help-footer button:hover {
+    background-color: #333;
+    border-color: #555;
+}
+
+.help-footer button.primary {
+    background-color: #0066cc;
+    border-color: #0066cc;
+}
+
+.help-footer button.primary:hover {
+    background-color: #0052a3;
+}
+
+/* Scrollbar styling for help modal */
+.help-body::-webkit-scrollbar {
+    width: 8px;
+}
+
+.help-body::-webkit-scrollbar-track {
+    background: #1e1e1e;
+}
+
+.help-body::-webkit-scrollbar-thumb {
+    background: #444;
+    border-radius: 4px;
+}
+
+.help-body::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+/* Info box */
+.help-info-box {
+    background-color: #2a3a4a;
+    border-left: 4px solid #0066cc;
+    padding: 16px;
+    margin: 16px 0;
+    border-radius: 4px;
+}
+
+.help-info-box p {
+    margin: 0;
+    color: #ccc;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.help-info-box strong {
+    color: #fff;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .help-content {
+        width: 95%;
+        max-height: 95vh;
+    }
+
+    .help-header {
+        padding: 16px;
+    }
+
+    .help-body {
+        padding: 16px;
+    }
+
+    .keybindings-table td:first-child {
+        width: 140px;
+    }
+
+    .keybindings-table td {
+        padding: 10px 12px;
+        font-size: 13px;
+    }
+
+    kbd {
+        font-size: 11px;
+        padding: 3px 6px;
+    }
+}
