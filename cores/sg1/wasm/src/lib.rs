@@ -814,7 +814,8 @@ impl RetroEmulator {
         format!("{:?}", self.genesis.debugger().get_execution_mode())
     }
 
-    /// Set execution mode.
+    /// Set execution mode. On `Paused` the CPU states `getCpuStates` returns
+    /// are written at once, wherever the game stopped.
     #[wasm_bindgen(js_name = setExecutionMode)]
     pub fn set_execution_mode(&mut self, mode: String) {
         let exec_mode = match mode.as_str() {
@@ -826,7 +827,7 @@ impl RetroEmulator {
             _ => ExecutionMode::Running,
         };
 
-        self.genesis.debugger().set_execution_mode(exec_mode);
+        self.genesis.set_execution_mode(exec_mode);
     }
 
     /// Get memory regions.

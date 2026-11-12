@@ -1048,6 +1048,17 @@ impl GenesisEmulator {
         &self.debugger
     }
 
+    /// Set the debugger's execution mode. A pause also writes the CPU states
+    /// the debugger reports: a game running with no breakpoint and no trace
+    /// runs the fast loop, which never writes them, so without it a pause
+    /// would report the state of the last reset or step.
+    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.debugger.set_execution_mode(mode);
+        if mode == ExecutionMode::Paused {
+            self.update_debugger_state();
+        }
+    }
+
     // ===== Tracing Methods =====
 
     /// Enable or disable execution tracing.
@@ -4752,6 +4763,27 @@ mod tests {
 
         assert_eq!(genesis.cpu().pc, 0x00000400);
         assert_eq!(genesis.frame_count(), 0);
+    }
+
+    #[test]
+    fn a_pause_reports_where_the_fast_loop_stopped() {
+        use retro_core::DebuggerCore;
+
+        let mut genesis = GenesisEmulator::new();
+        genesis.load_rom(&create_test_rom()).unwrap();
+        genesis.set_execution_mode(ExecutionMode::Running);
+        for _ in 0..3 {
+            genesis.run_frame_fast();
+        }
+        // The fast loop writes no CPU state: the debugger still holds the one
+        // the reset wrote.
+        assert_eq!(genesis.debugger().get_cpu_states()[0].pc, 0x400);
+
+        genesis.set_execution_mode(ExecutionMode::Paused);
+
+        let pc = genesis.cpu().pc;
+        assert_ne!(pc, 0x400);
+        assert_eq!(genesis.debugger().get_cpu_states()[0].pc, pc);
     }
 
     #[test]

@@ -1814,6 +1814,17 @@ impl SnesEmulator {
         }
     }
 
+    /// Set the debugger's execution mode. A pause also refreshes the register
+    /// snapshots the debugger reports: a game running with no breakpoint and no
+    /// trace runs the fast loop, which never refreshes them, so without it a
+    /// pause would report the state of the last reset or step.
+    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.debugger.set_execution_mode(mode);
+        if mode == ExecutionMode::Paused {
+            self.update_debugger_state();
+        }
+    }
+
     /// Refresh the debugger's cached register snapshots for every CPU
     /// (65C816 from the main CPU, SPC700 from the APU, and, on an SA-1, Super FX
     /// or Cx4 cart, the chip's CPU as slot 2).
@@ -2888,6 +2899,26 @@ mod tests {
         rom[offset + 0x2E..offset + 0x30].copy_from_slice(&checksum.to_le_bytes());
         rom[offset + 0x4C..offset + 0x4E].copy_from_slice(&0x8000u16.to_le_bytes());
         rom
+    }
+
+    #[test]
+    fn a_pause_reports_where_the_fast_loop_stopped() {
+        let mut emu = SnesEmulator::new();
+        emu.load_rom(&synth_hirom_2kib_sram_rom()).expect("loads");
+        let at_load = emu.debugger.get_cpu_states()[0].pc;
+        emu.set_execution_mode(ExecutionMode::Running);
+        for _ in 0..3 {
+            emu.run_frame_fast();
+        }
+        // The fast loop refreshes no snapshot: the debugger still holds the
+        // one the reset took.
+        assert_eq!(emu.debugger.get_cpu_states()[0].pc, at_load);
+
+        emu.set_execution_mode(ExecutionMode::Paused);
+
+        let live = cpu_state_65816(emu.cpu()).pc;
+        assert_ne!(live, at_load);
+        assert_eq!(emu.debugger.get_cpu_states()[0].pc, live);
     }
 
     #[test]

@@ -905,7 +905,9 @@ impl RetroEmulator {
     }
 
     /// Set execution mode
-    /// (`Running | Paused | StepInto | StepOver | StepOut`).
+    /// (`Running | Paused | StepInto | StepOver | StepOut`). On `Paused` the
+    /// CPU states `getCpuStates` returns are refreshed at once, wherever the
+    /// game stopped.
     #[wasm_bindgen(js_name = setExecutionMode)]
     pub fn set_execution_mode(&mut self, mode: String) {
         let exec_mode = match mode.as_str() {
@@ -916,7 +918,7 @@ impl RetroEmulator {
             "StepOut" => ExecutionMode::StepOut,
             _ => ExecutionMode::Running,
         };
-        self.snes.debugger().set_execution_mode(exec_mode);
+        self.snes.set_execution_mode(exec_mode);
     }
 
     /// Get memory regions (WRAM / VRAM / OAM / CGRAM / ARAM / ROM / SRAM).
