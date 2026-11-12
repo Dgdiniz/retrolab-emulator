@@ -16,7 +16,7 @@ import {
 } from '../src/debug-profile-core'
 
 describe('debug-profile-core > resolveDebugProfile', () => {
-  it('resolves the Genesis profile (68000 + Z80, tabs incl. vdp/audio/cartridge/capture)', () => {
+  it('resolves the Genesis profile (68000 + Z80, tabs incl. vdp/audio/cartridge)', () => {
     const p = resolveDebugProfile('genesis')
     expect(p.id).toBe('genesis')
     expect(p.cpus.map((c) => [c.id, c.label, c.kind])).toEqual([
@@ -24,25 +24,23 @@ describe('debug-profile-core > resolveDebugProfile', () => {
       [1, 'Z80', 'z80'],
     ])
     expect(p.infoTabs).toEqual([
-      'breakpoints', 'watchpoints', 'history', 'callstack', 'vdp', 'audio', 'input', 'cartridge', 'capture',
+      'breakpoints', 'watchpoints', 'history', 'callstack', 'vdp', 'audio', 'input', 'cartridge',
     ])
   })
 
-  it('resolves the SNES profile (65816 + SPC700, with ppu/apu/snesCartridge/capture viewers)', () => {
+  it('resolves the SNES profile (65816 + SPC700, with ppu/apu/snesCartridge viewers)', () => {
     const p = resolveDebugProfile('snes')
     expect(p.cpus.map((c) => [c.id, c.label, c.kind])).toEqual([
       [0, '65816', 'w65816'],
       [1, 'SPC700', 'spc700'],
     ])
     expect(p.infoTabs).toEqual([
-      'breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'ppu', 'apu', 'snesCartridge', 'capture',
+      'breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'ppu', 'apu', 'snesCartridge',
     ])
     // Uses the SNES-specific viewer ids, not the Genesis ones.
     expect(p.infoTabs).not.toContain('vdp')
     expect(p.infoTabs).not.toContain('audio')
     expect(p.infoTabs).not.toContain('cartridge')
-    // The graphics-extraction Capture tab is console-aware (SNES too).
-    expect(p.infoTabs).toContain('capture')
   })
 
   it('resolves the SNES SA-1 profile (adds the SA-1 second 65816 as slot 2)', () => {
@@ -211,11 +209,11 @@ describe('debug-profile-core > SNES family', () => {
 describe('debug-profile-core > info tab labels', () => {
   it('labels every tab id', () => {
     const ids: DebugInfoTabId[] = [
-      'breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'capture', 'vdp', 'audio', 'cartridge',
+      'breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'vdp', 'audio', 'cartridge',
       'ppu', 'apu', 'snesCartridge',
     ]
     expect(ids.map(infoTabLabel)).toEqual([
-      'Breakpoints', 'Watchpoints', 'History', 'Call Stack', 'Input', 'Capture', 'VDP', 'Audio', 'Cartridge',
+      'Breakpoints', 'Watchpoints', 'History', 'Call Stack', 'Input', 'VDP', 'Audio', 'Cartridge',
       // The SNES cartridge tab shares the 'Cartridge' label (distinct id).
       'PPU', 'APU', 'Cartridge',
     ])
@@ -223,7 +221,7 @@ describe('debug-profile-core > info tab labels', () => {
 
   it('INFO_TAB_LABELS covers exactly the tab id union', () => {
     expect(Object.keys(INFO_TAB_LABELS).sort()).toEqual([
-      'apu', 'audio', 'breakpoints', 'callstack', 'capture', 'cartridge',
+      'apu', 'audio', 'breakpoints', 'callstack', 'cartridge',
       'history', 'input', 'ppu', 'snesCartridge', 'vdp', 'watchpoints',
     ])
   })

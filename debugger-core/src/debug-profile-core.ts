@@ -47,11 +47,6 @@ export type DebugInfoTabId =
   | 'history'
   | 'callstack'
   | 'input'
-  // Graphics extraction surface (sprites/tiles/palette/layer stills ->
-  // PNG). Generic and console-aware: both the Genesis and SNES profiles
-  // opt in (the platform's capture tools read the active profile's id to
-  // pick the per-console assembler).
-  | 'capture'
   | 'vdp'
   | 'audio'
   | 'cartridge'
@@ -79,7 +74,6 @@ export const INFO_TAB_LABELS: Record<DebugInfoTabId, string> = {
   history: 'History',
   callstack: 'Call Stack',
   input: 'Input',
-  capture: 'Capture',
   vdp: 'VDP',
   audio: 'Audio',
   cartridge: 'Cartridge',
@@ -108,7 +102,6 @@ const GENESIS_PROFILE: DebugProfile = {
     'audio',
     'input',
     'cartridge',
-    'capture',
   ],
 }
 
@@ -121,7 +114,7 @@ const SNES_PROFILE: DebugProfile = {
     { id: 0, label: '65816', kind: 'w65816' },
     { id: 1, label: 'SPC700', kind: 'spc700', steppable: false },
   ],
-  infoTabs: ['breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'ppu', 'apu', 'snesCartridge', 'capture'],
+  infoTabs: ['breakpoints', 'watchpoints', 'history', 'callstack', 'input', 'ppu', 'apu', 'snesCartridge'],
 }
 
 // SNES with an SA-1 cartridge: the same console as `snes` plus the SA-1's
@@ -183,10 +176,10 @@ export const DEFAULT_DEBUG_PROFILE_ID = 'genesis'
  * The SNES-family profile ids, the base SNES roster and every
  * cartridge-varied superset of it (`snes-sa1` adds the SA-1's second 65816;
  * `snes-superfx` adds the Super FX GSU; `snes-cx4` adds the Cx4 HG51B169).
- * Hosts gate SNES-specific behaviour (PPU/APU readback, the SNES capture
- * assembler, the ARAM memory tab, the SNES controller diagram) on membership
- * here rather than `=== 'snes'`, so an SA-1 / Super FX / Cx4 cart isn't
- * misclassified as Genesis.
+ * Hosts gate SNES-specific behaviour (PPU/APU readback, the ARAM memory
+ * tab, the SNES controller diagram) on membership here rather than
+ * `=== 'snes'`, so an SA-1 / Super FX / Cx4 cart isn't misclassified as
+ * Genesis.
  */
 export const SNES_FAMILY_PROFILE_IDS: readonly string[] = [
   'snes',
