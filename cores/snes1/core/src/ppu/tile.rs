@@ -994,6 +994,91 @@ mod tests {
         assert_eq!(mode7_sample(&vram, 11, 20, 0), Some(0xAB));
     }
 
+    /// Drift guard for the platform's TypeScript reading of sprite tiles,
+    /// like the Mode 7 one above: the same settings and sprites on both
+    /// sides, and the VRAM word address each 8x8 cell of a sprite reads,
+    /// in display order (the top row first, each row left to right).
+    /// OBSEL $FB: small sprites 16x32, large 32x32, the first table at
+    /// word $6000, the second 256 tiles past it plus a gap of three steps
+    /// of 256 tiles, which wraps to word $2000.
+    ///
+    /// Sprite 0 is small, in the first table. Sprite 1 is large, at
+    /// character $FE, so its columns run 14, 15, 0, 1 and its rows 15, 0,
+    /// 1, 2: the table wraps on both axes. Sprite 2 is small, in the
+    /// second table and flipped both ways: its columns read right to left
+    /// and its rows are mirrored in blocks as tall as the sprite is wide.
+    #[test]
+    fn sprite_tile_parity_golden() {
+        use crate::ppu::sprite::{
+            parse_sprite, sprite_row_in_sprite, sprite_tile_number, SpriteAttrs,
+        };
+        use crate::ppu::{Ppu, SpriteTileSettings};
+
+        let mut ppu = Ppu::new();
+        ppu.write_2101(0xFB);
+        // Low table: X, Y, character, attributes; sprites 0 and 1 keep
+        // attributes 0.
+        ppu.oam[2] = 0x23;
+        ppu.oam[6] = 0xFE;
+        ppu.oam[10] = 0x05;
+        ppu.oam[11] = 0xC1; // vertical and horizontal flip, second table
+        ppu.oam[0x200] = 0x08; // high table: sprite 1 is large
+
+        assert_eq!(
+            ppu.sprite_tile_settings(),
+            SpriteTileSettings {
+                small_width: 16,
+                small_height: 32,
+                large_width: 32,
+                large_height: 32,
+                first_table_base_word: 0x6000,
+                second_table_base_word: 0x2000,
+            }
+        );
+
+        // The word each cell reads, the renderer's way: the row resolver
+        // over the sprite anchored at Y = 0, then each column's tile.
+        let words = |index: usize| -> Vec<u32> {
+            let sprite = parse_sprite(ppu.oam(), index, ppu.obj_base_size, false);
+            let anchored = SpriteAttrs { y: 0, ..sprite };
+            let mut words = Vec::new();
+            for tile_row in 0..u16::from(sprite.height >> 3) {
+                let y_row = sprite_row_in_sprite(&anchored, tile_row * 8, false, false);
+                for column in 0..sprite.width >> 3 {
+                    let tile = sprite_tile_number(
+                        ppu.obj_tiledata_addr,
+                        ppu.obj_name_select,
+                        sprite.character,
+                        sprite.nameselect,
+                        sprite.hflip,
+                        sprite.width,
+                        column,
+                        y_row,
+                    );
+                    words.push(u32::from(tile) << 4);
+                }
+            }
+            words
+        };
+        assert_eq!(
+            words(0),
+            [0x6230, 0x6240, 0x6330, 0x6340, 0x6430, 0x6440, 0x6530, 0x6540]
+        );
+        assert_eq!(
+            words(1),
+            [
+                0x6FE0, 0x6FF0, 0x6F00, 0x6F10, //
+                0x60E0, 0x60F0, 0x6000, 0x6010, //
+                0x61E0, 0x61F0, 0x6100, 0x6110, //
+                0x62E0, 0x62F0, 0x6200, 0x6210,
+            ]
+        );
+        assert_eq!(
+            words(2),
+            [0x2160, 0x2150, 0x2060, 0x2050, 0x2360, 0x2350, 0x2260, 0x2250]
+        );
+    }
+
     // -- Tilemap-row cache helpers -----------------------------
 
     #[test]

@@ -53,7 +53,7 @@
 pub mod cgram;
 pub mod colormath;
 mod debug;
-pub use debug::{BgLayout, SpriteDescriptor, TileSetSource, ViewerImage};
+pub use debug::{BgLayout, SpriteDescriptor, SpriteTileSettings, TileSetSource, ViewerImage};
 pub mod mode7;
 pub mod oam;
 pub mod regs;

@@ -20,7 +20,9 @@ use retro_core::video::{
 };
 
 use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
-use crate::ppu::sprite::{parse_sprite, sprite_row_in_sprite, sprite_tile_number, SpriteAttrs};
+use crate::ppu::sprite::{
+    parse_sprite, sprite_row_in_sprite, sprite_size, sprite_tile_number, SpriteAttrs,
+};
 use crate::ppu::tile::{decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row};
 use crate::ppu::{Ppu, LAYER_COUNT, LAYER_OBJ};
 
@@ -152,6 +154,43 @@ pub struct BgLayout {
     pub scroll_y: u16,
 }
 
+/// Where the renderer finds the sprites' tiles, and the two sizes a
+/// sprite can take, read off OBSEL (`$2101`) and the OBJ interlace bit
+/// of SETINI (`$2133` bit 1).
+///
+/// A sprite's tiles sit in a table of 16 x 16 characters, 4bpp, 16 VRAM
+/// words each. The character byte names the top-left tile (its low
+/// nibble the column, its high nibble the row) and the sprite's other
+/// tiles are its neighbours, wrapping inside the table on both axes
+/// ([`sprite_tile_number`]). A sprite whose name-select bit is set (bit 0
+/// of its fourth OAM byte) reads the second table. A horizontal flip
+/// reads the columns right to left; a vertical flip mirrors the rows in
+/// blocks as tall as the sprite is wide ([`sprite_row_in_sprite`]).
+///
+/// The host pairs this with `get_oam()` and a 4bpp decode of the whole
+/// VRAM (`decode_tiles`) to read a sprite's tiles the way the renderer
+/// reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SpriteTileSettings {
+    /// Width in pixels of a small sprite (size bit clear).
+    pub small_width: u8,
+    /// Height in pixels of a small sprite. Under OBJ interlace the
+    /// small height of size selectors 6 and 7 is 16, as in the sprite
+    /// list.
+    pub small_height: u8,
+    /// Width in pixels of a large sprite (size bit set).
+    pub large_width: u8,
+    /// Height in pixels of a large sprite.
+    pub large_height: u8,
+    /// VRAM word address of character 0 of the first table, wrapped
+    /// inside VRAM's 32 K words as the renderer wraps it.
+    pub first_table_base_word: u16,
+    /// VRAM word address of character 0 of the second table: 256 tiles
+    /// past the first, plus the gap OBSEL bits 3-4 select in steps of
+    /// 256 tiles, wrapped the same way.
+    pub second_table_base_word: u16,
+}
+
 /// Read one tilemap entry for background `tx,ty` honouring the SNES
 /// quadrant layout (32x32 sub-screens: TL, TR, BL, BR). `word_base` is
 /// the tilemap base in VRAM words.
@@ -229,6 +268,40 @@ impl Ppu {
             palette_base: palette_offset_for_bg(self.bgmode, bg),
             scroll_x: self.bg_hoffset(bg),
             scroll_y: self.bg_voffset(bg),
+        }
+    }
+
+    /// Where the renderer finds the sprites' tiles, and the two sprite
+    /// sizes ([`SpriteTileSettings`]), as they stand now. Each table's
+    /// address is the tile the renderer reads for character 0 of that
+    /// table, so the two cannot disagree.
+    #[must_use]
+    pub fn sprite_tile_settings(&self) -> SpriteTileSettings {
+        let (small_width, small_height) =
+            sprite_size(self.obj_base_size, false, self.obj_interlace);
+        let (large_width, large_height) = sprite_size(self.obj_base_size, true, self.obj_interlace);
+        let table_base_word = |second_table: bool| {
+            let tile = sprite_tile_number(
+                self.obj_tiledata_addr,
+                self.obj_name_select,
+                0,
+                second_table,
+                false,
+                8,
+                0,
+                0,
+            );
+            // A 4bpp tile is 16 words; the tile number is below 2048, so
+            // the address fits in 16 bits.
+            tile << 4
+        };
+        SpriteTileSettings {
+            small_width,
+            small_height,
+            large_width,
+            large_height,
+            first_table_base_word: table_base_word(false),
+            second_table_base_word: table_base_word(true),
         }
     }
 }
@@ -1148,6 +1221,88 @@ mod tests {
         assert_eq!(layout.bpp, 2, "BG2 mode 0 = 2bpp");
         assert_eq!(layout.palette_base, 32, "mode 0 -> bg*32");
         assert_eq!((layout.scroll_x, layout.scroll_y), (0x1FF, 0x0AA));
+    }
+
+    // -- sprite_tile_settings ----------------------------------------
+
+    #[test]
+    fn sprite_tile_settings_read_obsel_and_obj_interlace() {
+        let mut ppu = Ppu::new();
+        // Power-on OBSEL is 0: 8x8 and 16x16, the first table at word 0,
+        // the second 256 tiles past it.
+        assert_eq!(
+            ppu.sprite_tile_settings(),
+            SpriteTileSettings {
+                small_width: 8,
+                small_height: 8,
+                large_width: 16,
+                large_height: 16,
+                first_table_base_word: 0,
+                second_table_base_word: 0x1000,
+            }
+        );
+        // Base 2, gap 1: the tables at words $4000 and $4000 + $1000 +
+        // $1000.
+        ppu.write_2101(0x0A);
+        let settings = ppu.sprite_tile_settings();
+        assert_eq!(settings.first_table_base_word, 0x4000);
+        assert_eq!(settings.second_table_base_word, 0x6000);
+        // Base 4 is past VRAM's 32 K words and wraps to word 0, as the
+        // renderer reads it.
+        ppu.write_2101(0x04);
+        assert_eq!(ppu.sprite_tile_settings().first_table_base_word, 0);
+        // Selector 6 under OBJ interlace: the small height is 16, as in
+        // the sprite list; the large size is unchanged.
+        ppu.write_2101(0xC0);
+        ppu.obj_interlace = true;
+        let settings = ppu.sprite_tile_settings();
+        assert_eq!((settings.small_width, settings.small_height), (16, 16));
+        assert_eq!((settings.large_width, settings.large_height), (32, 64));
+    }
+
+    /// A host that adds a cell's place in the 16 x 16 table to the
+    /// table's address, both axes wrapping inside the table, reads the
+    /// tile the renderer reads: for every OBSEL value, both tables, and
+    /// every cell of a 64x64 sprite at characters on the table's edges
+    /// and inside it.
+    #[test]
+    fn sprite_tile_settings_locate_every_tile_the_renderer_reads() {
+        let mut ppu = Ppu::new();
+        for obsel in 0..=0xFFu8 {
+            ppu.write_2101(obsel);
+            let settings = ppu.sprite_tile_settings();
+            for second_table in [false, true] {
+                let table = if second_table {
+                    settings.second_table_base_word
+                } else {
+                    settings.first_table_base_word
+                } >> 4;
+                for character in [0x00u8, 0x0F, 0x5A, 0xF0, 0xFE, 0xFF] {
+                    for column in 0..8u8 {
+                        for tile_row in 0..8u16 {
+                            let renderer = sprite_tile_number(
+                                ppu.obj_tiledata_addr,
+                                ppu.obj_name_select,
+                                character,
+                                second_table,
+                                false,
+                                64,
+                                column,
+                                tile_row * 8,
+                            );
+                            let grid_column = (u16::from(character & 15) + u16::from(column)) & 15;
+                            let grid_row = (u16::from(character >> 4) + tile_row) & 15;
+                            assert_eq!(
+                                renderer,
+                                (table + grid_row * 16 + grid_column) & 0x07FF,
+                                "OBSEL {obsel:#04x}, second table {second_table}, \
+                                 character {character:#04x}, column {column}, row {tile_row}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -- repaint sequence (the core of SnesEmulator::repaint_held_frame) --

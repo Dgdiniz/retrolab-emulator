@@ -931,6 +931,13 @@ impl SnesEmulator {
         self.bus.ppu().bg_layout(bg)
     }
 
+    /// Where the renderer finds the sprites' tiles, and the two sprite
+    /// sizes ([`crate::ppu::SpriteTileSettings`]), for a host that reads
+    /// a sprite's tiles the way the renderer does.
+    pub fn sprite_tile_settings(&self) -> crate::ppu::SpriteTileSettings {
+        self.bus.ppu().sprite_tile_settings()
+    }
+
     /// Re-render the held frame from the present PPU state (VRAM / CGRAM /
     /// OAM / registers + the debugger layer mask) into the framebuffer,
     /// without advancing emulation.

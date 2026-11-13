@@ -1471,14 +1471,27 @@ impl RetroEmulator {
     }
 
     /// Per-background addressing + format snapshot (`BgLayout`) for the
-    /// host's raw-layer (full-map) assembler: `{ bg, bgMode,
-    /// tilemapBaseByte, charBaseByte, screenSize, widthCells, heightCells,
-    /// bpp, tileSize16, paletteBase, scrollX, scrollY }`. `bpp` is `0`
-    /// when the BG does not draw under the current mode (host falls back
-    /// to the viewport). `bg` is clamped to `0..=3`.
+    /// host's raw-layer (full-map) assembler, in the core's own field
+    /// names: `{ bg, bg_mode, tilemap_base_byte, char_base_byte,
+    /// screen_size, width_cells, height_cells, bpp, tile_size16,
+    /// palette_base, scroll_x, scroll_y }`. `bpp` is `0` when the BG does
+    /// not draw under the current mode (host falls back to the viewport).
+    /// `bg` is clamped to `0..=3`.
     #[wasm_bindgen(js_name = getBgLayout)]
     pub fn get_bg_layout(&self, bg: usize) -> JsValue {
         serde_wasm_bindgen::to_value(&self.snes.bg_layout(bg)).unwrap()
+    }
+
+    /// Where the renderer finds the sprites' tiles, and the two sprite
+    /// sizes (`SpriteTileSettings`), in the core's own field names:
+    /// `{ small_width, small_height, large_width, large_height,
+    /// first_table_base_word, second_table_base_word }`. The sizes are in
+    /// pixels and the addresses are VRAM word addresses; a sprite whose
+    /// name-select bit is set (bit 0 of its fourth OAM byte, `getOam`)
+    /// reads the second table. Read-only.
+    #[wasm_bindgen(js_name = getSpriteTileSettings)]
+    pub fn get_sprite_tile_settings(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(&self.snes.sprite_tile_settings()).unwrap()
     }
 
     /// Cartridge manifest: `{ memoryMap, romRegions, sramRegions,
@@ -1897,6 +1910,28 @@ mod tests {
         assert_eq!(emu.get_cgram().len(), 0x100);
         assert_eq!(emu.get_oam().len(), 0x220);
         assert_eq!(emu.get_aram().len(), 0x10000);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sprite_tile_settings_carry_the_core_names() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // OBSEL $FB: small 16x32, large 32x32, the first table at word
+        // $6000, the second 256 tiles and three gaps of 256 tiles on,
+        // which wraps to word $2000.
+        emu.write_memory_debug(0x2101, &[0xFB]);
+        let settings = emu.get_sprite_tile_settings();
+        let field = |name: &str| {
+            js_sys::Reflect::get(&settings, &JsValue::from_str(name))
+                .unwrap()
+                .as_f64()
+                .unwrap_or_else(|| panic!("{name} is not a number"))
+        };
+        assert_eq!(field("small_width"), 16.0);
+        assert_eq!(field("small_height"), 32.0);
+        assert_eq!(field("large_width"), 32.0);
+        assert_eq!(field("large_height"), 32.0);
+        assert_eq!(field("first_table_base_word"), f64::from(0x6000));
+        assert_eq!(field("second_table_base_word"), f64::from(0x2000));
     }
 
     #[wasm_bindgen_test]
