@@ -617,12 +617,13 @@ pub struct Ppu {
     pub(crate) bg_tilemap_row_cache: Box<[BgTilemapRowCache; 4]>,
 
     /// Monotonic VRAM-write counter driving tilemap-cache coherence.
-    /// [`vram::Ppu::vram_write_byte`] bumps it on every landed write;
-    /// each [`BgTilemapRowCache`] stores the value it was built under
-    /// and rebuilds when it changes. Writes only land while the access
-    /// gate is open (VBlank / forced blank), so the counter is frozen
-    /// across an active frame and the cache stays coherent for the
-    /// whole visible region.
+    /// [`vram::Ppu::vram_write_byte`] bumps it on every landed write,
+    /// and a debugger's [`Ppu::write_vram_debug`] once per write; each
+    /// [`BgTilemapRowCache`] stores the value it was built under and
+    /// rebuilds when it changes. Port writes only land while the access
+    /// gate is open (VBlank / forced blank), so in play the counter is
+    /// frozen across an active frame and the cache stays coherent for
+    /// the whole visible region.
     vram_generation: u64,
 
     /// Decoded-sprite-tile cache (see [`SpriteTileCache`]). Shares the
@@ -1139,8 +1140,9 @@ impl Ppu {
 
     /// Force every per-BG tilemap-row cache to miss on the next
     /// render. Test-only: production VRAM mutations all flow through
-    /// [`vram::Ppu::vram_write_byte`], which bumps the generation, so
-    /// this exists purely for tests that poke `vram` directly.
+    /// [`vram::Ppu::vram_write_byte`] or [`Ppu::write_vram_debug`], which
+    /// bump the generation, so this exists purely for tests that poke
+    /// `vram` directly.
     #[cfg(test)]
     pub(crate) fn invalidate_tilemap_caches(&mut self) {
         for slot in self.bg_tilemap_row_cache.iter_mut() {

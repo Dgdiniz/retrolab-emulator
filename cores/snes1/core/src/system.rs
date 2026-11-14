@@ -938,6 +938,26 @@ impl SnesEmulator {
         self.bus.ppu().sprite_tile_settings()
     }
 
+    /// Write `bytes` into VRAM from word `word_address` on, the way a
+    /// debugger edits graphics ([`crate::ppu::Ppu::write_vram_debug`]):
+    /// straight into memory, so the timing, the CPUs and every register
+    /// stay as they were.
+    pub fn write_vram_debug(&mut self, word_address: u32, bytes: &[u8]) {
+        self.bus.ppu_mut().write_vram_debug(word_address, bytes);
+    }
+
+    /// Write `colours` into CGRAM from colour `colour_index` on, the way a
+    /// debugger edits a palette ([`crate::ppu::Ppu::write_cgram_debug`]).
+    pub fn write_cgram_debug(&mut self, colour_index: u32, colours: &[u16]) {
+        self.bus.ppu_mut().write_cgram_debug(colour_index, colours);
+    }
+
+    /// Write `bytes` into OAM from `byte_address` on, the way a debugger
+    /// edits sprites ([`crate::ppu::Ppu::write_oam_debug`]).
+    pub fn write_oam_debug(&mut self, byte_address: u32, bytes: &[u8]) {
+        self.bus.ppu_mut().write_oam_debug(byte_address, bytes);
+    }
+
     /// Re-render the held frame from the present PPU state (VRAM / CGRAM /
     /// OAM / registers + the debugger layer mask) into the framebuffer,
     /// without advancing emulation.

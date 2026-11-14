@@ -1573,6 +1573,45 @@ impl RetroEmulator {
         self.snes.ppu().oam().to_vec()
     }
 
+    /// Write VRAM for debugging, to edit a game's graphics: `bytes` from
+    /// word `word_address` on, in the layout `getVram` returns (byte
+    /// `2 * word_address + n`, the low half of each word first), so
+    /// `getVram` gives them back. Straight into memory, through no port:
+    /// the timing, the CPUs and the PPU's registers are untouched, and the
+    /// write lands whatever line is being drawn. The word address wraps at
+    /// 32 K words, a buffer longer than the 64 KiB is cut to it, and an
+    /// empty one writes nothing. The renderer's cached tilemap rows and
+    /// sprite tiles follow the write. A running game shows the change on
+    /// its next frame, a paused one after `repaintFrame`.
+    #[wasm_bindgen(js_name = writeVram)]
+    pub fn write_vram(&mut self, word_address: u32, bytes: &[u8]) {
+        self.snes.write_vram_debug(word_address, bytes);
+    }
+
+    /// Write CGRAM for debugging, to edit a palette: `colours` from colour
+    /// `colour_index` (0-255) on, BGR555 words as `getCgram` returns them
+    /// (bit 15 is dropped, as the port drops it). Straight into memory,
+    /// through no port. The index wraps at 256, a buffer longer than CGRAM
+    /// is cut to its 256 colours, and an empty one writes nothing. A
+    /// running game shows the change on its next frame, a paused one after
+    /// `repaintFrame`.
+    #[wasm_bindgen(js_name = writeCgram)]
+    pub fn write_cgram(&mut self, colour_index: u32, colours: &[u16]) {
+        self.snes.write_cgram_debug(colour_index, colours);
+    }
+
+    /// Write OAM for debugging, to edit sprites: `bytes` from byte
+    /// `byte_address` (0-543) on, in the layout `getOam` returns (four
+    /// bytes a sprite in the 512-byte low table, then the 32-byte high
+    /// table). Straight into memory, through no port. The address wraps at
+    /// 544, a buffer longer than OAM is cut to its 544 bytes, and an empty
+    /// one writes nothing. A running game shows the change on its next
+    /// frame, a paused one after `repaintFrame`.
+    #[wasm_bindgen(js_name = writeOam)]
+    pub fn write_oam(&mut self, byte_address: u32, bytes: &[u8]) {
+        self.snes.write_oam_debug(byte_address, bytes);
+    }
+
     /// The SPC700's 64 KiB audio RAM (ARAM) as raw bytes, the address
     /// space the SPC700 + S-DSP execute against, surfaced as an ARAM
     /// memory tab when the SPC700 is the focused CPU.
@@ -2023,5 +2062,62 @@ mod tests {
         );
         assert!(emu.add_gamepad("gamepad-1".to_string()));
         assert_eq!(js_sys::Array::from(&emu.get_port_providers(1)).length(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn write_vram_reads_back_through_get_vram_wrapping_at_the_end() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // Word 0x7FFF is the last; the run goes on at word 0.
+        emu.write_vram(0x7FFF, &[1, 2, 3, 4]);
+        let vram = emu.get_vram();
+        assert_eq!(&vram[0xFFFE..], &[1, 2]);
+        assert_eq!(&vram[..2], &[3, 4]);
+
+        emu.write_vram(0x8003, &[9]);
+        assert_eq!(emu.get_vram()[6], 9, "a word address past the end wraps");
+
+        let before = emu.get_vram();
+        emu.write_vram(0x10, &[]);
+        assert_eq!(emu.get_vram(), before, "an empty write changes nothing");
+    }
+
+    #[wasm_bindgen_test]
+    fn write_cgram_reads_back_and_shows_after_a_repaint() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // Colour 255, then on round to colour 0; bit 15 is dropped.
+        emu.write_cgram(255, &[0xFFFF, 0x001F]);
+        let cgram = emu.get_cgram();
+        assert_eq!(cgram[255], 0x7FFF);
+        assert_eq!(cgram[0], 0x001F);
+
+        // INIDISP $0F: the display on at full brightness. With no layer
+        // on, the screen is the backdrop, colour 0, red now.
+        emu.write_memory_debug(0x2100, &[0x0F]);
+        emu.repaint_frame();
+        assert_eq!(
+            &emu.get_framebuffer_data().to_vec()[..4],
+            &[0xFF, 0x00, 0x00, 0xFF]
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn write_oam_reads_back_and_moves_a_sprite() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // The last byte of the high table, then on round to sprite 0's X.
+        emu.write_oam(543, &[0xAA, 100]);
+        let oam = emu.get_oam();
+        assert_eq!(oam[543], 0xAA);
+        assert_eq!(oam[0], 100);
+
+        let sprites: Vec<retro_core::video::SpriteData> =
+            serde_wasm_bindgen::from_value(emu.get_sprite_data()).unwrap();
+        assert_eq!(sprites[0].x, 100, "sprite 0 is at x 100");
+
+        let long: Vec<u8> = (0..600).map(|i| if i < 544 { 1 } else { 2 }).collect();
+        emu.write_oam(10, &long);
+        assert!(
+            emu.get_oam().iter().all(|&byte| byte == 1),
+            "a buffer longer than OAM is cut to it"
+        );
     }
 }

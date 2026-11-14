@@ -13,6 +13,11 @@
 //! 16 sixteen-colour palettes a 4bpp screen uses. Both reuse the pure
 //! decoders in [`crate::ppu::tile`] / [`crate::ppu::sprite`] so the
 //! debug path can never diverge from the renderer.
+//!
+//! The debugger's writes live here too: `write_vram_debug`,
+//! `write_cgram_debug` and `write_oam_debug` put new contents straight
+//! into video memory, to edit the graphics of a running or paused game,
+//! and keep the renderer's caches of VRAM in step.
 
 use retro_core::video::{
     ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
@@ -903,6 +908,99 @@ fn blit_tile(
     }
 }
 
+// -- Debugger writes (inherent) --------------------------------------
+//
+// A debugger edits a game's graphics by writing video memory straight in,
+// through none of the ports: the address registers, their latches, the
+// VRAM read buffer and the gates that close the ports while the picture
+// is drawn play no part, and the timing and every flag stay as they were.
+// `SnesEmulator` re-exposes thin wrappers.
+
+/// Bytes of VRAM, the span a debugger write into it wraps around.
+const VRAM_BYTES: usize = 0x1_0000;
+/// Colours in CGRAM.
+const CGRAM_COLOURS: usize = 0x100;
+/// The bits of a CGRAM word that hold a colour, five each of blue, green
+/// and red (`0BBBBBGGGGGRRRRR`): what the port stores.
+const CGRAM_COLOUR_BITS: u16 = 0x7FFF;
+/// Bytes of OAM: the 512-byte low table, then the 32-byte high table.
+const OAM_BYTES: usize = 0x220;
+
+impl Ppu {
+    /// Write `bytes` into VRAM from word `word_address` on, the way a
+    /// debugger edits graphics: straight into memory, through no port, so
+    /// the VRAM address, its read buffer and the gate that closes the port
+    /// while the picture is drawn play no part. Byte `n` lands at byte
+    /// `2 * word_address + n` of the 64 KiB as [`VideoDebugger::get_vram`]
+    /// lays them out, the low half of each word first, so that read gives
+    /// back what was written; an odd count leaves the high half of the
+    /// last word as it was.
+    ///
+    /// A word address past the 32 K words wraps to the start, and so does
+    /// a run that crosses the end. A buffer longer than VRAM is cut to its
+    /// size, so no byte is written twice; an empty one writes nothing.
+    ///
+    /// The renderer keeps the tilemap rows and the decoded sprite tiles it
+    /// read from VRAM until the VRAM generation moves. A write moves it,
+    /// as a write through the port does, so the next line drawn, or a
+    /// repaint, reads the new contents.
+    pub fn write_vram_debug(&mut self, word_address: u32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let start = (word_address as usize % (VRAM_BYTES / 2)) * 2;
+        for (offset, &value) in bytes.iter().take(VRAM_BYTES).enumerate() {
+            let byte_address = (start + offset) % VRAM_BYTES;
+            let word = &mut self.vram[byte_address >> 1];
+            let [mut low, mut high] = word.to_le_bytes();
+            if byte_address & 1 == 0 {
+                low = value;
+            } else {
+                high = value;
+            }
+            *word = u16::from_le_bytes([low, high]);
+        }
+        self.vram_generation = self.vram_generation.wrapping_add(1);
+    }
+
+    /// Write `colours` into CGRAM from colour `colour_index` on, the way a
+    /// debugger edits a palette: straight into memory, through no port, so
+    /// the CGRAM address and its latch stay as they were. Each colour is a
+    /// BGR555 word (`0BBBBBGGGGGRRRRR`) and keeps its low 15 bits, as the
+    /// port stores it, so [`Self::cgram`] gives back the written words with
+    /// bit 15 clear. The renderer reads CGRAM as it draws, so the next line
+    /// drawn, or a repaint, shows the new colours.
+    ///
+    /// An index past the 256 colours wraps to the start, and so does a run
+    /// that crosses the end. A buffer longer than CGRAM is cut to its 256
+    /// colours; an empty one writes nothing.
+    pub fn write_cgram_debug(&mut self, colour_index: u32, colours: &[u16]) {
+        let start = colour_index as usize % CGRAM_COLOURS;
+        for (offset, &colour) in colours.iter().take(CGRAM_COLOURS).enumerate() {
+            self.cgram[(start + offset) % CGRAM_COLOURS] = colour & CGRAM_COLOUR_BITS;
+        }
+    }
+
+    /// Write `bytes` into OAM from `byte_address` on, the way a debugger
+    /// edits sprites: straight into memory, through no port, so the OAM
+    /// address, its latch and the first-sprite rotation stay as they were.
+    /// The 544 bytes are laid out as [`Self::oam`] returns them: four for
+    /// each of the 128 sprites in the low table (X, Y, character,
+    /// attributes), then the 32-byte high table, two bits a sprite (bit 8
+    /// of X, then the size). The renderer reads OAM as it draws each line,
+    /// so the next line drawn, or a repaint, shows the new sprites.
+    ///
+    /// An address past the 544 bytes wraps to the start, and so does a run
+    /// that crosses the end. A buffer longer than OAM is cut to its 544
+    /// bytes; an empty one writes nothing.
+    pub fn write_oam_debug(&mut self, byte_address: u32, bytes: &[u8]) {
+        let start = byte_address as usize % OAM_BYTES;
+        for (offset, &value) in bytes.iter().take(OAM_BYTES).enumerate() {
+            self.oam[(start + offset) % OAM_BYTES] = value;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,5 +1447,279 @@ mod tests {
         // Re-enabling restores the original frame exactly.
         ppu.set_layer_debug_disabled(0, false);
         assert_eq!(repaint(&mut ppu), with_bg, "showing BG1 again is identical");
+    }
+
+    // -- debugger writes into video memory -------------------------------
+
+    /// Repaint a whole frame as `SnesEmulator::repaint_held_frame` does,
+    /// into a 256x224 framebuffer, and return its RGBA bytes.
+    fn repaint(ppu: &mut Ppu) -> Vec<u8> {
+        let mut fb = retro_core::Framebuffer::new(256, 224);
+        for scanline in 1..240u16 {
+            ppu.render_scanline(scanline, &mut fb);
+        }
+        ppu.finalize_frame(&mut fb);
+        fb.data
+    }
+
+    /// The RGBA of pixel `(x, y)` of a 256-wide frame.
+    fn pixel(frame: &[u8], x: usize, y: usize) -> [u8; 4] {
+        let at = (y * 256 + x) * 4;
+        [frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]
+    }
+
+    const WHITE: u16 = 0x7FFF;
+    const RED: u16 = 0x001F;
+
+    /// Mode 0 with BG1 on the main screen: its 32x32 tilemap at word 0 all
+    /// tile 1 (2bpp, all colour 1, white), and tile 2 (all colour 2, red)
+    /// beside it, at char word base 0x800.
+    fn ppu_with_bg1_of_tile_1() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.bgmode = 0;
+        ppu.bg_main_enable[0] = true;
+        ppu.bg_screen_addr[0] = 0;
+        ppu.bg_tiledata_addr[0] = 0x1000;
+        for cell in &mut ppu.vram[0..1024] {
+            *cell = 0x0001;
+        }
+        for row in 0..8 {
+            ppu.vram[0x808 + row] = 0x00FF; // tile 1: plane 0, colour 1
+            ppu.vram[0x810 + row] = 0xFF00; // tile 2: plane 1, colour 2
+        }
+        ppu.cgram[1] = WHITE;
+        ppu.cgram[2] = RED;
+        ppu
+    }
+
+    /// Sprites on the main screen and nothing else: sprite 0 small (8x8)
+    /// at (0, 0) with tile 0 of palette 0, all colour 1 (white), and the
+    /// other 127 below the picture.
+    fn ppu_with_sprite_0() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.obj_main_enable = true;
+        for sprite in 1..128 {
+            ppu.oam[sprite * 4 + 1] = 0xF0;
+        }
+        // Tile 0, 4bpp at word 0: every row with plane 0 set, colour 1.
+        for row in 0..8 {
+            ppu.vram[row] = 0x00FF;
+        }
+        ppu.cgram[128 + 1] = WHITE;
+        ppu.cgram[128 + 2] = RED;
+        ppu
+    }
+
+    #[test]
+    fn debugger_writes_read_back_and_leave_the_ports_alone() {
+        let mut ppu = Ppu::new();
+        // The display is on, which closes the ports while lines are drawn,
+        // and each port holds an address and a latched byte.
+        ppu.display_disable = false;
+        ppu.vram_addr = 0x1234;
+        ppu.vram_readbuffer = 0xBEEF;
+        ppu.oam_addr = 0x0123;
+        ppu.oam_latchdata = 0x45;
+        ppu.cgram_addr = 0x0042;
+        ppu.cgram_latchdata = 0x67;
+
+        ppu.write_vram_debug(0x2000, &[0x34, 0x12, 0x78]);
+        ppu.write_cgram_debug(5, &[0x1234, 0x0567]);
+        ppu.write_oam_debug(0x200, &[0x89, 0xAB]);
+
+        assert_eq!(&ppu.get_vram()[0x4000..0x4003], &[0x34, 0x12, 0x78]);
+        assert_eq!(ppu.vram()[0x2000], 0x1234, "the low half of a word first");
+        assert_eq!(ppu.vram()[0x2001], 0x0078, "an odd count keeps a high half");
+        assert_eq!(&ppu.cgram()[5..7], &[0x1234, 0x0567]);
+        assert_eq!(&ppu.oam()[0x200..0x202], &[0x89, 0xAB]);
+
+        assert_eq!(ppu.vram_addr(), 0x1234);
+        assert_eq!(ppu.vram_readbuffer, 0xBEEF);
+        assert_eq!(ppu.oam_addr(), 0x0123);
+        assert_eq!(ppu.oam_latchdata, 0x45);
+        assert_eq!(ppu.cgram_addr(), 0x0042);
+        assert_eq!(ppu.cgram_latchdata, 0x67);
+    }
+
+    #[test]
+    fn a_vram_write_wraps_past_the_end_and_is_cut_to_the_memory() {
+        let mut ppu = Ppu::new();
+        // Word 0x7FFF is the last; the run goes on at word 0.
+        ppu.write_vram_debug(0x7FFF, &[1, 2, 3, 4]);
+        assert_eq!(&ppu.get_vram()[0xFFFE..], &[1, 2]);
+        assert_eq!(&ppu.get_vram()[..2], &[3, 4]);
+
+        // A word address past the end wraps: 0x8003 is word 3.
+        ppu.write_vram_debug(0x8003, &[9]);
+        assert_eq!(ppu.get_vram()[6], 9);
+
+        // A buffer two bytes longer than VRAM from word 1: its first 64 KiB
+        // land once each, from byte 2 round to byte 1, and the two left
+        // over are dropped instead of written over the first two.
+        let pattern = |i: usize| (i % 251) as u8;
+        let long: Vec<u8> = (0..VRAM_BYTES + 2).map(pattern).collect();
+        ppu.write_vram_debug(1, &long);
+        let vram = ppu.get_vram();
+        assert!((0..VRAM_BYTES).all(|i| vram[(2 + i) % VRAM_BYTES] == pattern(i)));
+    }
+
+    #[test]
+    fn an_empty_vram_write_changes_nothing() {
+        let mut ppu = Ppu::new();
+        ppu.vram[5] = 0xBEEF;
+        let generation = ppu.vram_generation;
+
+        ppu.write_vram_debug(5, &[]);
+
+        let written = ppu.vram.iter().filter(|&&word| word != 0).count();
+        assert_eq!((ppu.vram[5], written), (0xBEEF, 1));
+        assert_eq!(
+            ppu.vram_generation, generation,
+            "the caches keep what they hold"
+        );
+    }
+
+    #[test]
+    fn a_vram_write_reaches_the_tilemap_row_the_renderer_keeps() {
+        let mut ppu = ppu_with_bg1_of_tile_1();
+        let mut fb = retro_core::Framebuffer::new(256, 224);
+        // Scanline 1 draws output row 0 from cell row 0, a row the renderer
+        // keeps for the scanlines after it in the same band.
+        ppu.render_scanline(1, &mut fb);
+        assert_eq!(pixel(&fb.data, 0, 0), bgr15_to_rgba8(WHITE));
+
+        // Poked behind the renderer's back, cell (0, 0) keeps the tile the
+        // kept row names.
+        ppu.vram[0] = 0x0002;
+        ppu.render_scanline(2, &mut fb);
+        assert_eq!(
+            pixel(&fb.data, 0, 1),
+            bgr15_to_rgba8(WHITE),
+            "the kept row still names tile 1"
+        );
+
+        // The same word through the debugger write reaches the renderer.
+        ppu.write_vram_debug(0, &[0x02, 0x00]);
+        ppu.render_scanline(3, &mut fb);
+        assert_eq!(
+            pixel(&fb.data, 0, 2),
+            bgr15_to_rgba8(RED),
+            "cell (0, 0) is tile 2 now"
+        );
+        assert_eq!(
+            pixel(&fb.data, 8, 2),
+            bgr15_to_rgba8(WHITE),
+            "cell (1, 0) is still tile 1"
+        );
+    }
+
+    #[test]
+    fn a_vram_write_reaches_the_sprite_tiles_the_renderer_keeps() {
+        let mut ppu = ppu_with_sprite_0();
+        assert_eq!(pixel(&repaint(&mut ppu), 0, 0), bgr15_to_rgba8(WHITE));
+
+        // Poked behind the renderer's back, tile 0 keeps the decode the
+        // renderer kept.
+        for row in 0..8 {
+            ppu.vram[row] = 0xFF00; // plane 1: colour 2
+        }
+        assert_eq!(
+            pixel(&repaint(&mut ppu), 0, 0),
+            bgr15_to_rgba8(WHITE),
+            "the kept decode is still colour 1"
+        );
+
+        // The same rows through the debugger write reach the renderer.
+        ppu.write_vram_debug(0, &[0x00, 0xFF].repeat(8));
+        assert_eq!(
+            pixel(&repaint(&mut ppu), 0, 0),
+            bgr15_to_rgba8(RED),
+            "tile 0 is colour 2 now"
+        );
+    }
+
+    #[test]
+    fn a_cgram_write_recolours_the_next_repaint() {
+        let mut ppu = ppu_with_bg1_of_tile_1();
+        assert_eq!(pixel(&repaint(&mut ppu), 0, 0), bgr15_to_rgba8(WHITE));
+
+        let green = 0x03E0;
+        ppu.write_cgram_debug(1, &[green]);
+
+        assert_eq!(ppu.cgram()[1], green);
+        assert_eq!(pixel(&repaint(&mut ppu), 0, 0), bgr15_to_rgba8(green));
+    }
+
+    #[test]
+    fn a_cgram_write_keeps_15_bits_wraps_and_is_cut_to_the_memory() {
+        let mut ppu = Ppu::new();
+        // Colour 255, then on round to colour 0; bit 15 is dropped, as the
+        // port drops it.
+        ppu.write_cgram_debug(255, &[0xFFFF, 0x1234]);
+        assert_eq!(ppu.cgram()[255], 0x7FFF);
+        assert_eq!(ppu.cgram()[0], 0x1234);
+
+        // An index past the 256 colours wraps.
+        ppu.write_cgram_debug(256 + 7, &[0x0042]);
+        assert_eq!(ppu.cgram()[7], 0x0042);
+
+        // 300 colours from colour 10: the first 256 land once each, the 44
+        // left over are dropped instead of written over 10..54.
+        let long: Vec<u16> = (0..300)
+            .map(|i| if i < 256 { 0x0001 } else { 0x0002 })
+            .collect();
+        ppu.write_cgram_debug(10, &long);
+        assert!(ppu.cgram().iter().all(|&colour| colour == 0x0001));
+
+        let before = *ppu.cgram();
+        ppu.write_cgram_debug(3, &[]);
+        assert_eq!(*ppu.cgram(), before, "an empty write changes nothing");
+    }
+
+    #[test]
+    fn an_oam_write_moves_the_sprite_on_the_next_repaint() {
+        let mut ppu = ppu_with_sprite_0();
+        let frame = repaint(&mut ppu);
+        assert_eq!(pixel(&frame, 0, 0), bgr15_to_rgba8(WHITE));
+        assert_eq!(pixel(&frame, 16, 0), bgr15_to_rgba8(0), "the backdrop");
+
+        // Sprite 0's X is its first byte.
+        ppu.write_oam_debug(0, &[16]);
+
+        assert_eq!(ppu.get_sprite_data()[0].x, 16);
+        let frame = repaint(&mut ppu);
+        assert_eq!(
+            pixel(&frame, 0, 0),
+            bgr15_to_rgba8(0),
+            "x 0 is backdrop now"
+        );
+        assert_eq!(pixel(&frame, 16, 0), bgr15_to_rgba8(WHITE));
+    }
+
+    #[test]
+    fn an_oam_write_wraps_past_the_end_and_is_cut_to_the_memory() {
+        let mut ppu = Ppu::new();
+        // The last byte of the high table, then on round to sprite 0's X.
+        ppu.write_oam_debug(0x21F, &[0xAA, 0xBB]);
+        assert_eq!(ppu.oam()[0x21F], 0xAA);
+        assert_eq!(ppu.oam()[0], 0xBB);
+
+        // An address past the 544 bytes wraps: 544 + 9 is byte 9.
+        ppu.write_oam_debug(0x220 + 9, &[0x42]);
+        assert_eq!(ppu.oam()[9], 0x42);
+
+        // 600 bytes from byte 10: the first 544 land once each, the 56
+        // left over are dropped instead of written over 10..66.
+        let long: Vec<u8> = (0..600).map(|i| if i < 0x220 { 1 } else { 2 }).collect();
+        ppu.write_oam_debug(10, &long);
+        assert!(ppu.oam().iter().all(|&byte| byte == 1));
+
+        let before = *ppu.oam();
+        ppu.write_oam_debug(3, &[]);
+        assert_eq!(*ppu.oam(), before, "an empty write changes nothing");
     }
 }

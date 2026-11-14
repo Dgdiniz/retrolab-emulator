@@ -1212,6 +1212,44 @@ impl RetroEmulator {
         self.genesis.vdp().get_vsram().to_vec()
     }
 
+    /// Write VRAM for debugging, to edit a game's graphics: `bytes` from
+    /// byte `byte_address` on, in the layout `getVram` returns, so
+    /// `getVram` gives them back. Straight into memory, through no port,
+    /// FIFO or DMA: the timing, the CPUs and the VDP's registers and
+    /// status are untouched. The address wraps at the end of the 64 KiB, a
+    /// buffer longer than VRAM is cut to it, and an empty one writes
+    /// nothing. A write into the sprite table reaches the renderer's
+    /// sprite list. A running game shows the change on its next frame, a
+    /// paused one after `repaintFrame`.
+    #[wasm_bindgen(js_name = writeVram)]
+    pub fn write_vram(&mut self, byte_address: u32, bytes: &[u8]) {
+        self.genesis.vdp_mut().write_vram_debug(byte_address, bytes);
+    }
+
+    /// Write CRAM for debugging, to edit a palette: `colours` from colour
+    /// `colour_index` (0-63) on, in the format `getCram` returns
+    /// (`0000 BBB0 GGG0 RRR0`; the other bits are dropped, as the data
+    /// port drops them). Straight into memory, through no port or DMA.
+    /// The index wraps at 64, a buffer longer than CRAM is cut to its 64
+    /// colours, and an empty one writes nothing. A running game shows the
+    /// change on its next frame, a paused one after `repaintFrame`.
+    #[wasm_bindgen(js_name = writeCram)]
+    pub fn write_cram(&mut self, colour_index: u32, colours: &[u16]) {
+        self.genesis
+            .vdp_mut()
+            .write_cram_debug(colour_index, colours);
+    }
+
+    /// Write VSRAM for debugging: `values` from word `index` (0-63) on,
+    /// each keeping its low 11 bits, as `getVsram` returns them. Straight
+    /// into memory, through no port or DMA. The index wraps at 64, a
+    /// buffer longer than the 64 words is cut to them, and an empty one
+    /// writes nothing.
+    #[wasm_bindgen(js_name = writeVsram)]
+    pub fn write_vsram(&mut self, index: u32, values: &[u16]) {
+        self.genesis.vdp_mut().write_vsram_debug(index, values);
+    }
+
     /// Get plane nametable addresses.
     #[wasm_bindgen(js_name = getPlaneAddresses)]
     pub fn get_plane_addresses(&self) -> JsValue {
@@ -2087,5 +2125,53 @@ mod tests {
         assert_eq!(emu.get_port_state(1), 1 << 6);
         let providers = emu.get_port_providers(1);
         assert_eq!(js_sys::Array::from(&providers).length(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn write_vram_reads_back_through_get_vram_wrapping_at_the_end() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.write_vram(0xFFFE, &[1, 2, 3, 4]);
+        let vram = emu.get_vram();
+        assert_eq!(&vram[0xFFFE..], &[1, 2]);
+        assert_eq!(&vram[..2], &[3, 4], "the run goes on from the start");
+
+        emu.write_vram(0x1_0005, &[9]);
+        assert_eq!(emu.get_vram()[5], 9, "an address past the end wraps");
+
+        let before = emu.get_vram();
+        emu.write_vram(0x10, &[]);
+        assert_eq!(emu.get_vram(), before, "an empty write changes nothing");
+    }
+
+    #[wasm_bindgen_test]
+    fn write_cram_reads_back_and_shows_after_a_repaint() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        // Colour 63, then on round to colour 0, keeping only the colour bits.
+        emu.write_cram(63, &[0xFFFF, 0x000E]);
+        let cram = emu.get_cram();
+        assert_eq!(cram[63], 0x0EEE);
+        assert_eq!(cram[0], 0x000E);
+
+        // A fresh VDP has its display off, so the screen is the backdrop:
+        // colour 0, red now.
+        emu.repaint_frame();
+        let (r, g, b) = sg1_core::vdp::Vdp::convert_genesis_color(0x000E);
+        assert_eq!(&emu.get_framebuffer_data().to_vec()[..4], &[r, g, b, 255]);
+    }
+
+    #[wasm_bindgen_test]
+    fn write_vsram_reads_back_eleven_bits_wrapping_at_the_end() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.write_vsram(63, &[0xFFFF, 0x0123]);
+        let vsram = emu.get_vsram();
+        assert_eq!(vsram[63], 0x07FF);
+        assert_eq!(vsram[0], 0x0123);
+
+        let long: Vec<u16> = (0..70).map(|i| if i < 64 { 1 } else { 2 }).collect();
+        emu.write_vsram(10, &long);
+        assert!(
+            emu.get_vsram().iter().all(|&value| value == 1),
+            "a buffer longer than VSRAM is cut to it"
+        );
     }
 }
