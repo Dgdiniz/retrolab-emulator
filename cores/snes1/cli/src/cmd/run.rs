@@ -25,7 +25,8 @@ pub struct RunArgs {
     /// Step exactly N 65C816 instructions.
     #[arg(long)]
     pub instructions: Option<u64>,
-    /// Run a single frame and stop at VBlank.
+    /// Run the first frame to the start of its vertical blanking and stop
+    /// there, the picture drawn and the NMI not yet raised.
     #[arg(long)]
     pub until_vblank: bool,
     /// Step until the 65C816 reaches this 24-bit PC (hex, e.g. `00ff03`).
@@ -102,6 +103,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         finish_bar(pb);
     } else if args.until_vblank {
         emu.run_until_vblank();
+        println!("Stopped at the start of vertical blanking.");
     } else if let Some(target) = args.until_pc {
         let mut steps = 0u64;
         loop {

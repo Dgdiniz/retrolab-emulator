@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use retro_core::video::PixelImage;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
-use sg1_core::vdp::RenderLayerMode;
+use sg1_core::vdp::{RenderLayerMode, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
 
 #[derive(Args, Debug)]
 pub struct ScreenshotArgs {
@@ -34,13 +35,19 @@ pub struct ScreenshotArgs {
     pub debug_pixel: Option<String>,
     /// Also save layer-separated PNGs (`_plane_b`, `_plane_a`, `_window`,
     /// `_sprites`, `_priority`, `_sprite_priority`) alongside the main
-    /// screenshot. `_plane_a` and `_window` each show only their own part of
-    /// the screen: the window replaces plane A where it covers. Transparent
-    /// pixels are magenta, so black text on a plane stays visible.
+    /// screenshot, all of the screenshot's frame: it stops where its
+    /// picture is drawn and vertical blanking has not begun, so the video
+    /// memory the layers are drawn from is the one the picture was drawn
+    /// from. The four layers keep transparency: a pixel the layer does not
+    /// cover has alpha 0. `_plane_a` and `_window` each show only their own
+    /// part of the screen: the window replaces plane A where it covers. The
+    /// two priority views are opaque.
     #[arg(long)]
     pub render_layers: bool,
-    /// Patch VRAM word(s) before the last frame render (for debugging).
-    /// Format: `ADDR=VALUE` (hex, e.g. `C6A6=825C`). Repeatable.
+    /// Patch VRAM word(s) before the last frame render (for debugging):
+    /// after the frames run, the words are written and one more frame is
+    /// drawn for the screenshot. Format: `ADDR=VALUE` (hex, e.g.
+    /// `C6A6=825C`). Repeatable.
     #[arg(long)]
     pub patch_vram: Vec<String>,
     /// After capturing, print the installed coprocessor(s) and their live
@@ -65,18 +72,27 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
 
     println!("Running {} frames...", args.frames);
     for f in 0..args.frames {
+        let last = f == args.frames - 1;
         // Enable per-pixel logging only on the last frame.
-        if f == args.frames - 1 {
+        if last {
             if let Some((x, y)) = dbg_px {
                 emu.vdp_mut().set_debug_pixel(x, y);
             }
         }
         super::apply_press(&mut emu, schedule.as_ref(), f);
-        emu.run_frame();
+        // The frame of the screenshot stops at the start of its vertical
+        // blanking, before the game uploads the next frame's graphics, so
+        // the layers below are drawn from the memory its picture was.
+        if last && vram_patches.is_empty() {
+            emu.run_until_vblank();
+        } else {
+            emu.run_frame();
+        }
     }
 
-    // Apply VRAM patches after running, then re-render one frame so the
-    // patched words are visible in the saved screenshot.
+    // Apply VRAM patches after running, then draw one more frame, stopped
+    // the same way, so the patched words are visible in the saved
+    // screenshot.
     if !vram_patches.is_empty() {
         for &(addr, value) in &vram_patches {
             let vram = emu.vdp_mut().get_vram_mut();
@@ -87,7 +103,7 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
                 eprintln!("[patch-vram] addr=0x{addr:04X} = 0x{value:04X}");
             }
         }
-        emu.run_frame();
+        emu.run_until_vblank();
     }
 
     emu.vdp_mut().clear_debug_pixel();
@@ -140,8 +156,9 @@ fn parse_vram_patches(specs: &[String]) -> Result<Vec<(u16, u16)>> {
     Ok(patches)
 }
 
-/// Re-render the current scene through each isolated layer mode and save
-/// a PNG per layer next to `output_path`.
+/// Draw each layer of the held frame alone, and the two priority views,
+/// and save a PNG of each next to `output_path`. Nothing runs between them,
+/// so all six come from the frame of the screenshot.
 fn save_layer_screenshots(emu: &mut sg1_core::GenesisEmulator, output_path: &Path) -> Result<()> {
     let stem = output_path
         .file_stem()
@@ -152,24 +169,49 @@ fn save_layer_screenshots(emu: &mut sg1_core::GenesisEmulator, output_path: &Pat
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "png".to_string());
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let path_for = |suffix: &str| parent.join(format!("{stem}_{suffix}.{ext}"));
 
-    let layer_modes = [
-        (RenderLayerMode::PlaneB, "plane_b"),
-        (RenderLayerMode::PlaneA, "plane_a"),
-        (RenderLayerMode::Window, "window"),
-        (RenderLayerMode::Sprites, "sprites"),
+    let layers = [
+        (LAYER_PLANE_B, "plane_b"),
+        (LAYER_PLANE_A, "plane_a"),
+        (LAYER_WINDOW, "window"),
+        (LAYER_SPRITES, "sprites"),
+    ];
+    for (layer, suffix) in layers {
+        let image = emu
+            .render_layer(layer as u32)
+            .ok_or_else(|| anyhow::anyhow!("no layer {layer}"))?;
+        save_rgba(&image, &path_for(suffix))?;
+    }
+
+    let views = [
         (RenderLayerMode::PriorityOverlay, "priority"),
         (RenderLayerMode::SpritePriority, "sprite_priority"),
     ];
-
-    for (mode, suffix) in layer_modes {
-        emu.vdp_mut().set_render_layer_mode(mode);
-        // Advance one frame so the VDP re-renders the scene in this mode.
-        emu.run_frame();
-        let layer_path = parent.join(format!("{stem}_{suffix}.{ext}"));
-        super::save_screenshot(emu, &layer_path)?;
+    for (mode, suffix) in views {
+        let image = emu.vdp_mut().render_mode_image(mode);
+        save_rgba(&image, &path_for(suffix))?;
     }
+    Ok(())
+}
 
-    emu.vdp_mut().set_render_layer_mode(RenderLayerMode::Normal);
+/// Save an RGBA picture as a PNG with its alpha.
+fn save_rgba(image: &PixelImage, path: &Path) -> Result<()> {
+    let png = image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to build {}x{} image from the layer",
+                image.width,
+                image.height
+            )
+        })?;
+    png.save(path)
+        .with_context(|| format!("failed to save layer: {}", path.display()))?;
+    println!(
+        "Layer saved: {} ({}x{})",
+        path.display(),
+        image.width,
+        image.height
+    );
     Ok(())
 }

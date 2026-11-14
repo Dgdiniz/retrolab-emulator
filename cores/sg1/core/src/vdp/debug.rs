@@ -26,7 +26,7 @@ use retro_core::video::{
     TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
 };
 
-use super::sprites::Sprite;
+use super::sprites::{link_chain, Sprite};
 use super::tiles::{build_rgba_palette, Tile};
 use super::{Vdp, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
 
@@ -91,10 +91,26 @@ impl Vdp {
     /// table register 5 places, 80 entries of 8 bytes in the 40-cell mode
     /// and 64 in the 32-cell mode, as `rebuild_sprite_cache` reads it.
     fn sprite_table_bytes(&self) -> Range<usize> {
-        let is_h40 = (self.registers[12] & 0x01) != 0;
-        let entries = if is_h40 { 80 } else { 64 };
         let base = usize::from(self.sat_base());
-        base..base + entries * 8
+        base..base + usize::from(self.sprite_table_slots()) * 8
+    }
+
+    /// Entries in the sprite table: 80 in the 40-cell mode, 64 in the
+    /// 32-cell mode.
+    fn sprite_table_slots(&self) -> u8 {
+        let is_h40 = (self.registers[12] & 0x01) != 0;
+        if is_h40 {
+            80
+        } else {
+            64
+        }
+    }
+
+    /// The sprites of the table in the order the renderer takes them, each
+    /// with its slot: the link chain from slot 0, stopped where the
+    /// renderer stops it ([`link_chain`]).
+    pub fn sprite_table_chain(&self) -> Vec<(u8, Sprite)> {
+        link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).collect()
     }
 
     /// Write `bytes` into VRAM from `byte_address` on, the way a debugger
@@ -233,37 +249,16 @@ impl VideoDebugger for Vdp {
     }
 
     fn resolved_sprite_render_order(&self) -> Vec<SpriteOrderEntry> {
-        let is_h40 = (self.registers[12] & 0x01) != 0;
-        let max_sprites: u8 = if is_h40 { 80 } else { 64 };
-        let sat_base = self.sat_base();
-
-        // Walk the SAT link chain exactly like `SpriteCache::build` so the
-        // order can never diverge from the renderer: the chain head is the
+        // The link chain as the renderer walks it: the chain head is the
         // highest-priority sprite (drawn on top of the ones it links to).
-        let mut chain: Vec<SpriteOrderEntry> = Vec::with_capacity(max_sprites as usize);
-        let mut current = 0u8;
-        let mut count = 0u8;
-        loop {
-            if count >= max_sprites {
-                break;
-            }
-            if let Some(sprite) = Sprite::from_sat(&self.vram, sat_base, current) {
-                chain.push(SpriteOrderEntry {
-                    index: u32::from(current),
-                    priority: u32::from(sprite.priority),
-                });
-                count += 1;
-                let link = sprite.link;
-                // Stop on a null link or one past the valid SAT range, the
-                // same guard the renderer's chain walk uses.
-                if link == 0 || link >= max_sprites {
-                    break;
-                }
-                current = link;
-            } else {
-                break;
-            }
-        }
+        let mut chain: Vec<SpriteOrderEntry> = self
+            .sprite_table_chain()
+            .into_iter()
+            .map(|(slot, sprite)| SpriteOrderEntry {
+                index: u32::from(slot),
+                priority: u32::from(sprite.priority),
+            })
+            .collect();
 
         // The renderer paints the per-line list in reverse (lowest priority
         // first) so the chain head wins overlaps (`vdp/mod.rs`: "Render
@@ -643,6 +638,36 @@ mod tests {
         let top = order.last().expect("non-empty order");
         assert_eq!(top.index, 0, "chain head paints last (on top)");
         assert_eq!(top.priority, 1, "priority bit carried");
+    }
+
+    #[test]
+    fn the_sprite_table_chain_stops_where_the_renderer_stops() {
+        let mut vdp = Vdp::new();
+        vdp.registers[5] = 0; // SAT base 0
+        vdp.registers[12] = 0; // 32 cells: 64 slots
+                               // Slot 0 links to 70, past a table of 64.
+        vdp.vram[3] = 70;
+        vdp.vram[70 * 8 + 3] = 0;
+
+        let slots = |vdp: &Vdp| -> Vec<u8> {
+            vdp.sprite_table_chain()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect()
+        };
+        assert_eq!(slots(&vdp), [0], "the walk ends before slot 70");
+        vdp.rebuild_sprite_cache();
+        assert_eq!(vdp.sprite_cache.len(), 1, "as the renderer's list does");
+
+        // 40 cells: 80 slots, so slot 70 is in the table.
+        vdp.registers[12] = 0x81;
+        assert_eq!(slots(&vdp), [0, 70]);
+
+        // A chain that loops is cut at the table's size in the 32-cell mode.
+        vdp.registers[12] = 0;
+        vdp.vram[3] = 1;
+        vdp.vram[8 + 3] = 1; // slot 1 links to itself
+        assert_eq!(vdp.sprite_table_chain().len(), 64);
     }
 
     #[test]

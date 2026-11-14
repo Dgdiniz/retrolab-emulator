@@ -11,7 +11,14 @@ pub mod tiles;
 pub mod timing;
 pub mod window;
 
+use retro_core::video::PixelImage;
 use window::WindowArea;
+
+/// Pixels in a row of the framebuffer: the 40-cell mode's width, which
+/// the 32-cell mode's 256 fit inside.
+const FRAMEBUFFER_WIDTH: u32 = 320;
+/// Rows of the framebuffer: the 28-cell mode's 224 lines.
+const FRAMEBUFFER_LINES: u32 = 224;
 
 /// VDP access codes (CD0-CD5 bits from control port)
 #[allow(dead_code)]
@@ -411,6 +418,76 @@ struct ProgressiveCramDma {
     cursor: usize,
 }
 
+/// What drawing a line leaves in the VDP besides its pixels: the sprite
+/// status flags (part of a savestate), the sprite list parsed from the
+/// sprite table, and the line's own buffers, from which a palette write
+/// later in the line re-tints it. A picture drawn again on demand (a
+/// repaint, a single layer) keeps these and puts them back after, so the
+/// next line the game draws, and the next savestate, find them as the
+/// frame left them.
+struct DrawState {
+    sprite_overflow: bool,
+    sprite_collision: bool,
+    sprite_mask_overflow: bool,
+    sprite_cache: sprites::SpriteCache,
+    sprite_cache_valid: bool,
+    sprite_pixel_buffer: Vec<bool>,
+    sprite_line_color: Vec<u8>,
+    sprite_line_palette: Vec<u8>,
+    sprite_line_priority: Vec<bool>,
+    sprites_on_line_buf: Vec<u16>,
+    line_index: Vec<u8>,
+    line_sh_op: Vec<u8>,
+    line_high_pri: Vec<bool>,
+    line_plane_a: Vec<i16>,
+    line_window: Vec<i16>,
+    line_plane_b: Vec<i16>,
+}
+
+impl DrawState {
+    /// A copy of what drawing changes in `vdp`.
+    fn keep(vdp: &Vdp) -> Self {
+        Self {
+            sprite_overflow: vdp.sprite_overflow,
+            sprite_collision: vdp.sprite_collision,
+            sprite_mask_overflow: vdp.sprite_mask_overflow,
+            sprite_cache: vdp.sprite_cache.clone(),
+            sprite_cache_valid: vdp.sprite_cache_valid,
+            sprite_pixel_buffer: vdp.sprite_pixel_buffer.clone(),
+            sprite_line_color: vdp.sprite_line_color.clone(),
+            sprite_line_palette: vdp.sprite_line_palette.clone(),
+            sprite_line_priority: vdp.sprite_line_priority.clone(),
+            sprites_on_line_buf: vdp.sprites_on_line_buf.clone(),
+            line_index: vdp.line_index.clone(),
+            line_sh_op: vdp.line_sh_op.clone(),
+            line_high_pri: vdp.line_high_pri.clone(),
+            line_plane_a: vdp.line_plane_a.clone(),
+            line_window: vdp.line_window.clone(),
+            line_plane_b: vdp.line_plane_b.clone(),
+        }
+    }
+
+    /// Put the copy back into `vdp`.
+    fn restore(self, vdp: &mut Vdp) {
+        vdp.sprite_overflow = self.sprite_overflow;
+        vdp.sprite_collision = self.sprite_collision;
+        vdp.sprite_mask_overflow = self.sprite_mask_overflow;
+        vdp.sprite_cache = self.sprite_cache;
+        vdp.sprite_cache_valid = self.sprite_cache_valid;
+        vdp.sprite_pixel_buffer = self.sprite_pixel_buffer;
+        vdp.sprite_line_color = self.sprite_line_color;
+        vdp.sprite_line_palette = self.sprite_line_palette;
+        vdp.sprite_line_priority = self.sprite_line_priority;
+        vdp.sprites_on_line_buf = self.sprites_on_line_buf;
+        vdp.line_index = self.line_index;
+        vdp.line_sh_op = self.line_sh_op;
+        vdp.line_high_pri = self.line_high_pri;
+        vdp.line_plane_a = self.line_plane_a;
+        vdp.line_window = self.line_window;
+        vdp.line_plane_b = self.line_plane_b;
+    }
+}
+
 /// A VRAM/CRAM/VSRAM DMA fill in progress, metered out of `tick_dma` one cell
 /// at a time. The destination address and target code are read live from the
 /// VDP (`self.address`/`self.code`) and the source word is re-read from the
@@ -431,16 +508,16 @@ struct FillState {
 /// Number of toggleable Genesis VDP debug layers: Plane A, Plane B,
 /// Window, and Sprites. The backdrop is always composited and is not
 /// part of the toggle set.
-pub(crate) const LAYER_COUNT: usize = 4;
+pub const LAYER_COUNT: usize = 4;
 /// Debug-layer index of the scrolling foreground plane.
-pub(crate) const LAYER_PLANE_A: usize = 0;
+pub const LAYER_PLANE_A: usize = 0;
 /// Debug-layer index of the scrolling background plane.
-pub(crate) const LAYER_PLANE_B: usize = 1;
+pub const LAYER_PLANE_B: usize = 1;
 /// Debug-layer index of the fixed window plane (replaces Plane A in its
 /// region on real hardware).
-pub(crate) const LAYER_WINDOW: usize = 2;
+pub const LAYER_WINDOW: usize = 2;
 /// Debug-layer index of the sprite (OBJ) plane.
-pub(crate) const LAYER_SPRITES: usize = 3;
+pub const LAYER_SPRITES: usize = 3;
 
 /// The colour the single-layer views ([`RenderLayerMode`]) and the CLI's
 /// tile exports give a transparent pixel: magenta, so black text on a
@@ -477,7 +554,7 @@ impl Vdp {
             cram: vec![0; 64],      // 64 colors
             vsram: vec![0; 64],     // Vertical scroll (64 addressable words)
             registers: [0; 24],
-            framebuffer: vec![0; 320 * 224 * 4], // RGBA
+            framebuffer: vec![0; (FRAMEBUFFER_WIDTH * FRAMEBUFFER_LINES * 4) as usize], // RGBA
             control_word: 0,
             pending_write: false,
             address: 0,
@@ -646,7 +723,14 @@ impl Vdp {
     /// end-of-frame approximation: mid-frame raster splits that depend on
     /// per-scanline register changes are flattened, which is exactly the
     /// right model for "show me this static frame with layer X hidden".
+    ///
+    /// Only the framebuffer changes. What drawing a line leaves behind
+    /// besides its pixels (`DrawState`: the sprite status flags a
+    /// savestate holds, the sprite list, the line buffers) is put back as
+    /// the frame left it, so a repaint moves neither the state hash nor
+    /// the lines the game draws next.
     pub fn rerender_current_frame(&mut self) {
+        let kept = DrawState::keep(self);
         // The SAT cache is rebuilt lazily on the first sprite line, but a
         // VRAM edit while paused could have left it stale; force a rebuild
         // so sprites reflect current memory.
@@ -654,6 +738,119 @@ impl Vdp {
         let visible = self.timing.visible_scanlines();
         for line in 0..visible {
             self.render_scanline(line);
+        }
+        kept.restore(self);
+    }
+
+    /// The first line of vertical blanking: the line whose start raises
+    /// the vertical interrupt's flag. The lines before it draw the picture.
+    pub fn first_vblank_line(&self) -> u16 {
+        self.timing.visible_scanlines()
+    }
+
+    /// Lines of the picture the VDP draws into its framebuffer: the mode's
+    /// 224 or 240 ([`Self::display_height`]), cut to the rows the
+    /// framebuffer holds.
+    pub fn drawn_height(&self) -> u32 {
+        self.display_height().min(FRAMEBUFFER_LINES)
+    }
+
+    /// One layer of the frame drawn again from video memory as it is now:
+    /// `layer` is one of the debugger's layers (0 plane A, 1 plane B, 2 the
+    /// window, 3 the sprites), `None` for any other. The picture is the
+    /// screen, the mode's width by [`Self::drawn_height`] lines, in RGBA: a
+    /// pixel the layer covers has its palette colour, before shadow and
+    /// highlight, and alpha 255; every other pixel is 0 in all four bytes,
+    /// never the backdrop nor a colour key. With the display off no layer
+    /// covers anything.
+    ///
+    /// It is drawn from the planes and the sprite table as they are now, so
+    /// it is the picture the game drew wherever nothing changed during the
+    /// frame. The debugger's layer toggles do not hide the layer asked for.
+    /// The drawing goes to the line buffers alone, whose contents are put
+    /// back after with the rest of `DrawState`: the framebuffer and
+    /// everything a savestate holds stay as they were.
+    pub fn render_layer_image(&mut self, layer: usize) -> Option<PixelImage> {
+        if layer >= LAYER_COUNT {
+            return None;
+        }
+        let width = self.display_width() as usize;
+        let height = self.drawn_height() as usize;
+        let mut rgba = vec![0u8; width * height * 4];
+        let display_on = (self.registers[1] & 0x40) != 0;
+        if display_on {
+            let kept = DrawState::keep(self);
+            let hidden = std::mem::replace(&mut self.debug_layer_disable, [false; LAYER_COUNT]);
+            let debug_pixel = self.debug_pixel.take();
+            self.sprite_cache_valid = false;
+            for line in 0..height {
+                self.composite_scanline(line as u16);
+                let row = &mut rgba[line * width * 4..(line + 1) * width * 4];
+                for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    if let Some((r, g, b)) = self.layer_pixel(layer, x) {
+                        *pixel = [r, g, b, 255];
+                    }
+                }
+            }
+            self.debug_pixel = debug_pixel;
+            self.debug_layer_disable = hidden;
+            kept.restore(self);
+        }
+        Some(PixelImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+        })
+    }
+
+    /// The colour `layer` gives pixel `x` of the line last composited, or
+    /// `None` where the layer is transparent: what the single-layer modes
+    /// of `remap_scanline_segment` draw, without their colour key.
+    fn layer_pixel(&self, layer: usize, x: usize) -> Option<(u8, u8, u8)> {
+        let index = match layer {
+            LAYER_PLANE_A => self.line_plane_a[x],
+            LAYER_PLANE_B => self.line_plane_b[x],
+            LAYER_WINDOW => self.line_window[x],
+            _ => {
+                // An operator sprite of shadow and highlight is not a pixel.
+                let colour = self.sprite_line_color[x];
+                if colour == 0 || self.line_sh_op[x] != 0 {
+                    -1
+                } else {
+                    (self.sprite_line_palette[x] as i16 * 16 + colour as i16).min(63)
+                }
+            }
+        };
+        (index >= 0).then(|| self.cram_rgb[index as usize])
+    }
+
+    /// The frame drawn again from video memory as it is now in `mode`, as
+    /// an opaque RGBA picture of the screen (the mode's width by
+    /// [`Self::drawn_height`] lines). The framebuffer, the mode and the
+    /// rest of `DrawState` are put back after, so nothing the game shows
+    /// or a savestate holds changes.
+    pub fn render_mode_image(&mut self, mode: RenderLayerMode) -> PixelImage {
+        let width = self.display_width() as usize;
+        let height = self.drawn_height() as usize;
+        let kept = DrawState::keep(self);
+        let framebuffer = self.framebuffer.clone();
+        let previous_mode = std::mem::replace(&mut self.render_layer_mode, mode);
+        self.sprite_cache_valid = false;
+        for line in 0..height {
+            self.render_scanline(line as u16);
+        }
+        let stride = FRAMEBUFFER_WIDTH as usize * 4;
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for line in 0..height {
+            rgba.extend_from_slice(&self.framebuffer[line * stride..line * stride + width * 4]);
+        }
+        self.render_layer_mode = previous_mode;
+        self.framebuffer = framebuffer;
+        kept.restore(self);
+        PixelImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
         }
     }
 
@@ -4096,6 +4293,98 @@ mod tests {
         vdp.set_layer_debug_disabled(LAYER_PLANE_A, false);
         vdp.rerender_current_frame();
         assert_eq!(px(&vdp), plane_rgb, "re-enabled plane A returns");
+    }
+
+    /// A VDP in the 32-cell mode with the display on, tile 1 all colour 1
+    /// in cell (0, 0) of plane A, and a backdrop of another colour.
+    fn vdp_with_one_tile() -> Vdp {
+        let mut vdp = Vdp::new();
+        vdp.registers[1] = 0x44; // display on, mode 5
+        vdp.registers[12] = 0x00; // 32 cells
+        vdp.registers[2] = 0x38; // plane A at 0xE000
+        vdp.registers[7] = 0x02; // backdrop: colour 2
+        vdp.vram[32..64].fill(0x11);
+        vdp.vram[0xE001] = 0x01;
+        vdp.cram[1] = 0x0E00;
+        vdp.cram[2] = 0x000E;
+        vdp.rebuild_cram_rgb();
+        vdp
+    }
+
+    #[test]
+    fn a_layer_is_drawn_alone_alpha_keyed_and_leaves_the_frame_alone() {
+        let mut vdp = vdp_with_one_tile();
+        // Plane A hidden in the debugger: the layer asked for is drawn
+        // anyway, and the toggle stays.
+        vdp.set_layer_debug_disabled(LAYER_PLANE_A, true);
+        let framebuffer = vdp.framebuffer.clone();
+
+        let plane_a = vdp.render_layer_image(LAYER_PLANE_A).expect("plane A");
+        assert_eq!((plane_a.width, plane_a.height), (256, 224));
+        let (r, g, b) = vdp.cram_rgb[1];
+        assert_eq!(plane_a.rgba[..4], [r, g, b, 255], "the tile's colour");
+        assert_eq!(
+            plane_a.rgba[8 * 4..8 * 4 + 4],
+            [0, 0, 0, 0],
+            "tile 0 next to it is transparent, not the backdrop"
+        );
+        assert!(vdp.layer_debug_disabled(LAYER_PLANE_A));
+        assert_eq!(vdp.framebuffer, framebuffer, "the framebuffer is untouched");
+
+        let plane_b = vdp.render_layer_image(LAYER_PLANE_B).expect("plane B");
+        assert!(plane_b.rgba.iter().all(|&byte| byte == 0));
+        assert!(vdp.render_layer_image(LAYER_COUNT).is_none());
+
+        // With the display off no layer covers anything.
+        vdp.registers[1] = 0x04;
+        let plane_a = vdp.render_layer_image(LAYER_PLANE_A).expect("plane A");
+        assert!(plane_a.rgba.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn a_picture_drawn_again_puts_back_what_drawing_leaves() {
+        let mut vdp = vdp_with_one_tile();
+        // Line 7 composited, with flags and a parsed sprite list the frame
+        // left: what a repaint or a layer must hand back.
+        vdp.composite_scanline(7);
+        vdp.sprite_overflow = true;
+        vdp.sprite_collision = false;
+        vdp.sprite_mask_overflow = true;
+        vdp.sprite_cache_valid = false;
+        let line_index = vdp.line_index.clone();
+        let line_plane_a = vdp.line_plane_a.clone();
+
+        vdp.rerender_current_frame();
+        vdp.render_layer_image(LAYER_SPRITES);
+        let overlay = vdp.render_mode_image(RenderLayerMode::PriorityOverlay);
+        assert_eq!((overlay.width, overlay.height), (256, 224));
+        assert!(overlay
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255));
+
+        assert!(vdp.sprite_overflow && !vdp.sprite_collision && vdp.sprite_mask_overflow);
+        assert!(
+            !vdp.sprite_cache_valid,
+            "the sprite list is parsed again later"
+        );
+        assert_eq!(vdp.line_index, line_index);
+        assert_eq!(vdp.line_plane_a, line_plane_a);
+        assert_eq!(vdp.render_layer_mode, RenderLayerMode::Normal);
+    }
+
+    #[test]
+    fn the_drawn_height_is_the_mode_s_cut_to_the_framebuffer() {
+        let mut vdp = Vdp::new();
+        assert_eq!(vdp.drawn_height(), 224);
+        vdp.registers[1] |= 0x08; // 30-cell lines
+        assert_eq!(vdp.display_height(), 240);
+        assert_eq!(vdp.drawn_height(), 224);
+        assert_eq!(vdp.first_vblank_line(), 224);
+        vdp.set_region(timing::VideoRegion::Pal);
+        assert_eq!(vdp.first_vblank_line(), 240);
     }
 
     #[test]

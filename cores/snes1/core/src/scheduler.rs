@@ -386,6 +386,17 @@ impl HEventScheduler {
         cycles
     }
 
+    /// The earliest cycle at which an event of `kind` is queued, if any. A
+    /// walk over the queue, for the once-a-frame question of where the
+    /// armed frame's `FrameEnd` falls.
+    pub fn earliest(&self, kind: &EventKind) -> Option<u64> {
+        self.events
+            .iter()
+            .filter(|Reverse(ev)| ev.kind == *kind)
+            .map(|Reverse(ev)| ev.at_cycle)
+            .min()
+    }
+
     /// Cycle of the earliest queued event, or `None` if no events
     /// are pending.
     pub fn peek_cycle(&self) -> Option<u64> {
@@ -445,6 +456,42 @@ impl HEventScheduler {
         }
         self.current_cycle = cycle;
         out
+    }
+
+    /// Like [`Self::drain_up_to_with_cycles`], but stop in front of the
+    /// first due event `stop` accepts: that event and every event after
+    /// it stay queued for a later drain. The `bool` is `true` when the
+    /// drain stopped there.
+    ///
+    /// The capture boundary uses it to hold a frame in front of its
+    /// `VBlankStart`. A later drain picks the held events up in the same
+    /// order, at their own cycles, so splitting a batch here changes
+    /// neither which events fire nor their order.
+    pub fn drain_up_to_before(
+        &mut self,
+        cycle: u64,
+        stop: impl Fn(&EventKind) -> bool,
+    ) -> (Vec<(u64, EventKind)>, bool) {
+        debug_assert!(
+            cycle >= self.current_cycle,
+            "drain_up_to_before ({cycle}) must not go backward below current_cycle ({})",
+            self.current_cycle
+        );
+        let mut out = Vec::new();
+        let mut stopped = false;
+        while let Some(Reverse(top)) = self.events.peek() {
+            if top.at_cycle > cycle {
+                break;
+            }
+            if stop(&top.kind) {
+                stopped = true;
+                break;
+            }
+            let Reverse(ev) = self.events.pop().expect("peek above guaranteed an element");
+            out.push((ev.at_cycle, ev.kind));
+        }
+        self.current_cycle = cycle;
+        (out, stopped)
     }
 
     /// Drop every queued event for which `pred(&kind)` returns
@@ -730,6 +777,35 @@ mod tests {
         );
         // The cursor advanced to the drain point, so a re-drain is empty.
         assert!(s.drain_up_to_with_cycles(1000).is_empty());
+    }
+
+    #[test]
+    fn drain_up_to_before_leaves_the_stop_event_and_what_follows_queued() {
+        let mut s = HEventScheduler::new(TimingProfile::NTSC);
+        s.schedule(100, EventKind::HdmaTrigger);
+        s.schedule(200, EventKind::VBlankStart);
+        s.schedule(200, EventKind::IrqV { v_target: 225 });
+        s.schedule(300, EventKind::RenderPos);
+        s.schedule(900, EventKind::FrameEnd);
+        let (drained, stopped) =
+            s.drain_up_to_before(400, |kind| matches!(kind, EventKind::VBlankStart));
+        assert!(stopped, "the drain stopped in front of VBlankStart");
+        assert_eq!(drained, vec![(100, EventKind::HdmaTrigger)]);
+        // A later drain takes the held events up in their own order, the
+        // event tied with VBlankStart on its cycle still after it.
+        assert_eq!(
+            s.drain_up_to_with_cycles(400),
+            vec![
+                (200, EventKind::VBlankStart),
+                (200, EventKind::IrqV { v_target: 225 }),
+                (300, EventKind::RenderPos),
+            ]
+        );
+        // With no stop event due, it drains like `drain_up_to_with_cycles`.
+        let (drained, stopped) =
+            s.drain_up_to_before(1000, |kind| matches!(kind, EventKind::VBlankStart));
+        assert!(!stopped);
+        assert_eq!(drained, vec![(900, EventKind::FrameEnd)]);
     }
 
     #[test]

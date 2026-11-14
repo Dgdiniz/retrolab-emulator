@@ -726,8 +726,21 @@ impl SnesDebugger {
     /// Pick the execution tier for the next frame given the current
     /// breakpoint / tracing / execution-mode state.
     pub fn execution_tier(&self) -> ExecutionTier {
+        self.tier_in_mode(self.execution_mode)
+    }
+
+    /// The tier a frame would run on in the `Running` mode: the fast loop
+    /// with no breakpoint and no trace, the instrumented one otherwise.
+    /// For work that runs the rest of a frame whatever the mode, such as a
+    /// savestate finishing the frame held at the capture boundary.
+    pub fn running_tier(&self) -> ExecutionTier {
+        self.tier_in_mode(ExecutionMode::Running)
+    }
+
+    /// The tier the breakpoints and traces select in `mode`.
+    fn tier_in_mode(&self, mode: ExecutionMode) -> ExecutionTier {
         select_tier(TierSelectorInputs {
-            execution_mode: self.execution_mode,
+            execution_mode: mode,
             has_breakpoints: !self.breakpoints.is_empty(),
             tracing_enabled_per_cpu: &[
                 self.tracing_65816.is_enabled(),

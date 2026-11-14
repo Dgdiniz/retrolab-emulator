@@ -29,7 +29,7 @@ use retro_core::audio::{AudioRingBuffer, LinearResampler};
 use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
 use retro_core::input::{GenericInputManager, KeyboardInputProvider};
-use retro_core::video::VideoDebugger;
+use retro_core::video::{ExportError, PixelImage, VideoDebugger, VideoRegister};
 use retro_core::*;
 use wdc65816::instructions::FLAG_I;
 use wdc65816::Wdc65816;
@@ -89,6 +89,42 @@ const AUTO_JOYPAD_CYCLES: u64 = 5360;
 /// large enough to cover the universal `lda $4210 / bpl` vblank-wait in
 /// any instruction phase.
 const NMI_DELIVERY_MAX_INSNS: u8 = 3;
+
+/// What a capture reads, copied out of the core: a frame's picture, and
+/// the video memory and PPU settings it was drawn from
+/// ([`SnesEmulator::capture_frame_snapshot`]).
+///
+/// Taken at a capture boundary the picture and the memory belong to the
+/// same frame. Taken anywhere else, after a whole frame for one, VRAM,
+/// CGRAM and OAM may already hold what the game uploaded in the vertical
+/// blank for the next frame, while the picture shows the frame before;
+/// `at_boundary` says which.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameSnapshot {
+    /// The frame's number: the count [`SnesEmulator::frame_count`] reports
+    /// once this frame is complete. At a capture boundary the frame is not
+    /// counted yet, so this is one more than `frame_count`; a snapshot of
+    /// the same frame taken after it ran whole carries the same number.
+    pub frame: u64,
+    /// Whether the core was stopped at a capture boundary.
+    pub at_boundary: bool,
+    /// Width of the picture, in pixels, as `DisplayInfo` reports it.
+    pub width: u32,
+    /// Height of the picture, in pixels.
+    pub height: u32,
+    /// The picture, RGBA8888, `width * height * 4` bytes, row-major.
+    pub framebuffer: Vec<u8>,
+    /// VRAM, 64 KiB, each 16-bit word low byte first.
+    pub vram: Vec<u8>,
+    /// CGRAM, 256 BGR555 colours (`0BBBBBGGGGGRRRRR`).
+    pub palette: Vec<u16>,
+    /// OAM, 544 bytes: the 512-byte table, then the 32-byte high table.
+    pub oam: Vec<u8>,
+    /// The register list `VideoDebugger::get_registers` reports.
+    pub registers: Vec<VideoRegister>,
+    /// The PPU's settings, structured.
+    pub ppu_settings: crate::ppu::PpuSettings,
+}
 
 /// SNES (Super Famicom) emulator.
 ///
@@ -246,6 +282,26 @@ pub struct SnesEmulator {
     /// leaving `state_hash` byte-identical to a presented run. Always
     /// `true` on the normal play path.
     present: bool,
+
+    /// Set for the length of a [`Self::run_to_capture_boundary`] call:
+    /// the frame loops then stop in front of the frame's `VBlankStart`.
+    capture_boundary_requested: bool,
+    /// The core is stopped at a capture boundary: the frame's active
+    /// display is drawn and its picture finished, and its `VBlankStart`,
+    /// still queued, has started nothing of the vertical blank. The next
+    /// frame call, step or savestate goes on from there.
+    ///
+    /// Never part of a savestate. That a frame is in progress is already
+    /// in the saved scheduler (see [`Self::frame_in_progress`]); this only
+    /// says that its picture is finished, so that the queued
+    /// `VBlankStart` does not finish it a second time.
+    held_at_capture_boundary: bool,
+    /// The cycle the drain that stopped at the capture boundary ran to:
+    /// the frame's `VBlankStart` and the events after it that were due by
+    /// then are the rest of that drain's batch (see
+    /// [`Self::release_capture_boundary`]). Meaningful only while
+    /// `held_at_capture_boundary`.
+    capture_boundary_cycle: u64,
 }
 
 impl Default for SnesEmulator {
@@ -332,6 +388,9 @@ impl SnesEmulator {
             irq_read_early: None,
             debug_event_scratch: Vec::new(),
             present: true,
+            capture_boundary_requested: false,
+            held_at_capture_boundary: false,
+            capture_boundary_cycle: 0,
         }
     }
 
@@ -727,6 +786,10 @@ impl SnesEmulator {
         // re-derived the next vblank.
         self.nmi_deliver_armed = false;
         self.nmi_deliver_countdown = 0;
+        // The restored machine is not stopped at a capture boundary: if
+        // its frame is in progress, its `VBlankStart` finishes its picture.
+        self.held_at_capture_boundary = false;
+        self.capture_boundary_requested = false;
         self.focused_cpu =
             (payload.focused_cpu as usize).min(self.system_info.cpus.len().saturating_sub(1));
         self.audio_enabled = payload.audio_enabled;
@@ -970,15 +1033,65 @@ impl SnesEmulator {
     /// normalisation. Only meaningful while paused, a running core
     /// repaints on its own next frame, but a paused one never would, so a
     /// host that toggles a layer calls this to see the change at once.
+    ///
+    /// The sprite range and time flags and the evaluator's OAM address,
+    /// which drawing moves and a savestate holds, are put back as they
+    /// were, so a repaint leaves the state hash where it was.
     pub fn repaint_held_frame(&mut self) {
-        // 240 is the overscan ceiling; `in_active_scanline` clips the
-        // tail to the live 224/240-line window per the overscan bit.
-        for scanline in 1..240u16 {
-            self.bus
-                .ppu_mut()
-                .render_scanline(scanline, &mut self.framebuffer);
+        self.bus.ppu_mut().redraw_frame(&mut self.framebuffer);
+    }
+
+    /// The held frame drawn again with only `layer` in it (`0..=3` BG1-4,
+    /// `4` OBJ), alpha-keyed: see [`crate::ppu::Ppu::render_layer`].
+    /// Emulation does not advance, the framebuffer the host shows is left
+    /// as it was, and so is everything a savestate holds.
+    pub fn render_layer(&mut self, layer: u32) -> Result<PixelImage, ExportError> {
+        self.bus.ppu_mut().render_layer(layer as usize)
+    }
+
+    /// The PPU's settings, structured ([`crate::ppu::PpuSettings`]).
+    pub fn ppu_settings(&self) -> crate::ppu::PpuSettings {
+        self.bus.ppu().settings()
+    }
+
+    /// Copies of the frame's picture and of the video memory and settings
+    /// it was drawn from ([`FrameSnapshot`]). Taken at a capture boundary
+    /// ([`Self::run_to_capture_boundary`]) the two describe the same
+    /// frame; anywhere else the memory may already hold what the game
+    /// uploaded in the vertical blank for the next frame, which
+    /// `at_boundary` tells the host.
+    pub fn capture_frame_snapshot(&self) -> FrameSnapshot {
+        let (width, height) = {
+            let display = &self.system_info.display;
+            (
+                display.width.min(self.framebuffer.width),
+                display.height.min(self.framebuffer.height),
+            )
+        };
+        let stride = self.framebuffer.width as usize * 4;
+        let row_bytes = width as usize * 4;
+        let mut framebuffer = Vec::with_capacity(row_bytes * height as usize);
+        for y in 0..height as usize {
+            framebuffer
+                .extend_from_slice(&self.framebuffer.data[y * stride..y * stride + row_bytes]);
         }
-        self.bus.ppu().finalize_frame(&mut self.framebuffer);
+        let ppu = self.bus.ppu();
+        FrameSnapshot {
+            frame: if self.held_at_capture_boundary {
+                self.frame_count + 1
+            } else {
+                self.frame_count
+            },
+            at_boundary: self.held_at_capture_boundary,
+            width,
+            height,
+            framebuffer,
+            vram: ppu.get_vram().to_vec(),
+            palette: ppu.cgram().to_vec(),
+            oam: ppu.oam().to_vec(),
+            registers: ppu.get_registers(),
+            ppu_settings: ppu.settings(),
+        }
     }
 
     /// A [`crate::cartridge::SnesCartridgeDebugger`] bound to the live
@@ -1332,6 +1445,14 @@ impl SnesEmulator {
                     .tick(stolen.min(u32::MAX as u64) as u32);
             }
             EventKind::VBlankStart => {
+                // A frame held at the capture boundary finished its
+                // picture when it stopped in front of this event; only
+                // the start of the vertical blank is left.
+                if self.held_at_capture_boundary {
+                    self.held_at_capture_boundary = false;
+                } else {
+                    self.finish_picture();
+                }
                 // Interlace field toggle, alternates once per frame
                 // even when the interlace bit itself is off, which
                 // mirrors how real silicon drives `$213F` bit 7.
@@ -1340,22 +1461,6 @@ impl SnesEmulator {
                 // its base (a side effect of sprite eval finishing on
                 // real hardware) when the display is active.
                 self.bus.ppu_mut().oam_reset_at_vblank();
-                // Normalize the frame for host display: when any line
-                // was hires the reported width is 512, so lo-res lines
-                // (HDMA mid-frame mode sweeps) are doubled in place to
-                // fill the full width. Must run before the display-size
-                // sync below so the framebuffer and `DisplayInfo` agree.
-                // Purely a framebuffer post-process (no serialized state),
-                // so a headless frame skips it.
-                if self.present {
-                    self.bus.ppu().finalize_frame(&mut self.framebuffer);
-                }
-                // Sync the cached `DisplayInfo` to the live PPU
-                // dimensions at the natural frame boundary so the
-                // next host poll of `get_display_info` reflects any
-                // hires / overscan toggles that happened during the
-                // frame just ended.
-                self.sync_display_info();
                 // Latch the NMI flag ($4210 bit 7) regardless of the
                 // enable bit and raise the HVBJOY VBlank flag. The CPU
                 // NMI signal itself is gated by NMITIMEN bit 7.
@@ -1467,6 +1572,27 @@ impl SnesEmulator {
         }
     }
 
+    /// Finish the frame's picture once its active display is drawn: the
+    /// first work of `VBlankStart`, which a frame held at the capture
+    /// boundary has already done when it stopped in front of that event.
+    ///
+    /// Normalize the frame for host display: when any line was hires the
+    /// reported width is 512, so lo-res lines (HDMA mid-frame mode sweeps)
+    /// are doubled in place to fill the full width. It runs before the
+    /// display-size sync so the framebuffer and `DisplayInfo` agree. It is
+    /// purely a framebuffer post-process (no serialized state), so a
+    /// headless frame skips it. The sync then mirrors the live PPU
+    /// dimensions into the cached `DisplayInfo`, so the next host poll of
+    /// `get_display_info` reflects any hires / overscan toggles of the
+    /// frame just drawn. Neither step reads the interlace field or the OAM
+    /// address the rest of `VBlankStart` moves.
+    fn finish_picture(&mut self) {
+        if self.present {
+            self.bus.ppu().finalize_frame(&mut self.framebuffer);
+        }
+        self.sync_display_info();
+    }
+
     /// Pull every queued 32 kHz `i16` sample out of the APU, resample it
     /// to the 44.1 kHz host rate, and push the `f32` result into the host
     /// audio ring. Called once per frame after the APU catch-up.
@@ -1565,14 +1691,170 @@ impl SnesEmulator {
         self.system_info.display.refresh_rate = self.timing.refresh_rate();
     }
 
+    /// Whether a frame is in progress: its end has not been handled yet,
+    /// so the `FrameEnd` it was armed with, at `frame_base_cycle` plus one
+    /// frame, is still queued. A frame call that stopped early (at a
+    /// breakpoint, at a pause, at the capture boundary), a debugger step, a
+    /// reset (frame 0 opens at cycle 0) or a savestate taken mid-frame
+    /// leaves one in progress; a frame call that ran its frame to the end
+    /// does not, since its tail armed the next frame from the cycle it
+    /// ended on. Read off the saved scheduler, so a state loaded mid-frame
+    /// goes on with its frame too.
+    ///
+    /// The clock alone cannot tell: one instruction, a long general DMA,
+    /// can carry it past both the frame's `VBlankStart` and its end, and a
+    /// frame stopped at its capture boundary there is still in progress.
+    pub fn frame_in_progress(&self) -> bool {
+        self.scheduler.earliest(&EventKind::FrameEnd)
+            == Some(self.frame_base_cycle + self.timing.cycles_per_frame())
+    }
+
+    /// Go on with the frame in progress, or open the next one, and return
+    /// the master cycle at which the frame ends.
+    ///
+    /// The next frame opens where the tail of the previous one armed its
+    /// events: its queued `FrameEnd` less one frame. That is the present
+    /// cycle on every path that runs frames, since nothing runs between a
+    /// frame's tail and the next call; bare CPU steps in between (which
+    /// handle no events) are counted inside the frame, so its raster
+    /// positions still decode against the base its events were armed on.
+    /// With no `FrameEnd` queued, the frame opens at the present cycle.
+    ///
+    /// Re-anchoring a frame that is in progress would decode its armed
+    /// events against the wrong base (every raster position off by the
+    /// cycles already run) and give it a whole frame's budget again, so a
+    /// frame stopped at a breakpoint would run long and draw at the wrong
+    /// rows; going on with it keeps the frame exactly as one run whole.
+    fn enter_frame(&mut self) -> u64 {
+        let frame_cycles = self.timing.cycles_per_frame();
+        let frame_end = self.frame_base_cycle + frame_cycles;
+        // Short of the frame's end the frame is in progress: its
+        // `FrameEnd` is handled only once the clock reaches it. The
+        // debugger's steps come through here once an instruction, and this
+        // spares them the walk over the queue.
+        if self.master_cycles < frame_end {
+            return frame_end;
+        }
+        match self.scheduler.earliest(&EventKind::FrameEnd) {
+            Some(end) if end == frame_end => {}
+            Some(end) => self.frame_base_cycle = end.saturating_sub(frame_cycles),
+            None => self.frame_base_cycle = self.master_cycles,
+        }
+        self.frame_base_cycle + frame_cycles
+    }
+
+    /// Handle the scheduler events due by the present cycle, in order.
+    ///
+    /// For a capture run the drain stops in front of the frame's
+    /// `VBlankStart`, which stays queued with every event after it: the
+    /// picture is finished there and the core is held at the capture
+    /// boundary, which the `true` return reports. The events left queued
+    /// are the ones the same drain would have handled after
+    /// `VBlankStart`; the first drain once the frame goes on handles them
+    /// (see [`Self::release_capture_boundary`]). No event a handler
+    /// schedules can fall due before them, since a handler only ever
+    /// schedules ahead of the present cycle.
+    #[inline]
+    fn handle_due_events(&mut self) -> bool {
+        if self.capture_boundary_requested | self.held_at_capture_boundary {
+            return self.handle_capture_events();
+        }
+        let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
+        for (at_cycle, ev) in events {
+            self.handle_event_at(at_cycle, ev);
+        }
+        false
+    }
+
+    /// The drain while a capture is under way (see
+    /// [`Self::handle_due_events`]): the rest of a split batch when the
+    /// core is held at the boundary, else a drain that stops in front of
+    /// the frame's `VBlankStart`.
+    fn handle_capture_events(&mut self) -> bool {
+        if self.held_at_capture_boundary {
+            self.release_capture_boundary();
+            return false;
+        }
+        let bound = self.master_cycles;
+        let (events, at_vblank) = self
+            .scheduler
+            .drain_up_to_before(bound, |kind| matches!(kind, EventKind::VBlankStart));
+        for (at_cycle, ev) in events {
+            self.handle_event_at(at_cycle, ev);
+        }
+        if at_vblank {
+            self.finish_picture();
+            self.held_at_capture_boundary = true;
+            self.capture_boundary_cycle = bound;
+        }
+        at_vblank
+    }
+
+    /// Handle the rest of the batch the capture boundary split: the
+    /// events that were due when the stopping drain ran, up to its own
+    /// cycle, the frame's `VBlankStart` first (whose handler ends the
+    /// hold). Events that came due since, which an HDMA transfer's cycles
+    /// can bring, wait for the next drain, as they would in a frame run
+    /// whole: the queue then sees the same pops and pushes in the same
+    /// order, and a savestate, which writes the queue in its stored order,
+    /// comes out byte for byte the same.
+    fn release_capture_boundary(&mut self) {
+        let events = self
+            .scheduler
+            .drain_up_to_with_cycles(self.capture_boundary_cycle);
+        for (at_cycle, ev) in events {
+            self.handle_event_at(at_cycle, ev);
+        }
+    }
+
+    /// Before an instruction runs from the capture boundary, handle what
+    /// the frame loop handles first there: the rest of the split batch
+    /// (the start of the vertical blank first), then every event due by
+    /// now, draining again, as the loop does, while the cycles an HDMA
+    /// transfer takes bring more events due; then, if the clock is already
+    /// past the frame's end (a long general DMA crossed both), close the
+    /// frame as the loop would. A step from the boundary is therefore the
+    /// step the frame loop would take: the same instruction against the
+    /// same state.
+    fn leave_capture_boundary(&mut self) {
+        if !self.held_at_capture_boundary {
+            return;
+        }
+        self.release_capture_boundary();
+        while self
+            .scheduler
+            .peek_cycle()
+            .is_some_and(|at| at <= self.master_cycles)
+        {
+            let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
+            for (at_cycle, ev) in events {
+                self.handle_event_at(at_cycle, ev);
+            }
+        }
+        if self.master_cycles >= self.frame_base_cycle + self.timing.cycles_per_frame() {
+            self.end_of_frame_bookkeeping();
+            self.frame_base_cycle = self.master_cycles;
+        }
+    }
+
     /// Run one frame with no debug instrumentation (the `Fast` tier).
     /// This is the hot path when the debugger panel is idle.
+    ///
+    /// Each pass handles the events due first, then runs CPU instructions
+    /// up to the next event or the frame's end. A frame picked up where an
+    /// earlier call stopped may have events due from before the stop, the
+    /// clock even past the frame's end, so they are handled before the
+    /// frame's end is checked.
     fn run_frame_fast(&mut self) {
-        let frame_start = self.master_cycles;
-        self.frame_base_cycle = frame_start;
-        let frame_end = frame_start + self.timing.cycles_per_frame();
+        let frame_end = self.enter_frame();
 
-        while self.master_cycles < frame_end {
+        loop {
+            if self.handle_due_events() {
+                return;
+            }
+            if self.master_cycles >= frame_end {
+                break;
+            }
             // Run CPU instructions until either (a) the next
             // scheduler event fires or (b) we've used the whole
             // frame budget. `target` is the lesser of the two.
@@ -1581,11 +1863,6 @@ impl SnesEmulator {
 
             while self.master_cycles < target {
                 self.step_cpu_internal();
-            }
-
-            let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
-            for (at_cycle, ev) in events {
-                self.handle_event_at(at_cycle, ev);
             }
         }
 
@@ -1609,6 +1886,109 @@ impl SnesEmulator {
         self.present = true;
     }
 
+    /// Run to the next capture boundary and stop there: the moment the
+    /// frame's active display has been drawn, in front of its
+    /// `VBlankStart`. The framebuffer is final there (the hires and
+    /// overscan normalisation done, `DisplayInfo` synced) while VRAM,
+    /// CGRAM, OAM and the registers still hold what the picture was drawn
+    /// from: no NMI is delivered and nothing of the vertical blank has run,
+    /// so the game's uploads for the next frame have not landed.
+    ///
+    /// Held at a boundary already, the call first finishes that frame,
+    /// then runs the next one to its boundary, so each call advances
+    /// exactly one frame. A frame in progress that is past its
+    /// `VBlankStart` (a breakpoint stopped it in the vertical blank) is
+    /// run to its end and the next one to its boundary.
+    ///
+    /// The loops are the ones a frame call picks, by the same tier
+    /// selection, and breakpoints stop where they stop: a breakpoint that
+    /// hits on the way leaves the frame paused there instead, which
+    /// [`Self::at_capture_boundary`] then reports as `false`. While the
+    /// debugger is paused or stepping the call does what a frame call
+    /// does then.
+    ///
+    /// The rest of a held frame runs on the next frame call (`run_frame`,
+    /// `run_frame_headless`), which finishes that frame and returns, on
+    /// the next boundary call (`run_until_vblank` is one), on the next
+    /// step, which leaves the boundary first (`leave_capture_boundary`),
+    /// or on the save path ([`Self::save_state_finishing_held_frame`]). A
+    /// reset, a ROM load or a state load drops it.
+    pub fn run_to_capture_boundary(&mut self) {
+        self.sync_spc_trace_enable();
+        self.sync_gsu_trace_enable();
+        self.sync_debug_arm();
+        let tier = self.debugger.execution_tier();
+        if tier == ExecutionTier::FullDebug {
+            self.run_frame_full();
+            return;
+        }
+        if self.held_at_capture_boundary {
+            self.run_frame_on_tier(tier);
+            if self.frame_call_stopped() {
+                // A breakpoint stopped the rest of the held frame.
+                return;
+            }
+        }
+        self.capture_boundary_requested = true;
+        // At most two frames: the rest of a frame already past its
+        // `VBlankStart`, then the next frame up to its own.
+        for _ in 0..2 {
+            self.run_frame_on_tier(tier);
+            if self.frame_call_stopped() {
+                break;
+            }
+        }
+        self.capture_boundary_requested = false;
+    }
+
+    /// Whether the frame call just made stopped before its frame's end, at
+    /// the capture boundary or at a breakpoint (which pauses the debugger,
+    /// even one that hit in the batch that ended the frame).
+    fn frame_call_stopped(&self) -> bool {
+        self.frame_in_progress() || self.debugger.get_execution_mode() != ExecutionMode::Running
+    }
+
+    /// Whether the core is stopped at a capture boundary (see
+    /// [`Self::run_to_capture_boundary`]).
+    pub fn at_capture_boundary(&self) -> bool {
+        self.held_at_capture_boundary
+    }
+
+    /// Run the rest of the frame held at the capture boundary, as a frame
+    /// call in the `Running` mode would, whatever the debugger's execution
+    /// mode: a breakpoint or a trace selects the instrumented loop, and a
+    /// breakpoint can stop it before the frame's end. Does nothing when the
+    /// core is not held at a boundary.
+    pub fn finish_held_frame(&mut self) {
+        if !self.held_at_capture_boundary {
+            return;
+        }
+        self.sync_spc_trace_enable();
+        self.sync_gsu_trace_enable();
+        self.sync_debug_arm();
+        let tier = self.debugger.running_tier();
+        self.run_frame_on_tier(tier);
+    }
+
+    /// A savestate of the machine, taken once the frame held at a capture
+    /// boundary, if any, is finished ([`Self::finish_held_frame`]): the
+    /// host's save path, so a savestate never holds a frame stopped at the
+    /// boundary. Anywhere else it is [`EmulatorCore::save_state`].
+    pub fn save_state_finishing_held_frame(&mut self) -> Vec<u8> {
+        self.finish_held_frame();
+        EmulatorCore::save_state(self)
+    }
+
+    /// Run the frame in progress, or the next one, on the fast or the
+    /// instrumented loop; the tier names which.
+    fn run_frame_on_tier(&mut self, tier: ExecutionTier) {
+        match tier {
+            ExecutionTier::Fast => self.run_frame_fast(),
+            ExecutionTier::LightDebug => self.run_frame_instrumented(false),
+            ExecutionTier::FullDebug => self.run_frame_full(),
+        }
+    }
+
     /// Run one frame with per-instruction debug hooks (the `LightDebug`
     /// tier). Before each 65C816 instruction we check execute breakpoints,
     /// record coverage, and, when 65C816 tracing is enabled, capture a
@@ -1616,15 +1996,52 @@ impl SnesEmulator {
     /// CPU-state snapshots; the tier dispatch passes `false`.
     ///
     /// A breakpoint hit flips the execution mode to `Paused` and returns
-    /// mid-frame; the partial scheduler progress is drained on the next
-    /// `run_frame` once the user resumes.
+    /// mid-frame; the next frame call goes on with the same frame (see
+    /// [`Self::enter_frame`]), so a frame broken into pieces ends where
+    /// one run whole ends, with the same state. Each pass handles the
+    /// events due first, as [`Self::run_frame_fast`] does, then runs
+    /// instructions up to the next event.
     fn run_frame_instrumented(&mut self, full: bool) {
-        let frame_start = self.master_cycles;
-        self.frame_base_cycle = frame_start;
-        let frame_end = frame_start + self.timing.cycles_per_frame();
-        self.pending_break = false;
+        // An event in the batch that reached the capture boundary may have
+        // matched an event breakpoint. The frame loop honours a match once
+        // the whole batch is handled, and the events after the boundary
+        // are the rest of that batch, so the match waits for them.
+        if !self.held_at_capture_boundary {
+            self.pending_break = false;
+        }
+        let frame_end = self.enter_frame();
 
-        while self.master_cycles < frame_end {
+        loop {
+            if self.handle_due_events() {
+                // Held at the capture boundary. The traces the APU and the
+                // coprocessor captured so far are flushed as at a frame's
+                // end; a breakpoint match waits for the rest of the batch.
+                self.drain_spc_trace();
+                self.drain_gsu_trace();
+                if full {
+                    self.update_debugger_state();
+                }
+                return;
+            }
+            // Inline events (VBlank/NMI/IRQ/HDMA/scanline set `pending_break`)
+            // and the FrameEnd APU catch-up's DSP-register writes are checked
+            // after the event batch drains.
+            let hit = self.debug_armed && (self.pending_break | self.drain_apu_dsp_events());
+            if self.master_cycles >= frame_end {
+                // The batch held the frame's end: the frame closes before a
+                // pause, so the next call opens the next frame.
+                self.end_of_frame_bookkeeping();
+                if hit {
+                    self.finish_paused_frame(full);
+                    return;
+                }
+                break;
+            }
+            if hit {
+                self.finish_paused_frame(full);
+                return;
+            }
+
             let next_event = self.scheduler.peek_cycle().unwrap_or(frame_end);
             let target = next_event.min(frame_end);
 
@@ -1661,21 +2078,8 @@ impl SnesEmulator {
                     return;
                 }
             }
-
-            let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
-            for (at_cycle, ev) in events {
-                self.handle_event_at(at_cycle, ev);
-            }
-            // Inline events (VBlank/NMI/IRQ/HDMA/scanline set `pending_break`)
-            // and the FrameEnd APU catch-up's DSP-register writes are checked
-            // after the event batch drains.
-            if self.debug_armed && (self.pending_break | self.drain_apu_dsp_events()) {
-                self.finish_paused_frame(full);
-                return;
-            }
         }
 
-        self.end_of_frame_bookkeeping();
         self.drain_spc_trace();
         self.drain_gsu_trace();
         if full {
@@ -1702,6 +2106,7 @@ impl SnesEmulator {
     /// that fall at the new master-cycle boundary so the PPU stays
     /// consistent. Used by the step modes and `EmulatorCore::step_cpu`.
     fn debug_single_step_65816(&mut self) {
+        self.enter_frame_for_step();
         let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
         self.debugger.record_coverage_65816(pc24);
         if self.debugger.is_tracing_enabled(0) {
@@ -1728,6 +2133,19 @@ impl SnesEmulator {
         self.drain_spc_trace();
         self.drain_gsu_trace();
         self.update_debugger_state();
+    }
+
+    /// Before a debugger step: leave the capture boundary if the core is
+    /// held there (see [`Self::leave_capture_boundary`]), then go on with
+    /// the frame in progress or open the next one, as a frame call does.
+    ///
+    /// Opening the next frame here matters after a frame call that ran its
+    /// frame to the end: the frame base would otherwise still be that
+    /// frame's, so the first step would close a frame at once and arm a
+    /// second set of events over the ones already armed.
+    fn enter_frame_for_step(&mut self) {
+        self.leave_capture_boundary();
+        self.enter_frame();
     }
 
     /// Drain every scheduler event due at the current master cycle and,
@@ -2205,6 +2623,10 @@ impl EmulatorCore for SnesEmulator {
         self.nmi_deliver_armed = false;
         self.nmi_deliver_countdown = 0;
         self.irq_read_early = None;
+        // A reset, and the ROM load that ends in one, leaves no frame
+        // stopped at a capture boundary.
+        self.held_at_capture_boundary = false;
+        self.capture_boundary_requested = false;
         self.scheduler.reset(0);
         // Frame 0 schedules off the live overscan bit (off at the
         // reset/power-on state); subsequent frames re-read it in
@@ -2251,6 +2673,10 @@ impl EmulatorCore for SnesEmulator {
     }
 
     fn step(&mut self) -> StepResult {
+        // From the capture boundary, the events the frame loop handles
+        // before the next instruction come first, so the instruction runs
+        // against the state it would in the loop.
+        self.leave_capture_boundary();
         let delta = self.step_cpu_internal();
         StepResult {
             cycles: delta.min(u32::MAX as u64) as u32,
@@ -2268,6 +2694,7 @@ impl EmulatorCore for SnesEmulator {
                 self.sync_spc_trace_enable();
                 self.sync_gsu_trace_enable();
                 self.sync_debug_arm();
+                self.enter_frame_for_step();
                 let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
                 self.debugger.record_coverage_65816(pc24);
                 if self.debugger.is_tracing_enabled(0) {
@@ -2362,12 +2789,11 @@ impl EmulatorCore for SnesEmulator {
         }
     }
 
+    /// Run to the start of vertical blanking and stop there: the capture
+    /// boundary ([`SnesEmulator::run_to_capture_boundary`]), on the loop
+    /// [`EmulatorCore::run_frame`] picks.
     fn run_until_vblank(&mut self) {
-        // VBlankStart raises NMI mid-frame, but the host-visible
-        // contract here is "framebuffer ready", so running a whole
-        // frame gives the same observable result without
-        // partial-frame state to track.
-        self.run_frame();
+        self.run_to_capture_boundary();
     }
 
     fn load_rom(&mut self, data: &[u8]) -> Result<(), String> {
@@ -2540,6 +2966,12 @@ impl EmulatorCore for SnesEmulator {
     fn save_state(&self) -> Vec<u8> {
         use crate::savestate::SNES_SAVESTATE_VERSION;
 
+        // This takes `&self`, so it cannot finish a frame held at the
+        // capture boundary: it saves that frame as it stands, its
+        // `VBlankStart` still queued, and a load goes on with it (the
+        // saved clock says the frame is in progress). A host saves through
+        // `save_state_finishing_held_frame`, which finishes it first.
+        //
         // Shared with `state_hash` so the hashed payload is exactly the
         // bytes persisted here (minus the envelope + compression).
         let payload = self.capture_save_state();

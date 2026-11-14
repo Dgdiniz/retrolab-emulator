@@ -99,6 +99,97 @@ pub struct InstructionAccessLog {
     pub dmas: Vec<MemoryDma>,
 }
 
+/// The frame as it stands at a capture boundary, or wherever
+/// [`GenesisEmulator::capture_frame_snapshot`] is called: copies of the
+/// picture the host shows and of the video memory and registers it was
+/// drawn from.
+#[derive(Debug, Clone)]
+pub struct CaptureFrameSnapshot {
+    /// The number of the frame the picture is: the frames finished so far,
+    /// plus one while a frame is held part of the way through (it is
+    /// counted once it ends).
+    pub frame: u64,
+    /// Whether the core is stopped at a capture boundary, where the
+    /// picture and the memory below belong to the same frame.
+    pub at_boundary: bool,
+    /// Width of the picture: 256 or 320.
+    pub width: u32,
+    /// Height of the picture ([`crate::vdp::Vdp::drawn_height`]).
+    pub height: u32,
+    /// The picture the host shows, RGBA, `width * height * 4` bytes.
+    pub framebuffer: Vec<u8>,
+    /// The 64 KiB of VRAM.
+    pub vram: Vec<u8>,
+    /// CRAM: the 64 colours of the four palettes, `0000 BBB0 GGG0 RRR0`.
+    pub palette: Vec<u16>,
+    /// The 64 words of the vertical scroll RAM.
+    pub vsram: Vec<u16>,
+    /// The 24 VDP registers.
+    pub registers: Vec<retro_core::video::VideoRegister>,
+}
+
+/// A frame a frame loop left part of the way through, and where it goes on
+/// from. Never part of a savestate: a savestate is always taken where a
+/// frame ends ([`GenesisEmulator::finish_frame_and_save_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldFrame {
+    /// The scanline the frame goes on from.
+    line: u32,
+    /// What of that line has run.
+    progress: LineProgress,
+    /// Why the frame stopped there.
+    reason: HoldReason,
+}
+
+/// How far a held frame's next line has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineProgress {
+    /// None of it: the line starts with the VDP's step onto it. `overshoot`
+    /// is the 68000 cycles already run past the previous line's budget,
+    /// which come out of this line's.
+    NotStarted { overshoot: u32 },
+    /// Its start: the VDP stepped onto the line, the interrupts that raised
+    /// were taken and the line's event breakpoints checked. `budget` is the
+    /// line's 68000 cycles and `spent` the cycles already out of it.
+    Started { budget: u32, spent: u32 },
+}
+
+/// Why a frame was left part of the way through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldReason {
+    /// A capture boundary: the picture is drawn and vertical blanking has
+    /// not begun.
+    CaptureBoundary,
+    /// An event breakpoint (VBlank, VInt, HInt, a scanline) fired at the
+    /// start of the line.
+    EventBreakpoint,
+}
+
+/// How one pass of a frame loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassEnd {
+    /// At the capture boundary, the frame held there.
+    Boundary,
+    /// At the end of the frame.
+    FrameEnd,
+    /// Anywhere else: a breakpoint, an event breakpoint or the debugger's
+    /// pause.
+    Stopped,
+}
+
+/// Where a pass of a frame loop starts and ends ([`GenesisEmulator::start_frame_pass`]).
+struct FramePass {
+    /// The first line the pass runs.
+    first_line: u32,
+    /// The line the pass stops before.
+    end_line: u32,
+    /// 68000 cycles the previous line ran past its budget.
+    overshoot: u32,
+    /// For a first line whose start has run already: its budget and the
+    /// cycles out of it.
+    started: Option<(u32, u32)>,
+}
+
 /// Main Genesis emulator struct.
 ///
 /// This implements the `EmulatorCore` trait and ties together all
@@ -238,6 +329,12 @@ pub struct GenesisEmulator {
     /// The bus accesses of the last instruction stepped while
     /// `instruction_access_logging` is on.
     instruction_access_log: InstructionAccessLog,
+
+    /// A frame left part of the way through, at a capture boundary or an
+    /// event breakpoint: the next frame call goes on from it instead of
+    /// starting a frame. Never part of a savestate; a reset, a savestate
+    /// load and a ROM load drop it.
+    held_frame: Option<HeldFrame>,
 }
 
 impl GenesisEmulator {
@@ -596,6 +693,7 @@ impl GenesisEmulator {
             last_rom: Vec::new(),
             instruction_access_logging: false,
             instruction_access_log: InstructionAccessLog::default(),
+            held_frame: None,
         }
     }
 
@@ -769,6 +867,129 @@ impl GenesisEmulator {
     pub fn repaint_held_frame(&mut self) {
         self.bus.vdp_mut().rerender_current_frame();
         self.update_cached_framebuffer();
+    }
+
+    /// Run to the next capture boundary and stop there: the moment the
+    /// frame's picture is drawn and vertical blanking has not begun, so no
+    /// VBlank interrupt is raised or taken and the game's VBlank code has
+    /// uploaded nothing for the next frame. There video memory and the
+    /// framebuffer belong to the same frame ([`Self::capture_frame_snapshot`],
+    /// [`Self::render_layer`]).
+    ///
+    /// The frame stays held there, outside every savestate, until the next
+    /// frame call finishes it (one call is the rest of the frame), a
+    /// savestate is taken ([`Self::finish_frame_and_save_state`] finishes
+    /// it first), or a reset, a savestate load or a ROM load drops it.
+    ///
+    /// A frame already held at its boundary, or past it, is finished first
+    /// and the next frame run to its boundary, so each call moves the game
+    /// on one frame; a frame held before its boundary (at an event
+    /// breakpoint) runs on to it. The frame loop is the one a frame call
+    /// picks ([`GenesisDebugger::execution_tier`]: the loop a player runs
+    /// while no debug feature is armed), and a breakpoint still stops where
+    /// it stops, leaving the core held at no boundary.
+    pub fn run_to_capture_boundary(&mut self) {
+        let frame_loop = self.debugger.execution_tier();
+        self.run_to_capture_boundary_with(frame_loop);
+    }
+
+    /// [`Self::run_to_capture_boundary`] on the frame loop `frame_loop`
+    /// instead of the one the debugger's state picks.
+    pub fn run_to_capture_boundary_with(&mut self, frame_loop: ExecutionTier) {
+        if self.run_frame_pass(frame_loop, true) == PassEnd::FrameEnd {
+            self.run_frame_pass(frame_loop, true);
+        }
+    }
+
+    /// Whether the core is held at a capture boundary
+    /// ([`Self::run_to_capture_boundary`]).
+    pub fn at_capture_boundary(&self) -> bool {
+        matches!(
+            self.held_frame,
+            Some(HeldFrame {
+                reason: HoldReason::CaptureBoundary,
+                ..
+            })
+        )
+    }
+
+    /// Finish a frame left part of the way through, at a capture boundary
+    /// or an event breakpoint: its remaining lines run, the cartridge
+    /// catches up, its audio is generated, it is counted and the host's
+    /// framebuffer refreshed, as at the end of a whole frame. The rest runs
+    /// on the loop a player runs, whatever the debugger is doing, so no
+    /// breakpoint can stop it before the frame ends. Returns whether there
+    /// was a frame to finish.
+    pub fn finish_held_frame(&mut self) -> bool {
+        if self.held_frame.is_none() {
+            return false;
+        }
+        self.run_frame_fast_inner(true, false);
+        // The fast loop writes no CPU state; a paused debugger shows where
+        // the frame ended.
+        self.update_debugger_state();
+        true
+    }
+
+    /// Save the machine's state where a frame ends: a frame held part of
+    /// the way through is finished first ([`Self::finish_held_frame`]), so
+    /// a savestate never holds a frame half run, which no savestate can
+    /// say where to resume. Every host saves through this:
+    /// [`EmulatorCore::save_state`] takes `&self`, so it cannot finish a
+    /// frame, and refuses while one is held.
+    pub fn finish_frame_and_save_state(&mut self) -> Vec<u8> {
+        self.finish_held_frame();
+        <Self as EmulatorCore>::save_state(self)
+    }
+
+    /// Copies of the picture the host shows and of the video memory and
+    /// registers ([`CaptureFrameSnapshot`]). At a capture boundary both
+    /// belong to the frame held there; elsewhere the memory may already
+    /// hold what the game wrote after the picture was drawn.
+    pub fn capture_frame_snapshot(&self) -> CaptureFrameSnapshot {
+        use retro_core::video::VideoDebugger;
+
+        let (width, height, framebuffer) = self.shown_picture();
+        let vdp = self.bus.vdp();
+        CaptureFrameSnapshot {
+            // The number of the frame the picture is: a frame held part of the
+            // way through is counted once it ends, so it is the next one.
+            frame: self.frame_count + u64::from(self.held_frame.is_some()),
+            at_boundary: self.at_capture_boundary(),
+            width,
+            height,
+            framebuffer,
+            vram: vdp.get_vram().to_vec(),
+            palette: vdp.get_cram().to_vec(),
+            vsram: vdp.get_vsram().to_vec(),
+            registers: vdp.get_registers(),
+        }
+    }
+
+    /// The picture the host shows, as [`EmulatorCore::get_display_info`]
+    /// sizes it: the framebuffer's rows cut to the lines the VDP draws.
+    fn shown_picture(&self) -> (u32, u32, Vec<u8>) {
+        let fb = &self.cached_framebuffer;
+        let display = &self.system_info.display;
+        let width = display.width.min(fb.width);
+        let height = display.height.min(fb.height);
+        let stride = fb.width as usize * 4;
+        let row_bytes = width as usize * 4;
+        let mut picture = Vec::with_capacity(row_bytes * height as usize);
+        for row in fb.data.chunks_exact(stride).take(height as usize) {
+            picture.extend_from_slice(&row[..row_bytes]);
+        }
+        (width, height, picture)
+    }
+
+    /// One layer of the frame drawn alone, alpha-keyed, from video memory
+    /// as it is now ([`crate::vdp::Vdp::render_layer_image`]); at a capture
+    /// boundary, the frame held there. `layer` is an id of the layer list
+    /// (`getLayerInfo`, `toggleLayer`), `None` for any other. Nothing runs:
+    /// the framebuffer the host reads, and everything a savestate or
+    /// [`Self::state_hash`] reads, stay as they were.
+    pub fn render_layer(&mut self, layer: u32) -> Option<retro_core::video::PixelImage> {
+        self.bus.vdp_mut().render_layer_image(layer as usize)
     }
 
     /// Set controller port button state directly (for CLI input injection).
@@ -1220,6 +1441,8 @@ impl GenesisEmulator {
 
         // Host-visible presentation state derived from the old machine.
         self.cached_framebuffer = Framebuffer::new(320, 224);
+        self.system_info.display.width = 320;
+        self.system_info.display.height = 224;
         self.mixed_waveform_buffer.clear();
         // A held button belongs to the outgoing session, never the incoming one.
         self.input_manager.clear_all_direct_overrides();
@@ -1325,6 +1548,10 @@ impl GenesisEmulator {
             }
             state
         };
+
+        // The machine becomes the savestate's, which ends a frame: a frame
+        // held part of the way through is dropped.
+        self.held_frame = None;
 
         // Apply state to all components
         self.cpu.from_savestate(&state.cpu68k);
@@ -1973,6 +2200,11 @@ impl GenesisEmulator {
         {
             self.cached_framebuffer = Framebuffer::new(display_width, display_height);
         }
+
+        // The display info gives the picture this framebuffer holds: the
+        // mode's width, and its height cut to the lines the VDP draws.
+        self.system_info.display.width = display_width;
+        self.system_info.display.height = self.bus.vdp().drawn_height();
 
         // Safety check: ensure VDP framebuffer has expected size
         if vdp_fb.len() != expected_vdp_size {
@@ -2784,6 +3016,93 @@ impl GenesisEmulator {
         brk
     }
 
+    /// One pass of the frame loop `frame_loop`, from a held frame or a new
+    /// one: to the capture boundary when `stop_at_boundary` and the frame
+    /// has not reached it, else to the frame's end. A breakpoint, an event
+    /// breakpoint or the debugger's pause can end it anywhere.
+    fn run_frame_pass(&mut self, frame_loop: ExecutionTier, stop_at_boundary: bool) -> PassEnd {
+        match frame_loop {
+            ExecutionTier::Fast => self.run_frame_fast_inner(true, stop_at_boundary),
+            ExecutionTier::LightDebug => self.run_frame_debug_light_inner(stop_at_boundary),
+            ExecutionTier::FullDebug => self.run_frame_full(stop_at_boundary),
+        }
+    }
+
+    /// Where a pass of a frame loop starts and stops. A held frame goes on
+    /// from where it stopped. Otherwise a frame starts at line 0 and takes
+    /// the players' input, once a frame, as a whole frame always has: a
+    /// frame stopped part of the way through keeps the input it started
+    /// with. The pass stops before the capture boundary's line when
+    /// `stop_at_boundary` and the frame has not reached it yet, else at the
+    /// frame's end.
+    fn start_frame_pass(&mut self, scanlines: u32, stop_at_boundary: bool) -> FramePass {
+        let (first_line, overshoot, started) = match self.held_frame.take() {
+            Some(held) => match held.progress {
+                LineProgress::NotStarted { overshoot } => (held.line, overshoot, None),
+                LineProgress::Started { budget, spent } => (held.line, 0, Some((budget, spent))),
+            },
+            None => {
+                // Sync input state from InputManager into I/O devices
+                let p0 = self.input_manager.get_port_state(0);
+                let p1 = self.input_manager.get_port_state(1);
+                self.bus.io_mut().sync_input(p0, p1);
+                (0, self.frame_cycle_overshoot, None)
+            }
+        };
+        let boundary = u32::from(self.bus.vdp().first_vblank_line());
+        let end_line = if stop_at_boundary && first_line < boundary {
+            boundary
+        } else {
+            scanlines
+        };
+        FramePass {
+            first_line,
+            end_line,
+            overshoot,
+            started,
+        }
+    }
+
+    /// Hold the frame at its capture boundary: `line`, the first line of
+    /// vertical blanking, has not started, and the 68000 already ran
+    /// `overshoot` cycles into it. The picture is drawn, so the host gets
+    /// it now (when `present`); the cartridge, the audio and the frame count
+    /// wait for the frame to finish, as they do for a whole frame.
+    fn hold_at_capture_boundary(&mut self, line: u32, overshoot: u32, present: bool) {
+        self.held_frame = Some(HeldFrame {
+            line,
+            progress: LineProgress::NotStarted { overshoot },
+            reason: HoldReason::CaptureBoundary,
+        });
+        if present {
+            self.update_cached_framebuffer();
+        }
+    }
+
+    /// Hold the frame at line `line`, whose start has run, for an event
+    /// breakpoint: `budget` is the line's 68000 cycles and `spent` the
+    /// cycles already out of it.
+    fn hold_at_event(&mut self, line: u32, budget: u32, spent: u32) {
+        self.held_frame = Some(HeldFrame {
+            line,
+            progress: LineProgress::Started { budget, spent },
+            reason: HoldReason::EventBreakpoint,
+        });
+    }
+
+    /// Charge `cycles` the 68000 ran while a frame is held to the rest of
+    /// that frame: they come out of the held line's budget, as an
+    /// instruction's overshoot past a line does, so the frame's 68000 time
+    /// is the same however many instructions were stepped while it was held.
+    fn charge_held_frame(&mut self, cycles: u32) {
+        if let Some(held) = &mut self.held_frame {
+            match &mut held.progress {
+                LineProgress::NotStarted { overshoot } => *overshoot += cycles,
+                LineProgress::Started { spent, .. } => *spent += cycles,
+            }
+        }
+    }
+
     /// Shared fast-path frame body: runs a complete frame using
     /// step_fast() with no debug overhead. Skips debugger execution
     /// mode checks, breakpoints, disassembly, instruction history,
@@ -2796,66 +3115,75 @@ impl GenesisEmulator {
     /// Neither feeds back into machine state, so the scanline loop,
     /// Z80, PSG/YM2612 clocking, I/O, and the frame counter advance
     /// byte-identically whether or not the frame is presented.
-    fn run_frame_fast_inner(&mut self, present: bool) {
+    ///
+    /// One pass of the loop: a frame held part of the way through goes on
+    /// from where it stopped ([`Self::start_frame_pass`]), and with
+    /// `stop_at_boundary` the pass stops at the capture boundary instead of
+    /// the frame's end.
+    fn run_frame_fast_inner(&mut self, present: bool, stop_at_boundary: bool) -> PassEnd {
         use retro_core::cpu::Clockable;
-
-        // Sync input state from InputManager into I/O devices
-        let p0 = self.input_manager.get_port_state(0);
-        let p1 = self.input_manager.get_port_state(1);
-        self.bus.io_mut().sync_input(p0, p1);
 
         let scanlines = self.region.scanlines();
         let has_rom = self.bus.cartridge().is_some();
+        let pass = self.start_frame_pass(scanlines, stop_at_boundary);
 
         // Track 68K overshoot between scanlines. On real hardware, the 68K uses
         // a continuous cycle counter, so if the last instruction of scanline N
         // overshoots by X cycles, scanline N+1 has X fewer cycles available.
         // We carry the overshoot across frames too via frame_cycle_overshoot.
-        let mut m68k_overshoot = self.frame_cycle_overshoot;
+        let mut m68k_overshoot = pass.overshoot;
+        let mut started_line = pass.started;
 
-        for scanline in 0..scanlines {
-            // Update VDP scanline
-            self.bus.vdp_mut().scanline(scanline as u16);
-            self.step_master_clocks_accumulated = 0;
-            // Exact per-line 68K budget; carries the 4/7-cycle remainder.
-            let cycles_per_scanline = self.next_scanline_cycles();
+        for scanline in pass.first_line..pass.end_line {
+            // A held line whose start ran already goes on with its budget and
+            // the cycles already out of it; any other line starts here.
+            let (cycles_per_scanline, cycles_spent) = if let Some(started) = started_line.take() {
+                started
+            } else {
+                // Update VDP scanline
+                self.bus.vdp_mut().scanline(scanline as u16);
+                self.step_master_clocks_accumulated = 0;
+                // Exact per-line 68K budget; carries the 4/7-cycle remainder.
+                let cycles_per_scanline = self.next_scanline_cycles();
 
-            // Check for VBLANK interrupt (VINT)
-            if self.bus.vdp().should_trigger_vint() {
-                // 68K: VINT is level 6 interrupt
-                let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
-                if vint_enabled && !self.bus.vdp().vint_request_delayed() {
-                    self.cpu.request_interrupt(6);
+                // Check for VBLANK interrupt (VINT)
+                if self.bus.vdp().should_trigger_vint() {
+                    // 68K: VINT is level 6 interrupt
+                    let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
+                    if vint_enabled && !self.bus.vdp().vint_request_delayed() {
+                        self.cpu.request_interrupt(6);
+                    }
+                    // Z80: VBLANK also triggers Z80 maskable IRQ (same VDP /INT line)
+                    self.z80_irq_pending = true;
+                    self.bus.vdp_mut().ack_vint();
                 }
-                // Z80: VBLANK also triggers Z80 maskable IRQ (same VDP /INT line)
-                self.z80_irq_pending = true;
-                self.bus.vdp_mut().ack_vint();
-            }
 
-            // Clear Z80 IRQ when no longer in VBLANK (level-triggered)
-            if !self.bus.vdp().in_vblank() {
-                self.z80_irq_pending = false;
-            }
+                // Clear Z80 IRQ when no longer in VBLANK (level-triggered)
+                if !self.bus.vdp().in_vblank() {
+                    self.z80_irq_pending = false;
+                }
 
-            // Check for HBLANK interrupt (HINT)
-            if self.bus.vdp().should_trigger_hint() {
-                self.cpu.request_interrupt(4);
-                self.bus.vdp_mut().ack_hint();
-            }
+                // Check for HBLANK interrupt (HINT)
+                if self.bus.vdp().should_trigger_hint() {
+                    self.cpu.request_interrupt(4);
+                    self.bus.vdp_mut().ack_hint();
+                }
 
-            // Refresh VINT level from VDP state (level-triggered)
-            self.refresh_vdp_interrupt_level();
+                // Refresh VINT level from VDP state (level-triggered)
+                self.refresh_vdp_interrupt_level();
 
-            // Process pending interrupts.
-            // Interrupt processing cycles count toward the scanline budget: the
-            // CPU has one cycle count for instructions and interrupts alike.
-            // Without this, HINT-heavy games get ~7% extra 68K cycles.
-            let pending_level = self.cpu.pending_irq_level;
-            let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
-            if irq_cycles > 0 {
-                self.handle_interrupt_ack(pending_level);
-                self.master_cycles += irq_cycles as u64;
-            }
+                // Process pending interrupts.
+                // Interrupt processing cycles count toward the scanline budget: the
+                // CPU has one cycle count for instructions and interrupts alike.
+                // Without this, HINT-heavy games get ~7% extra 68K cycles.
+                let pending_level = self.cpu.pending_irq_level;
+                let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
+                if irq_cycles > 0 {
+                    self.handle_interrupt_ack(pending_level);
+                    self.master_cycles += irq_cycles as u64;
+                }
+                (cycles_per_scanline, irq_cycles + m68k_overshoot)
+            };
 
             // Interleaved 68K + Z80 + YM2612 execution for this scanline.
             // Running the Z80 after each 68K instruction ensures the Z80 can execute
@@ -2874,7 +3202,7 @@ impl GenesisEmulator {
             // A pending 68k-bus DMA freezes the CPU; drain up to one line of it
             // into this scanline's budget so the transfer meters line-by-line.
             let dma_stall = self.drain_dma_stall_for_line();
-            let mut cycles_executed = irq_cycles + m68k_overshoot + dma_stall;
+            let mut cycles_executed = cycles_spent + dma_stall;
             let mut z80_target = 0u32; // absolute Z80 cycle target (monotonically increasing)
             let mut z80_credit_numer = 0u32; // fractional accumulator (numerator, /15)
             let mut z80_cycles_executed = 0u32;
@@ -3038,6 +3366,11 @@ impl GenesisEmulator {
             self.bus.io_mut().clock(cycles_per_scanline);
         }
 
+        if pass.end_line < scanlines {
+            self.hold_at_capture_boundary(pass.end_line, m68k_overshoot, present);
+            return PassEnd::Boundary;
+        }
+
         // Carry the final scanline's instruction overshoot into the next frame.
         self.frame_cycle_overshoot = m68k_overshoot;
 
@@ -3057,13 +3390,16 @@ impl GenesisEmulator {
         if present {
             self.update_cached_framebuffer();
         }
+        PassEnd::FrameEnd
     }
 
     /// Fast frame execution with presentation (audio + framebuffer).
     /// This is the tier the WASM `runFrame` dispatch selects when no
-    /// debug features are active.
+    /// debug features are active. A frame held part of the way through
+    /// ([`Self::run_to_capture_boundary`], an event breakpoint) is finished
+    /// instead: the call is the rest of that frame.
     pub fn run_frame_fast(&mut self) {
-        self.run_frame_fast_inner(true);
+        self.run_frame_fast_inner(true, false);
     }
 
     /// Headless frame for netplay rollback/catch-up: the full
@@ -3076,9 +3412,10 @@ impl GenesisEmulator {
     /// from a live audible run and trip a spurious netplay resync.
     /// Produces the exact same machine state (including `frame_count`)
     /// as [`Self::run_frame_fast`], so re-simulating a mispredicted
-    /// span leaves the emulator byte-identical to a live run.
+    /// span leaves the emulator byte-identical to a live run. Like it, it
+    /// finishes a frame held part of the way through.
     pub fn run_frame_headless(&mut self) {
-        self.run_frame_fast_inner(false);
+        self.run_frame_fast_inner(false, false);
     }
 
     /// Lightweight debug frame execution: uses step_debug_light() which adds only
@@ -3086,65 +3423,81 @@ impl GenesisEmulator {
     /// heavy per-instruction allocations of the full debug path (no disassembly,
     /// no register snapshots, no instruction history, no update_debugger_state).
     /// This is the middle tier between run_frame_fast() and run_frame().
+    /// A frame held part of the way through is finished instead: the call
+    /// is the rest of that frame, and an event breakpoint holds the frame
+    /// where it fires, so the next call goes on from there.
     pub fn run_frame_debug_light(&mut self) {
-        use retro_core::cpu::Clockable;
+        self.run_frame_debug_light_inner(false);
+    }
 
-        let p0 = self.input_manager.get_port_state(0);
-        let p1 = self.input_manager.get_port_state(1);
-        self.bus.io_mut().sync_input(p0, p1);
+    /// The light debug loop's frame body: one pass of it, from a held
+    /// frame or a new one, to the capture boundary when `stop_at_boundary`
+    /// and the frame has not reached it, else to the frame's end.
+    fn run_frame_debug_light_inner(&mut self, stop_at_boundary: bool) -> PassEnd {
+        use retro_core::cpu::Clockable;
 
         let scanlines = self.region.scanlines();
         let has_rom = self.bus.cartridge().is_some();
-        let mut m68k_overshoot = self.frame_cycle_overshoot;
+        let pass = self.start_frame_pass(scanlines, stop_at_boundary);
+        let mut m68k_overshoot = pass.overshoot;
+        let mut started_line = pass.started;
 
-        for scanline in 0..scanlines {
-            self.bus.vdp_mut().scanline(scanline as u16);
-            self.step_master_clocks_accumulated = 0;
-            // Exact per-line 68K budget; carries the 4/7-cycle remainder.
-            let cycles_per_scanline = self.next_scanline_cycles();
+        for scanline in pass.first_line..pass.end_line {
+            // A held line whose start ran already goes on with its budget and
+            // the cycles already out of it; any other line starts here.
+            let (cycles_per_scanline, cycles_spent) = if let Some(started) = started_line.take() {
+                started
+            } else {
+                self.bus.vdp_mut().scanline(scanline as u16);
+                self.step_master_clocks_accumulated = 0;
+                // Exact per-line 68K budget; carries the 4/7-cycle remainder.
+                let cycles_per_scanline = self.next_scanline_cycles();
 
-            let mut ev_vblank = false;
-            let mut ev_vint = false;
-            let mut ev_hint = false;
-            if self.bus.vdp().should_trigger_vint() {
-                ev_vblank = true;
-                let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
-                if vint_enabled && !self.bus.vdp().vint_request_delayed() {
-                    self.cpu.request_interrupt(6);
-                    ev_vint = true;
+                let mut ev_vblank = false;
+                let mut ev_vint = false;
+                let mut ev_hint = false;
+                if self.bus.vdp().should_trigger_vint() {
+                    ev_vblank = true;
+                    let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
+                    if vint_enabled && !self.bus.vdp().vint_request_delayed() {
+                        self.cpu.request_interrupt(6);
+                        ev_vint = true;
+                    }
+                    self.z80_irq_pending = true;
+                    self.bus.vdp_mut().ack_vint();
                 }
-                self.z80_irq_pending = true;
-                self.bus.vdp_mut().ack_vint();
-            }
 
-            if !self.bus.vdp().in_vblank() {
-                self.z80_irq_pending = false;
-            }
+                if !self.bus.vdp().in_vblank() {
+                    self.z80_irq_pending = false;
+                }
 
-            if self.bus.vdp().should_trigger_hint() {
-                self.cpu.request_interrupt(4);
-                self.bus.vdp_mut().ack_hint();
-                ev_hint = true;
-            }
+                if self.bus.vdp().should_trigger_hint() {
+                    self.cpu.request_interrupt(4);
+                    self.bus.vdp_mut().ack_hint();
+                    ev_hint = true;
+                }
 
-            self.refresh_vdp_interrupt_level();
+                self.refresh_vdp_interrupt_level();
 
-            let pending_level = self.cpu.pending_irq_level;
-            let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
-            if irq_cycles > 0 {
-                self.handle_interrupt_ack(pending_level);
-                self.master_cycles += irq_cycles as u64;
-            }
+                let pending_level = self.cpu.pending_irq_level;
+                let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
+                if irq_cycles > 0 {
+                    self.handle_interrupt_ack(pending_level);
+                    self.master_cycles += irq_cycles as u64;
+                }
 
-            // Raster/interrupt event breakpoints. Checked after the interrupt is
-            // taken (so a VInt break lands with PC at the handler entry) and
-            // costs nothing unless an event/watch breakpoint is armed.
-            if self.check_frame_events(scanline as u16, ev_vblank, ev_vint, ev_hint) {
-                self.debugger.set_execution_mode(ExecutionMode::Paused);
-                self.update_debugger_state();
-                self.update_cached_framebuffer();
-                return;
-            }
+                // Raster/interrupt event breakpoints. Checked after the interrupt is
+                // taken (so a VInt break lands with PC at the handler entry) and
+                // costs nothing unless an event/watch breakpoint is armed.
+                if self.check_frame_events(scanline as u16, ev_vblank, ev_vint, ev_hint) {
+                    self.hold_at_event(scanline, cycles_per_scanline, irq_cycles + m68k_overshoot);
+                    self.debugger.set_execution_mode(ExecutionMode::Paused);
+                    self.update_debugger_state();
+                    self.update_cached_framebuffer();
+                    return PassEnd::Stopped;
+                }
+                (cycles_per_scanline, irq_cycles + m68k_overshoot)
+            };
 
             let z80_tracing = self.debugger.is_z80_tracing_enabled();
             let z80_scanline = self.bus.vdp().timing().scanline;
@@ -3152,7 +3505,7 @@ impl GenesisEmulator {
 
             // Drain up to one line of pending 68k-bus DMA stall (freezes the CPU).
             let dma_stall = self.drain_dma_stall_for_line();
-            let mut cycles_executed = irq_cycles + m68k_overshoot + dma_stall;
+            let mut cycles_executed = cycles_spent + dma_stall;
             let mut z80_target = 0u32;
             let mut z80_credit_numer = 0u32;
             let mut z80_cycles_executed = 0u32;
@@ -3173,7 +3526,7 @@ impl GenesisEmulator {
                     self.z80_irq_pending = z80_irq;
                     self.update_debugger_state();
                     self.update_cached_framebuffer();
-                    return;
+                    return PassEnd::Stopped;
                 }
 
                 cycles_executed += step_result.cycles;
@@ -3307,6 +3660,11 @@ impl GenesisEmulator {
             self.bus.io_mut().clock(cycles_per_scanline);
         }
 
+        if pass.end_line < scanlines {
+            self.hold_at_capture_boundary(pass.end_line, m68k_overshoot, true);
+            return PassEnd::Boundary;
+        }
+
         self.frame_cycle_overshoot = m68k_overshoot;
 
         // Advance cartridge coprocessors to end-of-frame (SSP1601 seam).
@@ -3315,6 +3673,7 @@ impl GenesisEmulator {
         self.generate_and_mix_audio(true);
         self.frame_count += 1;
         self.update_cached_framebuffer();
+        PassEnd::FrameEnd
     }
 
     /// Profiled frame execution: identical to run_frame_fast() but measures time
@@ -3322,6 +3681,13 @@ impl GenesisEmulator {
     pub fn run_frame_profiled(&mut self) -> FrameProfile {
         use retro_core::cpu::Clockable;
         use std::time::Instant;
+
+        // A frame held part of the way through is finished, unmeasured: the
+        // call is the rest of that frame, as every frame call is.
+        if self.held_frame.is_some() {
+            self.run_frame_fast_inner(true, false);
+            return FrameProfile::default();
+        }
 
         // Sync input state from InputManager into I/O devices
         let p0 = self.input_manager.get_port_state(0);
@@ -3596,8 +3962,20 @@ impl Default for GenesisEmulator {
 // Private helper methods for CPU stepping (used by EmulatorCore trait impl)
 impl GenesisEmulator {
     /// Step the 68K CPU one instruction (full debug path).
+    ///
+    /// A frame held part of the way through ([`Self::run_to_capture_boundary`],
+    /// an event breakpoint) keeps the beam where it stopped: the instruction
+    /// runs there, its cycles come out of the rest of the held frame
+    /// ([`Self::charge_held_frame`]), and the Z80 and the sound chips, which
+    /// the frame gives their whole line when it goes on, are not clocked
+    /// here. The frame then finishes as a whole frame would, with the
+    /// stepped instructions where it stopped; driven by this path's own
+    /// beam instead, the frame loop would go on from a line the beam had
+    /// left, running lines twice.
     fn step_68k_internal(&mut self) -> StepResult {
         use retro_core::cpu::Clockable;
+
+        let held = self.held_frame.is_some();
 
         // Advance VDP timing BEFORE instruction executes
         // This ensures VDP state is up-to-date when instruction reads VDP registers
@@ -3611,8 +3989,9 @@ impl GenesisEmulator {
             self.step_master_clocks_accumulated -= master_clocks_per_scanline;
             // `run_frame` advances the beam once per outer iteration; burning
             // the credit here without a second `scanline()` keeps free-run
-            // phase stable (see `frame_runner_owns_beam`).
-            if self.frame_runner_owns_beam {
+            // phase stable (see `frame_runner_owns_beam`). A held frame's
+            // loop owns the beam the same way.
+            if self.frame_runner_owns_beam || held {
                 continue;
             }
             let current_scanline = self.bus.vdp().timing().scanline;
@@ -3692,6 +4071,9 @@ impl GenesisEmulator {
             self.step_master_clocks_accumulated +=
                 (idle_cycles as u64) * (self.region.cpu_divider() as u64);
             self.last_step_cycles = idle_cycles;
+            if held {
+                self.charge_held_frame(irq_cycles + idle_cycles);
+            }
             return StepResult {
                 cycles: idle_cycles,
                 breakpoint_hit: false,
@@ -3810,68 +4192,76 @@ impl GenesisEmulator {
                 self.z80.ei = 0;
             }
 
-            // Accumulate absolute Z80 target from this 68K instruction
-            // Z80 clock = master / 15, 68K clock = master / 7
-            // So Z80 cycles = 68K cycles * 7 / 15
-            if !self.bus.is_z80_reset() && !self.bus.is_z80_bus_requested() {
-                self.step_z80_credit_numer += total_cycles * 7;
-                self.step_z80_target += self.step_z80_credit_numer / 15;
-                self.step_z80_credit_numer %= 15;
-            }
+            // A held frame gives the Z80 and the YM2612 this time when it goes
+            // on; the instruction's cycles come out of the rest of the frame.
+            if held {
+                self.charge_held_frame(irq_cycles + total_cycles);
+            } else {
+                // Accumulate absolute Z80 target from this 68K instruction
+                // Z80 clock = master / 15, 68K clock = master / 7
+                // So Z80 cycles = 68K cycles * 7 / 15
+                if !self.bus.is_z80_reset() && !self.bus.is_z80_bus_requested() {
+                    self.step_z80_credit_numer += total_cycles * 7;
+                    self.step_z80_target += self.step_z80_credit_numer / 15;
+                    self.step_z80_credit_numer %= 15;
+                }
 
-            // Run Z80 when target is sufficiently ahead of executed.
-            // Absolute target means overshoot from previous bursts naturally
-            // prevents Z80 from running until the target catches up.
-            if self.step_z80_target > self.step_z80_executed + 3
-                && !self.bus.is_z80_reset()
-                && !self.bus.is_z80_bus_requested()
-                && self.bus.cartridge().is_some()
-            {
-                let mut z80_irq = self.z80_irq_pending;
-                let cycles_per_scanline = self.region.cycles_per_scanline();
-                let ym_cap = ym_before_z80 + total_cycles;
-                let mut z80_bus = self.bus.create_z80_bus();
+                // Run Z80 when target is sufficiently ahead of executed.
+                // Absolute target means overshoot from previous bursts naturally
+                // prevents Z80 from running until the target catches up.
+                if self.step_z80_target > self.step_z80_executed + 3
+                    && !self.bus.is_z80_reset()
+                    && !self.bus.is_z80_bus_requested()
+                    && self.bus.cartridge().is_some()
+                {
+                    let mut z80_irq = self.z80_irq_pending;
+                    let cycles_per_scanline = self.region.cycles_per_scanline();
+                    let ym_cap = ym_before_z80 + total_cycles;
+                    let mut z80_bus = self.bus.create_z80_bus();
 
-                while self.step_z80_executed < self.step_z80_target {
-                    let (processed, irq_cycles) =
-                        self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
-                    if processed {
-                        z80_irq = false;
-                        self.step_z80_executed += irq_cycles;
-                        let ym_c = (irq_cycles * 15 / 7)
+                    while self.step_z80_executed < self.step_z80_target {
+                        let (processed, irq_cycles) =
+                            self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
+                        if processed {
+                            z80_irq = false;
+                            self.step_z80_executed += irq_cycles;
+                            let ym_c = (irq_cycles * 15 / 7)
+                                .min(
+                                    cycles_per_scanline.saturating_sub(self.step_ym_cycles_clocked),
+                                )
+                                .min(ym_cap.saturating_sub(self.step_ym_cycles_clocked));
+                            z80_bus.clock_ym2612(ym_c);
+                            self.step_ym_cycles_clocked += ym_c;
+                        }
+                        self.debugger.record_coverage_z80(self.z80.pc);
+                        let zc = self.z80.step(&mut z80_bus);
+                        self.step_z80_executed += zc;
+                        let ym_c = (zc * 15 / 7)
                             .min(cycles_per_scanline.saturating_sub(self.step_ym_cycles_clocked))
                             .min(ym_cap.saturating_sub(self.step_ym_cycles_clocked));
                         z80_bus.clock_ym2612(ym_c);
                         self.step_ym_cycles_clocked += ym_c;
                     }
-                    self.debugger.record_coverage_z80(self.z80.pc);
-                    let zc = self.z80.step(&mut z80_bus);
-                    self.step_z80_executed += zc;
-                    let ym_c = (zc * 15 / 7)
-                        .min(cycles_per_scanline.saturating_sub(self.step_ym_cycles_clocked))
-                        .min(ym_cap.saturating_sub(self.step_ym_cycles_clocked));
-                    z80_bus.clock_ym2612(ym_c);
-                    self.step_ym_cycles_clocked += ym_c;
+
+                    self.z80_irq_pending = z80_irq;
                 }
 
-                self.z80_irq_pending = z80_irq;
-            }
-
-            // Ensure YM2612 is clocked by at least the 68K instruction's cycle count.
-            // The YM2612 has its own clock (master/7, same as 68K) independent of the Z80.
-            // When Z80 is running, it partially clocks the YM2612; we fill in the remainder.
-            // When Z80 is held/reset, we clock the full amount. Without this, the busy flag
-            // only decrements at scanline boundaries in bulk, causing games that poll
-            // YM2612 status with Z80 bus held to see stale values.
-            {
-                let cycles_per_scanline = self.region.cycles_per_scanline();
-                let ym_target = ym_before_z80 + total_cycles;
-                if self.step_ym_cycles_clocked < ym_target {
-                    let ym_remaining = (ym_target - self.step_ym_cycles_clocked)
-                        .min(cycles_per_scanline.saturating_sub(self.step_ym_cycles_clocked));
-                    if ym_remaining > 0 {
-                        self.bus.ym2612_mut().clock(ym_remaining);
-                        self.step_ym_cycles_clocked += ym_remaining;
+                // Ensure YM2612 is clocked by at least the 68K instruction's cycle count.
+                // The YM2612 has its own clock (master/7, same as 68K) independent of the Z80.
+                // When Z80 is running, it partially clocks the YM2612; we fill in the remainder.
+                // When Z80 is held/reset, we clock the full amount. Without this, the busy flag
+                // only decrements at scanline boundaries in bulk, causing games that poll
+                // YM2612 status with Z80 bus held to see stale values.
+                {
+                    let cycles_per_scanline = self.region.cycles_per_scanline();
+                    let ym_target = ym_before_z80 + total_cycles;
+                    if self.step_ym_cycles_clocked < ym_target {
+                        let ym_remaining = (ym_target - self.step_ym_cycles_clocked)
+                            .min(cycles_per_scanline.saturating_sub(self.step_ym_cycles_clocked));
+                        if ym_remaining > 0 {
+                            self.bus.ym2612_mut().clock(ym_remaining);
+                            self.step_ym_cycles_clocked += ym_remaining;
+                        }
                     }
                 }
             }
@@ -3967,194 +4357,122 @@ impl GenesisEmulator {
             instruction_executed: true,
         }
     }
-}
 
-impl EmulatorCore for GenesisEmulator {
-    fn system_info(&self) -> &SystemInfo {
-        &self.system_info
-    }
-
-    fn reset(&mut self) {
-        // Reset debugger state first (ensures clean execution mode)
-        self.debugger.set_execution_mode(ExecutionMode::Paused);
-        self.debugger.clear_instruction_boundaries();
-        self.last_bp_checked_pc = None;
-
-        // Reset 68000 CPU
-        self.cpu.reset(&mut self.bus);
-
-        // Reset Z80 CPU
-        self.z80 = Z80::new();
-        // Put Z80 in reset state (write 0 to 0xA11200) and release bus (write 0 to 0xA11100)
-        self.bus.write(0xA11200, 0x00); // Hold Z80 in reset
-        self.bus.write(0xA11100, 0x00); // Release bus request
-
-        // Reset VDP
-        self.bus.vdp_mut().reset();
-
-        // Reset PSG
-        self.bus.psg_mut().reset();
-
-        // Reset YM2612
-        self.bus.ym2612_mut().reset();
-
-        // Reset the cartridge: clear latches/SRAM-enable and re-anchor every
-        // coprocessor's clock to the region master clock.
-        let cart_mclk = self.region.master_clock();
-        if let Some(cart) = self.bus.cartridge_mut() {
-            cart.reset();
-            cart.reset_chip(cart_mclk);
-        }
-
-        // Reset counters
-        self.frame_count = 0;
-        // MAME shows totalcycles=0x22 (34) after hard reset, before first instruction
-        // This represents the reset sequence cycles. We match this for trace compatibility.
-        self.master_cycles = 34;
-        // Convert initial CPU cycles to master clocks: 34 * 7 = 238 master clocks
-        self.step_master_clocks_accumulated = 34 * 7;
-        self.frame_runner_owns_beam = false;
-        self.scanline_cycle_carry = 0;
-        self.frame_cycle_overshoot = 0;
-        self.bus_refresh_target = 128;
-        self.last_step_cycles = 0;
-        self.z80_irq_pending = false;
-        self.running = true;
-
-        // Drop any queued samples (this is a real reset, not
-        // mid-stream: the host is expected to drain after) and
-        // re-anchor the rate converter at the new master_cycles
-        // baseline (34, set above).
-        self.audio_ring.clear();
-        self.audio_ring.reset_counters();
-        self.audio_rate_converter.reset(self.master_cycles);
-
-        // Leave the reset state in the debugger, so a host that reads it
-        // before the first step or frame (the platform opens its debugger
-        // right after a load) shows the reset vector instead of nothing.
-        // It reads the registers only: nothing here runs or changes state.
-        self.update_debugger_state();
-    }
-
-    fn step(&mut self) -> StepResult {
-        self.step_cpu(self.focused_cpu)
-    }
-
-    fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
-        match cpu_id {
-            0 => self.step_68k_internal(),
-            1 => self.step_z80(),
-            _ => StepResult {
-                cycles: 0,
-                breakpoint_hit: false,
-                instruction_executed: false,
-            },
-        }
-    }
-
-    fn focused_cpu(&self) -> usize {
-        self.focused_cpu
-    }
-
-    fn set_focused_cpu(&mut self, cpu_id: usize) {
-        if cpu_id < self.system_info.cpus.len() {
-            self.focused_cpu = cpu_id;
-        }
-    }
-
-    fn disassemble_cpu(&mut self, cpu_id: usize, addr: u32, count: u32) -> Vec<Instruction> {
-        match cpu_id {
-            0 => Self::disassemble_at(self, addr, count),
-            1 => Self::disassemble_z80_at(self, addr, count),
-            _ => Vec::new(),
-        }
-    }
-
-    fn run_frame(&mut self) {
+    /// The full debug loop's frame body: one pass of it, from a held frame
+    /// or a new one, to the capture boundary when `stop_at_boundary` and
+    /// the frame has not reached it, else to the frame's end.
+    ///
+    /// While a frame is held, the debugger's pause runs nothing (the frame
+    /// stays held) and a step mode steps one instruction where the frame
+    /// is held ([`Self::step_68k_internal`]): this loop's first line would
+    /// otherwise run, and the rest of the held frame would be lost.
+    fn run_frame_full(&mut self, stop_at_boundary: bool) -> PassEnd {
         use retro_core::cpu::Clockable;
 
-        // Sync input state from InputManager into I/O devices
-        let p0 = self.input_manager.get_port_state(0);
-        let p1 = self.input_manager.get_port_state(1);
-        self.bus.io_mut().sync_input(p0, p1);
+        if self.held_frame.is_some() {
+            match self.debugger.get_execution_mode() {
+                ExecutionMode::Running => {}
+                ExecutionMode::Paused => return PassEnd::Stopped,
+                ExecutionMode::StepInto | ExecutionMode::StepOver | ExecutionMode::StepOut => {
+                    self.step();
+                    self.debugger.set_execution_mode(ExecutionMode::Paused);
+                    self.update_cached_framebuffer();
+                    return PassEnd::Stopped;
+                }
+            }
+        }
 
         let scanlines = self.region.scanlines();
-        let mut m68k_overshoot = self.frame_cycle_overshoot;
+        let pass = self.start_frame_pass(scanlines, stop_at_boundary);
+        let mut m68k_overshoot = pass.overshoot;
+        let mut started_line = pass.started;
 
         // Own the beam for this frame so step_68k_internal does not also
         // call scanline() when a 489-cycle line crosses 3420 mclks.
         self.frame_runner_owns_beam = true;
 
-        for frame_line in 0..scanlines {
-            // Walk the beam 0..scanlines, the same way `run_frame_fast` does.
-            // Free-running it from wherever the previous frame left off (the
-            // phase `step()` produces when it owns the beam) puts the frame
-            // boundary in the middle of VBlank, and a game whose main loop is
-            // driven by the vertical interrupt then re-enters its handler
-            // without ever leaving it: Dynamite Headdy freezes at $0118DE on
-            // frame 44, with the debug tier and the fast tier having agreed on
-            // every frame before it. Both runners present the same frame
-            // to the program, which is also what makes a screenshot taken
-            // here match what the player sees.
-            let scanline = frame_line as u16;
-            self.bus.vdp_mut().scanline(scanline);
+        for frame_line in pass.first_line..pass.end_line {
+            // A held line whose start ran already goes on with its budget and
+            // the cycles already out of it; any other line starts here.
+            let (cycles_per_scanline, cycles_spent) = if let Some(started) = started_line.take() {
+                started
+            } else {
+                // Walk the beam 0..scanlines, the same way `run_frame_fast` does.
+                // Free-running it from wherever the previous frame left off (the
+                // phase `step()` produces when it owns the beam) puts the frame
+                // boundary in the middle of VBlank, and a game whose main loop is
+                // driven by the vertical interrupt then re-enters its handler
+                // without ever leaving it: Dynamite Headdy freezes at $0118DE on
+                // frame 44, with the debug tier and the fast tier having agreed on
+                // every frame before it. Both runners present the same frame
+                // to the program, which is also what makes a screenshot taken
+                // here match what the player sees.
+                let scanline = frame_line as u16;
+                self.bus.vdp_mut().scanline(scanline);
 
-            // Reset step master clock accumulator each line. Combined with
-            // `frame_runner_owns_beam`, this keeps beam ownership exclusive to
-            // this loop (step()'s scanline advance is for CLI single-step only).
-            self.step_master_clocks_accumulated = 0;
-            // Exact per-line 68K budget; carries the 4/7-cycle remainder.
-            let cycles_per_scanline = self.next_scanline_cycles();
+                // Reset step master clock accumulator each line. Combined with
+                // `frame_runner_owns_beam`, this keeps beam ownership exclusive to
+                // this loop (step()'s scanline advance is for CLI single-step only).
+                self.step_master_clocks_accumulated = 0;
+                // Exact per-line 68K budget; carries the 4/7-cycle remainder.
+                let cycles_per_scanline = self.next_scanline_cycles();
 
-            // Check for VBLANK interrupt (VINT) when entering VBLANK
-            let mut ev_vblank = false;
-            let mut ev_vint = false;
-            let mut ev_hint = false;
-            if self.bus.vdp().should_trigger_vint() {
-                ev_vblank = true;
-                let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
-                if vint_enabled && !self.bus.vdp().vint_request_delayed() {
-                    self.cpu.request_interrupt(6); // VBLANK = IRQ level 6
-                    ev_vint = true;
+                // Check for VBLANK interrupt (VINT) when entering VBLANK
+                let mut ev_vblank = false;
+                let mut ev_vint = false;
+                let mut ev_hint = false;
+                if self.bus.vdp().should_trigger_vint() {
+                    ev_vblank = true;
+                    let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
+                    if vint_enabled && !self.bus.vdp().vint_request_delayed() {
+                        self.cpu.request_interrupt(6); // VBLANK = IRQ level 6
+                        ev_vint = true;
+                    }
+                    // Z80: VBLANK also triggers Z80 maskable IRQ
+                    self.z80_irq_pending = true;
+                    self.bus.vdp_mut().ack_vint();
                 }
-                // Z80: VBLANK also triggers Z80 maskable IRQ
-                self.z80_irq_pending = true;
-                self.bus.vdp_mut().ack_vint();
-            }
 
-            // Clear Z80 IRQ when no longer in VBLANK (level-triggered)
-            if !self.bus.vdp().in_vblank() {
-                self.z80_irq_pending = false;
-            }
+                // Clear Z80 IRQ when no longer in VBLANK (level-triggered)
+                if !self.bus.vdp().in_vblank() {
+                    self.z80_irq_pending = false;
+                }
 
-            // Check for HBLANK interrupt (HINT)
-            if self.bus.vdp().should_trigger_hint() {
-                self.cpu.request_interrupt(4); // HBLANK = IRQ level 4
-                self.bus.vdp_mut().ack_hint();
-                ev_hint = true;
-            }
+                // Check for HBLANK interrupt (HINT)
+                if self.bus.vdp().should_trigger_hint() {
+                    self.cpu.request_interrupt(4); // HBLANK = IRQ level 4
+                    self.bus.vdp_mut().ack_hint();
+                    ev_hint = true;
+                }
 
-            // Refresh VINT level from VDP state (level-triggered)
-            self.refresh_vdp_interrupt_level();
+                // Refresh VINT level from VDP state (level-triggered)
+                self.refresh_vdp_interrupt_level();
 
-            // Process pending interrupts (cycles count toward scanline budget)
-            let pending_level = self.cpu.pending_irq_level;
-            let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
-            if irq_cycles > 0 {
-                self.handle_interrupt_ack(pending_level);
-                self.master_cycles += irq_cycles as u64;
-            }
+                // Process pending interrupts (cycles count toward scanline budget)
+                let pending_level = self.cpu.pending_irq_level;
+                let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
+                if irq_cycles > 0 {
+                    self.handle_interrupt_ack(pending_level);
+                    self.master_cycles += irq_cycles as u64;
+                }
 
-            // Raster/interrupt event breakpoints. Checked after the interrupt is
-            // taken (so a VInt break lands with PC at the handler entry) and
-            // costs nothing unless an event/watch breakpoint is armed.
-            if self.check_frame_events(scanline, ev_vblank, ev_vint, ev_hint) {
-                self.debugger.set_execution_mode(ExecutionMode::Paused);
-                self.update_debugger_state();
-                self.update_cached_framebuffer();
-                self.frame_runner_owns_beam = false;
-                return;
-            }
+                // Raster/interrupt event breakpoints. Checked after the interrupt is
+                // taken (so a VInt break lands with PC at the handler entry) and
+                // costs nothing unless an event/watch breakpoint is armed.
+                if self.check_frame_events(scanline, ev_vblank, ev_vint, ev_hint) {
+                    self.hold_at_event(
+                        frame_line,
+                        cycles_per_scanline,
+                        irq_cycles + m68k_overshoot,
+                    );
+                    self.debugger.set_execution_mode(ExecutionMode::Paused);
+                    self.update_debugger_state();
+                    self.update_cached_framebuffer();
+                    self.frame_runner_owns_beam = false;
+                    return PassEnd::Stopped;
+                }
+                (cycles_per_scanline, irq_cycles + m68k_overshoot)
+            };
 
             // Interleaved 68K + Z80 + YM2612 execution (same approach as run_frame_fast)
             let has_rom = self.bus.cartridge().is_some();
@@ -4164,7 +4482,7 @@ impl EmulatorCore for GenesisEmulator {
 
             // Drain up to one line of pending 68k-bus DMA stall (freezes the CPU).
             let dma_stall = self.drain_dma_stall_for_line();
-            let mut cycles_executed = irq_cycles + m68k_overshoot + dma_stall;
+            let mut cycles_executed = cycles_spent + dma_stall;
             let mut z80_target = 0u32;
             let mut z80_credit_numer = 0u32;
             let mut z80_cycles_executed = 0u32;
@@ -4190,7 +4508,7 @@ impl EmulatorCore for GenesisEmulator {
                             self.z80_irq_pending = z80_irq;
                             self.update_cached_framebuffer();
                             self.frame_runner_owns_beam = false;
-                            return;
+                            return PassEnd::Stopped;
                         }
                         step_result.cycles
                     }
@@ -4198,7 +4516,7 @@ impl EmulatorCore for GenesisEmulator {
                         self.z80_irq_pending = z80_irq;
                         self.update_cached_framebuffer();
                         self.frame_runner_owns_beam = false;
-                        return;
+                        return PassEnd::Stopped;
                     }
                     ExecutionMode::StepInto | ExecutionMode::StepOver | ExecutionMode::StepOut => {
                         let step_result = self.step();
@@ -4291,7 +4609,7 @@ impl EmulatorCore for GenesisEmulator {
                     self.z80_irq_pending = z80_irq;
                     self.update_cached_framebuffer();
                     self.frame_runner_owns_beam = false;
-                    return;
+                    return PassEnd::Stopped;
                 }
             }
 
@@ -4354,6 +4672,12 @@ impl EmulatorCore for GenesisEmulator {
             self.bus.io_mut().clock(cycles_per_scanline);
         }
 
+        if pass.end_line < scanlines {
+            self.frame_runner_owns_beam = false;
+            self.hold_at_capture_boundary(pass.end_line, m68k_overshoot, true);
+            return PassEnd::Boundary;
+        }
+
         // Carry the final scanline's instruction overshoot into the next frame.
         self.frame_cycle_overshoot = m68k_overshoot;
 
@@ -4368,11 +4692,125 @@ impl EmulatorCore for GenesisEmulator {
 
         // Update cached framebuffer from VDP
         self.update_cached_framebuffer();
+        PassEnd::FrameEnd
+    }
+}
+
+impl EmulatorCore for GenesisEmulator {
+    fn system_info(&self) -> &SystemInfo {
+        &self.system_info
     }
 
+    fn reset(&mut self) {
+        // Reset debugger state first (ensures clean execution mode)
+        self.debugger.set_execution_mode(ExecutionMode::Paused);
+        self.debugger.clear_instruction_boundaries();
+        self.last_bp_checked_pc = None;
+        // The machine starts over: a frame held part of the way through is
+        // dropped, not finished.
+        self.held_frame = None;
+
+        // Reset 68000 CPU
+        self.cpu.reset(&mut self.bus);
+
+        // Reset Z80 CPU
+        self.z80 = Z80::new();
+        // Put Z80 in reset state (write 0 to 0xA11200) and release bus (write 0 to 0xA11100)
+        self.bus.write(0xA11200, 0x00); // Hold Z80 in reset
+        self.bus.write(0xA11100, 0x00); // Release bus request
+
+        // Reset VDP
+        self.bus.vdp_mut().reset();
+
+        // Reset PSG
+        self.bus.psg_mut().reset();
+
+        // Reset YM2612
+        self.bus.ym2612_mut().reset();
+
+        // Reset the cartridge: clear latches/SRAM-enable and re-anchor every
+        // coprocessor's clock to the region master clock.
+        let cart_mclk = self.region.master_clock();
+        if let Some(cart) = self.bus.cartridge_mut() {
+            cart.reset();
+            cart.reset_chip(cart_mclk);
+        }
+
+        // Reset counters
+        self.frame_count = 0;
+        // MAME shows totalcycles=0x22 (34) after hard reset, before first instruction
+        // This represents the reset sequence cycles. We match this for trace compatibility.
+        self.master_cycles = 34;
+        // Convert initial CPU cycles to master clocks: 34 * 7 = 238 master clocks
+        self.step_master_clocks_accumulated = 34 * 7;
+        self.frame_runner_owns_beam = false;
+        self.scanline_cycle_carry = 0;
+        self.frame_cycle_overshoot = 0;
+        self.bus_refresh_target = 128;
+        self.last_step_cycles = 0;
+        self.z80_irq_pending = false;
+        self.running = true;
+
+        // Drop any queued samples (this is a real reset, not
+        // mid-stream: the host is expected to drain after) and
+        // re-anchor the rate converter at the new master_cycles
+        // baseline (34, set above).
+        self.audio_ring.clear();
+        self.audio_ring.reset_counters();
+        self.audio_rate_converter.reset(self.master_cycles);
+
+        // Leave the reset state in the debugger, so a host that reads it
+        // before the first step or frame (the platform opens its debugger
+        // right after a load) shows the reset vector instead of nothing.
+        // It reads the registers only: nothing here runs or changes state.
+        self.update_debugger_state();
+    }
+
+    fn step(&mut self) -> StepResult {
+        self.step_cpu(self.focused_cpu)
+    }
+
+    fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
+        match cpu_id {
+            0 => self.step_68k_internal(),
+            1 => self.step_z80(),
+            _ => StepResult {
+                cycles: 0,
+                breakpoint_hit: false,
+                instruction_executed: false,
+            },
+        }
+    }
+
+    fn focused_cpu(&self) -> usize {
+        self.focused_cpu
+    }
+
+    fn set_focused_cpu(&mut self, cpu_id: usize) {
+        if cpu_id < self.system_info.cpus.len() {
+            self.focused_cpu = cpu_id;
+        }
+    }
+
+    fn disassemble_cpu(&mut self, cpu_id: usize, addr: u32, count: u32) -> Vec<Instruction> {
+        match cpu_id {
+            0 => Self::disassemble_at(self, addr, count),
+            1 => Self::disassemble_z80_at(self, addr, count),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The full debug loop (`GenesisEmulator::run_frame_full`): a frame,
+    /// or the rest of one held part of the way through.
+    fn run_frame(&mut self) {
+        self.run_frame_full(false);
+    }
+
+    /// Run to the start of vertical blanking and stop there, on the full
+    /// debug loop [`EmulatorCore::run_frame`] runs: the capture boundary
+    /// ([`GenesisEmulator::run_to_capture_boundary_with`]).
     fn run_until_vblank(&mut self) {
-        // Runs one whole frame rather than stopping at the VBlank.
-        self.run_frame();
+        self.run_to_capture_boundary_with(ExecutionTier::FullDebug);
     }
 
     fn load_rom(&mut self, data: &[u8]) -> Result<(), String> {
@@ -4511,6 +4949,10 @@ impl EmulatorCore for GenesisEmulator {
         &self.cached_framebuffer
     }
 
+    /// The size of the picture [`EmulatorCore::get_framebuffer`] holds: the
+    /// mode's width, 256 or 320, and its height cut to the lines the VDP
+    /// draws ([`crate::vdp::Vdp::drawn_height`]). It follows the framebuffer,
+    /// refreshed with it each frame shown.
     fn get_display_info(&self) -> &DisplayInfo {
         &self.system_info.display
     }
@@ -4567,11 +5009,21 @@ impl EmulatorCore for GenesisEmulator {
         &self.system_info.input
     }
 
+    /// The machine's state, where a frame ends. A frame held part of the
+    /// way through (a capture boundary, an event breakpoint) has no place
+    /// in a savestate, which cannot say where to resume it, and finishing
+    /// it needs `&mut self`: while one is held this returns nothing.
+    /// [`GenesisEmulator::finish_frame_and_save_state`] finishes the frame
+    /// first, and is what every host calls.
     fn save_state(&self) -> Vec<u8> {
         use crate::system::savestate::*;
         use retro_core::savestate::{
             serialize_compressed, SaveStateEnvelope, RETRO_SAVESTATE_ENVELOPE_VERSION,
         };
+
+        if self.held_frame.is_some() {
+            return Vec::new();
+        }
 
         let (game_title, rom_hash) = self
             .bus

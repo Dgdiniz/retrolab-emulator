@@ -53,7 +53,9 @@
 pub mod cgram;
 pub mod colormath;
 mod debug;
-pub use debug::{BgLayout, SpriteDescriptor, SpriteTileSettings, TileSetSource, ViewerImage};
+pub use debug::{
+    BgLayout, PpuSettings, SpriteDescriptor, SpriteTileSettings, TileSetSource, ViewerImage,
+};
 pub mod mode7;
 pub mod oam;
 pub mod regs;
@@ -105,7 +107,7 @@ impl PpuAccessCtx {
 /// Indexed via [`Ppu::window_enable`]; one struct per layer lets
 /// the dispatcher write `windows[layer] =
 /// WindowEnable { ... }` in one shot.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct WindowEnable {
     pub w1_enable: bool,
     pub w1_invert: bool,
@@ -637,6 +639,12 @@ pub struct Ppu {
     /// during normal play; toggled via [`Ppu::set_layer_debug_disabled`].
     debug_layer_disable: [bool; LAYER_COUNT],
 
+    /// The one layer a [`render::Ppu::render_layer`] pass draws, by the
+    /// debug layer index (`0..=3` BG1-4, `4` OBJ); `None` the rest of the
+    /// time, when every output line goes through the compositor. Set only
+    /// for the length of that pass, never part of a savestate.
+    pub(crate) isolated_layer: Option<usize>,
+
     // -- Frame-global display-size state (transient, not savestated) --
     /// ORs `is_hires_mode(bgmode)` across every visible scanline of the
     /// current frame so [`render::Ppu::active_display_size`] reports 512
@@ -789,6 +797,7 @@ impl Ppu {
             vram_generation: 0,
             sprite_tile_cache,
             debug_layer_disable: [false; LAYER_COUNT],
+            isolated_layer: None,
             frame_hires: false,
             render_interlace: false,
             line_hires: [false; MAX_OUTPUT_ROWS],

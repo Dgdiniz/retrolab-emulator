@@ -28,8 +28,10 @@ use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
 use crate::ppu::sprite::{
     parse_sprite, sprite_row_in_sprite, sprite_size, sprite_tile_number, SpriteAttrs,
 };
-use crate::ppu::tile::{decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row};
-use crate::ppu::{Ppu, LAYER_COUNT, LAYER_OBJ};
+use crate::ppu::tile::{
+    decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row, sign_extend_13,
+};
+use crate::ppu::{Ppu, WindowEnable, LAYER_COUNT, LAYER_OBJ};
 
 /// Number of 4bpp 8x8 tiles addressable in the 64 KiB VRAM word space
 /// (16 words per tile x 2048 tiles = 32768 words = the full bank).
@@ -196,6 +198,132 @@ pub struct SpriteTileSettings {
     pub second_table_base_word: u16,
 }
 
+/// The PPU's settings, read off the live registers in the names the
+/// renderer uses, for a host that has to know how the picture is drawn:
+/// the display state, the sprites' tiles and sizes, the background mode,
+/// mosaic, Mode 7, the windows, the screens and colour math.
+///
+/// The positions of the backgrounds (tilemap and character bases, screen
+/// size, scroll) are per background, in [`BgLayout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PpuSettings {
+    /// Forced blank (INIDISP bit 7): the frame draws nothing, black.
+    pub display_disable: bool,
+    /// Master brightness `0..=15` (INIDISP bits 0-3).
+    pub display_brightness: u8,
+
+    /// The sprite size pair selector `0..=7` (OBSEL bits 5-7).
+    pub obj_base_size: u8,
+    /// The gap between the two sprite character tables, in steps of 256
+    /// tiles (OBSEL bits 3-4).
+    pub obj_name_select: u8,
+    /// Byte address in VRAM of the first sprite character table (OBSEL
+    /// bits 0-2).
+    pub obj_tiledata_addr: u32,
+    /// The two sprite sizes and the VRAM word address of character 0 of
+    /// each table, as the renderer resolves them.
+    pub sprite_tiles: SpriteTileSettings,
+
+    /// Background mode `0..=7` (BGMODE bits 0-2).
+    pub bgmode: u8,
+    /// Mode 1's BG3 priority lift (BGMODE bit 3).
+    pub bg3_priority: bool,
+    /// 16x16 tiles, per background BG1-4 (BGMODE bits 4-7).
+    pub bg_tile_size: [bool; 4],
+
+    /// Mosaic block size in pixels, `1..=16` (MOSAIC bits 4-7, plus 1).
+    pub mosaic_size: u8,
+    /// Mosaic on, per background BG1-4 (MOSAIC bits 0-3).
+    pub bg_mosaic_enable: [bool; 4],
+
+    /// Mode 7 screen over (M7SEL bits 6-7): 0 or 1 wrap the plane, 2
+    /// leaves the outside transparent, 3 fills it with character 0.
+    pub mode7_repeat: u8,
+    /// Mode 7 vertical flip (M7SEL bit 1).
+    pub mode7_vflip: bool,
+    /// Mode 7 horizontal flip (M7SEL bit 0).
+    pub mode7_hflip: bool,
+    /// Mode 7 horizontal offset, sign-extended from the 13 bits the
+    /// renderer reads.
+    pub mode7_hoffset: i16,
+    /// Mode 7 vertical offset, sign-extended from 13 bits.
+    pub mode7_voffset: i16,
+    /// The Mode 7 matrix `[A, B, C, D]`, signed 8.8 fixed point.
+    pub mode7_matrix: [i16; 4],
+    /// The Mode 7 centre `[X, Y]`, sign-extended from 13 bits.
+    pub mode7_centre: [i16; 2],
+
+    /// Window enables and inversions per layer, in the order BG1, BG2,
+    /// BG3, BG4, OBJ, colour (W12SEL, W34SEL, WOBJSEL).
+    pub window_enable: [WindowEnable; 6],
+    /// Left edge of window 1 (WH0).
+    pub window_one_left: u8,
+    /// Right edge of window 1 (WH1).
+    pub window_one_right: u8,
+    /// Left edge of window 2 (WH2).
+    pub window_two_left: u8,
+    /// Right edge of window 2 (WH3).
+    pub window_two_right: u8,
+    /// How the two windows combine, per layer in the same order: 0 OR,
+    /// 1 AND, 2 XOR, 3 XNOR (WBGLOG, WOBJLOG).
+    pub window_combine: [u8; 6],
+    /// The windows clip BG1-4 on the main screen (TMW bits 0-3).
+    pub bg_main_window_disable: [bool; 4],
+    /// The windows clip sprites on the main screen (TMW bit 4).
+    pub obj_main_window_disable: bool,
+    /// The windows clip BG1-4 on the sub screen (TSW bits 0-3).
+    pub bg_sub_window_disable: [bool; 4],
+    /// The windows clip sprites on the sub screen (TSW bit 4).
+    pub obj_sub_window_disable: bool,
+
+    /// BG1-4 on the main screen (TM bits 0-3).
+    pub bg_main_enable: [bool; 4],
+    /// Sprites on the main screen (TM bit 4).
+    pub obj_main_enable: bool,
+    /// BG1-4 on the sub screen (TS bits 0-3).
+    pub bg_sub_enable: [bool; 4],
+    /// Sprites on the sub screen (TS bit 4).
+    pub obj_sub_enable: bool,
+
+    /// Where the main screen shows its pixels, black elsewhere: 0
+    /// everywhere, 1 inside the colour window, 2 outside it, 3 nowhere
+    /// (CGWSEL bits 6-7).
+    pub col_main_mask: u8,
+    /// Where colour math may run, in the same encoding (CGWSEL bits 4-5).
+    pub col_sub_mask: u8,
+    /// Colour math adds or subtracts the sub screen instead of the fixed
+    /// colour (CGWSEL bit 1).
+    pub addsub_mode: bool,
+    /// Direct colour for the 256-colour backgrounds (CGWSEL bit 0).
+    pub direct_color: bool,
+    /// Colour math subtracts instead of adding (CGADSUB bit 7).
+    pub color_math_subtract: bool,
+    /// Colour math halves its result (CGADSUB bit 6).
+    pub color_math_halve: bool,
+    /// Colour math on the backdrop (CGADSUB bit 5).
+    pub color_math_back_enable: bool,
+    /// Colour math on sprites, the ones in palettes 4-7 (CGADSUB bit 4).
+    pub color_math_oam_enable: bool,
+    /// Colour math on BG1-4 (CGADSUB bits 0-3).
+    pub color_math_bg_enable: [bool; 4],
+    /// The fixed colour, BGR555 (COLDATA).
+    pub fixed_color: u16,
+
+    /// Mode 7's second background (SETINI bit 6).
+    pub mode7_extbg: bool,
+    /// Pseudo-hires (SETINI bit 3).
+    pub pseudo_hires: bool,
+    /// Overscan, 239 visible lines instead of 224 (SETINI bit 2).
+    pub overscan: bool,
+    /// Sprite interlace (SETINI bit 1).
+    pub obj_interlace: bool,
+    /// Screen interlace (SETINI bit 0).
+    pub interlace: bool,
+    /// The interlace field the frame is drawn in, which alternates every
+    /// frame whether interlace is on or not.
+    pub field: bool,
+}
+
 /// Read one tilemap entry for background `tx,ty` honouring the SNES
 /// quadrant layout (32x32 sub-screens: TL, TR, BL, BR). `word_base` is
 /// the tilemap base in VRAM words.
@@ -309,7 +437,167 @@ impl Ppu {
             second_table_base_word: table_base_word(true),
         }
     }
+
+    /// The PPU's settings as they stand now ([`PpuSettings`]).
+    #[must_use]
+    pub fn settings(&self) -> PpuSettings {
+        let signed_13 = |value: u16| sign_extend_13(value) as i16;
+        PpuSettings {
+            display_disable: self.display_disable,
+            display_brightness: self.display_brightness,
+            obj_base_size: self.obj_base_size,
+            obj_name_select: self.obj_name_select,
+            obj_tiledata_addr: self.obj_tiledata_addr,
+            sprite_tiles: self.sprite_tile_settings(),
+            bgmode: self.bgmode,
+            bg3_priority: self.bg3_priority,
+            bg_tile_size: self.bg_tile_size,
+            mosaic_size: self.mosaic_size,
+            bg_mosaic_enable: self.bg_mosaic_enable,
+            mode7_repeat: self.mode7_repeat,
+            mode7_vflip: self.mode7_vflip,
+            mode7_hflip: self.mode7_hflip,
+            mode7_hoffset: signed_13(self.mode7_hoffset),
+            mode7_voffset: signed_13(self.mode7_voffset),
+            mode7_matrix: [
+                self.m7a as i16,
+                self.m7b as i16,
+                self.m7c as i16,
+                self.m7d as i16,
+            ],
+            mode7_centre: [signed_13(self.m7x), signed_13(self.m7y)],
+            window_enable: self.window_enable,
+            window_one_left: self.window_one_left,
+            window_one_right: self.window_one_right,
+            window_two_left: self.window_two_left,
+            window_two_right: self.window_two_right,
+            window_combine: self.window_combine,
+            bg_main_window_disable: self.bg_main_window_disable,
+            obj_main_window_disable: self.obj_main_window_disable,
+            bg_sub_window_disable: self.bg_sub_window_disable,
+            obj_sub_window_disable: self.obj_sub_window_disable,
+            bg_main_enable: self.bg_main_enable,
+            obj_main_enable: self.obj_main_enable,
+            bg_sub_enable: self.bg_sub_enable,
+            obj_sub_enable: self.obj_sub_enable,
+            col_main_mask: self.col_main_mask,
+            col_sub_mask: self.col_sub_mask,
+            addsub_mode: self.addsub_mode,
+            direct_color: self.direct_color,
+            color_math_subtract: self.color_math_subtract,
+            color_math_halve: self.color_math_halve,
+            color_math_back_enable: self.color_math_back_enable,
+            color_math_oam_enable: self.color_math_oam_enable,
+            color_math_bg_enable: self.color_math_bg_enable,
+            fixed_color: self.fixed_color,
+            mode7_extbg: self.mode7_extbg,
+            pseudo_hires: self.pseudo_hires,
+            overscan: self.overscan,
+            obj_interlace: self.obj_interlace,
+            interlace: self.interlace,
+            field: self.field,
+        }
+    }
+
+    /// The M7SEL byte as the game wrote it: the screen over in bits 6-7,
+    /// the vertical flip in bit 1, the horizontal flip in bit 0.
+    fn mode7_settings_byte(&self) -> u8 {
+        (self.mode7_repeat << 6) | (u8::from(self.mode7_vflip) << 1) | u8::from(self.mode7_hflip)
+    }
+
+    /// The 16x16 blocks a run of 16x16 background tiles name, stacked 16
+    /// rows apiece. Block `N` (`first_tile + i`) is what the renderer
+    /// reads for a 16x16 tile numbered `N`: the character `N` at its top
+    /// left, `N + 1` to its right, `N + 16` and `N + 17` below (the
+    /// character table is 16 tiles wide), each wrapped to the ten bits of
+    /// a character number, from the character base `base_addr`. The
+    /// renderer's flips mirror the block as a whole; the host applies
+    /// them as it does for an 8x8 tile. `first_tile` is a character
+    /// number, below 1024.
+    fn decode_vram_tiles_16(
+        &self,
+        request: &TileDecodeRequest,
+    ) -> Result<IndexedImage, ExportError> {
+        let decode_row = match request.bpp {
+            2 => decode_tile_2bpp_row,
+            4 => decode_tile_4bpp_row,
+            8 => decode_tile_8bpp_row,
+            _ => return Err(ExportError::Unsupported),
+        };
+        if request.count == 0 {
+            return Err(ExportError::Empty);
+        }
+        if request.first_tile >= CHARACTER_NUMBERS || (request.base_addr >> 1) as usize >= 0x8000 {
+            return Err(ExportError::OutOfRange);
+        }
+        const SIDE: usize = 16;
+        // The four characters of a block, from its top-left one, and where
+        // each lands in the block.
+        const QUADRANTS: [(u32, usize, usize); 4] = [(0, 0, 0), (1, 8, 0), (16, 0, 8), (17, 8, 8)];
+        let vram = self.vram();
+        let count = request.count as usize;
+        let mut pixels = vec![0u8; SIDE * SIDE * count];
+        for i in 0..count {
+            let block = request.first_tile.wrapping_add(i as u32);
+            for &(step, dx, dy) in &QUADRANTS {
+                let character = (block.wrapping_add(step) % CHARACTER_NUMBERS) as u16;
+                for py in 0..8u8 {
+                    let cols = decode_row(vram, character, request.base_addr, py, false, false);
+                    let start = (i * SIDE + dy + py as usize) * SIDE + dx;
+                    pixels[start..start + 8].copy_from_slice(&cols);
+                }
+            }
+        }
+        Ok(IndexedImage {
+            width: SIDE as u32,
+            height: (SIDE * count) as u32,
+            pixels,
+            bpp: request.bpp,
+            transparent_index: Some(0),
+        })
+    }
+
+    /// The Mode 7 characters `first_tile..first_tile + count`, 8bpp, 8x8,
+    /// stacked. Mode 7 VRAM interleaves its two tables byte by byte: the
+    /// tilemap in the low bytes of the first 16 K words and the characters
+    /// in their high bytes, 64 words a character, row by row. Character `c`
+    /// is therefore the high bytes of the words from `base_addr / 2 +
+    /// c * 64` on (wrapping inside VRAM), the bytes the Mode 7 plane
+    /// samples; character 0 sits at word 0 on the hardware, so a host
+    /// passes a `base_addr` of 0 for the plane's own characters.
+    fn decode_mode7_tiles(&self, request: &TileDecodeRequest) -> Result<IndexedImage, ExportError> {
+        if request.bpp != 8 {
+            return Err(ExportError::Unsupported);
+        }
+        if request.count == 0 {
+            return Err(ExportError::Empty);
+        }
+        const WORDS_PER_CHARACTER: usize = 64;
+        let start_word = u64::from(request.base_addr >> 1)
+            + u64::from(request.first_tile) * WORDS_PER_CHARACTER as u64;
+        if start_word >= 0x8000 {
+            return Err(ExportError::OutOfRange);
+        }
+        let start_word = start_word as usize;
+        let vram = self.vram();
+        let count = request.count as usize;
+        // Character after character, so pixel `n` of the sheet is the high
+        // byte of word `start_word + n`.
+        let pixels = (0..WORDS_PER_CHARACTER * count)
+            .map(|n| (vram[(start_word + n) & 0x7FFF] >> 8) as u8)
+            .collect();
+        Ok(IndexedImage {
+            width: 8,
+            height: (8 * count) as u32,
+            pixels,
+            bpp: 8,
+            transparent_index: Some(0),
+        })
+    }
 }
+
+/// How many character numbers a tilemap entry can name: ten bits.
+const CHARACTER_NUMBERS: u32 = 1024;
 
 impl VideoDebugger for Ppu {
     fn get_tile_data(&self, index: u32) -> Option<TileData> {
@@ -482,7 +770,12 @@ impl VideoDebugger for Ppu {
             ),
             reg(0x212C, "TM", tm, "Main screen designation"),
             reg(0x212D, "TS", ts, "Sub screen designation"),
-            reg(0x211A, "M7SEL", 0, "Mode 7 settings"),
+            reg(
+                0x211A,
+                "M7SEL",
+                u32::from(self.mode7_settings_byte()),
+                "Mode 7 settings",
+            ),
             reg(0x211B, "M7A", u32::from(self.m7a()), "Mode 7 matrix A"),
             reg(0x211C, "M7B", u32::from(self.m7b()), "Mode 7 matrix B"),
             reg(0x211D, "M7C", u32::from(self.m7c()), "Mode 7 matrix C"),
@@ -579,22 +872,31 @@ impl VideoDebugger for Ppu {
         })
     }
 
-    /// Decode a contiguous run of VRAM tiles to a vertically stacked
-    /// *indexed* sheet (tile `i` occupies rows `[i*8, i*8+8)`), honouring
-    /// 2/4/8 bpp.
+    /// Decode a run of tiles to a vertically stacked *indexed* sheet
+    /// (tile `i` occupies rows `[i*h, i*h+h)`, `h` the tile's height),
+    /// honouring 2/4/8 bpp.
     ///
     /// Unlike the Genesis 4bpp-only path, the SNES needs all three BG
     /// depths. The core owns only the per-bpp bitplane decode (shared
     /// with the renderer's `decode_tile_{2,4,8}bpp_row`); the host reads
     /// the tilemap and applies the per-cell palette + flip + transparency
-    /// policy. 16x16-tile modes are resolved host-side over these 8x8
-    /// tiles, so only `Vram` + `Px8` is decoded here. The per-tile byte
-    /// base folds `first_tile + i` into the address (not the decoder's
-    /// `& 0x3FF` tile index) so runs past the 1024-tile half still
-    /// advance, while each row read wraps inside the 32 KiB-word bank.
+    /// policy. Three kinds of tile:
+    ///
+    /// - `Vram` + `Px8`: 8x8 characters from `base_addr` on. The per-tile
+    ///   byte base folds `first_tile + i` into the address (not the
+    ///   decoder's `& 0x3FF` tile index) so runs past the 1024-tile half
+    ///   still advance, while each row read wraps inside the 32 KiB-word
+    ///   bank.
+    /// - `Vram` + `Px16`: the 16x16 block a 16x16 background tile names,
+    ///   read as the renderer reads it (`decode_vram_tiles_16`).
+    /// - `Mode7` + `Px8`: the 8bpp Mode 7 characters
+    ///   (`decode_mode7_tiles`).
     fn decode_tiles(&self, request: &TileDecodeRequest) -> Result<IndexedImage, ExportError> {
-        if request.source != TileSource::Vram || request.tile_size != TileSize::Px8 {
-            return Err(ExportError::Unsupported);
+        match (request.source, request.tile_size) {
+            (TileSource::Vram, TileSize::Px8) => {}
+            (TileSource::Vram, TileSize::Px16) => return self.decode_vram_tiles_16(request),
+            (TileSource::Mode7, TileSize::Px8) => return self.decode_mode7_tiles(request),
+            (TileSource::Mode7, TileSize::Px16) => return Err(ExportError::Unsupported),
         }
         let words_per_tile: u32 = match request.bpp {
             2 => 8,
@@ -1190,18 +1492,254 @@ mod tests {
             ppu.decode_tiles(&vram_decode_req(3, 1)),
             Err(ExportError::Unsupported)
         );
-        // 16x16 tile size is resolved host-side, not in the core.
-        let px16 = TileDecodeRequest {
-            tile_size: TileSize::Px16,
-            ..vram_decode_req(4, 1)
-        };
-        assert_eq!(ppu.decode_tiles(&px16), Err(ExportError::Unsupported));
         // A start word already past the 32 KiB-word bank -> OutOfRange.
         let oob = TileDecodeRequest {
             base_addr: 0x1_0000,
             ..vram_decode_req(4, 1)
         };
         assert_eq!(ppu.decode_tiles(&oob), Err(ExportError::OutOfRange));
+        // A 16x16 block is named by a ten-bit character number.
+        let px16_past_numbers = TileDecodeRequest {
+            tile_size: TileSize::Px16,
+            first_tile: 1024,
+            ..vram_decode_req(4, 1)
+        };
+        assert_eq!(
+            ppu.decode_tiles(&px16_past_numbers),
+            Err(ExportError::OutOfRange)
+        );
+        // Mode 7 characters are 8bpp and 8x8, and start inside VRAM.
+        let mode7 = |bpp: u8, tile_size: TileSize, first_tile: u32| TileDecodeRequest {
+            source: TileSource::Mode7,
+            tile_size,
+            first_tile,
+            ..vram_decode_req(bpp, 1)
+        };
+        assert_eq!(
+            ppu.decode_tiles(&mode7(4, TileSize::Px8, 0)),
+            Err(ExportError::Unsupported)
+        );
+        assert_eq!(
+            ppu.decode_tiles(&mode7(8, TileSize::Px16, 0)),
+            Err(ExportError::Unsupported)
+        );
+        assert_eq!(
+            ppu.decode_tiles(&mode7(8, TileSize::Px8, 512)),
+            Err(ExportError::OutOfRange)
+        );
+    }
+
+    /// Write 4bpp character `character` of the table at byte `base_byte`,
+    /// its pixel `(x, y)` holding `index(x, y)`.
+    fn write_4bpp_character(
+        ppu: &mut Ppu,
+        base_byte: u32,
+        character: u32,
+        index: impl Fn(usize, usize) -> u8,
+    ) {
+        let word_base = (base_byte >> 1) as usize + character as usize * 16;
+        for y in 0..8 {
+            let mut planes = [0u8; 4];
+            for x in 0..8 {
+                let value = index(x, y);
+                for (bit, plane) in planes.iter_mut().enumerate() {
+                    if (value >> bit) & 1 != 0 {
+                        *plane |= 0x80 >> x;
+                    }
+                }
+            }
+            ppu.vram[(word_base + y) & 0x7FFF] = u16::from(planes[0]) | (u16::from(planes[1]) << 8);
+            ppu.vram[(word_base + 8 + y) & 0x7FFF] =
+                u16::from(planes[2]) | (u16::from(planes[3]) << 8);
+        }
+    }
+
+    #[test]
+    fn decode_tiles_16x16_is_the_block_the_renderer_draws() {
+        use retro_core::Framebuffer;
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.bgmode = 1;
+        ppu.bg_main_enable[0] = true;
+        ppu.bg_tile_size[0] = true;
+        ppu.bg_screen_addr[0] = 0;
+        ppu.bg_tiledata_addr[0] = 0x4000;
+        // Scanline 1 draws the tilemap's first row.
+        ppu.bg_voffset[0] = 0xFFFF;
+        // The first tilemap entry names block 0x0F. Its right half is
+        // character 0x10, on the next row of the 16-wide table, and its
+        // bottom half the characters 0x1F and 0x20.
+        ppu.vram[0] = 0x000F;
+        for (quadrant, character) in [0x0Fu32, 0x10, 0x1F, 0x20].into_iter().enumerate() {
+            write_4bpp_character(&mut ppu, 0x4000, character, |x, y| {
+                ((quadrant * 5 + x + y) % 15 + 1) as u8
+            });
+        }
+        for index in 0..16u16 {
+            ppu.cgram[usize::from(index)] = index * 0x0421 + 0x0010;
+        }
+
+        let mut fb = Framebuffer::new(256, 224);
+        for scanline in 1..=16 {
+            ppu.render_scanline(scanline, &mut fb);
+        }
+        let block = ppu
+            .decode_tiles(&TileDecodeRequest {
+                source: TileSource::Vram,
+                base_addr: 0x4000,
+                first_tile: 0x0F,
+                count: 1,
+                bpp: 4,
+                tile_size: TileSize::Px16,
+            })
+            .expect("one 16x16 block");
+        assert_eq!((block.width, block.height), (16, 16));
+        for y in 0..16 {
+            for x in 0..16 {
+                let index = block.pixels[y * 16 + x];
+                assert_ne!(index, 0, "every pixel of the block is drawn");
+                assert_eq!(
+                    pixel(&fb.data, x, y),
+                    bgr15_to_rgba8(ppu.cgram[usize::from(index)]),
+                    "pixel ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_tiles_16x16_stacks_blocks_and_wraps_the_character_number() {
+        let mut ppu = Ppu::new();
+        // Block 0x3FF reads characters 0x3FF, 0x000, 0x00F and 0x010:
+        // the character number wraps at ten bits, as the renderer's does.
+        for (character, value) in [(0x3FFu32, 1u8), (0x000, 2), (0x00F, 3), (0x010, 4)] {
+            write_4bpp_character(&mut ppu, 0, character, |_, _| value);
+        }
+        let blocks = ppu
+            .decode_tiles(&TileDecodeRequest {
+                source: TileSource::Vram,
+                base_addr: 0,
+                first_tile: 0x3FF,
+                count: 2,
+                bpp: 4,
+                tile_size: TileSize::Px16,
+            })
+            .expect("two 16x16 blocks");
+        assert_eq!((blocks.width, blocks.height), (16, 32));
+        let at = |x: usize, y: usize| blocks.pixels[y * 16 + x];
+        assert_eq!([at(0, 0), at(8, 0), at(0, 8), at(8, 8)], [1, 2, 3, 4]);
+        // The second block is block 0x000 (0x3FF + 1, wrapped): its top
+        // left is the character 0x000 the first block's top right is.
+        assert_eq!(at(0, 16), 2);
+    }
+
+    #[test]
+    fn decode_tiles_mode7_is_the_character_the_plane_samples() {
+        use crate::ppu::tile::mode7_sample;
+        use retro_core::Framebuffer;
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.bgmode = 7;
+        ppu.bg_main_enable[0] = true;
+        ppu.m7a = 0x0100;
+        ppu.m7d = 0x0100;
+        // Tilemap cell (0, 0), the low byte of word 0, names character 5;
+        // the character's pixel (x, y) is the high byte of word
+        // 5 * 64 + 8y + x. The low bytes of those words are other tilemap
+        // cells, left at 0.
+        ppu.vram[0] = 0x0005;
+        for y in 0..8 {
+            for x in 0..8 {
+                let word = 5 * 64 + y * 8 + x;
+                ppu.vram[word] = ((1 + x + 8 * y) as u16) << 8;
+            }
+        }
+        for index in 0..256u16 {
+            ppu.cgram[usize::from(index)] = (index * 37) & 0x7FFF;
+        }
+
+        let mut fb = Framebuffer::new(256, 224);
+        for scanline in 1..8 {
+            ppu.render_scanline(scanline, &mut fb);
+        }
+        let character = ppu
+            .decode_tiles(&TileDecodeRequest {
+                source: TileSource::Mode7,
+                base_addr: 0,
+                first_tile: 5,
+                count: 1,
+                bpp: 8,
+                tile_size: TileSize::Px8,
+            })
+            .expect("one Mode 7 character");
+        assert_eq!((character.width, character.height), (8, 8));
+        assert_eq!(character.bpp, 8);
+        // With the identity matrix scanline `s` samples world row `s` (the
+        // line count starts at 1) and draws output row `s - 1`.
+        for world_y in 1..8 {
+            for x in 0..8 {
+                let index = character.pixels[world_y * 8 + x];
+                assert_eq!(index, (1 + x + 8 * world_y) as u8);
+                assert_eq!(
+                    pixel(&fb.data, x, world_y - 1),
+                    bgr15_to_rgba8(ppu.cgram[usize::from(index)]),
+                    "pixel ({x}, {world_y})"
+                );
+            }
+        }
+        // Row 0 no line draws here; the plane's own sampler reads it.
+        for x in 0..8 {
+            assert_eq!(
+                Some(character.pixels[x]),
+                mode7_sample(ppu.vram(), x as i32, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_read_the_mode_flags_and_mode7_select_from_their_own_fields() {
+        use crate::ppu::PpuAccessCtx;
+        let mut ppu = Ppu::new();
+        let ctx = PpuAccessCtx::ZERO;
+        // BGMODE: mode 1, BG3 lifted, 16x16 tiles on BG2 and BG4.
+        ppu.write_reg(0x05, 0b1010_1001, &ctx);
+        // M7SEL: screen over 2, both flips.
+        ppu.write_reg(0x1A, 0b1000_0011, &ctx);
+        let settings = ppu.settings();
+        assert_eq!(settings.bgmode, 1);
+        assert!(settings.bg3_priority);
+        assert_eq!(settings.bg_tile_size, [false, true, false, true]);
+        assert_eq!(
+            (
+                settings.mode7_repeat,
+                settings.mode7_vflip,
+                settings.mode7_hflip
+            ),
+            (2, true, true)
+        );
+        let m7sel = ppu
+            .get_registers()
+            .into_iter()
+            .find(|register| register.name == "M7SEL")
+            .expect("M7SEL is listed");
+        assert_eq!(m7sel.value, 0b1000_0011);
+    }
+
+    #[test]
+    fn settings_sign_extend_the_mode7_offsets_and_centre() {
+        let mut ppu = Ppu::new();
+        ppu.mode7_hoffset = 0x1FFF;
+        ppu.mode7_voffset = 0x0FFF;
+        ppu.m7x = 0x1000;
+        ppu.m7y = 0x0010;
+        ppu.m7a = 0xFF00;
+        let settings = ppu.settings();
+        assert_eq!(settings.mode7_hoffset, -1);
+        assert_eq!(settings.mode7_voffset, 0x0FFF);
+        assert_eq!(settings.mode7_centre, [-0x1000, 0x10]);
+        assert_eq!(settings.mode7_matrix[0], -0x100);
     }
 
     // -- sprite list + render order ----------------------------------

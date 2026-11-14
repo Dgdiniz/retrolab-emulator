@@ -38,6 +38,7 @@
 //! mid-frame switches the renderer on/off for the extra rows
 //! without rescheduling.
 
+use retro_core::video::{ExportError, PixelImage};
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
@@ -49,7 +50,7 @@ use crate::ppu::tile::{
 };
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::window_layer;
-use crate::ppu::{Ppu, LAYER_OBJ};
+use crate::ppu::{Ppu, LAYER_COUNT, LAYER_OBJ};
 
 /// One BG layer's contribution to a single scanline, retained
 /// between scanlines so vertical mosaic can replay the previous
@@ -281,6 +282,12 @@ impl Ppu {
         if fb_row >= fb.height {
             return;
         }
+        // A single-layer render draws its one layer instead of the
+        // composite (see `render_layer`); never set during play.
+        if let Some(layer) = self.isolated_layer {
+            self.render_isolated_line(layer, vy, obj_line, fb_row, fb);
+            return;
+        }
 
         let hires = is_hires_mode(self.bgmode);
         let output_width = if hires {
@@ -328,7 +335,9 @@ impl Ppu {
         // stays transparent here even though both enable bits may be
         // set.
         if self.bgmode == 7 {
-            self.render_mode7_rows(vy, &mut main_rows);
+            let bg1 = self.bg_main_enable[0];
+            let bg2 = self.mode7_extbg && self.bg_main_enable[1];
+            self.render_mode7_rows(vy, &mut main_rows, bg1, bg2);
         } else {
             for bg_id in 0..4 {
                 if !bg_visible_in_mode(self.bgmode, bg_id) {
@@ -1087,6 +1096,9 @@ impl Ppu {
     /// feeds BG2: its low 7 bits are the colour index and bit 7 is
     /// the priority bit. Only `main_rows` is filled, Mode 7 is
     /// non-hires so the sub plane never reaches the composite.
+    /// `bg1` and `bg2` say which of the two rows to fill: the compositor
+    /// fills the ones on the main screen (BG2 only with EXTBG), a
+    /// single-layer render the one it draws.
     ///
     /// The matrix math is the hardware's as Anomie's Mode 7 notes give
     /// it (checked against bsnes-plus). Coefficients A-D are 8.8 fixed
@@ -1096,7 +1108,13 @@ impl Ppu {
     /// [`sign_extend_13`] reads the centre / scroll registers;
     /// [`mode7_clip`] is the separate clip applied to the
     /// scroll-minus-centre differences.
-    fn render_mode7_rows(&self, scanline: u16, main_rows: &mut [BgRowBuffer; 4]) {
+    fn render_mode7_rows(
+        &self,
+        scanline: u16,
+        main_rows: &mut [BgRowBuffer; 4],
+        bg1: bool,
+        bg2: bool,
+    ) {
         let a = self.m7a as i16 as i32;
         let b = self.m7b as i16 as i32;
         let c = self.m7c as i16 as i32;
@@ -1126,10 +1144,9 @@ impl Ppu {
             .wrapping_add(d.wrapping_mul(y) & !63)
             .wrapping_add(cy << 8);
 
-        let extbg = self.mode7_extbg;
         let direct = self.direct_color;
-        let bg1_main = self.bg_main_enable[0];
-        let bg2_main = extbg && self.bg_main_enable[1];
+        let bg1_main = bg1;
+        let bg2_main = bg2;
 
         // Two independent row buffers (BG1 + EXTBG BG2) are written at the
         // same x; zipping both through iterators would obscure the mode-7
@@ -1493,6 +1510,216 @@ impl Ppu {
     /// duplicate produced by [`Self::finalize_frame`].
     pub fn frame_interlaced(&self) -> bool {
         self.frame_hires && self.render_interlace
+    }
+
+    /// Draw the held frame again from the present state into `fb` and
+    /// finish its picture, without advancing emulation: every visible line
+    /// through [`Self::render_scanline`] (from line 1, so the frame's own
+    /// resets run; the active-region gate drops the lines past the
+    /// overscan setting), then [`Self::finalize_frame`].
+    ///
+    /// Drawing moves state a savestate holds, the sprite range and time
+    /// flags and the evaluator's OAM address; they are put back as they
+    /// were (see [`RedrawKeeps`]), so the state hash does not move.
+    pub(crate) fn redraw_frame(&mut self, fb: &mut Framebuffer) {
+        let keeps = RedrawKeeps::take(self);
+        for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
+            self.render_scanline(scanline, fb);
+        }
+        self.finalize_frame(fb);
+        keeps.put_back(self);
+    }
+
+    /// The held frame drawn again with only `layer` in it, as RGBA the
+    /// size of the frame's picture: each pixel the layer covers is opaque,
+    /// and every other pixel, the backdrop's included, has alpha 0.
+    /// `layer` is a debug layer index (`0..=3` BG1-4, `4` OBJ), the ids
+    /// [`VideoDebugger::toggle_layer`](retro_core::video::VideoDebugger)
+    /// uses; another index is [`ExportError::OutOfRange`].
+    ///
+    /// The layer is drawn as the frame draws it: the same fetch (direct
+    /// colour, 16x16 tiles, offset-per-tile, hires, the Mode 7 plane),
+    /// the same mosaic and the same rows (the interlace weave, the hires
+    /// and overscan normalisation of `finalize_frame`), in its
+    /// colours at the master brightness. A pixel of the layer is therefore
+    /// the composite's pixel wherever the layer is the one shown and no
+    /// colour math touches it. It is drawn whatever the main and sub
+    /// screen designations, the window clips and the debugger's layer
+    /// mask say, which choose what the composite shows of a layer rather
+    /// than what the layer holds; a background the mode has no plane for
+    /// comes out empty. Colour math is not applied: its result belongs to
+    /// two layers, or to a layer and the fixed colour, never to one layer
+    /// alone. In forced blank the frame draws no layer, and the image is
+    /// empty; at brightness 0 the layer's pixels are black, as the frame's.
+    ///
+    /// Like any redraw it uses the registers as they stand now, so a
+    /// raster effect (an HDMA scroll or mode change down the frame) comes
+    /// out with the values of the last line. Emulation does not advance,
+    /// the host framebuffer is not touched, and the state a savestate
+    /// holds stays as it was, the frame's own display state with it.
+    pub fn render_layer(&mut self, layer: usize) -> Result<PixelImage, ExportError> {
+        if layer >= LAYER_COUNT {
+            return Err(ExportError::OutOfRange);
+        }
+        let keeps = RedrawKeeps::take(self);
+        let picture = HeldPicture::take(self);
+        let mut fb = Framebuffer::new(MAX_SCANLINE_WIDTH as u32, MAX_OUTPUT_ROWS as u32);
+        self.isolated_layer = Some(layer);
+        for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
+            self.render_scanline(scanline, &mut fb);
+        }
+        self.isolated_layer = None;
+        self.finalize_frame(&mut fb);
+        let (width, height) = self.active_display_size();
+        picture.put_back(self);
+        keeps.put_back(self);
+
+        let stride = fb.width as usize * 4;
+        let row_bytes = width as usize * 4;
+        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+        for y in 0..height as usize {
+            rgba.extend_from_slice(&fb.data[y * stride..y * stride + row_bytes]);
+        }
+        Ok(PixelImage {
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    /// One output row of [`Self::render_layer`]: the isolated layer's
+    /// pixels, the rest of the row transparent. Mirrors
+    /// [`Self::render_output_line`] up to the composite: the same row
+    /// fetch, the same mosaic replay (kept in `previous_bg_rows` for the
+    /// pass), the same 256-dot sprite row widened to a hires line.
+    fn render_isolated_line(
+        &mut self,
+        layer: usize,
+        vy: u16,
+        obj_line: u16,
+        fb_row: u32,
+        fb: &mut Framebuffer,
+    ) {
+        let hires = is_hires_mode(self.bgmode);
+        let output_width = if hires {
+            MAX_SCANLINE_WIDTH
+        } else {
+            NORMAL_SCANLINE_WIDTH
+        };
+        let stride = fb.width as usize * 4;
+        let base = stride * fb_row as usize;
+        let visible_w = (fb.width as usize).min(output_width);
+        fb.data[base..base + visible_w * 4].fill(0);
+
+        if self.display_disable {
+            for bg in 0..4 {
+                self.previous_bg_rows[bg] = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
+            }
+            return;
+        }
+        let brightness = self.display_brightness;
+        let mut put = |x: usize, colour: u16| {
+            let [r, g, b] = if brightness == 0 {
+                [0, 0, 0]
+            } else {
+                bgr15_to_rgb8_with_brightness(colour, brightness)
+            };
+            let p = base + x * 4;
+            fb.data[p..p + 4].copy_from_slice(&[r, g, b, 0xFF]);
+        };
+
+        if layer == LAYER_OBJ {
+            let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+            self.render_obj_row(obj_line, &mut obj_row);
+            for x in 0..visible_w {
+                let pixel = obj_row[if hires { x >> 1 } else { x }];
+                if pixel.opaque {
+                    put(x, pixel.color);
+                }
+            }
+            return;
+        }
+
+        let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
+        if self.bgmode == 7 {
+            // The affine plane is BG1, and BG2 too with EXTBG; there is
+            // no BG3 or BG4 in Mode 7.
+            let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
+            self.render_mode7_rows(vy, &mut rows, layer == 0, layer == 1 && self.mode7_extbg);
+            row = rows[layer];
+        } else if bg_visible_in_mode(self.bgmode, layer) {
+            self.render_bg_row(layer, vy, &mut row, hires);
+        }
+        self.apply_mosaic_for_bg(layer, vy, &mut row, output_width);
+        self.previous_bg_rows[layer] = row;
+        for (x, pixel) in row.iter().enumerate().take(visible_w) {
+            if pixel.opaque {
+                put(x, pixel.color);
+            }
+        }
+    }
+}
+
+/// One past the last scanline a frame can draw: the overscan frame's 239
+/// visible lines end at line 239, and the active-region gate drops the
+/// lines past the overscan setting in force.
+const FIRST_LINE_PAST_OVERSCAN: u16 = 240;
+
+/// What drawing the frame again changes that is not the picture: the
+/// sprite range and time flags STAT77 reads and the address the sprite
+/// evaluator leaves for OAM reads, all three part of a savestate and of
+/// the state hash. A redraw takes them first and puts them back after,
+/// so a repaint or a single-layer render leaves the machine as it was.
+#[derive(Clone, Copy)]
+struct RedrawKeeps {
+    sprite_range_over: bool,
+    sprite_time_over: bool,
+    oam_iaddr: u16,
+}
+
+impl RedrawKeeps {
+    fn take(ppu: &Ppu) -> Self {
+        Self {
+            sprite_range_over: ppu.sprite_range_over,
+            sprite_time_over: ppu.sprite_time_over,
+            oam_iaddr: ppu.oam_iaddr,
+        }
+    }
+
+    fn put_back(self, ppu: &mut Ppu) {
+        ppu.sprite_range_over = self.sprite_range_over;
+        ppu.sprite_time_over = self.sprite_time_over;
+        ppu.oam_iaddr = self.oam_iaddr;
+    }
+}
+
+/// What the held frame's picture leaves in the PPU besides the
+/// framebuffer: the frame-global hires and interlace state its display
+/// size and normalisation read, and the vertical-mosaic rows. A
+/// single-layer render draws into a framebuffer of its own, so it puts
+/// these back for the frame the host still shows.
+struct HeldPicture {
+    frame_hires: bool,
+    render_interlace: bool,
+    line_hires: [bool; MAX_OUTPUT_ROWS],
+    previous_bg_rows: Box<[BgRowBuffer; 4]>,
+}
+
+impl HeldPicture {
+    fn take(ppu: &Ppu) -> Self {
+        Self {
+            frame_hires: ppu.frame_hires,
+            render_interlace: ppu.render_interlace,
+            line_hires: ppu.line_hires,
+            previous_bg_rows: ppu.previous_bg_rows.clone(),
+        }
+    }
+
+    fn put_back(self, ppu: &mut Ppu) {
+        ppu.frame_hires = self.frame_hires;
+        ppu.render_interlace = self.render_interlace;
+        ppu.line_hires = self.line_hires;
+        ppu.previous_bg_rows = self.previous_bg_rows;
     }
 }
 
@@ -2283,7 +2510,7 @@ mod tests {
         ppu.cgram[0x42] = 0x1234;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows);
+        ppu.render_mode7_rows(1, &mut rows, true, false);
 
         assert!(rows[0][0].opaque);
         assert_eq!(rows[0][0].color, 0x1234);
@@ -2304,7 +2531,7 @@ mod tests {
         ppu.cgram[0x03] = 0x5555;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows);
+        ppu.render_mode7_rows(1, &mut rows, true, true);
 
         // BG1 uses the full 8-bit value at low priority.
         assert!(rows[0][0].opaque);
@@ -2329,7 +2556,7 @@ mod tests {
         ppu.cgram[0x07] = 0x7FFF;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows);
+        ppu.render_mode7_rows(1, &mut rows, true, false);
 
         assert!(rows[0][0].opaque);
         assert_eq!(rows[0][0].color, direct_color_word(0x07, 0));
@@ -3100,5 +3327,143 @@ mod tests {
         let before = fb.data.clone();
         ppu.finalize_frame(&mut fb);
         assert_eq!(fb.data, before, "no crop when show_overscan is set");
+    }
+
+    // -- Redraws: repaint and single layers ------------------------
+
+    /// Mode 1 with BG1 and sprites on the main screen over a green
+    /// backdrop. BG1's tilemap entry (0, 0) is tile 1, solid colour 1
+    /// (red); every other entry is tile 0, empty. Sprite 0 is 8x8 at
+    /// (16, 0), solid colour 1 of palette 0 (blue); the other 127 sit on
+    /// line 100 at x 200, enough to overflow it.
+    fn layered_ppu() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.bgmode = 1;
+        ppu.bg_main_enable[0] = true;
+        ppu.obj_main_enable = true;
+        ppu.bg_screen_addr[0] = 0x0000;
+        ppu.bg_tiledata_addr[0] = 0x2000;
+        ppu.bg_voffset[0] = 0xFFFF;
+        ppu.vram[0] = 0x0001;
+        for row in 0..8 {
+            // Tile 1 (4bpp, words 0x1010..) and sprite tile 0x40
+            // (words 0x400..): plane 0 set, colour 1.
+            ppu.vram[0x1010 + row] = 0x00FF;
+            ppu.vram[0x400 + row] = 0x00FF;
+        }
+        ppu.cgram[0] = 0x03E0; // backdrop green
+        ppu.cgram[1] = 0x001F; // BG1 red
+        ppu.cgram[129] = 0x7C00; // sprite blue
+        set_sprite(&mut ppu, 0, 16, 0, 0x40, 0);
+        for i in 1..128 {
+            set_sprite(&mut ppu, i, 200, 100, 0x40, 0);
+        }
+        ppu
+    }
+
+    /// The alpha of every pixel of an RGBA image.
+    fn alphas(rgba: &[u8]) -> impl Iterator<Item = u8> + '_ {
+        rgba.iter().skip(3).step_by(4).copied()
+    }
+
+    /// The RGBA of pixel `(x, y)` of an image `width` pixels wide.
+    fn rgba_at(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let at = (y * width + x) * 4;
+        [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
+    }
+
+    #[test]
+    fn render_layer_keys_everything_but_the_layer_to_alpha_0() {
+        let mut ppu = layered_ppu();
+        let bg1 = ppu.render_layer(0).expect("BG1");
+        assert_eq!((bg1.width, bg1.height), (256, 224));
+        let w = bg1.width as usize;
+        // Tile 1 covers (0..8, 0..8) in BG1's red; nothing else of BG1,
+        // and neither the sprite nor the backdrop, shows.
+        assert_eq!(rgba_at(&bg1.rgba, w, 0, 0), [0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(rgba_at(&bg1.rgba, w, 7, 7), [0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(rgba_at(&bg1.rgba, w, 8, 0)[3], 0, "past the tile");
+        assert_eq!(rgba_at(&bg1.rgba, w, 16, 0)[3], 0, "the sprite");
+        assert_eq!(rgba_at(&bg1.rgba, w, 100, 100)[3], 0, "the backdrop");
+
+        let obj = ppu.render_layer(4).expect("OBJ");
+        assert_eq!(rgba_at(&obj.rgba, w, 16, 0), [0x00, 0x00, 0xFF, 0xFF]);
+        assert_eq!(rgba_at(&obj.rgba, w, 0, 0)[3], 0, "BG1's tile");
+
+        // A background the mode has no plane for comes out empty.
+        let bg4 = ppu.render_layer(3).expect("BG4");
+        assert!(alphas(&bg4.rgba).all(|alpha| alpha == 0));
+        assert_eq!(ppu.render_layer(5), Err(ExportError::OutOfRange));
+    }
+
+    #[test]
+    fn render_layer_is_the_composite_where_the_layer_shows() {
+        let mut ppu = layered_ppu();
+        let mut fb = Framebuffer::new(256, 224);
+        ppu.redraw_frame(&mut fb);
+        for layer in [0usize, 4] {
+            let image = ppu.render_layer(layer).expect("layer");
+            for at in (0..image.rgba.len()).step_by(4) {
+                if image.rgba[at + 3] != 0 {
+                    // The two layers do not overlap, so where one has a
+                    // pixel it is the one shown.
+                    assert_eq!(image.rgba[at..at + 4], fb.data[at..at + 4]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_layer_draws_a_layer_whatever_the_screens_and_the_debug_mask() {
+        let mut ppu = layered_ppu();
+        ppu.bg_main_enable[0] = false;
+        ppu.set_layer_debug_disabled(0, true);
+        let bg1 = ppu.render_layer(0).expect("BG1");
+        assert_eq!(rgba_at(&bg1.rgba, 256, 0, 0), [0xFF, 0x00, 0x00, 0xFF]);
+        // In forced blank the frame draws no layer.
+        ppu.display_disable = true;
+        let blank = ppu.render_layer(0).expect("BG1");
+        assert!(alphas(&blank.rgba).all(|alpha| alpha == 0));
+    }
+
+    #[test]
+    fn redraws_put_back_the_sprite_flags_and_the_oam_address() {
+        let mut ppu = layered_ppu();
+        // As the end of a frame might leave them: flags clear (the game's
+        // sprites moved in the vertical blank, say) and the OAM address
+        // re-anchored.
+        ppu.sprite_range_over = false;
+        ppu.sprite_time_over = false;
+        ppu.oam_iaddr = 0x0123;
+        let mut fb = Framebuffer::new(256, 224);
+        ppu.redraw_frame(&mut fb);
+        assert!(
+            !ppu.sprite_range_over && !ppu.sprite_time_over,
+            "the redraw's overflow on line 100 is not kept"
+        );
+        assert_eq!(ppu.oam_iaddr, 0x0123);
+
+        ppu.render_layer(4).expect("OBJ");
+        assert!(!ppu.sprite_range_over && !ppu.sprite_time_over);
+        assert_eq!(ppu.oam_iaddr, 0x0123);
+    }
+
+    #[test]
+    fn render_layer_leaves_the_held_frame_display_state() {
+        let mut ppu = layered_ppu();
+        ppu.frame_hires = true;
+        ppu.render_interlace = true;
+        ppu.line_hires[3] = true;
+        ppu.previous_bg_rows[0][5] = BgRowPixel {
+            color: 0x1234,
+            opaque: true,
+            priority: true,
+        };
+        ppu.render_layer(0).expect("BG1");
+        assert!(ppu.frame_hires && ppu.render_interlace && ppu.line_hires[3]);
+        assert_eq!(ppu.previous_bg_rows[0][5].color, 0x1234);
+        assert_eq!(ppu.isolated_layer, None);
     }
 }

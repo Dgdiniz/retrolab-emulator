@@ -1,5 +1,6 @@
 //! `savestate save|load`: capture or restore the full emulator state via
-//! `EmulatorCore::save_state` / `load_state`.
+//! `GenesisEmulator::finish_frame_and_save_state` (a savestate is taken
+//! where a frame ends) / `EmulatorCore::load_state`.
 //!
 //! `save` boots a ROM, advances `--frames`, and writes the binary state
 //! blob (optionally pre-loading an SRAM image first). `load` boots the
@@ -85,9 +86,9 @@ fn save(args: SaveArgs) -> Result<()> {
         emu.run_frame_fast();
     }
 
-    let state_data = emu.save_state();
+    let state_data = emu.finish_frame_and_save_state();
     if state_data.is_empty() {
-        anyhow::bail!("save_state() returned empty data");
+        anyhow::bail!("the savestate came back empty");
     }
     std::fs::write(&args.output, &state_data)
         .with_context(|| format!("failed to write savestate: {}", args.output.display()))?;

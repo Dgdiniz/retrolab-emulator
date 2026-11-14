@@ -325,11 +325,123 @@ impl RetroEmulator {
         self.refresh_present();
     }
 
-    /// Run until VBLANK.
+    /// Run to the start of vertical blanking and stop there: the capture
+    /// boundary, as `runToCaptureBoundary`.
     #[wasm_bindgen(js_name = runUntilVBlank)]
     pub fn run_until_vblank(&mut self) {
         self.snes.run_until_vblank();
         self.refresh_present();
+    }
+
+    // ===== Capture =====
+
+    /// Run to the next capture boundary and stop there: the frame's
+    /// active display drawn and its picture final, nothing of the vertical
+    /// blank run yet, so VRAM, CGRAM, OAM and the registers still hold what
+    /// the picture was drawn from. Held at a boundary already, the call
+    /// finishes that frame first, so each call advances exactly one frame.
+    /// The tier a frame call picks runs it, and a breakpoint stops it where
+    /// it stops (`atCaptureBoundary` is then `false`). Any other frame call
+    /// made at the boundary runs the rest of the held frame and returns;
+    /// a step leaves the boundary first; `saveState` finishes the frame
+    /// before it saves.
+    #[wasm_bindgen(js_name = runToCaptureBoundary)]
+    pub fn run_to_capture_boundary(&mut self) {
+        self.snes.run_to_capture_boundary();
+        self.refresh_present();
+    }
+
+    /// Whether the core is stopped at a capture boundary.
+    #[wasm_bindgen(js_name = atCaptureBoundary)]
+    pub fn at_capture_boundary(&self) -> bool {
+        self.snes.at_capture_boundary()
+    }
+
+    /// A frame's picture and the video memory and settings it was drawn
+    /// from, all copies (never views into WASM memory):
+    /// `{ frame, atBoundary, width, height, framebuffer: Uint8Array (RGBA
+    /// of the picture, packed), vram: Uint8Array (as getVram), palette:
+    /// Uint16Array (CGRAM, as getCgram), oam: Uint8Array (as getOam),
+    /// registers (as getPpuRegisters), ppuSettings (as getPpuSettings) }`.
+    /// At a capture boundary the picture and the memory belong to the same
+    /// frame; anywhere else (`atBoundary` false) the memory may already
+    /// hold the game's uploads for the next frame. `frame` is the number
+    /// `getFrameNumber` reports once this picture's frame is complete.
+    /// The snapshot and the objects in it are plain objects.
+    #[wasm_bindgen(js_name = captureFrameSnapshot)]
+    pub fn capture_frame_snapshot(&self) -> JsValue {
+        let snapshot = self.snes.capture_frame_snapshot();
+        let obj = js_sys::Object::new();
+        let set = |key: &str, value: &JsValue| {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
+        };
+        set("frame", &JsValue::from_f64(snapshot.frame as f64));
+        set("atBoundary", &JsValue::from_bool(snapshot.at_boundary));
+        set("width", &JsValue::from_f64(f64::from(snapshot.width)));
+        set("height", &JsValue::from_f64(f64::from(snapshot.height)));
+        set(
+            "framebuffer",
+            &js_sys::Uint8Array::from(snapshot.framebuffer.as_slice()).into(),
+        );
+        set(
+            "vram",
+            &js_sys::Uint8Array::from(snapshot.vram.as_slice()).into(),
+        );
+        set(
+            "palette",
+            &js_sys::Uint16Array::from(snapshot.palette.as_slice()).into(),
+        );
+        set(
+            "oam",
+            &js_sys::Uint8Array::from(snapshot.oam.as_slice()).into(),
+        );
+        set("registers", &map_as_object(&snapshot.registers));
+        set("ppuSettings", &map_as_object(&snapshot.ppu_settings));
+        obj.into()
+    }
+
+    /// The held frame drawn again with only one layer in it, by the ids
+    /// `getLayerInfo` and `toggleLayer` use (0-3 BG1-4, 4 OBJ):
+    /// `{ width, height, data: Uint8Array }`, RGBA the size of the frame's
+    /// picture, alpha 0 on every pixel the layer does not cover (the
+    /// backdrop's included), or `null` for an unknown id. The layer is
+    /// drawn as the frame draws it, at the master brightness, whatever the
+    /// screens, the window clips and the debugger's layer mask say; colour
+    /// math is not applied. Emulation does not advance, the framebuffer
+    /// the host shows is left as it was, and so is everything a savestate
+    /// holds.
+    #[wasm_bindgen(js_name = renderLayer)]
+    pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
+        match self.snes.render_layer(layer_id) {
+            Ok(img) => {
+                let data = js_sys::Uint8Array::from(img.rgba.as_slice());
+                let obj = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("width"),
+                    &JsValue::from_f64(f64::from(img.width)),
+                );
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("height"),
+                    &JsValue::from_f64(f64::from(img.height)),
+                );
+                let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data);
+                obj.into()
+            }
+            Err(_) => JsValue::NULL,
+        }
+    }
+
+    /// The PPU's settings in the core's own field names (`PpuSettings`),
+    /// a plain object: the display state, the sprites' tiles and sizes
+    /// (`sprite_tiles`, as getSpriteTileSettings), the background mode,
+    /// mosaic, Mode 7 (select bits, offsets, matrix and centre), the
+    /// windows per layer, the screens and colour math, and the SETINI
+    /// flags.
+    #[wasm_bindgen(js_name = getPpuSettings)]
+    pub fn get_ppu_settings(&self) -> JsValue {
+        map_as_object(&self.snes.ppu_settings())
     }
 
     // ===== Netplay determinism primitives =====
@@ -767,10 +879,14 @@ impl RetroEmulator {
 
     // ===== Save state / SRAM =====
 
-    /// Save emulator state (zstd-compressed envelope).
+    /// Save emulator state (zstd-compressed envelope). Stopped at a
+    /// capture boundary, the frame held there is finished first, so a
+    /// savestate never holds it.
     #[wasm_bindgen(js_name = saveState)]
-    pub fn save_state(&self) -> Vec<u8> {
-        self.snes.save_state()
+    pub fn save_state(&mut self) -> Vec<u8> {
+        let state = self.snes.save_state_finishing_held_frame();
+        self.refresh_present();
+        state
     }
 
     /// Load emulator state. A savestate made on another ROM is refused
@@ -1014,7 +1130,8 @@ impl RetroEmulator {
         self.snes.is_covered(cpu_id, addr)
     }
 
-    /// `{ totalBytes, coveredBytes, percent }` for the given CPU.
+    /// `{ totalBytes, coveredBytes, percent }` for the given CPU, a plain
+    /// object.
     #[wasm_bindgen(js_name = getCoverageStats)]
     pub fn get_coverage_stats(&self, cpu_id: usize) -> JsValue {
         let (total, covered) = self.snes.coverage_stats(cpu_id);
@@ -1028,7 +1145,7 @@ impl RetroEmulator {
             "coveredBytes": covered,
             "percent": percent,
         });
-        serde_wasm_bindgen::to_value(&obj).unwrap()
+        map_as_object(&obj)
     }
 
     // ===== Tracing (65C816 primary CPU) =====
@@ -1259,21 +1376,18 @@ impl RetroEmulator {
         self.snes.ppu().bgmode() & 0x07
     }
 
-    /// `$2105` breakdown: `{ mode, bg3Priority, bgTileSize16[4] }`.
+    /// `$2105` breakdown: `{ mode, bg3Priority, bgTileSize16[4] }`, a plain
+    /// object. The PPU keeps the mode and the two flags in fields of their
+    /// own, so the flags are read from those, not from the mode.
     #[wasm_bindgen(js_name = getPpuModeBreakdown)]
     pub fn get_ppu_mode_breakdown(&self) -> JsValue {
-        let bgmode = self.snes.ppu().bgmode();
+        let settings = self.snes.ppu_settings();
         let obj = serde_json::json!({
-            "mode": bgmode & 0x07,
-            "bg3Priority": (bgmode & 0x08) != 0,
-            "bgTileSize16": [
-                (bgmode & 0x10) != 0,
-                (bgmode & 0x20) != 0,
-                (bgmode & 0x40) != 0,
-                (bgmode & 0x80) != 0,
-            ],
+            "mode": settings.bgmode & 0x07,
+            "bg3Priority": settings.bg3_priority,
+            "bgTileSize16": settings.bg_tile_size,
         });
-        serde_wasm_bindgen::to_value(&obj).unwrap()
+        map_as_object(&obj)
     }
 
     /// Live Mode 7 matrix as signed `[A, B, C, D, X, Y]`.
@@ -1403,9 +1517,13 @@ impl RetroEmulator {
     /// {2,4,8}`; the core owns only the per-depth bitplane decode while the
     /// platform reads the tilemap and applies palette + flip + transparency.
     ///
-    /// `source`: 0 = VRAM. `tileSize`: 0 = 8x8 (only 8x8 is decoded here;
-    /// 16x16 modes are resolved host-side). `pixels` is one palette index
-    /// per pixel, `count` tiles stacked vertically.
+    /// `source`: 0 = VRAM characters from `baseAddr` (a byte address), 1 =
+    /// the Mode 7 characters (8bpp, 8x8; `baseAddr` 0 for the plane's own,
+    /// at word 0). `tileSize`: 0 = 8x8; 1 = the 16x16 block a 16x16
+    /// background tile names (`firstTile` the tile number, the block its
+    /// characters N, N+1, N+16 and N+17 from the character base
+    /// `baseAddr`, as the renderer reads them). `pixels` is one palette
+    /// index per pixel, `count` tiles stacked vertically, `width` 8 or 16.
     #[wasm_bindgen(js_name = decodeTiles)]
     pub fn decode_tiles(
         &mut self,
@@ -1419,6 +1537,7 @@ impl RetroEmulator {
         use retro_core::video::{TileDecodeRequest, TileSize, TileSource};
         let source = match source {
             0 => TileSource::Vram,
+            1 => TileSource::Mode7,
             _ => return JsValue::NULL,
         };
         let tile_size = match tile_size {
@@ -1495,7 +1614,8 @@ impl RetroEmulator {
     }
 
     /// Cartridge manifest: `{ memoryMap, romRegions, sramRegions,
-    /// mapperState }` derived from the installed map plan.
+    /// mapperState }` derived from the installed map plan, plain objects
+    /// all the way down.
     #[wasm_bindgen(js_name = getCartridgeManifest)]
     pub fn get_cartridge_manifest(&mut self) -> JsValue {
         let dbg = self.snes.cartridge_debugger();
@@ -1505,7 +1625,7 @@ impl RetroEmulator {
             "sramRegions": dbg.get_sram_regions(),
             "mapperState": dbg.get_mapper_state(),
         });
-        serde_wasm_bindgen::to_value(&manifest).unwrap()
+        map_as_object(&manifest)
     }
 
     /// Detect the editable `cartridge-manifest-v1` for an arbitrary ROM
@@ -2098,6 +2218,169 @@ mod tests {
             &emu.get_framebuffer_data().to_vec()[..4],
             &[0xFF, 0x00, 0x00, 0xFF]
         );
+    }
+
+    /// A property of a JS object.
+    fn property(object: &JsValue, key: &str) -> JsValue {
+        js_sys::Reflect::get(object, &JsValue::from_str(key)).unwrap()
+    }
+
+    /// A reader's result reaches the app as a plain object: not a `Map`,
+    /// whose entries a property read does not see, and `key` one of its
+    /// properties.
+    fn assert_plain_object(value: &JsValue, key: &str) {
+        assert!(value.is_object(), "an object, holding {key}");
+        assert!(
+            !value.is_instance_of::<js_sys::Map>(),
+            "not a Map, holding {key}"
+        );
+        assert!(
+            js_sys::Reflect::has(value, &JsValue::from_str(key)).unwrap(),
+            "{key} is a property"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_coverage_stats_are_a_plain_object() {
+        let emu = RetroEmulator::new("snes").unwrap();
+        let stats = emu.get_coverage_stats(0);
+        assert_plain_object(&stats, "totalBytes");
+        assert_eq!(
+            property(&stats, "totalBytes").as_f64(),
+            Some(f64::from(0x0100_0000))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_mode_breakdown_is_a_plain_object() {
+        let emu = RetroEmulator::new("snes").unwrap();
+        assert_plain_object(&emu.get_ppu_mode_breakdown(), "mode");
+    }
+
+    #[wasm_bindgen_test]
+    fn the_cartridge_manifest_is_plain_objects_all_the_way_down() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("MANIFEST")).unwrap();
+        let manifest = emu.get_cartridge_manifest();
+        assert_plain_object(&manifest, "memoryMap");
+        assert_plain_object(&property(&manifest, "memoryMap"), "regions");
+        assert_plain_object(&property(&manifest, "mapperState"), "mapper_id");
+        assert!(js_sys::Array::is_array(&property(&manifest, "romRegions")));
+    }
+
+    #[wasm_bindgen_test]
+    fn the_ppu_settings_are_a_plain_object() {
+        let emu = RetroEmulator::new("snes").unwrap();
+        let settings = emu.get_ppu_settings();
+        assert_plain_object(&settings, "obj_base_size");
+        assert_plain_object(&property(&settings, "sprite_tiles"), "small_width");
+    }
+
+    #[wasm_bindgen_test]
+    fn the_frame_snapshot_is_a_plain_object() {
+        let emu = RetroEmulator::new("snes").unwrap();
+        let snapshot = emu.capture_frame_snapshot();
+        assert_plain_object(&snapshot, "framebuffer");
+        assert_plain_object(&property(&snapshot, "ppuSettings"), "bgmode");
+        let registers = js_sys::Array::from(&property(&snapshot, "registers"));
+        assert_plain_object(&registers.get(0), "name");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_capture_boundary_snapshot_carries_copies_under_its_names() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("CAPTURE")).unwrap();
+        assert!(!emu.at_capture_boundary());
+        emu.run_to_capture_boundary();
+        assert!(emu.at_capture_boundary());
+        assert_eq!(
+            emu.get_frame_number(),
+            0,
+            "the held frame is not counted yet"
+        );
+
+        let snapshot = emu.capture_frame_snapshot();
+        assert_eq!(property(&snapshot, "frame").as_f64(), Some(1.0));
+        assert_eq!(property(&snapshot, "atBoundary").as_bool(), Some(true));
+        let width = property(&snapshot, "width").as_f64().unwrap() as u32;
+        let height = property(&snapshot, "height").as_f64().unwrap() as u32;
+        assert_eq!((width, height), (256, 224));
+        let bytes =
+            |key: &str| -> js_sys::Uint8Array { property(&snapshot, key).dyn_into().unwrap() };
+        assert_eq!(bytes("framebuffer").length(), width * height * 4);
+        assert_eq!(bytes("vram").length(), 0x10000);
+        assert_eq!(bytes("oam").length(), 0x220);
+        let palette: js_sys::Uint16Array = property(&snapshot, "palette").dyn_into().unwrap();
+        assert_eq!(palette.length(), 0x100);
+        assert!(js_sys::Array::is_array(&property(&snapshot, "registers")));
+        let settings = property(&snapshot, "ppuSettings");
+        assert_eq!(property(&settings, "bgmode").as_f64(), Some(0.0));
+        assert!(property(&settings, "sprite_tiles").is_object());
+
+        // A save finishes the held frame first.
+        emu.save_state();
+        assert!(!emu.at_capture_boundary());
+        assert_eq!(emu.get_frame_number(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_layer_render_keys_what_the_layer_does_not_cover() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // Display on over a red backdrop, and no layer drawn anywhere: the
+        // composite is red, every layer image empty.
+        emu.write_cgram(0, &[0x001F]);
+        emu.write_memory_debug(0x2100, &[0x0F]);
+        emu.repaint_frame();
+        let image = emu.render_layer(0);
+        assert_eq!(property(&image, "width").as_f64(), Some(256.0));
+        let data: js_sys::Uint8Array = property(&image, "data").dyn_into().unwrap();
+        assert!(data
+            .to_vec()
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .all(|&alpha| alpha == 0));
+        assert_eq!(
+            &emu.get_framebuffer_data().to_vec()[..4],
+            &[0xFF, 0x00, 0x00, 0xFF],
+            "the composite the host shows is left as it was"
+        );
+        assert!(emu.render_layer(5).is_null());
+    }
+
+    #[wasm_bindgen_test]
+    fn the_mode_breakdown_and_the_settings_read_the_flags_from_their_fields() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        // BGMODE: mode 1, BG3 lifted, 16x16 tiles on BG2 and BG4.
+        emu.write_memory_debug(0x2105, &[0b1010_1001]);
+        let breakdown = emu.get_ppu_mode_breakdown();
+        assert_eq!(property(&breakdown, "mode").as_f64(), Some(1.0));
+        assert_eq!(property(&breakdown, "bg3Priority").as_bool(), Some(true));
+        let sizes: Vec<Option<bool>> = js_sys::Array::from(&property(&breakdown, "bgTileSize16"))
+            .iter()
+            .map(|size| size.as_bool())
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![Some(false), Some(true), Some(false), Some(true)]
+        );
+        let settings = emu.get_ppu_settings();
+        assert_eq!(property(&settings, "bg3_priority").as_bool(), Some(true));
+    }
+
+    #[wasm_bindgen_test]
+    fn decode_tiles_takes_the_mode7_source_and_16x16_blocks() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        let mode7 = emu.decode_tiles(1, 0, 0, 256, 8, 0);
+        assert_eq!(property(&mode7, "width").as_f64(), Some(8.0));
+        assert_eq!(property(&mode7, "height").as_f64(), Some(2048.0));
+        assert!(
+            emu.decode_tiles(1, 0, 0, 1, 4, 0).is_null(),
+            "Mode 7 is 8bpp"
+        );
+        let blocks = emu.decode_tiles(0, 0, 0, 4, 4, 1);
+        assert_eq!(property(&blocks, "width").as_f64(), Some(16.0));
+        assert_eq!(property(&blocks, "height").as_f64(), Some(64.0));
     }
 
     #[wasm_bindgen_test]

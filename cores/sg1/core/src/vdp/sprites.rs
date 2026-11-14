@@ -167,7 +167,68 @@ impl Sprite {
     }
 }
 
+/// The sprites the VDP draws in a frame, in the order it takes them: the
+/// slot at the head of the table (slot 0) first, then the slot each one's
+/// link names. The walk stops after a link of 0, before a link that names a
+/// slot past the table (64 slots in the 32-cell mode, 80 in the 40-cell
+/// mode, given as `slots`), and after `slots` sprites, so a chain that loops
+/// back repeats its sprites up to that count, as the chip's own walk does.
+/// Each item is a slot and its sprite.
+///
+/// The renderer's sprite list, the sprite table the debugger shows and the
+/// paint order it reports all walk the chain through this, so the three
+/// never disagree on where it stops.
+pub fn link_chain(vram: &[u8], sat_base: u16, slots: u8) -> LinkChain<'_> {
+    LinkChain {
+        vram,
+        sat_base,
+        slots,
+        next: Some(0),
+        taken: 0,
+    }
+}
+
+/// The walk of the sprite table's link chain [`link_chain`] returns.
+pub struct LinkChain<'a> {
+    vram: &'a [u8],
+    sat_base: u16,
+    slots: u8,
+    /// The slot read next, or `None` once the walk has stopped.
+    next: Option<u8>,
+    /// Sprites the walk has given so far.
+    taken: u8,
+}
+
+impl Iterator for LinkChain<'_> {
+    type Item = (u8, Sprite);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let slot = self.next?;
+        // 80 is the most sprites a frame can hold, whatever `slots` says.
+        if self.taken >= self.slots || self.taken >= 80 {
+            self.next = None;
+            return None;
+        }
+        let Some(sprite) = Sprite::from_sat(self.vram, self.sat_base, slot) else {
+            self.next = None;
+            return None;
+        };
+        self.taken += 1;
+        // Stop on a null link or one that points past the valid SAT range.
+        // Without it a chain into the out-of-range indices renders phantom
+        // sprites past the per-frame limit (Genesis Plus GX stops its walk
+        // there too).
+        self.next = if sprite.link == 0 || sprite.link >= self.slots {
+            None
+        } else {
+            Some(sprite.link)
+        };
+        Some((slot, sprite))
+    }
+}
+
 /// Sprite cache for efficient rendering.
+#[derive(Clone)]
 pub struct SpriteCache {
     sprites: Vec<Sprite>,
 }
@@ -194,36 +255,11 @@ impl SpriteCache {
         self.sprites.is_empty()
     }
 
-    /// Build sprite cache from SAT, following link chain.
+    /// Build sprite cache from SAT, following link chain ([`link_chain`]).
     pub fn build(&mut self, vram: &[u8], sat_base: u16, max_sprites: u8) {
         self.sprites.clear();
-
-        let mut current = 0u8;
-        let mut count = 0;
-
-        loop {
-            if count >= max_sprites || count >= 80 {
-                break;
-            }
-
-            if let Some(sprite) = Sprite::from_sat(vram, sat_base, current) {
-                let link = sprite.link;
-                self.sprites.push(sprite);
-                count += 1;
-
-                // Stop on a null link or one that points past the valid SAT
-                // range (>= 64 entries in H32, >= 80 in H40). Without it a
-                // chain into the out-of-range indices renders phantom sprites
-                // past the per-frame limit (Genesis Plus GX stops its walk
-                // there too).
-                if link == 0 || link >= max_sprites {
-                    break;
-                }
-                current = link;
-            } else {
-                break;
-            }
-        }
+        self.sprites
+            .extend(link_chain(vram, sat_base, max_sprites).map(|(_, sprite)| sprite));
     }
 
     /// Get sprites overlapping a specific scanline (max 20).
@@ -623,5 +659,39 @@ mod tests {
 
         let sprites = cache.get_sprites_on_line(100);
         assert_eq!(sprites.len(), 20); // Hardware limit
+    }
+
+    /// Point the sprite table entry at `slot` (table at VRAM 0) to `link`.
+    fn link_slot(vram: &mut [u8], slot: usize, link: u8) {
+        vram[slot * 8 + 3] = link;
+    }
+
+    #[test]
+    fn the_link_chain_stops_before_a_slot_past_the_table() {
+        let mut vram = vec![0u8; 0x10000];
+        link_slot(&mut vram, 0, 5);
+        link_slot(&mut vram, 5, 70);
+        link_slot(&mut vram, 70, 0);
+
+        // 64 slots in the 32-cell mode: 70 is past the table, so the walk
+        // ends at slot 5, as the renderer's does.
+        let slots: Vec<u8> = link_chain(&vram, 0, 64).map(|(slot, _)| slot).collect();
+        assert_eq!(slots, [0, 5]);
+        let mut cache = SpriteCache::new();
+        cache.build(&vram, 0, 64);
+        assert_eq!(cache.len(), 2);
+
+        // 80 slots in the 40-cell mode reach it.
+        let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
+        assert_eq!(slots, [0, 5, 70]);
+    }
+
+    #[test]
+    fn a_chain_that_loops_back_stops_at_the_table_size() {
+        let mut vram = vec![0u8; 0x10000];
+        link_slot(&mut vram, 0, 1);
+        link_slot(&mut vram, 1, 1); // slot 1 links to itself
+        assert_eq!(link_chain(&vram, 0, 64).count(), 64);
+        assert_eq!(link_chain(&vram, 0, 80).count(), 80);
     }
 }

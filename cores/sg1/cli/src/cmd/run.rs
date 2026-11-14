@@ -24,7 +24,8 @@ pub struct RunArgs {
     /// Step exactly N 68000 instructions.
     #[arg(long, short)]
     pub instructions: Option<u64>,
-    /// Run a single frame and stop at VBlank.
+    /// Run the first frame to the start of its vertical blanking and stop
+    /// there, the picture drawn and the VBlank interrupt not yet raised.
     #[arg(long)]
     pub until_vblank: bool,
     /// Step until the 68000 reaches this 24-bit PC (hex, e.g. `000400`).
@@ -88,7 +89,11 @@ pub fn run(args: RunArgs) -> Result<()> {
         }
         finish_bar(pb);
     } else if args.until_vblank {
+        // The full debug loop runs nothing while the debugger is paused, as
+        // it is after a load.
+        emu.debugger().set_execution_mode(ExecutionMode::Running);
         emu.run_until_vblank();
+        println!("Stopped at the start of vertical blanking.");
     } else if let Some(target) = args.until_pc {
         emu.debugger().set_execution_mode(ExecutionMode::StepInto);
         let mut steps = 0u64;

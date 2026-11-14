@@ -35,7 +35,11 @@ fn load_state_refusal(error: LoadStateError) -> JsValue {
 /// The default `serde_wasm_bindgen` serializer emits a Rust `HashMap` as an ES
 /// `Map`, which a plain-object `x[key]` read on the JS side (e.g. the netplay
 /// input folder) silently reads as `undefined`. The mapping getters here are
-/// typed `Record<...>` on the JS side, so honour that contract.
+/// typed `Record<...>` on the JS side, so honour that contract. A
+/// `serde_json` object is a map to the serializer too: every reader that
+/// builds its result as one (the mapper, chip, memory-map, manifest,
+/// coverage and YM2612 readers) goes through here, or the app's viewers,
+/// which read plain objects, would find nothing in it.
 ///
 /// Object keys must be text: a map with number keys is refused by the
 /// serializer, so callers pass gamepad maps through
@@ -56,6 +60,21 @@ fn gamepad_map_from_js(value: JsValue) -> Option<std::collections::HashMap<u32, 
     }
     let map: std::collections::HashMap<String, u32> = serde_wasm_bindgen::from_value(value).ok()?;
     gamepad_map_from_text_keys(map)
+}
+
+/// A `Uint8Array` holding a copy of `bytes`, owned by JavaScript: not a
+/// view into this module's memory, which a later call can move or reuse.
+fn bytes_copy(bytes: &[u8]) -> JsValue {
+    let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+    array.copy_from(bytes);
+    array.into()
+}
+
+/// A `Uint16Array` holding a copy of `words` ([`bytes_copy`]).
+fn words_copy(words: &[u16]) -> JsValue {
+    let array = js_sys::Uint16Array::new_with_length(words.len() as u32);
+    array.copy_from(words);
+    array.into()
 }
 
 /// UI badge label for a Genesis mapper. retro-core's `MapperId` enumerates
@@ -204,10 +223,33 @@ impl RetroEmulator {
         }
     }
 
-    /// Run until VBLANK.
+    /// Run to the start of vertical blanking and stop there, on the full
+    /// debug loop: `runToCaptureBoundary` on that loop.
     #[wasm_bindgen(js_name = runUntilVBlank)]
     pub fn run_until_vblank(&mut self) {
         self.genesis.run_until_vblank();
+    }
+
+    /// Run to the next capture boundary and stop there: the frame's picture
+    /// is drawn and vertical blanking has not begun, so video memory and the
+    /// framebuffer belong to the same frame (`captureFrameSnapshot`,
+    /// `renderLayer`). Each call moves the game on one frame: a frame held
+    /// at its boundary is finished first. The loop is the one `runFrame`
+    /// picks, and a breakpoint still stops where it stops.
+    ///
+    /// The frame stays held until the next frame call (`runFrame`,
+    /// `runFrameHeadless`, `runUntilVBlank`), which runs the rest of it;
+    /// `saveState` finishes it before saving; a reset, `loadState` or
+    /// `loadRom` drops it.
+    #[wasm_bindgen(js_name = runToCaptureBoundary)]
+    pub fn run_to_capture_boundary(&mut self) {
+        self.genesis.run_to_capture_boundary();
+    }
+
+    /// Whether the core is held at a capture boundary.
+    #[wasm_bindgen(js_name = atCaptureBoundary)]
+    pub fn at_capture_boundary(&self) -> bool {
+        self.genesis.at_capture_boundary()
     }
 
     // ===== Netplay determinism primitives =====
@@ -333,7 +375,11 @@ impl RetroEmulator {
         self.genesis.get_framebuffer().data.len() as u32
     }
 
-    /// Get display info.
+    /// Display info: the size of the picture `getFramebuffer` holds,
+    /// `width` 256 or 320 from the mode and `height` the lines the VDP
+    /// draws into its framebuffer, which holds 224 (in the 30-cell mode too,
+    /// whose last 16 lines it does not draw). It follows the framebuffer,
+    /// refreshed with it each frame shown.
     #[wasm_bindgen(js_name = getDisplayInfo)]
     pub fn get_display_info(&self) -> JsValue {
         serde_wasm_bindgen::to_value(self.genesis.get_display_info()).unwrap()
@@ -505,10 +551,12 @@ impl RetroEmulator {
         self.genesis.set_input(player, InputState { buttons });
     }
 
-    /// Save emulator state.
+    /// Save emulator state, where a frame ends: a frame held at a capture
+    /// boundary or an event breakpoint is finished first, on the loop a
+    /// player runs.
     #[wasm_bindgen(js_name = saveState)]
-    pub fn save_state(&self) -> Vec<u8> {
-        self.genesis.save_state()
+    pub fn save_state(&mut self) -> Vec<u8> {
+        self.genesis.finish_frame_and_save_state()
     }
 
     /// Load emulator state. A savestate made on another ROM is refused
@@ -591,8 +639,7 @@ impl RetroEmulator {
     pub fn get_mapper_state(&mut self) -> Result<JsValue, JsValue> {
         use retro_core::cartridge::CartridgeDebugger;
         let state = self.genesis.cartridge_debugger().get_mapper_state();
-        serde_wasm_bindgen::to_value(&mapper_state_json(state))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        Ok(map_as_object(&mapper_state_json(state)))
     }
 
     /// Get the primary coprocessor's live debug snapshot (`chip_type`,
@@ -601,9 +648,7 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = getChipState)]
     pub fn get_chip_state(&self) -> Result<JsValue, JsValue> {
         match self.genesis.coprocessor_debug_state() {
-            Some(state) => {
-                serde_wasm_bindgen::to_value(&state).map_err(|e| JsValue::from_str(&e.to_string()))
-            }
+            Some(state) => Ok(map_as_object(&state)),
             None => Ok(JsValue::NULL),
         }
     }
@@ -628,7 +673,7 @@ impl RetroEmulator {
                 })
             })
             .collect();
-        serde_wasm_bindgen::to_value(&rows).map_err(|e| JsValue::from_str(&e.to_string()))
+        Ok(map_as_object(&rows))
     }
 
     /// Get memory map visualization data, the installed cartridge's
@@ -638,7 +683,7 @@ impl RetroEmulator {
     pub fn get_memory_map(&self) -> Result<JsValue, JsValue> {
         let regions = self.genesis.cartridge_map_regions();
         let map = serde_json::json!({ "regions": regions });
-        serde_wasm_bindgen::to_value(&map).map_err(|e| JsValue::from_str(&e.to_string()))
+        Ok(map_as_object(&map))
     }
 
     // ===== Cartridge manifest =====
@@ -668,7 +713,7 @@ impl RetroEmulator {
             "sramRegions": sram_regions,
             "mapperState": mapper_state_json(mapper_state),
         });
-        serde_wasm_bindgen::to_value(&manifest).unwrap()
+        map_as_object(&manifest)
     }
 
     /// Detect the editable `cartridge-manifest-v1` for arbitrary ROM bytes,
@@ -971,7 +1016,7 @@ impl RetroEmulator {
             "coveredBytes": covered,
             "percent": percent,
         });
-        serde_wasm_bindgen::to_value(&obj).unwrap()
+        map_as_object(&obj)
     }
 
     /// Wipe every bit of the requested CPU's coverage bitmap. The
@@ -1280,16 +1325,17 @@ impl RetroEmulator {
     /// Get the parsed Sprite Attribute Table (SAT).
     ///
     /// Walks the linked sprite list starting at index 0, following each
-    /// entry's `link` field. Returns at most 80 entries (the hardware
-    /// cap on sprites per frame). The SAT base address is derived from
-    /// VDP register 5 with the H40-aware mask used by `rebuild_sprite_cache`.
+    /// entry's `link` field, and stops where the renderer stops: after a
+    /// link of 0, before a link past the table (64 entries in the 32-cell
+    /// mode, 80 in the 40-cell mode), and after that many entries. The SAT
+    /// base address is derived from VDP register 5 with the H40-aware mask
+    /// used by `rebuild_sprite_cache`.
     ///
     /// This is read-only / debug-only, it does not touch the live
     /// sprite cache or any rendering buffers.
     #[wasm_bindgen(js_name = getSpriteAttrTable)]
     pub fn get_sprite_attr_table(&self) -> JsValue {
         use serde::Serialize;
-        use sg1_core::vdp::sprites::Sprite;
 
         #[derive(Serialize)]
         struct SpriteAttr {
@@ -1306,48 +1352,25 @@ impl RetroEmulator {
             link: u8,
         }
 
-        let vdp = self.genesis.vdp();
-        let regs = vdp.registers();
-        let vram = vdp.get_vram();
-
-        let reg5 = regs[5];
-        let is_h40 = (regs[12] & 0x01) != 0;
-        let sat_addr = if is_h40 {
-            ((reg5 & 0x7E) as u16) << 9
-        } else {
-            ((reg5 & 0x7F) as u16) << 9
-        };
-
-        let mut sprites: Vec<SpriteAttr> = Vec::with_capacity(80);
-        let mut current: u8 = 0;
-        let mut count: usize = 0;
-
-        while count < 80 {
-            match Sprite::from_sat(vram, sat_addr, current) {
-                Some(s) => {
-                    let link = s.link;
-                    sprites.push(SpriteAttr {
-                        index: current,
-                        x: s.x,
-                        y: s.y,
-                        h_tiles: s.width_tiles,
-                        v_tiles: s.height_tiles,
-                        tile: s.pattern_base,
-                        palette: s.palette,
-                        priority: s.priority,
-                        h_flip: s.flip_h,
-                        v_flip: s.flip_v,
-                        link,
-                    });
-                    count += 1;
-                    if link == 0 {
-                        break;
-                    }
-                    current = link;
-                }
-                None => break,
-            }
-        }
+        let sprites: Vec<SpriteAttr> = self
+            .genesis
+            .vdp()
+            .sprite_table_chain()
+            .into_iter()
+            .map(|(index, s)| SpriteAttr {
+                index,
+                x: s.x,
+                y: s.y,
+                h_tiles: s.width_tiles,
+                v_tiles: s.height_tiles,
+                tile: s.pattern_base,
+                palette: s.palette,
+                priority: s.priority,
+                h_flip: s.flip_h,
+                v_flip: s.flip_v,
+                link: s.link,
+            })
+            .collect();
 
         serde_wasm_bindgen::to_value(&sprites).unwrap()
     }
@@ -1533,6 +1556,65 @@ impl RetroEmulator {
         self.genesis.repaint_held_frame();
     }
 
+    /// The frame as it stands, as copies: `{ frame, atBoundary, width,
+    /// height, framebuffer, vram, palette, vsram, registers }`. `frame` is
+    /// the frames finished so far (a held frame counts once it finishes);
+    /// `framebuffer` the picture shown, RGBA, `width * height * 4` bytes, as
+    /// `getDisplayInfo` sizes it; `vram` as `getVram` returns it; `palette`
+    /// CRAM's 64 words as `getCram` returns them; `vsram` as `getVsram`
+    /// does; `registers` as `getVdpRegisters` does. At a capture boundary
+    /// (`atBoundary`) the picture and the memory belong to the same frame.
+    /// Every array is the caller's own, never a view into this module's
+    /// memory.
+    #[wasm_bindgen(js_name = captureFrameSnapshot)]
+    pub fn capture_frame_snapshot(&self) -> JsValue {
+        let snapshot = self.genesis.capture_frame_snapshot();
+        let obj = js_sys::Object::new();
+        let set = |key: &str, value: &JsValue| {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
+        };
+        set("frame", &JsValue::from_f64(snapshot.frame as f64));
+        set("atBoundary", &JsValue::from_bool(snapshot.at_boundary));
+        set("width", &JsValue::from_f64(f64::from(snapshot.width)));
+        set("height", &JsValue::from_f64(f64::from(snapshot.height)));
+        set("framebuffer", &bytes_copy(&snapshot.framebuffer));
+        set("vram", &bytes_copy(&snapshot.vram));
+        set("palette", &words_copy(&snapshot.palette));
+        set("vsram", &words_copy(&snapshot.vsram));
+        set("registers", &map_as_object(&snapshot.registers));
+        obj.into()
+    }
+
+    /// One layer of the frame drawn alone from video memory as it is now
+    /// (at a capture boundary, the frame held there): `{ width, height,
+    /// data: Uint8Array }`, RGBA, with alpha 0 wherever the layer does not
+    /// cover the pixel; `null` for a layer id that is none of
+    /// `getLayerInfo`'s. Colours are the layer's palette colours, before
+    /// shadow and highlight. Nothing runs, the framebuffer `getFramebuffer`
+    /// gives stays as it was, and so does everything a savestate holds.
+    #[wasm_bindgen(js_name = renderLayer)]
+    pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
+        match self.genesis.render_layer(layer_id) {
+            Some(img) => {
+                let obj = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("width"),
+                    &JsValue::from_f64(f64::from(img.width)),
+                );
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("height"),
+                    &JsValue::from_f64(f64::from(img.height)),
+                );
+                let _ =
+                    js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &bytes_copy(&img.rgba));
+                obj.into()
+            }
+            None => JsValue::NULL,
+        }
+    }
+
     // ===== YM2612 Audio Debugger Methods =====
 
     /// Get YM2612 channel count (always 6).
@@ -1559,25 +1641,25 @@ impl RetroEmulator {
     /// Get YM2612 LFO state.
     #[wasm_bindgen(js_name = getYm2612LfoState)]
     pub fn get_ym2612_lfo_state(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.genesis.get_ym2612_lfo_state()).unwrap()
+        map_as_object(&self.genesis.get_ym2612_lfo_state())
     }
 
     /// Get YM2612 DAC state.
     #[wasm_bindgen(js_name = getYm2612DacState)]
     pub fn get_ym2612_dac_state(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.genesis.get_ym2612_dac_state()).unwrap()
+        map_as_object(&self.genesis.get_ym2612_dac_state())
     }
 
     /// Get YM2612 Timer A state.
     #[wasm_bindgen(js_name = getYm2612TimerAState)]
     pub fn get_ym2612_timer_a_state(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.genesis.get_ym2612_timer_a_state()).unwrap()
+        map_as_object(&self.genesis.get_ym2612_timer_a_state())
     }
 
     /// Get YM2612 Timer B state.
     #[wasm_bindgen(js_name = getYm2612TimerBState)]
     pub fn get_ym2612_timer_b_state(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.genesis.get_ym2612_timer_b_state()).unwrap()
+        map_as_object(&self.genesis.get_ym2612_timer_b_state())
     }
 
     // ========================================================================
@@ -2125,6 +2207,241 @@ mod tests {
         assert_eq!(emu.get_port_state(1), 1 << 6);
         let providers = emu.get_port_providers(1);
         assert_eq!(js_sys::Array::from(&providers).length(), 1);
+    }
+
+    /// Assert `value` is a plain object, not a `Map`, holding every key of
+    /// `keys`: what the app's readers find with `value[key]`.
+    fn assert_plain_object(value: &JsValue, keys: &[&str], reader: &str) {
+        assert!(value.is_object(), "{reader}: an object");
+        assert!(
+            !value.is_instance_of::<js_sys::Map>(),
+            "{reader}: a plain object, not a Map"
+        );
+        for key in keys {
+            let field = js_sys::Reflect::get(value, &JsValue::from_str(key)).unwrap();
+            assert!(!field.is_undefined(), "{reader}: `{key}` is there");
+        }
+    }
+
+    /// An emulator with a plain cartridge loaded.
+    fn with_plain_cartridge() -> RetroEmulator {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&synth_genesis_rom("PLAIN GAME")).unwrap();
+        emu
+    }
+
+    /// An emulator with an SVP cartridge loaded (the `SV` header tag).
+    fn with_svp_cartridge() -> RetroEmulator {
+        let mut rom = synth_genesis_rom("SVP GAME");
+        rom[0x1C8..0x1CA].copy_from_slice(b"SV");
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&rom).unwrap();
+        emu
+    }
+
+    #[wasm_bindgen_test]
+    fn get_mapper_state_is_a_plain_object() {
+        let mut emu = with_plain_cartridge();
+        let state = emu.get_mapper_state().unwrap();
+        assert_plain_object(
+            &state,
+            &["mapper_type", "registers", "banks"],
+            "getMapperState",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_chip_state_is_a_plain_object() {
+        let emu = with_svp_cartridge();
+        let state = emu.get_chip_state().unwrap();
+        assert_plain_object(
+            &state,
+            &["chip_type", "registers", "cycle_count"],
+            "getChipState",
+        );
+        let registers = js_sys::Array::from(
+            &js_sys::Reflect::get(&state, &JsValue::from_str("registers")).unwrap(),
+        );
+        assert!(registers.length() > 0);
+        assert_plain_object(
+            &registers.get(0),
+            &["address", "name", "value"],
+            "getChipState register",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_chip_states_holds_plain_objects() {
+        let emu = with_svp_cartridge();
+        let rows = js_sys::Array::from(&emu.get_chip_states().unwrap());
+        assert_eq!(rows.length(), 1);
+        let row = rows.get(0);
+        assert_plain_object(&row, &["chipId", "label", "state"], "getChipStates");
+        let state = js_sys::Reflect::get(&row, &JsValue::from_str("state")).unwrap();
+        assert_plain_object(&state, &["chip_type"], "getChipStates state");
+    }
+
+    #[wasm_bindgen_test]
+    fn get_memory_map_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        let map = emu.get_memory_map().unwrap();
+        assert_plain_object(&map, &["regions"], "getMemoryMap");
+        let regions = js_sys::Array::from(
+            &js_sys::Reflect::get(&map, &JsValue::from_str("regions")).unwrap(),
+        );
+        assert!(regions.length() > 0);
+        assert_plain_object(
+            &regions.get(0),
+            &["label", "start", "end", "detail"],
+            "getMemoryMap region",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_cartridge_manifest_is_a_plain_object() {
+        let mut emu = with_plain_cartridge();
+        let manifest = emu.get_cartridge_manifest();
+        assert_plain_object(
+            &manifest,
+            &["memoryMap", "romRegions", "sramRegions", "mapperState"],
+            "getCartridgeManifest",
+        );
+        let mapper = js_sys::Reflect::get(&manifest, &JsValue::from_str("mapperState")).unwrap();
+        assert_plain_object(
+            &mapper,
+            &["mapper_type"],
+            "getCartridgeManifest mapperState",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_coverage_stats_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        assert_plain_object(
+            &emu.get_coverage_stats(0),
+            &["totalBytes", "coveredBytes", "percent"],
+            "getCoverageStats",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_ym2612_lfo_state_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        assert_plain_object(
+            &emu.get_ym2612_lfo_state(),
+            &["enabled", "frequency"],
+            "getYm2612LfoState",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_ym2612_dac_state_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        assert_plain_object(
+            &emu.get_ym2612_dac_state(),
+            &["enabled"],
+            "getYm2612DacState",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_ym2612_timer_a_state_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        assert_plain_object(
+            &emu.get_ym2612_timer_a_state(),
+            &["running", "period", "overflowed"],
+            "getYm2612TimerAState",
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn get_ym2612_timer_b_state_is_a_plain_object() {
+        let emu = with_plain_cartridge();
+        assert_plain_object(
+            &emu.get_ym2612_timer_b_state(),
+            &["running", "period", "overflowed"],
+            "getYm2612TimerBState",
+        );
+    }
+
+    /// A ROM whose 68000 loops at $400 with no interrupt on.
+    fn looping_rom() -> Vec<u8> {
+        let mut rom = synth_genesis_rom("LOOPING");
+        rom[0x400..0x402].copy_from_slice(&[0x60, 0xFE]); // BRA *
+        rom
+    }
+
+    #[wasm_bindgen_test]
+    fn a_frame_held_at_its_capture_boundary_is_read_drawn_and_saved() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+        assert!(emu.at_capture_boundary());
+        let frame = emu.get_frame_number();
+
+        let snapshot = emu.capture_frame_snapshot();
+        assert_plain_object(
+            &snapshot,
+            &[
+                "frame",
+                "atBoundary",
+                "width",
+                "height",
+                "framebuffer",
+                "vram",
+                "palette",
+                "vsram",
+                "registers",
+            ],
+            "captureFrameSnapshot",
+        );
+        let get = |key: &str| js_sys::Reflect::get(&snapshot, &JsValue::from_str(key)).unwrap();
+        // The held frame is counted once it ends: the picture is the next one.
+        assert_eq!(get("frame").as_f64(), Some((frame + 1) as f64));
+        assert_eq!(get("atBoundary").as_bool(), Some(true));
+        assert_eq!(get("width").as_f64(), Some(320.0));
+        assert_eq!(get("height").as_f64(), Some(224.0));
+        for (key, length) in [("framebuffer", 320 * 224 * 4), ("vram", 0x10000)] {
+            let bytes: js_sys::Uint8Array = get(key).dyn_into().expect(key);
+            assert_eq!(bytes.length(), length, "{key}");
+        }
+        for key in ["palette", "vsram"] {
+            let words: js_sys::Uint16Array = get(key).dyn_into().expect(key);
+            assert_eq!(words.length(), 64, "{key}");
+        }
+        assert_eq!(js_sys::Array::from(&get("registers")).length(), 24);
+        // Copies, not views into this module's memory.
+        let vram: js_sys::Uint8Array = get("vram").dyn_into().unwrap();
+        let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().dyn_into().unwrap();
+        assert!(!js_sys::Object::is(&vram.buffer(), &memory.buffer()));
+
+        let layer = emu.render_layer(0);
+        let data: js_sys::Uint8Array = js_sys::Reflect::get(&layer, &JsValue::from_str("data"))
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(data.length(), 320 * 224 * 4);
+        assert!(emu.render_layer(7).is_null());
+        assert!(emu.at_capture_boundary(), "drawing a layer runs nothing");
+
+        // A save finishes the held frame first.
+        assert!(!emu.save_state().is_empty());
+        assert!(!emu.at_capture_boundary());
+        assert_eq!(emu.get_frame_number(), frame + 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_sprite_table_stops_where_the_renderer_stops() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        // 40 cells and the table at 0, the VDP's state after a reset: slot 0
+        // links to slot 100, past the table's 80 slots.
+        emu.write_vram(3, &[100]);
+        assert_eq!(
+            js_sys::Array::from(&emu.get_sprite_attr_table()).length(),
+            1
+        );
     }
 
     #[wasm_bindgen_test]

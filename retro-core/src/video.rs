@@ -157,6 +157,12 @@ pub struct IndexedImage {
 pub enum TileSource {
     /// A contiguous run of tiles addressed directly in VRAM.
     Vram,
+    /// The SNES Mode 7 characters: 8bpp 8x8 tiles that share VRAM with
+    /// the Mode 7 tilemap, one pixel in the high byte of each 16-bit word,
+    /// 64 words a character, character 0 at word 0. `base_addr` is the
+    /// byte address of character 0 and `first_tile` + `count` pick the
+    /// characters; the request is 8bpp and 8x8.
+    Mode7,
 }
 
 /// Tile dimensions for a decode request.
@@ -174,7 +180,10 @@ pub enum TileSize {
 /// `base_addr + tile_index * tile_byte_size`); `bpp` and `tile_size`
 /// describe the pixel layout. The fields the Genesis path does not vary
 /// (`source` beyond `Vram`, non-`Px8` sizes, non-4 `bpp`) exist so the
-/// request shape stays stable for the consoles that need them.
+/// request shape stays stable for the consoles that need them. A `Px16`
+/// tile is the block a 16x16 background tile names, which the core lays
+/// out the way its renderer reads such a tile; `width` and the height of
+/// each tile in the result are then 16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileDecodeRequest {
     pub source: TileSource,

@@ -7,7 +7,7 @@
 //! crops the active rectangle out of the wider buffer using the full
 //! `fb.width` row stride, see [`crop_framebuffer_rgb`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -38,6 +38,14 @@ pub struct ScreenshotArgs {
     /// `--show-only`), keeping the rest. E.g. `--hide 0` drops BG1.
     #[arg(long)]
     pub hide: Option<String>,
+    /// Also write each layer alone beside the screenshot (`<stem>_bg1`
+    /// to `<stem>_bg4` and `<stem>_obj`), RGBA PNGs in which every pixel
+    /// the layer does not cover is transparent. All of them come from the
+    /// screenshot's own frame: the last frame stops at its capture
+    /// boundary, where video memory still holds what its picture was
+    /// drawn from, and each layer is drawn again from there.
+    #[arg(long, conflicts_with_all = ["show_only", "hide"])]
+    pub render_layers: bool,
     /// Mash these player-1 buttons (comma-separated:
     /// `start,select,a,b,x,y,l,r,up,down,left,right`) during the run.
     /// The buttons are pulsed on/off every few frames so title and menu
@@ -127,7 +135,14 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
                 },
             );
         }
-        emu.run_frame();
+        // The layers come from the screenshot's frame, held at its capture
+        // boundary: its picture is the one the whole frame leaves, and its
+        // video memory has not taken the next frame's uploads yet.
+        if args.render_layers && i + 1 == args.frames {
+            emu.run_to_capture_boundary();
+        } else {
+            emu.run_frame();
+        }
         if let Some(pb) = &pb {
             pb.inc(1);
         }
@@ -196,6 +211,41 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
         args.output.display(),
         args.frames
     );
+
+    if args.render_layers {
+        save_layer_images(&mut emu, &args.output)?;
+    }
+    Ok(())
+}
+
+/// Write each layer of the held frame alone, alpha-keyed, beside
+/// `output_path`: `<stem>_bg1` to `<stem>_bg4` and `<stem>_obj`.
+fn save_layer_images(emu: &mut SnesEmulator, output_path: &Path) -> Result<()> {
+    let stem = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "screenshot".to_string());
+    let ext = output_path
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "png".to_string());
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    for (layer, suffix) in ["bg1", "bg2", "bg3", "bg4", "obj"].into_iter().enumerate() {
+        let image = emu
+            .render_layer(layer as u32)
+            .map_err(|e| anyhow::anyhow!("failed to render layer {suffix}: {e}"))?;
+        let (width, height) = (image.width, image.height);
+        let png = image::RgbaImage::from_raw(width, height, image.rgba).ok_or_else(|| {
+            anyhow::anyhow!("failed to build a {width}x{height} image for layer {suffix}")
+        })?;
+        let path = parent.join(format!("{stem}_{suffix}.{ext}"));
+        png.save(&path)
+            .with_context(|| format!("failed to save layer {suffix}: {}", path.display()))?;
+        println!(
+            "Saved {width}x{height} layer {suffix} to {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
