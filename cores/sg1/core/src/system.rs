@@ -12,6 +12,7 @@ use crate::io::devices::genesis_3button::Genesis3ButtonDevice;
 use crate::io::devices::genesis_6button::Genesis6ButtonDevice;
 use crate::timing::VideoRegion;
 use crate::vdp::dma::MemoryDma;
+use crate::vdp::{CaptureRecording, LayerImage, LinePalettes};
 use crate::z80::Z80;
 use retro_core::cpu::Addressable;
 
@@ -335,6 +336,11 @@ pub struct GenesisEmulator {
     /// starting a frame. Never part of a savestate; a reset, a savestate
     /// load and a ROM load drop it.
     held_frame: Option<HeldFrame>,
+
+    /// What the host asked the video chip to record while frames run, for a
+    /// capture ([`Self::set_capture_recording`]). A host setting, never
+    /// serialized, applied again whenever the video chip is replaced.
+    capture_recording: CaptureRecording,
 }
 
 impl GenesisEmulator {
@@ -694,6 +700,7 @@ impl GenesisEmulator {
             instruction_access_logging: false,
             instruction_access_log: InstructionAccessLog::default(),
             held_frame: None,
+            capture_recording: CaptureRecording::default(),
         }
     }
 
@@ -864,9 +871,55 @@ impl GenesisEmulator {
     /// new pixels land in the VDP's own framebuffer, not the cache the host
     /// reads, so this re-syncs the cache too. Mirrors the per-frame cache
     /// refresh the `run_frame*` paths already perform.
-    pub fn repaint_held_frame(&mut self) {
-        self.bus.vdp_mut().rerender_current_frame();
+    ///
+    /// Returns whether every line was drawn from the state it was drawn
+    /// with, from the line table ([`Self::set_capture_recording`]).
+    pub fn repaint_held_frame(&mut self) -> bool {
+        let from_line_states = self.bus.vdp_mut().rerender_current_frame();
         self.update_cached_framebuffer();
+        from_line_states
+    }
+
+    /// Ask the video chip to record what the host wants of each frame while
+    /// frames run ([`CaptureRecording`]): this core records the line states,
+    /// the settings each line of the picture was drawn with, with which a
+    /// repaint, a layer and [`Self::picture_from_line_states`] draw each line
+    /// as it was drawn. A host setting: never part of a savestate, kept
+    /// across a reset, a ROM load, a savestate load and a power cycle, and
+    /// nothing the machine does depends on it. Recording only reads; the
+    /// state hash, the picture and the sound are the same either way.
+    pub fn set_capture_recording(&mut self, wanted: CaptureRecording) {
+        self.capture_recording = wanted;
+        self.bus.vdp_mut().set_capture_recording(wanted);
+    }
+
+    /// What the video chip records while frames run: what the host asked
+    /// for that this core records.
+    pub fn capture_recording(&self) -> CaptureRecording {
+        self.bus.vdp().capture_recording()
+    }
+
+    /// The settings each line of the picture was drawn with, as a table
+    /// ([`retro_core::video::LineStateTable`]); `None` while line states are
+    /// not recorded.
+    pub fn line_states(&self) -> Option<retro_core::video::LineStateTable> {
+        retro_core::video::VideoDebugger::get_line_states(self.bus.vdp())
+    }
+
+    /// The palettes the lines of the picture began with, and the palette
+    /// writes made while each was on screen ([`LinePalettes`]); `None`
+    /// while line states are not recorded.
+    pub fn line_palettes(&self) -> Option<LinePalettes> {
+        self.bus.vdp().line_palettes()
+    }
+
+    /// The picture drawn again from the line table into a buffer of its
+    /// own, cut as the host's picture is
+    /// ([`crate::vdp::Vdp::picture_from_line_states`]); `None` while line
+    /// states are not recorded. Nothing runs, and the framebuffer and
+    /// everything a savestate holds stay as they were.
+    pub fn picture_from_line_states(&mut self) -> Option<retro_core::video::PixelImage> {
+        self.bus.vdp_mut().picture_from_line_states()
     }
 
     /// Run to the next capture boundary and stop there: the moment the
@@ -982,13 +1035,16 @@ impl GenesisEmulator {
         (width, height, picture)
     }
 
-    /// One layer of the frame drawn alone, alpha-keyed, from video memory
-    /// as it is now ([`crate::vdp::Vdp::render_layer_image`]); at a capture
-    /// boundary, the frame held there. `layer` is an id of the layer list
-    /// (`getLayerInfo`, `toggleLayer`), `None` for any other. Nothing runs:
-    /// the framebuffer the host reads, and everything a savestate or
-    /// [`Self::state_hash`] reads, stay as they were.
-    pub fn render_layer(&mut self, layer: u32) -> Option<retro_core::video::PixelImage> {
+    /// One layer of the frame drawn alone, alpha-keyed
+    /// ([`crate::vdp::Vdp::render_layer_image`]); at a capture boundary,
+    /// the frame held there. Each line is drawn from the state it was drawn
+    /// with where the line table holds it, from video memory as it is now
+    /// otherwise; [`LayerImage::from_line_states`] says whether every line
+    /// had its record. `layer` is an id of the layer list (`getLayerInfo`,
+    /// `toggleLayer`), `None` for any other. Nothing runs: the framebuffer
+    /// the host reads, and everything a savestate or [`Self::state_hash`]
+    /// reads, stay as they were.
+    pub fn render_layer(&mut self, layer: u32) -> Option<LayerImage> {
         self.bus.vdp_mut().render_layer_image(layer as usize)
     }
 
@@ -1385,8 +1441,11 @@ impl GenesisEmulator {
         let rom = std::mem::take(&mut self.last_rom);
         let manifest = self.cartridge_manifest_override.take();
         let region = self.region;
+        let capture_recording = self.capture_recording;
 
         *self = GenesisEmulator::new();
+        // What a capture records is the host's setting, not the machine's.
+        self.set_capture_recording(capture_recording);
         // Must precede `load_rom`, which reads it to build the cartridge.
         self.cartridge_manifest_override = manifest;
         if !rom.is_empty() {
@@ -1438,6 +1497,10 @@ impl GenesisEmulator {
         // is constructed at its NTSC default, so re-apply the system region to
         // keep its scanline timing in lockstep (a no-op on NTSC).
         self.set_region(self.region);
+        // The new VDP records what the host asked the old one to.
+        self.bus
+            .vdp_mut()
+            .set_capture_recording(self.capture_recording);
 
         // Host-visible presentation state derived from the old machine.
         self.cached_framebuffer = Framebuffer::new(320, 224);
@@ -2620,6 +2683,7 @@ impl GenesisEmulator {
             self.step_master_clocks_accumulated +=
                 (irq_cycles as u64) * (self.region.cpu_divider() as u64);
         }
+        let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
         if self.cpu.stopped {
             let idle_cycles = 4u32;
@@ -2729,8 +2793,29 @@ impl GenesisEmulator {
 
         StepResult {
             cycles: total_cycles,
-            breakpoint_hit: breakpoint_hit_before || breakpoint_hit_after || watchpoint_hit,
+            breakpoint_hit: breakpoint_hit_before
+                || breakpoint_hit_after
+                || watchpoint_hit
+                || interrupt_event,
             instruction_executed: true,
+        }
+    }
+
+    /// Whether an event breakpoint stops on the interrupt of `level` the
+    /// 68000 has just taken: the vertical interrupt's at level 6, the
+    /// horizontal interrupt's at level 4. The stepping paths ask this when
+    /// they take an interrupt, so the event is the interrupt delivered, part
+    /// of the way into a line too; the stop then lands after the handler's
+    /// first instruction, as one on an execute breakpoint at its entry does.
+    /// Nothing is checked while no event or watch breakpoint is armed.
+    fn interrupt_event_hit(&mut self, level: u8) -> bool {
+        if !self.debugger.has_watchpoints() {
+            return false;
+        }
+        match level {
+            6 => self.debugger.check_event(GenesisEvent::VInt),
+            4 => self.debugger.check_event(GenesisEvent::HInt),
+            _ => false,
         }
     }
 
@@ -3046,6 +3131,10 @@ impl GenesisEmulator {
                 let p0 = self.input_manager.get_port_state(0);
                 let p1 = self.input_manager.get_port_state(1);
                 self.bus.io_mut().sync_input(p0, p1);
+                // The frame is counted once it ends: it is the next one.
+                self.bus
+                    .vdp_mut()
+                    .set_frame_being_drawn(self.frame_count + 1);
                 (0, self.frame_cycle_overshoot, None)
             }
         };
@@ -3454,14 +3543,11 @@ impl GenesisEmulator {
                 let cycles_per_scanline = self.next_scanline_cycles();
 
                 let mut ev_vblank = false;
-                let mut ev_vint = false;
-                let mut ev_hint = false;
                 if self.bus.vdp().should_trigger_vint() {
                     ev_vblank = true;
                     let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
                     if vint_enabled && !self.bus.vdp().vint_request_delayed() {
                         self.cpu.request_interrupt(6);
-                        ev_vint = true;
                     }
                     self.z80_irq_pending = true;
                     self.bus.vdp_mut().ack_vint();
@@ -3474,7 +3560,6 @@ impl GenesisEmulator {
                 if self.bus.vdp().should_trigger_hint() {
                     self.cpu.request_interrupt(4);
                     self.bus.vdp_mut().ack_hint();
-                    ev_hint = true;
                 }
 
                 self.refresh_vdp_interrupt_level();
@@ -3485,6 +3570,12 @@ impl GenesisEmulator {
                     self.handle_interrupt_ack(pending_level);
                     self.master_cycles += irq_cycles as u64;
                 }
+                // The interrupt events are the interrupts taken here, not those
+                // requested: a request the 68000's mask holds back, or the
+                // vertical interrupt's that lands later in the line, is taken
+                // in a step, which checks them itself.
+                let ev_vint = irq_cycles > 0 && pending_level == 6;
+                let ev_hint = irq_cycles > 0 && pending_level == 4;
 
                 // Raster/interrupt event breakpoints. Checked after the interrupt is
                 // taken (so a VInt break lands with PC at the handler entry) and
@@ -3693,6 +3784,9 @@ impl GenesisEmulator {
         let p0 = self.input_manager.get_port_state(0);
         let p1 = self.input_manager.get_port_state(1);
         self.bus.io_mut().sync_input(p0, p1);
+        self.bus
+            .vdp_mut()
+            .set_frame_being_drawn(self.frame_count + 1);
 
         let frame_start = Instant::now();
         let mut profile = FrameProfile::default();
@@ -4063,6 +4157,7 @@ impl GenesisEmulator {
             self.step_master_clocks_accumulated +=
                 (irq_cycles as u64) * (self.region.cpu_divider() as u64);
         }
+        let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
         // If CPU is halted (STOP instruction), just consume idle cycles
         if self.cpu.stopped {
@@ -4353,7 +4448,10 @@ impl GenesisEmulator {
             // step_debug_light() both already return total_cycles, so this keeps
             // the three execution tiers paced identically.
             cycles: total_cycles,
-            breakpoint_hit: breakpoint_hit_before || breakpoint_hit_after || watchpoint_hit,
+            breakpoint_hit: breakpoint_hit_before
+                || breakpoint_hit_after
+                || watchpoint_hit
+                || interrupt_event,
             instruction_executed: true,
         }
     }
@@ -4419,14 +4517,11 @@ impl GenesisEmulator {
 
                 // Check for VBLANK interrupt (VINT) when entering VBLANK
                 let mut ev_vblank = false;
-                let mut ev_vint = false;
-                let mut ev_hint = false;
                 if self.bus.vdp().should_trigger_vint() {
                     ev_vblank = true;
                     let vint_enabled = (self.bus.vdp().registers()[1] & 0x20) != 0;
                     if vint_enabled && !self.bus.vdp().vint_request_delayed() {
                         self.cpu.request_interrupt(6); // VBLANK = IRQ level 6
-                        ev_vint = true;
                     }
                     // Z80: VBLANK also triggers Z80 maskable IRQ
                     self.z80_irq_pending = true;
@@ -4442,7 +4537,6 @@ impl GenesisEmulator {
                 if self.bus.vdp().should_trigger_hint() {
                     self.cpu.request_interrupt(4); // HBLANK = IRQ level 4
                     self.bus.vdp_mut().ack_hint();
-                    ev_hint = true;
                 }
 
                 // Refresh VINT level from VDP state (level-triggered)
@@ -4455,6 +4549,10 @@ impl GenesisEmulator {
                     self.handle_interrupt_ack(pending_level);
                     self.master_cycles += irq_cycles as u64;
                 }
+                // The interrupt events are the interrupts taken here; one
+                // taken later, in a step, is checked there.
+                let ev_vint = irq_cycles > 0 && pending_level == 6;
+                let ev_hint = irq_cycles > 0 && pending_level == 4;
 
                 // Raster/interrupt event breakpoints. Checked after the interrupt is
                 // taken (so a VInt break lands with PC at the handler entry) and

@@ -22,10 +22,11 @@
 
 use retro_core::cartridge::CartridgeDebugger;
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
+use retro_core::video::PixelImage;
 use retro_core::*;
 use snes1_core::{
-    format_trace_line_65816, format_trace_line_spc700, parse_manifest, CoprocessorMode,
-    SnesEmulator, TileSetSource, TraceEntryBinary65816, TraceEntryBinarySpc700,
+    format_trace_line_65816, format_trace_line_spc700, parse_manifest, CaptureRecording,
+    CoprocessorMode, SnesEmulator, TileSetSource, TraceEntryBinary65816, TraceEntryBinarySpc700,
     TRACE_ENTRY_SIZE_65816, TRACE_ENTRY_SIZE_CX4, TRACE_ENTRY_SIZE_GSU, TRACE_ENTRY_SIZE_SPC700,
 };
 #[cfg(feature = "chip-cx4")]
@@ -82,6 +83,47 @@ pub fn init() {
 fn map_as_object<T: serde::Serialize>(value: &T) -> JsValue {
     let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     value.serialize(&serializer).unwrap_or(JsValue::UNDEFINED)
+}
+
+/// A plain JS object with these properties, in this order.
+fn plain_object(entries: &[(&str, JsValue)]) -> JsValue {
+    let obj = js_sys::Object::new();
+    for (key, value) in entries {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
+    }
+    obj.into()
+}
+
+/// An RGBA image as `{ width, height, data: Uint8Array }`, the data copied.
+fn image_object(image: &PixelImage) -> JsValue {
+    plain_object(&[
+        ("width", JsValue::from_f64(f64::from(image.width))),
+        ("height", JsValue::from_f64(f64::from(image.height))),
+        (
+            "data",
+            js_sys::Uint8Array::from(image.rgba.as_slice()).into(),
+        ),
+    ])
+}
+
+/// The property names of [`CaptureRecording`]'s fields, as JS reads them.
+const RECORDING_KEYS: [&str; 5] = [
+    "lineStates",
+    "pixelSources",
+    "lineSprites",
+    "videoMemorySources",
+    "frameWrites",
+];
+
+/// The fields of a [`CaptureRecording`] in the order of [`RECORDING_KEYS`].
+fn recording_flags(recording: &mut CaptureRecording) -> [&mut bool; 5] {
+    [
+        &mut recording.line_states,
+        &mut recording.pixel_sources,
+        &mut recording.line_sprites,
+        &mut recording.video_memory_sources,
+        &mut recording.frame_writes,
+    ]
 }
 
 /// Read a gamepad button map sent from JS: a `Map` with number keys, or a
@@ -410,26 +452,151 @@ impl RetroEmulator {
     /// math is not applied. Emulation does not advance, the framebuffer
     /// the host shows is left as it was, and so is everything a savestate
     /// holds.
+    ///
+    /// `fromLineStates` says whether the layer was drawn from the frame's
+    /// line table (each line with its own settings and the video memory it
+    /// read, so a raster effect comes out as the frame drew it: see
+    /// `setCaptureRecording`) or from the registers as they stand.
     #[wasm_bindgen(js_name = renderLayer)]
     pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
+        let from_line_states = self.snes.draws_from_line_states();
         match self.snes.render_layer(layer_id) {
             Ok(img) => {
-                let data = js_sys::Uint8Array::from(img.rgba.as_slice());
-                let obj = js_sys::Object::new();
+                let obj = image_object(&img);
                 let _ = js_sys::Reflect::set(
                     &obj,
-                    &JsValue::from_str("width"),
-                    &JsValue::from_f64(f64::from(img.width)),
+                    &JsValue::from_str("fromLineStates"),
+                    &JsValue::from_bool(from_line_states),
                 );
-                let _ = js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("height"),
-                    &JsValue::from_f64(f64::from(img.height)),
-                );
-                let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data);
-                obj.into()
+                obj
             }
             Err(_) => JsValue::NULL,
+        }
+    }
+
+    /// Choose what the core records while frames run, for a capture to
+    /// read: `options` is `{ lineStates?, pixelSources?, lineSprites?,
+    /// videoMemorySources?, frameWrites? }`, booleans; a key left out keeps
+    /// its value. All off at first; kept across `loadRom` and `reset`,
+    /// never in a savestate, and nothing recorded changes what the game
+    /// does. `lineStates` keeps the line table (`getLineStates`,
+    /// `getLinePalettes`, `pictureFromLineStates`), from which
+    /// `repaintFrame` and `renderLayer` then draw the frame again; on this
+    /// core `pixelSources` and `lineSprites` are worked out from that table,
+    /// so either of them keeps it too. This core records nothing for
+    /// `videoMemorySources` and `frameWrites`. A table armed in the middle
+    /// of a frame holds that frame only from there; the next frame's is
+    /// whole.
+    #[wasm_bindgen(js_name = setCaptureRecording)]
+    pub fn set_capture_recording(&mut self, options: JsValue) {
+        let mut recording = self.snes.capture_recording();
+        for (key, flag) in RECORDING_KEYS.iter().zip(recording_flags(&mut recording)) {
+            let given = js_sys::Reflect::get(&options, &JsValue::from_str(key))
+                .ok()
+                .and_then(|value| value.as_bool());
+            if let Some(on) = given {
+                *flag = on;
+            }
+        }
+        self.snes.set_capture_recording(recording);
+    }
+
+    /// What the core records: `{ lineStates, pixelSources, lineSprites,
+    /// videoMemorySources, frameWrites }`, a plain object of booleans.
+    #[wasm_bindgen(js_name = getCaptureRecording)]
+    pub fn get_capture_recording(&self) -> JsValue {
+        let mut recording = self.snes.capture_recording();
+        let entries: Vec<(&str, JsValue)> = RECORDING_KEYS
+            .iter()
+            .zip(recording_flags(&mut recording))
+            .map(|(key, flag)| (*key, JsValue::from_bool(*flag)))
+            .collect();
+        plain_object(&entries)
+    }
+
+    /// The settings each line of the frame drawn last was drawn with, when
+    /// `lineStates` is recorded: `null`, or `{ frame, fromFirstLine,
+    /// complete, memoryExact, rowsPerLine, firstRowLine, columns: string[],
+    /// values: Uint32Array }`. `columns` names each value of a row: `line`
+    /// (the scanline, 1 for the first drawn) and then every setting the
+    /// renderer reads, in the core's own names (`bg_hoffset[0]`,
+    /// `window_enable[2].w1_enable`, `mode7_matrix_a`...), raw as stored;
+    /// `values` holds the rows one after the other. `frame` is the number
+    /// `captureFrameSnapshot` gives the same frame. `fromFirstLine` and
+    /// `complete` say the table holds the frame from its first line to its
+    /// finished picture; `memoryExact` that the video memory can be put
+    /// back as each line read it (no log filled up, no debugger edit since);
+    /// `rowsPerLine` (1, or 2 for a woven or doubled hires frame) and
+    /// `firstRowLine` (1, or 8 when the overscan lines are cropped) map the
+    /// lines to the picture's rows. Copies, never views into WASM memory.
+    #[wasm_bindgen(js_name = getLineStates)]
+    pub fn get_line_states(&self) -> JsValue {
+        let Some(table) = self.snes.line_states() else {
+            return JsValue::NULL;
+        };
+        let columns = js_sys::Array::new();
+        for name in &table.columns {
+            columns.push(&JsValue::from_str(name));
+        }
+        plain_object(&[
+            ("frame", JsValue::from_f64(table.frame as f64)),
+            ("fromFirstLine", JsValue::from_bool(table.from_first_line)),
+            ("complete", JsValue::from_bool(table.complete)),
+            ("memoryExact", JsValue::from_bool(table.memory_exact)),
+            (
+                "rowsPerLine",
+                JsValue::from_f64(f64::from(table.rows_per_line)),
+            ),
+            (
+                "firstRowLine",
+                JsValue::from_f64(f64::from(table.first_row_line)),
+            ),
+            ("columns", columns.into()),
+            (
+                "values",
+                js_sys::Uint32Array::from(table.values.as_slice()).into(),
+            ),
+        ])
+    }
+
+    /// The palettes the lines of the line table were drawn with: `null`, or
+    /// `{ coloursPerPalette, palettes: Uint16Array, paletteOfLine:
+    /// Uint16Array }`. `palettes` holds each distinct CGRAM a line read
+    /// once, `coloursPerPalette` (256) colours apiece, in CGRAM's own BGR555
+    /// words; `paletteOfLine` has one entry per row of `getLineStates`, the
+    /// palette that line was drawn with. Copies.
+    #[wasm_bindgen(js_name = getLinePalettes)]
+    pub fn get_line_palettes(&self) -> JsValue {
+        let Some(palettes) = self.snes.line_palettes() else {
+            return JsValue::NULL;
+        };
+        plain_object(&[
+            (
+                "coloursPerPalette",
+                JsValue::from_f64(f64::from(palettes.colours_per_palette)),
+            ),
+            (
+                "palettes",
+                js_sys::Uint16Array::from(palettes.palettes.as_slice()).into(),
+            ),
+            (
+                "paletteOfLine",
+                js_sys::Uint16Array::from(palettes.palette_of_line.as_slice()).into(),
+            ),
+        ])
+    }
+
+    /// The frame's picture drawn again from its line table, each line with
+    /// its own settings and the video memory it read: `null` when the
+    /// table does not hold a whole frame, or `{ width, height, data:
+    /// Uint8Array }`, RGBA cropped as the picture is. It equals the picture
+    /// the frame left unless `memoryExact` is false. Does not advance, does
+    /// not touch the framebuffer, leaves the state hash alone.
+    #[wasm_bindgen(js_name = pictureFromLineStates)]
+    pub fn picture_from_line_states(&mut self) -> JsValue {
+        match self.snes.picture_from_line_states() {
+            Some(image) => image_object(&image),
+            None => JsValue::NULL,
         }
     }
 
@@ -1769,12 +1936,15 @@ impl RetroEmulator {
         self.snes.video_debugger().toggle_layer(layer_id, visible);
     }
 
-    /// Re-render the held frame from present PPU state plus the debugger
-    /// layer mask, without advancing emulation. The host calls this after
-    /// a `toggleLayer` while paused so the canvas reflects the change at
-    /// once (a running core repaints on its own next frame; a paused one
-    /// never would). Drives [`SnesEmulator::repaint_held_frame`], the
-    /// SNES equivalent of `sg1`'s `repaintFrame`.
+    /// Re-render the held frame plus the debugger layer mask, without
+    /// advancing emulation: from the frame's line table when it holds the
+    /// frame (`setCaptureRecording`), each line with its own settings and
+    /// the video memory it read, else from the present PPU state. The host
+    /// calls this after a `toggleLayer` while paused so the canvas reflects
+    /// the change at once (a running core repaints on its own next frame; a
+    /// paused one never would). Drives
+    /// [`SnesEmulator::repaint_held_frame`], the SNES equivalent of `sg1`'s
+    /// `repaintFrame`.
     #[wasm_bindgen(js_name = repaintFrame)]
     pub fn repaint_frame(&mut self) {
         self.snes.repaint_held_frame();
@@ -2381,6 +2551,140 @@ mod tests {
         let blocks = emu.decode_tiles(0, 0, 0, 4, 4, 1);
         assert_eq!(property(&blocks, "width").as_f64(), Some(16.0));
         assert_eq!(property(&blocks, "height").as_f64(), Some(64.0));
+    }
+
+    /// The options object `setCaptureRecording` takes.
+    fn recording_options(entries: &[(&str, bool)]) -> JsValue {
+        let options = js_sys::Object::new();
+        for (key, on) in entries {
+            js_sys::Reflect::set(&options, &JsValue::from_str(key), &JsValue::from_bool(*on))
+                .unwrap();
+        }
+        options.into()
+    }
+
+    /// A machine running [`synth_lorom`] with the line table kept, the
+    /// display lit over a red backdrop, held at the capture boundary of its
+    /// second frame.
+    fn recording_a_red_screen() -> RetroEmulator {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("LINE STATES")).unwrap();
+        emu.set_capture_recording(recording_options(&[("lineStates", true)]));
+        emu.write_cgram(0, &[0x001F]);
+        emu.write_memory_debug(0x2100, &[0x0F]);
+        emu.run_to_capture_boundary();
+        emu.run_to_capture_boundary();
+        emu
+    }
+
+    #[wasm_bindgen_test]
+    fn the_recording_switch_is_a_plain_object_and_a_key_left_out_keeps_its_value() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        let flags = |emu: &RetroEmulator| -> Vec<Option<bool>> {
+            let switch = emu.get_capture_recording();
+            assert_plain_object(&switch, "lineStates");
+            RECORDING_KEYS
+                .iter()
+                .map(|key| property(&switch, key).as_bool())
+                .collect()
+        };
+        assert_eq!(flags(&emu), vec![Some(false); 5], "all off at first");
+        emu.set_capture_recording(recording_options(&[
+            ("lineStates", true),
+            ("frameWrites", true),
+        ]));
+        let on = vec![
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+        ];
+        assert_eq!(flags(&emu), on);
+        emu.set_capture_recording(recording_options(&[]));
+        assert_eq!(flags(&emu), on, "an empty object changes nothing");
+        emu.set_capture_recording(JsValue::NULL);
+        assert_eq!(flags(&emu), on, "nor does no object");
+        emu.set_capture_recording(recording_options(&[("lineStates", false)]));
+        let only_writes = vec![
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+        ];
+        assert_eq!(flags(&emu), only_writes);
+        emu.load_rom(&synth_lorom("KEPT")).unwrap();
+        emu.reset();
+        assert_eq!(flags(&emu), only_writes, "a load and a reset keep it");
+    }
+
+    #[wasm_bindgen_test]
+    fn the_line_states_are_a_plain_object_of_copies() {
+        let emu = recording_a_red_screen();
+        let table = emu.get_line_states();
+        assert_plain_object(&table, "values");
+        assert_eq!(property(&table, "frame").as_f64(), Some(2.0));
+        for key in ["fromFirstLine", "complete", "memoryExact"] {
+            assert_eq!(property(&table, key).as_bool(), Some(true), "{key}");
+        }
+        assert_eq!(property(&table, "rowsPerLine").as_f64(), Some(1.0));
+        assert_eq!(property(&table, "firstRowLine").as_f64(), Some(1.0));
+        let columns = js_sys::Array::from(&property(&table, "columns"));
+        assert_eq!(columns.get(0).as_string().as_deref(), Some("line"));
+        let values: js_sys::Uint32Array = property(&table, "values").dyn_into().unwrap();
+        assert_eq!(values.length(), columns.length() * 224);
+        assert_eq!(values.get_index(0), 1, "the first row is line 1");
+        values.set_index(0, 999);
+        let again: js_sys::Uint32Array = property(&emu.get_line_states(), "values")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(again.get_index(0), 1, "a copy, not a view");
+    }
+
+    #[wasm_bindgen_test]
+    fn the_palettes_and_the_picture_come_from_the_line_states() {
+        let mut emu = recording_a_red_screen();
+        let palettes = emu.get_line_palettes();
+        assert_plain_object(&palettes, "paletteOfLine");
+        assert_eq!(
+            property(&palettes, "coloursPerPalette").as_f64(),
+            Some(256.0)
+        );
+        let colours: js_sys::Uint16Array = property(&palettes, "palettes").dyn_into().unwrap();
+        assert_eq!(colours.length(), 256, "one palette for the whole frame");
+        assert_eq!(colours.get_index(0), 0x001F);
+        let of_line: js_sys::Uint16Array = property(&palettes, "paletteOfLine").dyn_into().unwrap();
+        assert_eq!(of_line.length(), 224);
+        assert!(of_line.to_vec().iter().all(|&palette| palette == 0));
+
+        let picture = emu.picture_from_line_states();
+        assert_plain_object(&picture, "data");
+        assert_eq!(property(&picture, "width").as_f64(), Some(256.0));
+        assert_eq!(property(&picture, "height").as_f64(), Some(224.0));
+        let data: js_sys::Uint8Array = property(&picture, "data").dyn_into().unwrap();
+        assert_eq!(data.to_vec(), emu.get_framebuffer_data().to_vec());
+        assert_eq!(&data.to_vec()[..4], &[0xFF, 0x00, 0x00, 0xFF]);
+
+        emu.set_capture_recording(recording_options(&[("lineStates", false)]));
+        assert!(emu.get_line_states().is_null());
+        assert!(emu.get_line_palettes().is_null());
+        assert!(emu.picture_from_line_states().is_null());
+    }
+
+    #[wasm_bindgen_test]
+    fn a_layer_render_says_whether_it_drew_from_the_line_states() {
+        let mut emu = recording_a_red_screen();
+        let from_line_states =
+            |emu: &mut RetroEmulator| property(&emu.render_layer(0), "fromLineStates").as_bool();
+        assert_eq!(from_line_states(&mut emu), Some(true));
+        // A register written by hand: the registers as they stand show it.
+        emu.write_memory_debug(0x2105, &[0x01]);
+        assert_eq!(from_line_states(&mut emu), Some(false));
+        emu.run_to_capture_boundary();
+        assert_eq!(from_line_states(&mut emu), Some(true));
+        emu.set_capture_recording(recording_options(&[("lineStates", false)]));
+        assert_eq!(from_line_states(&mut emu), Some(false));
     }
 
     #[wasm_bindgen_test]

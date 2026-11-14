@@ -1,8 +1,9 @@
-//! Sprite rendering for VDP.
+//! The sprites of the VDP's sprite table: their attributes, the link chain
+//! the chip walks, and the list the renderer parses once a frame.
 //!
-//! Genesis supports 80 sprites with up to 20 per scanline in H40 (64 and 16 in H32).
-
-use super::tiles::{build_rgba_palette, Tile};
+//! The table holds 80 sprites in the 40-cell mode, 64 in the 32-cell mode;
+//! a line shows at most 20 or 16 of them. The renderer
+//! (`Vdp::render_sprite_line`) draws them line by line from the list here.
 
 /// Sprite data structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,69 +103,6 @@ impl Sprite {
         let height = (self.height_tiles as i16) * 8;
         (self.x, self.y, self.x + width, self.y + height)
     }
-
-    /// Check if sprite is visible on screen.
-    pub fn is_visible(&self, screen_width: u32, screen_height: u32) -> bool {
-        let (x1, y1, x2, y2) = self.bounds();
-
-        // Check if sprite overlaps screen area
-        !(x2 <= 0 || x1 >= screen_width as i16 || y2 <= 0 || y1 >= screen_height as i16)
-    }
-
-    /// Render sprite to framebuffer.
-    pub fn render(
-        &self,
-        framebuffer: &mut [u8],
-        vram: &[u8],
-        cram: &[u16],
-        screen_width: u32,
-        _screen_height: u32,
-    ) {
-        let palette = build_rgba_palette(cram, self.palette);
-
-        // Render each tile in sprite
-        for ty in 0..self.height_tiles {
-            for tx in 0..self.width_tiles {
-                // Calculate tile index in pattern (column-major: top-to-bottom, left-to-right)
-                // Apply flips to source tile coordinates
-                let src_tx = if self.flip_h {
-                    self.width_tiles - 1 - tx
-                } else {
-                    tx
-                };
-                let src_ty = if self.flip_v {
-                    self.height_tiles - 1 - ty
-                } else {
-                    ty
-                };
-                let tile_offset = src_tx * self.height_tiles + src_ty;
-
-                let pattern_index = self.pattern_base + tile_offset as u16;
-                let pattern_addr = (pattern_index as usize) * 32;
-
-                if pattern_addr + 32 > vram.len() {
-                    continue;
-                }
-
-                let tile = Tile::decode(&vram[pattern_addr..pattern_addr + 32]);
-
-                // Calculate screen position
-                let screen_x = self.x + (tx as i16) * 8;
-                let screen_y = self.y + (ty as i16) * 8;
-
-                // Render tile
-                tile.render_to_framebuffer(
-                    framebuffer,
-                    screen_x as i32,
-                    screen_y as i32,
-                    screen_width,
-                    &palette,
-                    self.flip_h,
-                    self.flip_v,
-                );
-            }
-        }
-    }
 }
 
 /// The sprites the VDP draws in a frame, in the order it takes them: the
@@ -260,34 +198,6 @@ impl SpriteCache {
         self.sprites.clear();
         self.sprites
             .extend(link_chain(vram, sat_base, max_sprites).map(|(_, sprite)| sprite));
-    }
-
-    /// Get sprites overlapping a specific scanline (max 20).
-    pub fn get_sprites_on_line(&self, scanline: i16) -> Vec<&Sprite> {
-        self.sprites
-            .iter()
-            .filter(|s| {
-                let (_, y1, _, y2) = s.bounds();
-                scanline >= y1 && scanline < y2
-            })
-            .take(20) // H40's limit of 20 sprites per line (H32's is 16)
-            .collect()
-    }
-
-    /// Render all sprites to framebuffer.
-    pub fn render_all(
-        &self,
-        framebuffer: &mut [u8],
-        vram: &[u8],
-        cram: &[u16],
-        screen_width: u32,
-        screen_height: u32,
-    ) {
-        for sprite in &self.sprites {
-            if sprite.is_visible(screen_width, screen_height) {
-                sprite.render(framebuffer, vram, cram, screen_width, screen_height);
-            }
-        }
     }
 }
 
@@ -427,60 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sprite_is_visible_on_screen() {
-        let sprite = Sprite {
-            x: 10,
-            y: 20,
-            width_tiles: 1,
-            height_tiles: 1,
-            pattern_base: 0,
-            palette: 0,
-            priority: false,
-            flip_h: false,
-            flip_v: false,
-            link: 0,
-        };
-
-        assert!(sprite.is_visible(320, 224));
-    }
-
-    #[test]
-    fn test_sprite_is_visible_offscreen_left() {
-        let sprite = Sprite {
-            x: -16,
-            y: 100,
-            width_tiles: 1,
-            height_tiles: 1,
-            pattern_base: 0,
-            palette: 0,
-            priority: false,
-            flip_h: false,
-            flip_v: false,
-            link: 0,
-        };
-
-        assert!(!sprite.is_visible(320, 224));
-    }
-
-    #[test]
-    fn test_sprite_is_visible_partially_offscreen() {
-        let sprite = Sprite {
-            x: -4,
-            y: 100,
-            width_tiles: 1,
-            height_tiles: 1,
-            pattern_base: 0,
-            palette: 0,
-            priority: false,
-            flip_h: false,
-            flip_v: false,
-            link: 0,
-        };
-
-        assert!(sprite.is_visible(320, 224));
-    }
-
-    #[test]
     fn test_sprite_cache_build_single() {
         let mut vram = vec![0u8; 0x10000];
 
@@ -594,71 +450,6 @@ mod tests {
         cache.build(&vram, 0, 80);
 
         assert_eq!(cache.sprites.len(), 80);
-    }
-
-    #[test]
-    fn test_sprite_cache_get_sprites_on_line() {
-        let sprite1 = Sprite {
-            x: 0,
-            y: 10,
-            width_tiles: 1,
-            height_tiles: 2, // covers y=10..26
-            pattern_base: 0,
-            palette: 0,
-            priority: false,
-            flip_h: false,
-            flip_v: false,
-            link: 0,
-        };
-
-        let sprite2 = Sprite {
-            x: 0,
-            y: 100,
-            width_tiles: 1,
-            height_tiles: 1,
-            pattern_base: 0,
-            palette: 0,
-            priority: false,
-            flip_h: false,
-            flip_v: false,
-            link: 0,
-        };
-
-        let mut cache = SpriteCache::new();
-        cache.sprites.push(sprite1);
-        cache.sprites.push(sprite2);
-
-        let line_15 = cache.get_sprites_on_line(15);
-        assert_eq!(line_15.len(), 1);
-        assert_eq!(line_15[0].y, 10);
-
-        let line_100 = cache.get_sprites_on_line(100);
-        assert_eq!(line_100.len(), 1);
-        assert_eq!(line_100[0].y, 100);
-    }
-
-    #[test]
-    fn test_sprite_cache_20_per_line_limit() {
-        let mut cache = SpriteCache::new();
-
-        // Add 30 sprites all on same line
-        for i in 0..30 {
-            cache.sprites.push(Sprite {
-                x: i * 8,
-                y: 100,
-                width_tiles: 1,
-                height_tiles: 1,
-                pattern_base: 0,
-                palette: 0,
-                priority: false,
-                flip_h: false,
-                flip_v: false,
-                link: 0,
-            });
-        }
-
-        let sprites = cache.get_sprites_on_line(100);
-        assert_eq!(sprites.len(), 20); // Hardware limit
     }
 
     /// Point the sprite table entry at `slot` (table at VRAM 0) to `link`.

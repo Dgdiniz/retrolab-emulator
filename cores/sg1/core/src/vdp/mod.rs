@@ -5,13 +5,16 @@
 pub mod debug;
 pub mod dma;
 pub mod planes;
-pub mod renderer;
+pub mod recording;
+mod redraw;
 pub mod sprites;
 pub mod tiles;
 pub mod timing;
 pub mod window;
 
-use retro_core::video::PixelImage;
+use recording::PaletteRedraw;
+pub use recording::{CaptureRecording, LineKind, LinePalettes, NO_COLUMN, NO_PALETTE};
+pub use redraw::LayerImage;
 use window::WindowArea;
 
 /// Pixels in a row of the framebuffer: the 40-cell mode's width, which
@@ -373,6 +376,17 @@ pub struct Vdp {
     /// fill to the just-written value, exactly as the hardware snoops the bus).
     /// Transient within-frame state, never part of the savestate.
     fill_state: Option<FillState>,
+
+    /// The number of the frame being drawn, which the system sets as each
+    /// frame starts and every record of the frame carries. Not part of the
+    /// savestate.
+    frame_being_drawn: u64,
+
+    /// What is recorded of each frame for a capture ([`recording`]):
+    /// `None` until a host arms something, so a frame recording nothing
+    /// pays one check of it at each place that records. Never part of the
+    /// savestate.
+    recording: Option<Box<recording::Recording>>,
 }
 
 /// What a DMA moves, which sets how much of it one scanline carries
@@ -602,6 +616,8 @@ impl Vdp {
             debug_pixel: None,
             render_layer_mode: RenderLayerMode::Normal,
             debug_layer_disable: [false; LAYER_COUNT],
+            frame_being_drawn: 0,
+            recording: None,
         };
 
         // Initialize with default register values
@@ -650,6 +666,9 @@ impl Vdp {
         self.fifo_slot_mclks = [0; 4];
         self.pending_cpu_wait_cycles = 0;
         self.odd_frame = false;
+        // What was recorded described the machine before the reset; what is
+        // armed stays armed.
+        self.clear_recorded_frames();
 
         // Render backdrop color
         self.render_backdrop();
@@ -710,38 +729,6 @@ impl Vdp {
             .unwrap_or(false)
     }
 
-    /// Re-render every visible scanline from the present VDP state into the
-    /// framebuffer, without advancing timing or touching interrupts.
-    ///
-    /// Used by the debugger to refresh a paused frame after a layer toggle:
-    /// the live frame loop composites each line as the beam scans it, so a
-    /// paused core never re-composites and a `toggle_layer` would have no
-    /// visible effect until the game resumes. This replays the same
-    /// `render_scanline` path the running emulator uses (so the debug
-    /// composite can never diverge from the real one), reading the current
-    /// VRAM/CRAM/VSRAM/registers and the debugger layer mask. It is an
-    /// end-of-frame approximation: mid-frame raster splits that depend on
-    /// per-scanline register changes are flattened, which is exactly the
-    /// right model for "show me this static frame with layer X hidden".
-    ///
-    /// Only the framebuffer changes. What drawing a line leaves behind
-    /// besides its pixels (`DrawState`: the sprite status flags a
-    /// savestate holds, the sprite list, the line buffers) is put back as
-    /// the frame left it, so a repaint moves neither the state hash nor
-    /// the lines the game draws next.
-    pub fn rerender_current_frame(&mut self) {
-        let kept = DrawState::keep(self);
-        // The SAT cache is rebuilt lazily on the first sprite line, but a
-        // VRAM edit while paused could have left it stale; force a rebuild
-        // so sprites reflect current memory.
-        self.sprite_cache_valid = false;
-        let visible = self.timing.visible_scanlines();
-        for line in 0..visible {
-            self.render_scanline(line);
-        }
-        kept.restore(self);
-    }
-
     /// The first line of vertical blanking: the line whose start raises
     /// the vertical interrupt's flag. The lines before it draw the picture.
     pub fn first_vblank_line(&self) -> u16 {
@@ -753,105 +740,6 @@ impl Vdp {
     /// framebuffer holds.
     pub fn drawn_height(&self) -> u32 {
         self.display_height().min(FRAMEBUFFER_LINES)
-    }
-
-    /// One layer of the frame drawn again from video memory as it is now:
-    /// `layer` is one of the debugger's layers (0 plane A, 1 plane B, 2 the
-    /// window, 3 the sprites), `None` for any other. The picture is the
-    /// screen, the mode's width by [`Self::drawn_height`] lines, in RGBA: a
-    /// pixel the layer covers has its palette colour, before shadow and
-    /// highlight, and alpha 255; every other pixel is 0 in all four bytes,
-    /// never the backdrop nor a colour key. With the display off no layer
-    /// covers anything.
-    ///
-    /// It is drawn from the planes and the sprite table as they are now, so
-    /// it is the picture the game drew wherever nothing changed during the
-    /// frame. The debugger's layer toggles do not hide the layer asked for.
-    /// The drawing goes to the line buffers alone, whose contents are put
-    /// back after with the rest of `DrawState`: the framebuffer and
-    /// everything a savestate holds stay as they were.
-    pub fn render_layer_image(&mut self, layer: usize) -> Option<PixelImage> {
-        if layer >= LAYER_COUNT {
-            return None;
-        }
-        let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
-        let mut rgba = vec![0u8; width * height * 4];
-        let display_on = (self.registers[1] & 0x40) != 0;
-        if display_on {
-            let kept = DrawState::keep(self);
-            let hidden = std::mem::replace(&mut self.debug_layer_disable, [false; LAYER_COUNT]);
-            let debug_pixel = self.debug_pixel.take();
-            self.sprite_cache_valid = false;
-            for line in 0..height {
-                self.composite_scanline(line as u16);
-                let row = &mut rgba[line * width * 4..(line + 1) * width * 4];
-                for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    if let Some((r, g, b)) = self.layer_pixel(layer, x) {
-                        *pixel = [r, g, b, 255];
-                    }
-                }
-            }
-            self.debug_pixel = debug_pixel;
-            self.debug_layer_disable = hidden;
-            kept.restore(self);
-        }
-        Some(PixelImage {
-            width: width as u32,
-            height: height as u32,
-            rgba,
-        })
-    }
-
-    /// The colour `layer` gives pixel `x` of the line last composited, or
-    /// `None` where the layer is transparent: what the single-layer modes
-    /// of `remap_scanline_segment` draw, without their colour key.
-    fn layer_pixel(&self, layer: usize, x: usize) -> Option<(u8, u8, u8)> {
-        let index = match layer {
-            LAYER_PLANE_A => self.line_plane_a[x],
-            LAYER_PLANE_B => self.line_plane_b[x],
-            LAYER_WINDOW => self.line_window[x],
-            _ => {
-                // An operator sprite of shadow and highlight is not a pixel.
-                let colour = self.sprite_line_color[x];
-                if colour == 0 || self.line_sh_op[x] != 0 {
-                    -1
-                } else {
-                    (self.sprite_line_palette[x] as i16 * 16 + colour as i16).min(63)
-                }
-            }
-        };
-        (index >= 0).then(|| self.cram_rgb[index as usize])
-    }
-
-    /// The frame drawn again from video memory as it is now in `mode`, as
-    /// an opaque RGBA picture of the screen (the mode's width by
-    /// [`Self::drawn_height`] lines). The framebuffer, the mode and the
-    /// rest of `DrawState` are put back after, so nothing the game shows
-    /// or a savestate holds changes.
-    pub fn render_mode_image(&mut self, mode: RenderLayerMode) -> PixelImage {
-        let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
-        let kept = DrawState::keep(self);
-        let framebuffer = self.framebuffer.clone();
-        let previous_mode = std::mem::replace(&mut self.render_layer_mode, mode);
-        self.sprite_cache_valid = false;
-        for line in 0..height {
-            self.render_scanline(line as u16);
-        }
-        let stride = FRAMEBUFFER_WIDTH as usize * 4;
-        let mut rgba = Vec::with_capacity(width * height * 4);
-        for line in 0..height {
-            rgba.extend_from_slice(&self.framebuffer[line * stride..line * stride + width * 4]);
-        }
-        self.render_layer_mode = previous_mode;
-        self.framebuffer = framebuffer;
-        kept.restore(self);
-        PixelImage {
-            width: width as u32,
-            height: height as u32,
-            rgba,
-        }
     }
 
     /// Log a traced VRAM write if the address falls within the watched range.
@@ -1342,6 +1230,7 @@ impl Vdp {
                     let raw_addr = init_addr as usize;
                     let wa = raw_addr & 0xFFFE;
                     if wa + 1 < self.vram.len() {
+                        self.note_vram_write(wa);
                         if (raw_addr & 1) == 0 {
                             self.vram[wa] = (value >> 8) as u8;
                             self.vram[wa + 1] = (value & 0xFF) as u8;
@@ -1358,6 +1247,7 @@ impl Vdp {
                     if index < 64 {
                         self.cram[index] = value & 0x0EEE;
                         self.cram_rgb[index] = Self::convert_genesis_color(value & 0x0EEE);
+                        self.note_palette_change(index, value & 0x0EEE, PaletteRedraw::Nothing);
                     }
                 }
                 0x05 => {
@@ -1422,6 +1312,7 @@ impl Vdp {
                 let raw_addr = self.address as usize;
                 let addr = raw_addr & 0xFFFE; // Word-align
                 if addr + 1 < self.vram.len() {
+                    self.note_vram_write(addr);
                     if (raw_addr & 1) == 0 {
                         self.vram[addr] = (value >> 8) as u8;
                         self.vram[addr + 1] = (value & 0xFF) as u8;
@@ -1446,16 +1337,27 @@ impl Vdp {
                     // keep their colour, so multiple writes build colour segments,
                     // beyond Genesis Plus GX's whole-line update). Display off -> only a
                     // backdrop-pen change is visible, so re-blank the line.
+                    let mut redraw = PaletteRedraw::Nothing;
                     if self.midline_render_window() {
                         let line = self.timing.scanline;
                         if (self.registers[1] & 0x40) != 0 {
                             let x0 = self.beam_active_x();
                             let w = self.display_width() as usize;
                             self.remap_scanline_segment(line, x0, w);
+                            redraw = PaletteRedraw::Columns {
+                                from: x0 as u16,
+                                to: w as u16,
+                                shadow_highlight: (self.registers[12] & 0x08) != 0,
+                            };
                         } else if index == self.backdrop_index() {
                             self.render_scanline(line);
+                            redraw = PaletteRedraw::WholeLine {
+                                width: self.display_width() as u16,
+                                backdrop: index as u8,
+                            };
                         }
                     }
+                    self.note_palette_change(index, masked, redraw);
                 }
                 self.address = self.address.wrapping_add(self.registers[15] as u16);
             }
@@ -1686,6 +1588,9 @@ impl Vdp {
 
         if !self.sprite_cache_valid {
             self.rebuild_sprite_cache();
+            if self.recording.is_some() {
+                self.record_sprite_list(line);
+            }
         }
 
         // Build list of sprites on this line with masking (reuse scratch buffer)
@@ -1826,27 +1731,9 @@ impl Vdp {
     ///   3 = Per line
     #[inline(always)]
     fn read_hscroll(&self, hscroll_base: usize, plane_offset: usize, mode: u8, line: u16) -> u16 {
-        let addr = match mode {
-            0 => hscroll_base + plane_offset,
-            1 => {
-                // "Prohibited" mode: only the line's low three bits pick the
-                // entry, so it wraps within the first 8.
-                let l = (line & 7) as usize;
-                hscroll_base + l * 4 + plane_offset
-            }
-            2 => {
-                // Per-cell: the line counts in eight bits and its low three
-                // are dropped, so the table can't run past the 8-bit line
-                // range.
-                let cell = ((line & 0xFF) / 8) as usize;
-                hscroll_base + cell * 32 + plane_offset
-            }
-            3 => {
-                // Per-line: the line counts in eight bits.
-                let l = (line & 0xFF) as usize;
-                hscroll_base + l * 4 + plane_offset
-            }
-            _ => return 0,
+        let Some(addr) = Self::horizontal_scroll_address(hscroll_base, plane_offset, mode, line)
+        else {
+            return 0;
         };
         if addr + 1 < self.vram.len() {
             let high = self.vram[addr] as u16;
@@ -1854,6 +1741,39 @@ impl Vdp {
             ((high << 8) | low) & 0x03FF
         } else {
             0
+        }
+    }
+
+    /// The address in VRAM of the horizontal scroll a plane reads on `line`
+    /// ([`Self::read_hscroll`]), or `None` for a mode with none.
+    #[inline(always)]
+    fn horizontal_scroll_address(
+        hscroll_base: usize,
+        plane_offset: usize,
+        mode: u8,
+        line: u16,
+    ) -> Option<usize> {
+        match mode {
+            0 => Some(hscroll_base + plane_offset),
+            1 => {
+                // "Prohibited" mode: only the line's low three bits pick the
+                // entry, so it wraps within the first 8.
+                let l = (line & 7) as usize;
+                Some(hscroll_base + l * 4 + plane_offset)
+            }
+            2 => {
+                // Per-cell: the line counts in eight bits and its low three
+                // are dropped, so the table can't run past the 8-bit line
+                // range.
+                let cell = ((line & 0xFF) / 8) as usize;
+                Some(hscroll_base + cell * 32 + plane_offset)
+            }
+            3 => {
+                // Per-line: the line counts in eight bits.
+                let l = (line & 0xFF) as usize;
+                Some(hscroll_base + l * 4 + plane_offset)
+            }
+            _ => None,
         }
     }
 
@@ -1920,6 +1840,7 @@ impl Vdp {
 
         // Render this scanline if in visible area
         if line < visible {
+            let display_on = (self.registers[1] & 0x40) != 0;
             if self.progressive_cram.is_some() {
                 // Direct-Color-DMA streams CRAM with the display forcibly off, so
                 // the screen is all backdrop and each ~2-pixel run shows the DMA
@@ -1928,15 +1849,29 @@ impl Vdp {
                 // of per-pixel CRAM that resolves the actual picture instead
                 // of one colour per line. With the display on, a CRAM DMA is an ordinary
                 // raster palette/backdrop effect: keep the per-line band model.
-                if (self.registers[1] & 0x40) == 0 {
+                if !display_on {
+                    if self.recording.is_some() {
+                        self.record_line(line, LineKind::DirectColour);
+                    }
                     self.render_dcdma_line_beamx(line);
                 } else {
                     // Land this line's share of the metered mid-active CRAM DMA
                     // before sampling the palette, so the per-line colour is right.
                     self.apply_progressive_cram_for_line(line);
+                    if self.recording.is_some() {
+                        self.record_line(line, LineKind::Drawn);
+                    }
                     self.render_scanline(line);
                 }
             } else {
+                if self.recording.is_some() {
+                    let kind = if display_on {
+                        LineKind::Drawn
+                    } else {
+                        LineKind::Blank
+                    };
+                    self.record_line(line, kind);
+                }
                 self.render_scanline(line);
             }
         }
@@ -2013,10 +1948,22 @@ impl Vdp {
     /// (reg1 bit 6 clear): every layer mode shows the backdrop, as on hardware.
     fn render_blanked_line(&mut self, line: u16) {
         let width = self.display_width() as usize;
+        self.render_blanked_columns(line, width, self.backdrop_index());
+    }
+
+    /// Fill the first `width` pixels of scanline `line` with backdrop colour
+    /// `backdrop` (a CRAM index), and its index buffers with that pen: the
+    /// body of [`Self::render_blanked_line`], with the width and the
+    /// backdrop given, as a line drawn again from its record gives them.
+    fn render_blanked_columns(&mut self, line: u16, width: usize, backdrop: usize) {
         let internal_width = 320usize;
         let fb_offset = (line as usize) * internal_width * 4;
-        let backdrop_color = self.backdrop_rgb();
-        let bd_idx = self.backdrop_index().min(63) as u8;
+        let backdrop_color = if backdrop < 64 {
+            self.cram_rgb[backdrop]
+        } else {
+            (0, 0, 0)
+        };
+        let bd_idx = backdrop.min(63) as u8;
         for x in 0..width {
             // Keep the index buffers consistent with the backdrop fill: a
             // disabled line holds the backdrop pen, so a later mid-line CRAM
@@ -2385,9 +2332,17 @@ impl Vdp {
     /// approximation of per-pixel CRAM, finer than a whole-line update).
     /// `remap_scanline` is the whole-line case `[0, width)`.
     fn remap_scanline_segment(&mut self, line: u16, x_start: usize, x_end: usize) {
+        let shadow_highlight = (self.registers[12] & 0x08) != 0;
+        self.remap_columns(line, x_start, x_end, shadow_highlight);
+    }
+
+    /// The body of [`Self::remap_scanline_segment`], with shadow and
+    /// highlight given, as a palette write recorded on a line gives it when
+    /// the line is drawn again.
+    #[inline]
+    fn remap_columns(&mut self, line: u16, x_start: usize, x_end: usize, shadow_highlight: bool) {
         let internal_width = 320usize;
         let fb_offset = (line as usize) * internal_width * 4;
-        let shadow_highlight = (self.registers[12] & 0x08) != 0;
 
         for x in x_start..x_end {
             let final_index = self.line_index[x];
@@ -3062,6 +3017,9 @@ impl Vdp {
                 commit_dest = commit_dest.wrapping_add(auto_increment);
             }
         } else {
+            if code == 0x01 {
+                self.note_vram_transfer(dest_start & 0xFFFE, auto_increment, words);
+            }
             let mut dest = dest_start;
             for i in 0..words {
                 let byte_offset = i * 2;
@@ -3096,6 +3054,7 @@ impl Vdp {
                             let masked = word & 0x0EEE;
                             self.cram[index] = masked;
                             self.cram_rgb[index] = Self::convert_genesis_color(masked);
+                            self.note_palette_change(index, masked, PaletteRedraw::Nothing);
                         }
                     }
                     0x05 => {
@@ -3225,6 +3184,14 @@ impl Vdp {
         // word.
         let base = prog.cursor;
         let backdrop = self.backdrop_rgb();
+        if self.recording.is_some() {
+            let painted = (base..base + width.div_ceil(2))
+                .take_while(|&slot| slot * 2 + 1 < prog.buffer.len())
+                .map(|slot| {
+                    u16::from_be_bytes([prog.buffer[slot * 2], prog.buffer[slot * 2 + 1]]) & 0x0EEE
+                });
+            self.record_direct_colours(line, painted);
+        }
         for x in 0..width {
             let slot = base + (x / 2);
             let bo = slot * 2;
@@ -3274,6 +3241,7 @@ impl Vdp {
                 // Render table only; `cram` read-back state stays at its
                 // DMA-final value (committed in `execute_pending_dma`).
                 self.cram_rgb[index] = Self::convert_genesis_color(word & 0x0EEE);
+                self.note_palette_change(index, word & 0x0EEE, PaletteRedraw::Nothing);
             }
             prog.cursor += 1;
         }
@@ -3462,6 +3430,7 @@ impl Vdp {
             0x01 => {
                 // VRAM fill: write high byte
                 let vram_addr = addr as usize;
+                self.note_vram_write(vram_addr & 0xFFFE);
                 if (vram_addr & 1) != 0 {
                     let word_addr = vram_addr ^ 1;
                     if word_addr < self.vram.len() {
@@ -3482,6 +3451,7 @@ impl Vdp {
                 if index < 64 {
                     self.cram[index] = cram_word;
                     self.cram_rgb[index] = Self::convert_genesis_color(cram_word);
+                    self.note_palette_change(index, cram_word, PaletteRedraw::Nothing);
                 }
             }
             0x05 => {
@@ -3556,6 +3526,10 @@ impl Vdp {
         let auto_increment = self.registers[15] as u16;
         let mut src = source;
         let mut dst = dest;
+
+        // Each destination byte lies in the word at its address with bit 0
+        // cleared; the journal takes those words before any is written.
+        self.note_vram_transfer(dest & 0xFFFE, auto_increment, length as usize);
 
         // Copy byte-by-byte IN PLACE (read one byte, immediately write it, then
         // advance), NOT through a temp buffer. Overlapping src/dst regions must
@@ -4230,6 +4204,9 @@ impl Vdp {
         // Rebuild derived state
         self.sprite_cache_valid = false;
         self.rebuild_cram_rgb();
+        // What was recorded described the machine before the load; what is
+        // armed stays armed.
+        self.clear_recorded_frames();
     }
 }
 
@@ -4319,7 +4296,10 @@ mod tests {
         vdp.set_layer_debug_disabled(LAYER_PLANE_A, true);
         let framebuffer = vdp.framebuffer.clone();
 
-        let plane_a = vdp.render_layer_image(LAYER_PLANE_A).expect("plane A");
+        let plane_a = vdp
+            .render_layer_image(LAYER_PLANE_A)
+            .expect("plane A")
+            .image;
         assert_eq!((plane_a.width, plane_a.height), (256, 224));
         let (r, g, b) = vdp.cram_rgb[1];
         assert_eq!(plane_a.rgba[..4], [r, g, b, 255], "the tile's colour");
@@ -4331,13 +4311,19 @@ mod tests {
         assert!(vdp.layer_debug_disabled(LAYER_PLANE_A));
         assert_eq!(vdp.framebuffer, framebuffer, "the framebuffer is untouched");
 
-        let plane_b = vdp.render_layer_image(LAYER_PLANE_B).expect("plane B");
+        let plane_b = vdp
+            .render_layer_image(LAYER_PLANE_B)
+            .expect("plane B")
+            .image;
         assert!(plane_b.rgba.iter().all(|&byte| byte == 0));
         assert!(vdp.render_layer_image(LAYER_COUNT).is_none());
 
         // With the display off no layer covers anything.
         vdp.registers[1] = 0x04;
-        let plane_a = vdp.render_layer_image(LAYER_PLANE_A).expect("plane A");
+        let plane_a = vdp
+            .render_layer_image(LAYER_PLANE_A)
+            .expect("plane A")
+            .image;
         assert!(plane_a.rgba.iter().all(|&byte| byte == 0));
     }
 

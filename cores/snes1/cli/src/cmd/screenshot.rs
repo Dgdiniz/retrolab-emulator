@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use retro_core::{EmulatorCore, InputState};
-use snes1_core::SnesEmulator;
+use snes1_core::{CaptureRecording, SnesEmulator};
 
 #[derive(Args, Debug)]
 pub struct ScreenshotArgs {
@@ -41,9 +41,11 @@ pub struct ScreenshotArgs {
     /// Also write each layer alone beside the screenshot (`<stem>_bg1`
     /// to `<stem>_bg4` and `<stem>_obj`), RGBA PNGs in which every pixel
     /// the layer does not cover is transparent. All of them come from the
-    /// screenshot's own frame: the last frame stops at its capture
-    /// boundary, where video memory still holds what its picture was
-    /// drawn from, and each layer is drawn again from there.
+    /// screenshot's own frame: the run records the settings each line is
+    /// drawn with, the last frame stops at its capture boundary, and each
+    /// layer is drawn again from that frame's lines, so a raster effect
+    /// (a scroll or a mode changed down the frame) comes out as the
+    /// picture shows it.
     #[arg(long, conflicts_with_all = ["show_only", "hide"])]
     pub render_layers: bool,
     /// Mash these player-1 buttons (comma-separated:
@@ -93,6 +95,15 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
     let mut emu = SnesEmulator::new();
     args.coprocessor.apply(&mut emu)?;
     emu.set_show_overscan(args.overscan);
+    // The layers are drawn from the settings each line of the last frame
+    // was drawn with: record them from the start, so that frame's table
+    // holds it from its first line.
+    if args.render_layers {
+        emu.set_capture_recording(CaptureRecording {
+            line_states: true,
+            ..Default::default()
+        });
+    }
     super::apply_force_detect(&mut emu, &rom, args.force_detect);
     emu.load_rom(&rom)
         .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
@@ -230,6 +241,12 @@ fn save_layer_images(emu: &mut SnesEmulator, output_path: &Path) -> Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "png".to_string());
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let source = if emu.draws_from_line_states() {
+        "drawn from the frame's line states"
+    } else {
+        "drawn from the registers as they stand"
+    };
+    println!("Layers {source}");
     for (layer, suffix) in ["bg1", "bg2", "bg3", "bg4", "obj"].into_iter().enumerate() {
         let image = emu
             .render_layer(layer as u32)

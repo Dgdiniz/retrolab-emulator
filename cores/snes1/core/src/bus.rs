@@ -427,6 +427,14 @@ pub enum BusDebugEvent {
     ApuPortWrite { port: u8 },
 }
 
+/// Whether a CPU address reaches a PPU register: `$2100-$213F` of the
+/// system-area B-bus window (banks `$00-$3F` / `$80-$BF`), the range
+/// [`classify_b_bus_write`] reports as PPU register writes.
+pub(crate) fn is_ppu_register_address(addr: u32) -> bool {
+    let bank = (addr >> 16) & 0xFF;
+    (bank <= 0x3F || (0x80..=0xBF).contains(&bank)) && (0x2100..=0x213F).contains(&(addr & 0xFFFF))
+}
+
 /// Classify a CPU write address into the PPU-register / APU-port event
 /// it represents, if any. Only the system-area B-bus window (`$2100-
 /// $21FF` in banks `$00-$3F` / `$80-$BF`) qualifies, the same range

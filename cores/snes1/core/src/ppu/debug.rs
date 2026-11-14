@@ -20,8 +20,9 @@
 //! and keep the renderer's caches of VRAM in step.
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
-    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
+    ExportError, IndexedImage, LayerData, LineStateTable, PaletteData, PixelImage, SpriteData,
+    SpriteOrderEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
+    VideoRegister,
 };
 
 use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
@@ -872,6 +873,18 @@ impl VideoDebugger for Ppu {
         })
     }
 
+    /// The line table, when the host asked for it
+    /// ([`crate::ppu::CaptureRecording`]): `line` (the scanline, 1 for the
+    /// first drawn) then every setting of [`crate::ppu::LineState`], in
+    /// its own names, one row per line drawn. A setting kept per
+    /// background or per layer gives a column per element
+    /// (`bg_hoffset[0]`), a window selection a column per flag
+    /// (`window_enable[2].w1_enable`). `None` when no table is kept or no
+    /// line was drawn since it was started.
+    fn get_line_states(&self) -> Option<LineStateTable> {
+        self.line_state_table()
+    }
+
     /// Decode a run of tiles to a vertically stacked *indexed* sheet
     /// (tile `i` occupies rows `[i*h, i*h+h)`, `h` the tile's height),
     /// honouring 2/4/8 bpp.
@@ -1245,11 +1258,14 @@ impl Ppu {
     /// The renderer keeps the tilemap rows and the decoded sprite tiles it
     /// read from VRAM until the VRAM generation moves. A write moves it,
     /// as a write through the port does, so the next line drawn, or a
-    /// repaint, reads the new contents.
+    /// repaint, reads the new contents. A write is no write of the frame's:
+    /// a frame drawn again from its line table shows it on every line, and
+    /// the table then reports its memory as not exact.
     pub fn write_vram_debug(&mut self, word_address: u32, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+        self.before_video_memory_edit();
         let start = (word_address as usize % (VRAM_BYTES / 2)) * 2;
         for (offset, &value) in bytes.iter().take(VRAM_BYTES).enumerate() {
             let byte_address = (start + offset) % VRAM_BYTES;
@@ -1263,6 +1279,7 @@ impl Ppu {
             *word = u16::from_le_bytes([low, high]);
         }
         self.vram_generation = self.vram_generation.wrapping_add(1);
+        self.after_video_memory_edit();
     }
 
     /// Write `colours` into CGRAM from colour `colour_index` on, the way a
@@ -1271,16 +1288,22 @@ impl Ppu {
     /// BGR555 word (`0BBBBBGGGGGRRRRR`) and keeps its low 15 bits, as the
     /// port stores it, so [`Self::cgram`] gives back the written words with
     /// bit 15 clear. The renderer reads CGRAM as it draws, so the next line
-    /// drawn, or a repaint, shows the new colours.
+    /// drawn, or a repaint, shows the new colours; a line table then
+    /// reports its memory as not exact, as for [`Self::write_vram_debug`].
     ///
     /// An index past the 256 colours wraps to the start, and so does a run
     /// that crosses the end. A buffer longer than CGRAM is cut to its 256
     /// colours; an empty one writes nothing.
     pub fn write_cgram_debug(&mut self, colour_index: u32, colours: &[u16]) {
+        if colours.is_empty() {
+            return;
+        }
+        self.before_video_memory_edit();
         let start = colour_index as usize % CGRAM_COLOURS;
         for (offset, &colour) in colours.iter().take(CGRAM_COLOURS).enumerate() {
             self.cgram[(start + offset) % CGRAM_COLOURS] = colour & CGRAM_COLOUR_BITS;
         }
+        self.after_video_memory_edit();
     }
 
     /// Write `bytes` into OAM from `byte_address` on, the way a debugger
@@ -1290,16 +1313,23 @@ impl Ppu {
     /// each of the 128 sprites in the low table (X, Y, character,
     /// attributes), then the 32-byte high table, two bits a sprite (bit 8
     /// of X, then the size). The renderer reads OAM as it draws each line,
-    /// so the next line drawn, or a repaint, shows the new sprites.
+    /// so the next line drawn, or a repaint, shows the new sprites; a line
+    /// table then reports its memory as not exact, as for
+    /// [`Self::write_vram_debug`].
     ///
     /// An address past the 544 bytes wraps to the start, and so does a run
     /// that crosses the end. A buffer longer than OAM is cut to its 544
     /// bytes; an empty one writes nothing.
     pub fn write_oam_debug(&mut self, byte_address: u32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.before_video_memory_edit();
         let start = byte_address as usize % OAM_BYTES;
         for (offset, &value) in bytes.iter().take(OAM_BYTES).enumerate() {
             self.oam[(start + offset) % OAM_BYTES] = value;
         }
+        self.after_video_memory_edit();
     }
 }
 

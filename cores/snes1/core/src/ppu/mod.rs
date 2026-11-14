@@ -34,6 +34,7 @@
 //! | [`window`]   | pure window-mask + colour-region helpers (no `&self`)                     |
 //! | [`colormath`]| pure colour add/sub arithmetic (no `&self`)                              |
 //! | [`render`]   | per-scanline raster, Modes 0-7, mosaic, OBJ, sub-screen, windows, colour math |
+//! | [`record`]   | what a capture asks to record: the settings each line was drawn with, the writes to video memory |
 //! | `mod.rs`     | struct, [`PpuAccessCtx`], [`Ppu::reset`], [`Ppu::read_reg`] / [`Ppu::write_reg`] dispatch |
 //!
 //! ## Access context
@@ -58,6 +59,8 @@ pub use debug::{
 };
 pub mod mode7;
 pub mod oam;
+pub mod record;
+pub use record::{CaptureRecording, LinePalettes, LineState};
 pub mod regs;
 pub mod render;
 pub mod sprite;
@@ -293,6 +296,11 @@ impl SpriteTileCache {
 /// is stored but not drawn). Keeping the surface complete means those
 /// effects drop in without having to extend the dispatch matrix or the
 /// test fixtures.
+///
+/// A register the renderer reads must also be a setting of
+/// [`record::LineState`]: a frame drawn again from its line table sets
+/// each line's registers from it, and a register left out would be drawn
+/// as it stands.
 pub struct Ppu {
     // -- Memories -------------------------------------------------
     /// 64 KiB of VRAM, addressed as 32 K 16-bit words. The 5A22
@@ -664,6 +672,10 @@ pub struct Ppu {
     /// `frame_hires`. Sized for the worst case (240 overscan x 2
     /// interlace = 480 rows). Rebuilt every frame, never savestated.
     pub(crate) line_hires: [bool; MAX_OUTPUT_ROWS],
+
+    /// What the host asked the PPU to record while frames run (see
+    /// [`record`]): empty until armed, never part of a savestate.
+    pub(crate) recorders: record::Recorders,
 }
 
 /// Number of toggleable debug layers: BG1-4 plus OBJ.
@@ -801,6 +813,7 @@ impl Ppu {
             frame_hires: false,
             render_interlace: false,
             line_hires: [false; MAX_OUTPUT_ROWS],
+            recorders: record::Recorders::default(),
         };
         ppu.reset();
         ppu
@@ -1007,6 +1020,10 @@ impl Ppu {
         self.frame_hires = false;
         self.render_interlace = false;
         self.line_hires = [false; MAX_OUTPUT_ROWS];
+
+        // The line table described the frame before the load, and its logs
+        // the memory the load replaced; the recorders stay armed.
+        self.drop_recorded_frame();
     }
 
     /// Reset to the canonical PPU power-on state. Memories are
@@ -1145,6 +1162,10 @@ impl Ppu {
 
         // Sprite-tile cache rides the same generation reset.
         self.sprite_tile_cache.reset();
+
+        // A line table describes a frame drawn before the reset; the
+        // recorders stay armed.
+        self.drop_recorded_frame();
     }
 
     /// Force every per-BG tilemap-row cache to miss on the next

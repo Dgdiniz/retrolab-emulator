@@ -1,5 +1,6 @@
 //! The VDP driven through its ports and registers, alone and from the CPU.
 
+mod draw;
 mod vdp_cpu_integration;
 mod vdp_debugger_integration;
 mod vdp_dma_integration;

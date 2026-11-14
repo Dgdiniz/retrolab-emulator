@@ -627,7 +627,10 @@ fn a_layer_is_drawn_alone_and_changes_nothing() {
     let shown = emu.get_framebuffer().data.clone();
     let (tile_colour, _) = shown_and_held_colour(&emu);
 
-    let plane_a = emu.render_layer(LAYER_PLANE_A as u32).expect("plane A");
+    let plane_a = emu
+        .render_layer(LAYER_PLANE_A as u32)
+        .expect("plane A")
+        .image;
     assert_eq!((plane_a.width, plane_a.height), (320, 224));
     assert_eq!(
         plane_a.rgba[..4],
@@ -641,7 +644,7 @@ fn a_layer_is_drawn_alone_and_changes_nothing() {
     );
 
     for layer in [LAYER_PLANE_B, LAYER_WINDOW, LAYER_SPRITES] {
-        let image = emu.render_layer(layer as u32).expect("a layer");
+        let image = emu.render_layer(layer as u32).expect("a layer").image;
         assert!(
             image.rgba.iter().all(|&byte| byte == 0),
             "layer {layer} covers nothing: every pixel transparent"
@@ -707,7 +710,10 @@ fn a_repaint_and_a_layer_move_no_saved_state_on_a_frame_with_sprite_overflow() {
     }
     assert_eq!(emu.vdp().status_word() & 0x0040, 0);
 
-    let sprites = emu.render_layer(LAYER_SPRITES as u32).expect("the sprites");
+    let sprites = emu
+        .render_layer(LAYER_SPRITES as u32)
+        .expect("the sprites")
+        .image;
     let pixel = |x: usize, y: usize| &sprites.rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
     assert_eq!(pixel(0, 16)[3], 255, "the first sprite");
     assert_eq!(pixel(159, 16)[3], 255, "the twentieth");

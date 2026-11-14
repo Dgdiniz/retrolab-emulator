@@ -48,8 +48,8 @@ pub use debugger::{
 };
 pub use ppu::tile::TilemapEntry;
 pub use ppu::{
-    window_layer, Ppu, PpuAccessCtx, PpuSettings, SpriteDescriptor, TileSetSource, ViewerImage,
-    WindowEnable,
+    window_layer, CaptureRecording, LinePalettes, LineState, Ppu, PpuAccessCtx, PpuSettings,
+    SpriteDescriptor, TileSetSource, ViewerImage, WindowEnable,
 };
 pub use savestate::{SnesSaveState, SNES_SAVESTATE_VERSION};
 pub use scheduler::{

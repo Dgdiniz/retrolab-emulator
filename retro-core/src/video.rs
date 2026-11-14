@@ -194,6 +194,33 @@ pub struct TileDecodeRequest {
     pub tile_size: TileSize,
 }
 
+/// The settings each line of a frame was drawn with, as a core recorded them
+/// while the lines were drawn: one column per setting, in the core's own
+/// names, one row per line. A core records it only while a host asks for it,
+/// and never keeps it in a savestate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineStateTable {
+    /// The number of the frame the lines belong to: the frames finished, plus
+    /// one while the frame is in progress or held at its capture boundary, as
+    /// a frame snapshot numbers its picture.
+    pub frame: u64,
+    /// The table begins with the frame's first drawn line.
+    pub from_first_line: bool,
+    /// The frame's picture is finished: every line drawn is in the table.
+    pub complete: bool,
+    /// Video memory can be put back as each line read it.
+    pub memory_exact: bool,
+    /// Rows of the picture each line gives: 1, or 2 when lines are woven or
+    /// doubled.
+    pub rows_per_line: u32,
+    /// The line drawn into the picture's first row.
+    pub first_row_line: u32,
+    /// The column names, `line` first.
+    pub columns: Vec<String>,
+    /// The values, row after row, `columns.len()` to a row.
+    pub values: Vec<u32>,
+}
+
 /// Video debugging interface for tile-based graphics systems.
 pub trait VideoDebugger {
     /// Get tile data by index.
@@ -277,5 +304,13 @@ pub trait VideoDebugger {
     fn decode_tiles(&self, request: &TileDecodeRequest) -> Result<IndexedImage, ExportError> {
         let _ = request;
         Err(ExportError::Unsupported)
+    }
+
+    /// The settings each line of the frame last drawn was drawn with, when
+    /// the core keeps a line table and a host asked it to record one.
+    ///
+    /// Default: `None`, a core that keeps no line table.
+    fn get_line_states(&self) -> Option<LineStateTable> {
+        None
     }
 }

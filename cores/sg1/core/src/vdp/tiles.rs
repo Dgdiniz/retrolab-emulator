@@ -1,6 +1,9 @@
-//! Tile rendering and decoding for VDP.
+//! Tile decoding for the VDP's debugger views and exports.
 //!
-//! Handles 8x8 tile patterns (4bpp) and conversion to indexed pixels.
+//! Handles 8x8 tile patterns (4bpp) and conversion to indexed pixels. The
+//! renderer reads its pixels straight from VRAM as it draws
+//! (`Vdp::read_tile_pixel_from_vram`); this decode is for the views and
+//! exports that want a whole tile.
 
 /// A decoded 8x8 tile (64 pixels, 4-bit indexed color per pixel).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,58 +66,6 @@ impl Tile {
         let x = if flip_h { 7 - x } else { x };
         let y = if flip_v { 7 - y } else { y };
         self.pixels[(y * 8 + x) as usize]
-    }
-
-    /// Render tile to a framebuffer at specific position.
-    ///
-    /// # Arguments
-    /// * `framebuffer` - RGBA framebuffer (stride = width * 4)
-    /// * `x` - X position in framebuffer
-    /// * `y` - Y position in framebuffer
-    /// * `width` - Framebuffer width
-    /// * `palette` - 16-color palette (RGBA format)
-    /// * `flip_h` - Horizontal flip
-    /// * `flip_v` - Vertical flip
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_to_framebuffer(
-        &self,
-        framebuffer: &mut [u8],
-        x: i32,
-        y: i32,
-        width: u32,
-        palette: &[(u8, u8, u8, u8); 16],
-        flip_h: bool,
-        flip_v: bool,
-    ) {
-        for ty in 0..8 {
-            for tx in 0..8 {
-                let pixel = self.get_pixel(tx, ty, flip_h, flip_v);
-
-                // Color 0 is transparent (don't draw)
-                if pixel == 0 {
-                    continue;
-                }
-
-                let screen_x = x + tx as i32;
-                let screen_y = y + ty as i32;
-
-                // Clip to the framebuffer's width and to 224 lines
-                if screen_x < 0 || screen_y < 0 {
-                    continue;
-                }
-                if screen_x >= width as i32 || screen_y >= 224 {
-                    continue;
-                }
-
-                let idx = ((screen_y * width as i32 + screen_x) * 4) as usize;
-                let color = palette[pixel as usize];
-
-                framebuffer[idx] = color.0; // R
-                framebuffer[idx + 1] = color.1; // G
-                framebuffer[idx + 2] = color.2; // B
-                framebuffer[idx + 3] = color.3; // A
-            }
-        }
     }
 }
 

@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use clap::Args;
 use retro_core::video::PixelImage;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
-use sg1_core::vdp::{RenderLayerMode, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
+use sg1_core::vdp::{
+    CaptureRecording, RenderLayerMode, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
+};
 
 #[derive(Args, Debug)]
 pub struct ScreenshotArgs {
@@ -36,12 +38,16 @@ pub struct ScreenshotArgs {
     /// Also save layer-separated PNGs (`_plane_b`, `_plane_a`, `_window`,
     /// `_sprites`, `_priority`, `_sprite_priority`) alongside the main
     /// screenshot, all of the screenshot's frame: it stops where its
-    /// picture is drawn and vertical blanking has not begun, so the video
-    /// memory the layers are drawn from is the one the picture was drawn
-    /// from. The four layers keep transparency: a pixel the layer does not
-    /// cover has alpha 0. `_plane_a` and `_window` each show only their own
-    /// part of the screen: the window replaces plane A where it covers. The
-    /// two priority views are opaque.
+    /// picture is drawn and vertical blanking has not begun, and the line
+    /// states are recorded from the first frame on, so each line of a
+    /// layer is drawn from the state it was drawn with (its scroll, palette,
+    /// registers and the video memory it read): a raster effect, a scroll
+    /// or palette changed part of the way down the screen, shows in the
+    /// layers as it shows in the screenshot. The four layers keep
+    /// transparency: a pixel the layer does not cover has alpha 0.
+    /// `_plane_a` and `_window` each show only their own part of the
+    /// screen: the window replaces plane A where it covers. The two
+    /// priority views are opaque.
     #[arg(long)]
     pub render_layers: bool,
     /// Patch VRAM word(s) before the last frame render (for debugging):
@@ -69,6 +75,16 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
     let schedule = super::parse_press_schedule(args.press_at.as_deref())?;
 
     emu.debugger().set_execution_mode(ExecutionMode::Running);
+
+    // The layers are drawn line by line from the state each line was
+    // drawn with: record it while the frames run. Recording changes
+    // nothing the game does, so the screenshot is the same either way.
+    if args.render_layers {
+        emu.set_capture_recording(CaptureRecording {
+            line_states: true,
+            ..CaptureRecording::default()
+        });
+    }
 
     println!("Running {} frames...", args.frames);
     for f in 0..args.frames {
@@ -158,7 +174,8 @@ fn parse_vram_patches(specs: &[String]) -> Result<Vec<(u16, u16)>> {
 
 /// Draw each layer of the held frame alone, and the two priority views,
 /// and save a PNG of each next to `output_path`. Nothing runs between them,
-/// so all six come from the frame of the screenshot.
+/// so all six come from the frame of the screenshot, each line from the
+/// line table the run recorded.
 fn save_layer_screenshots(emu: &mut sg1_core::GenesisEmulator, output_path: &Path) -> Result<()> {
     let stem = output_path
         .file_stem()
@@ -178,10 +195,15 @@ fn save_layer_screenshots(emu: &mut sg1_core::GenesisEmulator, output_path: &Pat
         (LAYER_SPRITES, "sprites"),
     ];
     for (layer, suffix) in layers {
-        let image = emu
+        let layer_image = emu
             .render_layer(layer as u32)
             .ok_or_else(|| anyhow::anyhow!("no layer {layer}"))?;
-        save_rgba(&image, &path_for(suffix))?;
+        if !layer_image.from_line_states {
+            eprintln!(
+                "[render-layers] {suffix}: some lines were drawn from the state at the frame's end"
+            );
+        }
+        save_rgba(&layer_image.image, &path_for(suffix))?;
     }
 
     let views = [

@@ -220,6 +220,13 @@ pub struct SnesEmulator {
     /// state, so it is intentionally outside savestate.
     show_overscan: bool,
 
+    /// What the host asked the core to record while frames run, for a
+    /// capture to read ([`crate::ppu::CaptureRecording`]). Kept here, as
+    /// `show_overscan` is, so it survives the bus rebuild in
+    /// [`EmulatorCore::load_rom`]: `reset` applies it again. A host
+    /// setting, never part of a savestate.
+    capture_recording: crate::ppu::CaptureRecording,
+
     /// Breakpoints, coverage, tracing, and cached CPU-state snapshots.
     /// Drives execution-tier selection in [`Self::run_frame`].
     debugger: SnesDebugger,
@@ -379,6 +386,7 @@ impl SnesEmulator {
             last_unsupported_chip: None,
             cartridge_manifest_override: None,
             show_overscan: false,
+            capture_recording: crate::ppu::CaptureRecording::default(),
             debugger,
             debug_armed: false,
             pending_break: false,
@@ -430,6 +438,22 @@ impl SnesEmulator {
     /// Whether the full overscan frame is exposed (vs cropped to 224).
     pub fn show_overscan_enabled(&self) -> bool {
         self.show_overscan
+    }
+
+    /// Choose what the core records while frames run, for a capture to
+    /// read ([`crate::ppu::CaptureRecording`]). Applies at once and
+    /// survives a ROM load and a reset; a host setting, never part of a
+    /// savestate, and nothing it records changes what the game does. A line
+    /// table armed in the middle of a frame does not hold that frame from
+    /// its line 1, so the frame it describes whole is the next one.
+    pub fn set_capture_recording(&mut self, recording: crate::ppu::CaptureRecording) {
+        self.capture_recording = recording;
+        self.bus.ppu_mut().set_capture_recording(recording);
+    }
+
+    /// What the core was asked to record.
+    pub fn capture_recording(&self) -> crate::ppu::CaptureRecording {
+        self.capture_recording
     }
 
     /// Stage a cartridge manifest applied on the next
@@ -779,6 +803,9 @@ impl SnesEmulator {
         self.master_cycles = payload.master_cycles;
         self.frame_base_cycle = payload.frame_base_cycle;
         self.frame_count = payload.frame_count;
+        // The PPU dropped its line table with the memory it described; the
+        // lines drawn next belong to the frame after the ones finished.
+        self.bus.ppu_mut().set_recording_frame(self.frame_count + 1);
         // Saves are taken at frame boundaries, where NMI delivery has
         // already resolved (it arms and fires within a frame), so it is
         // not part of the wire format, just clear the transient state.
@@ -1049,6 +1076,34 @@ impl SnesEmulator {
         self.bus.ppu_mut().render_layer(layer as usize)
     }
 
+    /// Whether a repaint or a layer render made now draws the frame from
+    /// its line table, each line with its own settings and the video
+    /// memory it read ([`crate::ppu::Ppu::draws_from_line_states`]), rather
+    /// than from the registers as they stand.
+    pub fn draws_from_line_states(&self) -> bool {
+        self.bus.ppu().draws_from_line_states()
+    }
+
+    /// The settings each line of the frame drawn last was drawn with, when
+    /// the line table is kept (`VideoDebugger::get_line_states`).
+    pub fn line_states(&self) -> Option<retro_core::video::LineStateTable> {
+        self.bus.ppu().get_line_states()
+    }
+
+    /// The palettes the lines of the line table were drawn with
+    /// ([`crate::ppu::Ppu::line_palettes`]).
+    pub fn line_palettes(&self) -> Option<crate::ppu::LinePalettes> {
+        self.bus.ppu().line_palettes()
+    }
+
+    /// The frame's picture drawn again from its line table
+    /// ([`crate::ppu::Ppu::picture_from_line_states`]), cropped as the
+    /// picture is. Emulation does not advance, the framebuffer the host
+    /// shows is left as it was, and so is everything a savestate holds.
+    pub fn picture_from_line_states(&mut self) -> Option<PixelImage> {
+        self.bus.ppu_mut().picture_from_line_states()
+    }
+
     /// The PPU's settings, structured ([`crate::ppu::PpuSettings`]).
     pub fn ppu_settings(&self) -> crate::ppu::PpuSettings {
         self.bus.ppu().settings()
@@ -1153,9 +1208,17 @@ impl SnesEmulator {
     /// effect with their normal side effects (matching what a CPU store would
     /// do); plain WRAM/SRAM edits behave as the memory editor expects.
     /// [`EmulatorCore::read_memory_debug`] reads through the same bus.
+    ///
+    /// A write to a PPU register is not one the frame made: until the next
+    /// frame's line 1, a repaint and a layer render draw from the registers
+    /// as they stand, which show it, rather than from the line table.
     pub fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
         for (i, &byte) in data.iter().enumerate() {
-            self.bus.write(addr.wrapping_add(i as u32), byte);
+            let at = addr.wrapping_add(i as u32);
+            if crate::bus::is_ppu_register_address(at) {
+                self.bus.ppu_mut().note_registers_edited();
+            }
+            self.bus.write(at, byte);
         }
     }
 
@@ -1590,6 +1653,7 @@ impl SnesEmulator {
         if self.present {
             self.bus.ppu().finalize_frame(&mut self.framebuffer);
         }
+        self.bus.ppu_mut().note_picture_finished();
         self.sync_display_info();
     }
 
@@ -2181,6 +2245,9 @@ impl SnesEmulator {
     /// small overshoot from this frame's last instruction).
     fn end_of_frame_bookkeeping(&mut self) {
         self.frame_count += 1;
+        // The lines drawn next belong to the next frame: one store, made
+        // whether or not anything records them.
+        self.bus.ppu_mut().set_recording_frame(self.frame_count + 1);
         // Read the live overscan bit so the upcoming frame's VBlank/NMI
         // and HDMA range land on the right scanline (240 when overscan
         // is on, else the region default). Games set overscan during
@@ -2660,6 +2727,12 @@ impl EmulatorCore for SnesEmulator {
         // the display dimensions (a plain reset re-applies the same
         // value, a no-op).
         self.bus.ppu_mut().set_show_overscan(self.show_overscan);
+        // The same for what the host asked to record; a line table kept
+        // across the reset would describe a frame from before it.
+        let ppu = self.bus.ppu_mut();
+        ppu.set_capture_recording(self.capture_recording);
+        ppu.drop_recorded_frame();
+        ppu.set_recording_frame(1);
         // The bus reset zeroes the PPU register file -> bgmode 0
         // (non-hires) + overscan off -> resync the public display
         // dimensions to the default 256x224 view.

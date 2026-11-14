@@ -1,7 +1,8 @@
-//! Integration tests for VDP tile rendering: patterns and colors written
-//! through the bus, tiles decoded and drawn into a framebuffer, and the color
-//! conversion.
+//! Tiles: patterns and colours written through the bus, tiles decoded, tiles
+//! drawn by the renderer the console runs, and the colour conversion of the
+//! debugger's exports.
 
+use super::draw;
 use retro_core::cpu::Addressable;
 use sg1_core::bus::AddressBus;
 use sg1_core::vdp::tiles::{build_rgba_palette, convert_genesis_color_to_rgb, Tile};
@@ -47,16 +48,35 @@ fn test_palette_write_to_cram() {
     assert_eq!(bus.vdp().get_cram()[0..4], [0x0000, 0x000E, 0x00E0, 0x0E00]);
 }
 
-#[test]
-fn test_tile_render_to_framebuffer() {
-    // Create a simple test tile
-    let mut pattern = [0u8; 32];
+/// The frame of tile 1, a pattern of `pattern`, drawn as plane A's top left
+/// cell moved to (`x`, `y`) by the scrolls, colour 1 red and the backdrop
+/// blue.
+fn draw_tile_at(pattern: &[u8; 32], x: u16, y: u16) -> sg1_core::vdp::Vdp {
+    let mut vdp = draw::vdp();
+    draw::put_tile(&mut vdp, 1, pattern);
+    draw::put_cell(
+        &mut vdp,
+        draw::PLANE_A,
+        32,
+        0,
+        0,
+        draw::entry(1, 0, false, false, false),
+    );
+    draw::set_colour(&mut vdp, 1, draw::RED);
+    draw::set_colour(&mut vdp, 2, draw::BLUE);
+    vdp.set_test_register(7, 0x02);
+    // Plane A is 256 lines high: scrolling up by 256 - y moves it down by y.
+    draw::scroll_across(&mut vdp, x, 0);
+    draw::scroll_down(&mut vdp, (256 - y) & 0xFF, 0);
+    draw::draw(&mut vdp);
+    vdp
+}
 
-    // A frame of color 1, two pixels to a byte (the left one in the high
-    // nibble):
-    // Row 0: 11111111
-    // Rows 1-6: 10000001 (edges only)
-    // Row 7: 11111111
+#[test]
+fn a_tile_is_drawn_where_the_scrolls_put_it() {
+    // A frame of colour 1, two pixels to a byte (the left one in the high
+    // nibble): rows 0 and 7 whole, rows 1-6 their two edges.
+    let mut pattern = [0u8; 32];
     pattern[0..4].copy_from_slice(&[0x11, 0x11, 0x11, 0x11]);
     for row in 1..7 {
         let base = row * 4;
@@ -64,130 +84,80 @@ fn test_tile_render_to_framebuffer() {
     }
     pattern[28..32].copy_from_slice(&[0x11, 0x11, 0x11, 0x11]);
 
-    let tile = Tile::decode(&pattern);
-
-    // Create a simple palette (color 1 = red)
-    let mut palette = [(0u8, 0u8, 0u8, 255u8); 16];
-    palette[1] = (255, 0, 0, 255); // Red
-
-    // Create framebuffer
-    let mut framebuffer = vec![0u8; 320 * 224 * 4];
-
-    // Render tile at position (10, 10)
-    tile.render_to_framebuffer(&mut framebuffer, 10, 10, 320, &palette, false, false);
-
-    // Verify some pixels
-    let get_pixel = |x: u32, y: u32| -> (u8, u8, u8) {
-        let idx = ((y * 320 + x) * 4) as usize;
-        (framebuffer[idx], framebuffer[idx + 1], framebuffer[idx + 2])
-    };
-
-    // Top-left of tile (10, 10) should be red
-    assert_eq!(get_pixel(10, 10), (255, 0, 0), "Top-left should be red");
-
-    // Center of tile should be black (color 0 = transparent)
-    assert_eq!(get_pixel(13, 13), (0, 0, 0), "Center should be black");
-
-    // Bottom-right corner should be red
-    assert_eq!(get_pixel(17, 17), (255, 0, 0), "Bottom-right should be red");
+    let vdp = draw_tile_at(&pattern, 10, 10);
+    assert_eq!(
+        draw::pixel(&vdp, 10, 10),
+        draw::shown(draw::RED),
+        "top left"
+    );
+    assert_eq!(
+        draw::pixel(&vdp, 13, 13),
+        draw::shown(draw::BLUE),
+        "the middle is colour 0: the backdrop"
+    );
+    assert_eq!(
+        draw::pixel(&vdp, 17, 17),
+        draw::shown(draw::RED),
+        "bottom right"
+    );
+    assert_eq!(draw::pixel(&vdp, 9, 10), draw::shown(draw::BLUE));
+    assert_eq!(draw::pixel(&vdp, 18, 18), draw::shown(draw::BLUE));
 }
 
 #[test]
-fn test_multiple_tiles_no_overlap() {
-    // All pixels = color 1
-    let pattern = [0x11u8; 32];
-
-    let tile = Tile::decode(&pattern);
-
-    let mut palette = [(0u8, 0u8, 0u8, 255u8); 16];
-    palette[1] = (255, 0, 0, 255); // Red
-
-    let mut framebuffer = vec![0u8; 320 * 224 * 4];
-
-    // Render 3 tiles in a row
-    tile.render_to_framebuffer(&mut framebuffer, 0, 0, 320, &palette, false, false);
-    tile.render_to_framebuffer(&mut framebuffer, 8, 0, 320, &palette, false, false);
-    tile.render_to_framebuffer(&mut framebuffer, 16, 0, 320, &palette, false, false);
-
-    let get_pixel = |x: u32, y: u32| -> (u8, u8, u8) {
-        let idx = ((y * 320 + x) * 4) as usize;
-        (framebuffer[idx], framebuffer[idx + 1], framebuffer[idx + 2])
-    };
-
-    // Verify pixels in each tile
-    assert_eq!(get_pixel(0, 0), (255, 0, 0));
-    assert_eq!(get_pixel(8, 0), (255, 0, 0));
-    assert_eq!(get_pixel(16, 0), (255, 0, 0));
-}
-
-#[test]
-fn test_tile_with_different_palettes() {
-    // All pixels = color 1
-    let pattern = [0x11u8; 32];
-
-    let tile = Tile::decode(&pattern);
-
-    // Palette 0: color 1 = red
-    let mut palette0 = [(0u8, 0u8, 0u8, 255u8); 16];
-    palette0[1] = (255, 0, 0, 255);
-
-    // Palette 1: color 1 = blue
-    let mut palette1 = [(0u8, 0u8, 0u8, 255u8); 16];
-    palette1[1] = (0, 0, 255, 255);
-
-    let mut framebuffer = vec![0u8; 320 * 224 * 4];
-
-    // Render same tile with different palettes
-    tile.render_to_framebuffer(&mut framebuffer, 0, 0, 320, &palette0, false, false);
-    tile.render_to_framebuffer(&mut framebuffer, 8, 0, 320, &palette1, false, false);
-
-    let get_pixel = |x: u32, y: u32| -> (u8, u8, u8) {
-        let idx = ((y * 320 + x) * 4) as usize;
-        (framebuffer[idx], framebuffer[idx + 1], framebuffer[idx + 2])
-    };
-
-    // First tile should be red
-    assert_eq!(get_pixel(0, 0), (255, 0, 0));
-
-    // Second tile should be blue
-    assert_eq!(get_pixel(8, 0), (0, 0, 255));
-}
-
-#[test]
-fn test_transparency_color_0() {
-    let mut pattern = [0u8; 32];
-    // Create a tile with color 0 (transparent) and color 1
-    // Only first pixel is color 1, rest are color 0
-    pattern[0] = 0x10; // First pixel, high nibble
-
-    let tile = Tile::decode(&pattern);
-
-    let mut palette = [(0u8, 0u8, 0u8, 255u8); 16];
-    palette[1] = (255, 0, 0, 255); // Red
-
-    // Fill framebuffer with blue background
-    let mut framebuffer = vec![0u8; 320 * 224 * 4];
-    for i in 0..(320 * 224) {
-        let idx = i * 4;
-        framebuffer[idx] = 0; // R
-        framebuffer[idx + 1] = 0; // G
-        framebuffer[idx + 2] = 255; // B (blue background)
-        framebuffer[idx + 3] = 255; // A
+fn tiles_in_a_row_do_not_overlap() {
+    let mut vdp = draw::vdp();
+    draw::put_tile(&mut vdp, 1, &draw::solid_tile(1));
+    for column in 0..3 {
+        let value = draw::entry(1, 0, false, false, false);
+        draw::put_cell(&mut vdp, draw::PLANE_A, 32, column, 0, value);
     }
+    draw::set_colour(&mut vdp, 1, draw::RED);
+    draw::draw(&mut vdp);
+    for x in [0, 8, 16, 23] {
+        assert_eq!(
+            draw::pixel(&vdp, x, 0),
+            draw::shown(draw::RED),
+            "column {x}"
+        );
+    }
+    assert_eq!(draw::pixel(&vdp, 24, 0), draw::shown(0));
+}
 
-    // Render tile
-    tile.render_to_framebuffer(&mut framebuffer, 10, 10, 320, &palette, false, false);
+#[test]
+fn one_tile_takes_the_colours_of_the_palette_line_its_cell_names() {
+    let mut vdp = draw::vdp();
+    draw::put_tile(&mut vdp, 1, &draw::solid_tile(1));
+    draw::put_cell(
+        &mut vdp,
+        draw::PLANE_A,
+        32,
+        0,
+        0,
+        draw::entry(1, 0, false, false, false),
+    );
+    draw::put_cell(
+        &mut vdp,
+        draw::PLANE_A,
+        32,
+        1,
+        0,
+        draw::entry(1, 1, false, false, false),
+    );
+    draw::set_colour(&mut vdp, 1, draw::RED);
+    draw::set_colour(&mut vdp, 17, draw::BLUE);
+    draw::draw(&mut vdp);
+    assert_eq!(draw::pixel(&vdp, 0, 0), draw::shown(draw::RED));
+    assert_eq!(draw::pixel(&vdp, 8, 0), draw::shown(draw::BLUE));
+}
 
-    let get_pixel = |x: u32, y: u32| -> (u8, u8, u8) {
-        let idx = ((y * 320 + x) * 4) as usize;
-        (framebuffer[idx], framebuffer[idx + 1], framebuffer[idx + 2])
-    };
-
-    // First pixel should be red (tile color)
-    assert_eq!(get_pixel(10, 10), (255, 0, 0));
-
-    // Second pixel should still be blue (background shows through)
-    assert_eq!(get_pixel(11, 10), (0, 0, 255));
+#[test]
+fn colour_0_of_a_tile_lets_the_backdrop_through() {
+    let mut pattern = [0u8; 32];
+    pattern[0] = 0x10; // only the first pixel, colour 1
+    let vdp = draw_tile_at(&pattern, 10, 10);
+    assert_eq!(draw::pixel(&vdp, 10, 10), draw::shown(draw::RED));
+    assert_eq!(draw::pixel(&vdp, 11, 10), draw::shown(draw::BLUE));
 }
 
 #[test]

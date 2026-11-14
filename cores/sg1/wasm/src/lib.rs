@@ -77,6 +77,24 @@ fn words_copy(words: &[u16]) -> JsValue {
     array.into()
 }
 
+/// `{ width, height, data: Uint8Array }` for an RGBA picture, its bytes
+/// copied.
+fn picture_object(picture: &retro_core::video::PixelImage) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("width"),
+        &JsValue::from_f64(f64::from(picture.width)),
+    );
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("height"),
+        &JsValue::from_f64(f64::from(picture.height)),
+    );
+    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &bytes_copy(&picture.rgba));
+    obj
+}
+
 /// UI badge label for a Genesis mapper. retro-core's `MapperId` enumerates
 /// SNES mappers, so every Genesis shape arrives as `Custom(plan_name)`; a
 /// plain cartridge (or no cartridge) reads as `"None"` so the mapper viewer
@@ -1585,32 +1603,168 @@ impl RetroEmulator {
         obj.into()
     }
 
-    /// One layer of the frame drawn alone from video memory as it is now
-    /// (at a capture boundary, the frame held there): `{ width, height,
-    /// data: Uint8Array }`, RGBA, with alpha 0 wherever the layer does not
-    /// cover the pixel; `null` for a layer id that is none of
-    /// `getLayerInfo`'s. Colours are the layer's palette colours, before
-    /// shadow and highlight. Nothing runs, the framebuffer `getFramebuffer`
-    /// gives stays as it was, and so does everything a savestate holds.
+    /// One layer of the frame drawn alone (at a capture boundary, the frame
+    /// held there): `{ width, height, data: Uint8Array, fromLineStates }`,
+    /// RGBA, with alpha 0 wherever the layer does not cover the pixel;
+    /// `null` for a layer id that is none of `getLayerInfo`'s. Colours are
+    /// the layer's palette colours, before shadow and highlight. While line
+    /// states are recorded (`setCaptureRecording`), each line is drawn from
+    /// the state it was drawn with, so a scroll or palette split shows as
+    /// it was drawn; `fromLineStates` says every line was. Otherwise the
+    /// lines are drawn from video memory as it is now. Nothing runs, the
+    /// framebuffer `getFramebuffer` gives stays as it was, and so does
+    /// everything a savestate holds.
     #[wasm_bindgen(js_name = renderLayer)]
     pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
         match self.genesis.render_layer(layer_id) {
-            Some(img) => {
-                let obj = js_sys::Object::new();
+            Some(layer) => {
+                let obj = picture_object(&layer.image);
                 let _ = js_sys::Reflect::set(
                     &obj,
-                    &JsValue::from_str("width"),
-                    &JsValue::from_f64(f64::from(img.width)),
+                    &JsValue::from_str("fromLineStates"),
+                    &JsValue::from_bool(layer.from_line_states),
                 );
-                let _ = js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("height"),
-                    &JsValue::from_f64(f64::from(img.height)),
-                );
-                let _ =
-                    js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &bytes_copy(&img.rgba));
                 obj.into()
             }
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Choose what the core records of each frame while frames run, for a
+    /// capture to read: `options` is `{ lineStates?, pixelSources?,
+    /// lineSprites?, videoMemorySources?, frameWrites? }`, booleans, and a
+    /// key left out keeps its value. A host setting: never part of a
+    /// savestate, kept across a reset, `loadRom` and `loadState`, and
+    /// nothing the game does depends on it. This core records the line
+    /// states; the other four stay false (`getCaptureRecording`).
+    #[wasm_bindgen(js_name = setCaptureRecording)]
+    pub fn set_capture_recording(&mut self, options: JsValue) {
+        let mut wanted = self.genesis.capture_recording();
+        let asked = |key: &str| {
+            js_sys::Reflect::get(&options, &JsValue::from_str(key))
+                .ok()
+                .and_then(|value| value.as_bool())
+        };
+        for (key, flag) in [
+            ("lineStates", &mut wanted.line_states),
+            ("pixelSources", &mut wanted.pixel_sources),
+            ("lineSprites", &mut wanted.line_sprites),
+            ("videoMemorySources", &mut wanted.video_memory_sources),
+            ("frameWrites", &mut wanted.frame_writes),
+        ] {
+            if let Some(on) = asked(key) {
+                *flag = on;
+            }
+        }
+        self.genesis.set_capture_recording(wanted);
+    }
+
+    /// What the core records while frames run: `{ lineStates, pixelSources,
+    /// lineSprites, videoMemorySources, frameWrites }`, a plain object of
+    /// booleans.
+    #[wasm_bindgen(js_name = getCaptureRecording)]
+    pub fn get_capture_recording(&self) -> JsValue {
+        let recording = self.genesis.capture_recording();
+        let obj = js_sys::Object::new();
+        for (key, on) in [
+            ("lineStates", recording.line_states),
+            ("pixelSources", recording.pixel_sources),
+            ("lineSprites", recording.line_sprites),
+            ("videoMemorySources", recording.video_memory_sources),
+            ("frameWrites", recording.frame_writes),
+        ] {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(on));
+        }
+        obj.into()
+    }
+
+    /// The settings each line of the picture was drawn with, while line
+    /// states are recorded, else `null`: `{ frame, fromFirstLine, complete,
+    /// memoryExact, rowsPerLine, firstRowLine, columns: string[], values:
+    /// Uint32Array }`, the values row after row, `columns.length` to a row,
+    /// one row per line of the picture. The columns: `line`; `frame` (the
+    /// frame the line was drawn in, its low 32 bits); `kind` (0 not
+    /// recorded, 1 drawn, 2 blank with the display off, 3 painted by a CRAM
+    /// transfer with the display off); `exact` (1 when the video memory the
+    /// line read can be given back exactly); `register_0` to `register_23`;
+    /// `plane_a_horizontal_scroll` and `plane_b_horizontal_scroll`;
+    /// `vertical_scroll_0` to `vertical_scroll_39`; `sprite_mask_carried_in`;
+    /// and `palette`, an index into `getLinePalettes().palettes` (65535 for a
+    /// line not recorded). `frame` is numbered as `captureFrameSnapshot`
+    /// numbers its picture. Every array is the caller's own copy.
+    #[wasm_bindgen(js_name = getLineStates)]
+    pub fn get_line_states(&self) -> JsValue {
+        let Some(table) = self.genesis.line_states() else {
+            return JsValue::NULL;
+        };
+        let obj = js_sys::Object::new();
+        let set = |key: &str, value: &JsValue| {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
+        };
+        set("frame", &JsValue::from_f64(table.frame as f64));
+        set("fromFirstLine", &JsValue::from_bool(table.from_first_line));
+        set("complete", &JsValue::from_bool(table.complete));
+        set("memoryExact", &JsValue::from_bool(table.memory_exact));
+        set(
+            "rowsPerLine",
+            &JsValue::from_f64(f64::from(table.rows_per_line)),
+        );
+        set(
+            "firstRowLine",
+            &JsValue::from_f64(f64::from(table.first_row_line)),
+        );
+        let columns = js_sys::Array::new();
+        for name in &table.columns {
+            columns.push(&JsValue::from_str(name));
+        }
+        set("columns", &columns);
+        let values = js_sys::Uint32Array::new_with_length(table.values.len() as u32);
+        values.copy_from(&table.values);
+        set("values", &values);
+        obj.into()
+    }
+
+    /// The palettes the lines of the picture began with, while line states
+    /// are recorded, else `null`: `{ coloursPerPalette, palettes:
+    /// Uint16Array, paletteOfLine: Uint16Array, changes: Uint16Array }`.
+    /// `palettes` holds each palette once, `coloursPerPalette` (64) CRAM
+    /// words each (`0000 BBB0 GGG0 RRR0`); `paletteOfLine` has one entry per
+    /// row of `getLineStates`, an index into `palettes` (65535 for a line
+    /// not recorded). `changes` lists the palette writes made while each
+    /// line was on screen, five values each: the row, the column the write
+    /// coloured the line again from (65535 when it coloured nothing), the
+    /// colour index, the colour word, and 1 when it coloured the whole line
+    /// again. Every array is the caller's own copy.
+    #[wasm_bindgen(js_name = getLinePalettes)]
+    pub fn get_line_palettes(&self) -> JsValue {
+        let Some(palettes) = self.genesis.line_palettes() else {
+            return JsValue::NULL;
+        };
+        let obj = js_sys::Object::new();
+        let set = |key: &str, value: &JsValue| {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
+        };
+        set(
+            "coloursPerPalette",
+            &JsValue::from_f64(f64::from(palettes.colours_per_palette)),
+        );
+        set("palettes", &words_copy(&palettes.palettes));
+        set("paletteOfLine", &words_copy(&palettes.palette_of_line));
+        set("changes", &words_copy(&palettes.changes));
+        obj.into()
+    }
+
+    /// The picture drawn again from the line table, while line states are
+    /// recorded, else `null`: `{ width, height, data: Uint8Array }`, RGBA,
+    /// cut as `getFramebuffer`'s picture is. Where the table holds every
+    /// line of the frame and video memory could be given back exactly
+    /// (`getLineStates().complete` and `memoryExact`), it is the frame's
+    /// picture byte for byte. Nothing runs, and the framebuffer and
+    /// everything a savestate holds stay as they were.
+    #[wasm_bindgen(js_name = pictureFromLineStates)]
+    pub fn picture_from_line_states(&mut self) -> JsValue {
+        match self.genesis.picture_from_line_states() {
+            Some(picture) => picture_object(&picture).into(),
             None => JsValue::NULL,
         }
     }
@@ -2430,6 +2584,144 @@ mod tests {
         assert!(!emu.save_state().is_empty());
         assert!(!emu.at_capture_boundary());
         assert_eq!(emu.get_frame_number(), frame + 1);
+    }
+
+    /// `{ key: value, ... }` as the options a host passes.
+    fn options(pairs: &[(&str, bool)]) -> JsValue {
+        let obj = js_sys::Object::new();
+        for &(key, on) in pairs {
+            js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(on)).unwrap();
+        }
+        obj.into()
+    }
+
+    /// `value[key]`.
+    fn field(value: &JsValue, key: &str) -> JsValue {
+        js_sys::Reflect::get(value, &JsValue::from_str(key)).unwrap()
+    }
+
+    /// Whether `array` is a view into this module's memory.
+    fn views_module_memory(buffer: &js_sys::ArrayBuffer) -> bool {
+        let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().dyn_into().unwrap();
+        js_sys::Object::is(buffer, &memory.buffer())
+    }
+
+    #[wasm_bindgen_test]
+    fn capture_recording_is_a_plain_object_and_a_key_left_out_keeps_its_value() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        let keys = [
+            "lineStates",
+            "pixelSources",
+            "lineSprites",
+            "videoMemorySources",
+            "frameWrites",
+        ];
+        assert_plain_object(&emu.get_capture_recording(), &keys, "getCaptureRecording");
+        let on =
+            |emu: &RetroEmulator, key: &str| field(&emu.get_capture_recording(), key).as_bool();
+        for key in keys {
+            assert_eq!(on(&emu, key), Some(false), "{key} starts off");
+        }
+
+        emu.set_capture_recording(options(&[("lineStates", true)]));
+        assert_eq!(on(&emu, "lineStates"), Some(true));
+        emu.set_capture_recording(options(&[]));
+        assert_eq!(
+            on(&emu, "lineStates"),
+            Some(true),
+            "a key left out keeps its value"
+        );
+        emu.set_capture_recording(options(&[("pixelSources", true)]));
+        assert_eq!(on(&emu, "lineStates"), Some(true));
+        assert_eq!(
+            on(&emu, "pixelSources"),
+            Some(false),
+            "not recorded by this core"
+        );
+        emu.set_capture_recording(options(&[("lineStates", false)]));
+        assert_eq!(on(&emu, "lineStates"), Some(false));
+    }
+
+    #[wasm_bindgen_test]
+    fn line_states_their_palettes_and_the_picture_drawn_from_them_are_plain_objects_of_copies() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        assert!(emu.get_line_states().is_null(), "nothing recorded yet");
+        assert!(emu.get_line_palettes().is_null());
+        assert!(emu.picture_from_line_states().is_null());
+        let layer = emu.render_layer(0);
+        assert_plain_object(
+            &layer,
+            &["width", "height", "data", "fromLineStates"],
+            "renderLayer",
+        );
+        assert_eq!(field(&layer, "fromLineStates").as_bool(), Some(false));
+
+        emu.set_capture_recording(options(&[("lineStates", true)]));
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+
+        let states = emu.get_line_states();
+        assert_plain_object(
+            &states,
+            &[
+                "frame",
+                "fromFirstLine",
+                "complete",
+                "memoryExact",
+                "rowsPerLine",
+                "firstRowLine",
+                "columns",
+                "values",
+            ],
+            "getLineStates",
+        );
+        assert_eq!(
+            field(&states, "frame").as_f64(),
+            Some((emu.get_frame_number() + 1) as f64)
+        );
+        assert_eq!(field(&states, "complete").as_bool(), Some(true));
+        assert_eq!(field(&states, "fromFirstLine").as_bool(), Some(true));
+        assert_eq!(field(&states, "rowsPerLine").as_f64(), Some(1.0));
+        let columns = js_sys::Array::from(&field(&states, "columns"));
+        assert_eq!(columns.length(), 72);
+        assert_eq!(columns.get(0).as_string().as_deref(), Some("line"));
+        assert_eq!(columns.get(71).as_string().as_deref(), Some("palette"));
+        let values: js_sys::Uint32Array = field(&states, "values").dyn_into().unwrap();
+        assert_eq!(values.length(), 72 * 224);
+        assert!(!views_module_memory(&values.buffer()));
+
+        let palettes = emu.get_line_palettes();
+        assert_plain_object(
+            &palettes,
+            &["coloursPerPalette", "palettes", "paletteOfLine", "changes"],
+            "getLinePalettes",
+        );
+        assert_eq!(field(&palettes, "coloursPerPalette").as_f64(), Some(64.0));
+        let of_line: js_sys::Uint16Array = field(&palettes, "paletteOfLine").dyn_into().unwrap();
+        assert_eq!(of_line.length(), 224);
+        let all: js_sys::Uint16Array = field(&palettes, "palettes").dyn_into().unwrap();
+        assert!(all.length() > 0 && all.length().is_multiple_of(64));
+        let changes: js_sys::Uint16Array = field(&palettes, "changes").dyn_into().unwrap();
+        assert!(changes.length().is_multiple_of(5));
+        assert!(!views_module_memory(&all.buffer()));
+
+        let picture = emu.picture_from_line_states();
+        assert_plain_object(
+            &picture,
+            &["width", "height", "data"],
+            "pictureFromLineStates",
+        );
+        assert_eq!(field(&picture, "width").as_f64(), Some(320.0));
+        assert_eq!(field(&picture, "height").as_f64(), Some(224.0));
+        let data: js_sys::Uint8Array = field(&picture, "data").dyn_into().unwrap();
+        assert!(!views_module_memory(&data.buffer()));
+        assert_eq!(data.to_vec(), emu.get_framebuffer_data().to_vec());
+
+        let layer = emu.render_layer(0);
+        assert_eq!(field(&layer, "fromLineStates").as_bool(), Some(true));
+        assert!(emu.at_capture_boundary(), "nothing ran");
     }
 
     #[wasm_bindgen_test]

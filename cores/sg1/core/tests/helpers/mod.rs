@@ -6,11 +6,14 @@
 //! lint while another binary depends on it, hence the explicit allow:
 //! deleting an apparently-unused line here breaks a sibling test target.
 
+pub mod m68k_program;
 pub mod m68k_rom_builder;
 pub mod mini_cartridge;
 pub mod z80_rom_builder;
 pub mod z80_test_runner;
 
+#[allow(unused_imports)]
+pub use m68k_program::M68kProgram;
 #[allow(unused_imports)]
 pub use m68k_rom_builder::M68kRomBuilder;
 #[allow(unused_imports)]

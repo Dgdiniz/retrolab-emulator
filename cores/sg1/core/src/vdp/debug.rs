@@ -22,8 +22,9 @@
 use std::ops::Range;
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
-    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
+    ExportError, IndexedImage, LayerData, LineStateTable, PaletteData, PixelImage, SpriteData,
+    SpriteOrderEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
+    VideoRegister,
 };
 
 use super::sprites::{link_chain, Sprite};
@@ -77,7 +78,7 @@ const REGISTER_NAMES: [&str; 24] = [
 impl Vdp {
     /// Sprite Attribute Table base address in VRAM, derived from reg 5
     /// (H40 masks bit 0). Mirrors `rebuild_sprite_cache`.
-    fn sat_base(&self) -> u16 {
+    pub(super) fn sat_base(&self) -> u16 {
         let reg5 = self.registers[5];
         let is_h40 = (self.registers[12] & 0x01) != 0;
         if is_h40 {
@@ -97,7 +98,7 @@ impl Vdp {
 
     /// Entries in the sprite table: 80 in the 40-cell mode, 64 in the
     /// 32-cell mode.
-    fn sprite_table_slots(&self) -> u8 {
+    pub(super) fn sprite_table_slots(&self) -> u8 {
         let is_h40 = (self.registers[12] & 0x01) != 0;
         if is_h40 {
             80
@@ -129,6 +130,13 @@ impl Vdp {
     /// table once a frame. A write that lands in the table marks that
     /// list stale, so the next line drawn, or a repaint, reads the sprites
     /// as they now are. A write elsewhere leaves the list alone.
+    ///
+    /// The write changes VRAM as it is now. While the line table is armed,
+    /// a line drawn again from it reads VRAM as the line read it: the
+    /// frame's own writes are undone, so a line drawn before the frame last
+    /// wrote one of these bytes shows the frame's earlier value there, and
+    /// every other line shows the debugger's. The sprite lists the table
+    /// recorded are parsed again on the same terms.
     pub fn write_vram_debug(&mut self, byte_address: u32, bytes: &[u8]) {
         let sprite_table = self.sprite_table_bytes();
         let start = byte_address as usize % VRAM_BYTES;
@@ -140,6 +148,7 @@ impl Vdp {
         }
         if sprite_table_written {
             self.invalidate_sprite_cache();
+            self.reparse_recorded_sprite_lists();
         }
     }
 
@@ -156,6 +165,12 @@ impl Vdp {
     /// An index past the 64 colours wraps to the start, and so does a run
     /// that crosses the end. A buffer longer than CRAM is cut to its 64
     /// colours; an empty one writes nothing.
+    ///
+    /// While the line table is armed, every line it holds takes the new
+    /// colour too, and so does every palette write it recorded of that
+    /// colour, so a repaint shows the edit wherever the colour is used: a
+    /// colour the frame changed part of the way down the screen takes the
+    /// edit above and below the change alike.
     pub fn write_cram_debug(&mut self, colour_index: u32, colours: &[u16]) {
         let start = colour_index as usize % CRAM_COLOURS;
         for (offset, &colour) in colours.iter().take(CRAM_COLOURS).enumerate() {
@@ -163,6 +178,7 @@ impl Vdp {
             let stored = colour & CRAM_COLOUR_BITS;
             self.cram[index] = stored;
             self.cram_rgb[index] = Self::convert_genesis_color(stored);
+            self.patch_recorded_colour(index, stored);
         }
     }
 
@@ -176,10 +192,15 @@ impl Vdp {
     /// An index past the 64 words wraps to the start, and so does a run
     /// that crosses the end. A buffer longer than the 64 words is cut to
     /// them; an empty one writes nothing.
+    ///
+    /// While the line table is armed, every line it holds takes the new
+    /// words too, so a repaint shows the edit on every line.
     pub fn write_vsram_debug(&mut self, index: u32, values: &[u16]) {
         let start = index as usize % VSRAM_WORDS;
         for (offset, &value) in values.iter().take(VSRAM_WORDS).enumerate() {
-            self.vsram[(start + offset) % VSRAM_WORDS] = value & VSRAM_SCROLL_BITS;
+            let word = (start + offset) % VSRAM_WORDS;
+            self.vsram[word] = value & VSRAM_SCROLL_BITS;
+            self.patch_recorded_vertical_scroll(word, value & VSRAM_SCROLL_BITS);
         }
     }
 }
@@ -326,6 +347,33 @@ impl VideoDebugger for Vdp {
         self.rerender_current_frame();
     }
 
+    /// The settings each line of the picture was drawn with, while line
+    /// states are recorded (`Vdp::set_capture_recording`): one row for each
+    /// visible line, the table's `frame` the one its journal follows. The
+    /// columns:
+    ///
+    /// - `line`; `frame`, the frame the line was drawn in (its low 32 bits);
+    /// - `kind`, how it was drawn (`LineKind`: 0 not recorded, 1 drawn,
+    ///   2 blank, 3 painted by a CRAM transfer);
+    /// - `exact`, 1 when the video memory the line read can be given back
+    ///   exactly (it was drawn in the frame the journal follows, and the
+    ///   journal had room);
+    /// - `register_0` to `register_23`, the VDP registers;
+    /// - `plane_a_horizontal_scroll`, `plane_b_horizontal_scroll`, the
+    ///   horizontal scroll the line read for each plane;
+    /// - `vertical_scroll_0` to `vertical_scroll_39`, the vertical scroll
+    ///   memory the renderer reads;
+    /// - `sprite_mask_carried_in`, 1 when the line above ran out of sprite
+    ///   dots and armed the sprite mask for this one;
+    /// - `palette`, the palette the line began with, an index into
+    ///   `Vdp::line_palettes`, or `NO_PALETTE` (65535).
+    ///
+    /// A line nothing was recorded of holds 0 in every column but `line`
+    /// and `palette`.
+    fn get_line_states(&self) -> Option<LineStateTable> {
+        self.line_state_table()
+    }
+
     fn get_vram(&self) -> &[u8] {
         &self.vram
     }
@@ -346,13 +394,15 @@ impl VideoDebugger for Vdp {
     /// Decode a Genesis sprite (1-4 tiles per side) into a tight RGBA crop
     /// with hardware transparency (palette index 0 -> alpha 0).
     ///
-    /// Tile selection and flips mirror [`Sprite::render`] exactly so the
-    /// cut-out is pixel-identical to what the compositor draws: the
-    /// destination tile `(tx, ty)` reads the source tile chosen by the
-    /// flip-aware column-major offset, and intra-tile pixels are flipped
-    /// via [`Tile::get_pixel`]. The buffer starts fully transparent, so any
-    /// pixel left untouched (index 0, or a pattern address past VRAM)
-    /// stays alpha 0.
+    /// Tiles are picked as the renderer picks them (`Vdp::render_sprite_line`):
+    /// column-major, tile `x * height + y` from the sprite's pattern, the
+    /// whole sprite flipped first, then each tile's pixels flipped inside
+    /// it ([`Tile::get_pixel`]). So the crop holds the pixels the renderer
+    /// draws. Its colours come from [`build_rgba_palette`], which scales
+    /// each three-bit level by 36 (level 7 is 252), while the screen
+    /// replicates the bits (level 7 is 255). The buffer starts fully
+    /// transparent, so any pixel left untouched (index 0, or a pattern
+    /// address past VRAM) stays alpha 0.
     fn export_sprite_image(&self, index: u32) -> Result<PixelImage, ExportError> {
         // 80 is the hardware per-frame sprite cap (and the max SAT slot the
         // host's sprite list walks). Guard before the u8 cast so a bogus

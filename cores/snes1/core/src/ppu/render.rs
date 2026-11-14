@@ -50,7 +50,7 @@ use crate::ppu::tile::{
 };
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::window_layer;
-use crate::ppu::{Ppu, LAYER_COUNT, LAYER_OBJ};
+use crate::ppu::{record, Ppu, LAYER_COUNT, LAYER_OBJ};
 
 /// One BG layer's contribution to a single scanline, retained
 /// between scanlines so vertical mosaic can replay the previous
@@ -191,6 +191,11 @@ impl Ppu {
     pub fn render_scanline(&mut self, scanline: u16, fb: &mut Framebuffer) {
         if scanline == 0 || !self.in_active_scanline(scanline) {
             return;
+        }
+        // The line table takes the settings the line is drawn with, when
+        // one is kept (see `record`).
+        if self.recorders.lines.is_some() {
+            self.record_line_state(scanline);
         }
 
         // Per-frame reset of the sprite-overflow flags. They accumulate
@@ -1512,21 +1517,24 @@ impl Ppu {
         self.frame_hires && self.render_interlace
     }
 
-    /// Draw the held frame again from the present state into `fb` and
-    /// finish its picture, without advancing emulation: every visible line
+    /// Draw the held frame again into `fb` and finish its picture, without
+    /// advancing emulation.
+    ///
+    /// When the line table holds the frame ([`Self::draws_from_line_states`])
+    /// each line is drawn with its own settings and the video memory it
+    /// read, so a raster effect comes out as the frame drew it. Otherwise
+    /// every visible line is drawn from the registers as they stand,
     /// through [`Self::render_scanline`] (from line 1, so the frame's own
     /// resets run; the active-region gate drops the lines past the
-    /// overscan setting), then [`Self::finalize_frame`].
+    /// overscan setting). Either way [`Self::finalize_frame`] follows.
     ///
     /// Drawing moves state a savestate holds, the sprite range and time
     /// flags and the evaluator's OAM address; they are put back as they
     /// were (see [`RedrawKeeps`]), so the state hash does not move.
     pub(crate) fn redraw_frame(&mut self, fb: &mut Framebuffer) {
         let keeps = RedrawKeeps::take(self);
-        for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
-            self.render_scanline(scanline, fb);
-        }
-        self.finalize_frame(fb);
+        let from_table = self.draws_from_line_states();
+        self.draw_frame_again(fb, from_table);
         keeps.put_back(self);
     }
 
@@ -1552,25 +1560,54 @@ impl Ppu {
     /// alone. In forced blank the frame draws no layer, and the image is
     /// empty; at brightness 0 the layer's pixels are black, as the frame's.
     ///
-    /// Like any redraw it uses the registers as they stand now, so a
-    /// raster effect (an HDMA scroll or mode change down the frame) comes
-    /// out with the values of the last line. Emulation does not advance,
-    /// the host framebuffer is not touched, and the state a savestate
-    /// holds stays as it was, the frame's own display state with it.
+    /// When the line table holds the frame ([`Self::draws_from_line_states`])
+    /// each line is drawn with its own settings and the video memory it
+    /// read, so a raster effect (an HDMA scroll or mode change down the
+    /// frame) comes out as the frame drew it. Otherwise the layer is drawn
+    /// from the registers as they stand, and such an effect comes out with
+    /// the values of the last line. Emulation does not advance, the host
+    /// framebuffer is not touched, and the state a savestate holds stays
+    /// as it was, the frame's own display state with it.
     pub fn render_layer(&mut self, layer: usize) -> Result<PixelImage, ExportError> {
         if layer >= LAYER_COUNT {
             return Err(ExportError::OutOfRange);
         }
+        let from_table = self.draws_from_line_states();
+        self.isolated_layer = Some(layer);
+        let image = self.picture_drawn_again(from_table);
+        self.isolated_layer = None;
+        Ok(image)
+    }
+
+    /// The frame's picture drawn again from its line table, into a buffer
+    /// of its own, cropped as the picture is: each line with the settings
+    /// it was drawn with and the video memory it read, then finished as
+    /// the picture was. Equal to the picture the frame left, unless the
+    /// debugger edited video memory since (the table then reports its
+    /// memory as not exact) or the game redrew lines after the picture was
+    /// finished.
+    ///
+    /// `None` when no line table is kept, or it does not hold a frame from
+    /// its line 1 to its finished picture. Emulation does not advance, the
+    /// host framebuffer is not touched, and the state a savestate holds
+    /// stays as it was.
+    pub fn picture_from_line_states(&mut self) -> Option<PixelImage> {
+        let whole = self
+            .recorders
+            .lines
+            .as_deref()
+            .is_some_and(record::LineRecorder::holds_whole_frame);
+        whole.then(|| self.picture_drawn_again(true))
+    }
+
+    /// Draw the frame again into a buffer of its own and crop it to the
+    /// picture's size, leaving the held frame's display state, and the
+    /// state a savestate holds, as they were.
+    fn picture_drawn_again(&mut self, from_table: bool) -> PixelImage {
         let keeps = RedrawKeeps::take(self);
         let picture = HeldPicture::take(self);
         let mut fb = Framebuffer::new(MAX_SCANLINE_WIDTH as u32, MAX_OUTPUT_ROWS as u32);
-        self.isolated_layer = Some(layer);
-        for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
-            self.render_scanline(scanline, &mut fb);
-        }
-        self.isolated_layer = None;
-        self.finalize_frame(&mut fb);
-        let (width, height) = self.active_display_size();
+        let (width, height) = self.draw_frame_again(&mut fb, from_table);
         picture.put_back(self);
         keeps.put_back(self);
 
@@ -1580,11 +1617,80 @@ impl Ppu {
         for y in 0..height as usize {
             rgba.extend_from_slice(&fb.data[y * stride..y * stride + row_bytes]);
         }
-        Ok(PixelImage {
+        PixelImage {
             width,
             height,
             rgba,
-        })
+        }
+    }
+
+    /// Draw the frame again into `fb` and finish it, from the line table
+    /// when `from_table` (the caller has checked that it holds the frame),
+    /// else from the registers as they stand; return the size of the
+    /// picture. The registers and the line table are left as they were.
+    fn draw_frame_again(&mut self, fb: &mut Framebuffer, from_table: bool) -> (u32, u32) {
+        // Taken out for the length of the redraw, so that the lines drawn
+        // again are not recorded over the frame's own.
+        let mut table = self.recorders.lines.take();
+        let live = match table.as_deref_mut() {
+            Some(table) if from_table => Some(self.draw_lines_from_table(table, fb)),
+            _ => {
+                for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
+                    self.render_scanline(scanline, fb);
+                }
+                None
+            }
+        };
+        self.finalize_frame(fb);
+        let size = self.active_display_size();
+        if let Some(live) = live {
+            live.apply(self);
+        }
+        self.recorders.lines = table;
+        size
+    }
+
+    /// Draw every line of `table` again, each with the settings it was
+    /// drawn with: what video memory took since the last line logged
+    /// first, then memory wound back to the first line, moved forward as
+    /// the frame moved it, line by line, and on to the end of the log,
+    /// which leaves it as it was. Returns the settings as they stood
+    /// before, for the caller to put back once the picture is finished;
+    /// until then the overscan bit is the one the picture was finished
+    /// with.
+    fn draw_lines_from_table(
+        &mut self,
+        table: &mut record::LineRecorder,
+        fb: &mut Framebuffer,
+    ) -> record::LineState {
+        let live = record::LineState::capture(self);
+        table.catch_up(&self.video_memory_now());
+        let mut cursor = record::ReplayCursor::default();
+        if table.rewind(&mut self.video_memory()) {
+            self.vram_moved();
+        }
+        for index in 0..table.lines().len() {
+            if table.replay_through(index, &mut cursor, &mut self.video_memory()) {
+                self.vram_moved();
+            }
+            let (line, state) = table.lines()[index];
+            state.apply(self);
+            self.render_scanline(line, fb);
+        }
+        if table.replay_through(usize::MAX, &mut cursor, &mut self.video_memory()) {
+            self.vram_moved();
+        }
+        // Memory stands as the table's copy holds it again, under a VRAM
+        // generation of its own.
+        table.memory_put_back(self.vram_generation);
+        self.overscan = table.finished_overscan();
+        live
+    }
+
+    /// VRAM changed outside its port: the rows and tiles decoded from it
+    /// are rebuilt the next time they are read.
+    fn vram_moved(&mut self) {
+        self.vram_generation = self.vram_generation.wrapping_add(1);
     }
 
     /// One output row of [`Self::render_layer`]: the isolated layer's
