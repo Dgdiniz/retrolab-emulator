@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::video::PixelImage;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
-use sg1_core::vdp::{
-    CaptureRecording, RenderLayerMode, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
-};
+use sg1_core::vdp::{RenderLayerMode, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
 
 #[derive(Args, Debug)]
 pub struct ScreenshotArgs {

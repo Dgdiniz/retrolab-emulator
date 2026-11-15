@@ -773,6 +773,55 @@ pub enum MapTarget {
     OpenBus,
 }
 
+/// The code of an address whose byte comes from nowhere a file holds: open
+/// bus, a register or port, past the end of the ROM.
+pub const SOURCE_UNKNOWN: i32 = -1;
+/// The code of an address in the console's work RAM.
+pub const SOURCE_WORK_RAM: i32 = -2;
+/// The code of an address in the cartridge's RAM (its battery-backed RAM,
+/// switched in).
+pub const SOURCE_CARTRIDGE_RAM: i32 = -3;
+/// The code of an address a coprocessor answers from its own memory or
+/// registers.
+pub const SOURCE_COPROCESSOR: i32 = -4;
+
+/// Where the byte a read of an address reaches comes from, through the
+/// cartridge's mapping as it stands: what a debugger shows for the source of
+/// a transfer or a store. Each core walks its own map plan to find it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePlace {
+    /// The cartridge's ROM, at this offset into the image the core maps. A
+    /// core whose files can carry a header in front of the image (a
+    /// copier's) adds its length before it hands the offset to a host, so
+    /// that the host reads an offset into the file.
+    Rom(u32),
+    /// The console's work RAM.
+    WorkRam,
+    /// The cartridge's RAM.
+    CartridgeRam,
+    /// A coprocessor's own memory or registers, or a window it answers.
+    Coprocessor,
+    /// Nothing a file holds: open bus, a register or port, past the end of
+    /// the ROM.
+    Unknown,
+}
+
+impl SourcePlace {
+    /// The ROM offset [`Self::Rom`] holds, or the negative code naming where
+    /// else the byte comes from: [`SOURCE_WORK_RAM`], [`SOURCE_CARTRIDGE_RAM`],
+    /// [`SOURCE_COPROCESSOR`] or [`SOURCE_UNKNOWN`] (also for an offset too
+    /// large for the code).
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Rom(offset) => i32::try_from(offset).unwrap_or(SOURCE_UNKNOWN),
+            Self::WorkRam => SOURCE_WORK_RAM,
+            Self::CartridgeRam => SOURCE_CARTRIDGE_RAM,
+            Self::Coprocessor => SOURCE_COPROCESSOR,
+            Self::Unknown => SOURCE_UNKNOWN,
+        }
+    }
+}
+
 // ============================================================================
 // Cartridge Audio Trait
 // ============================================================================
@@ -986,4 +1035,34 @@ pub struct ExpansionChipState {
     pub internal_ram: Option<Vec<u8>>,
     pub program_counter: Option<u32>,
     pub cycle_count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_source_place_gives_the_rom_offset_or_its_negative_code() {
+        assert_eq!(SourcePlace::Rom(0).code(), 0);
+        assert_eq!(SourcePlace::Rom(0x1F_FFFF).code(), 0x1F_FFFF);
+        assert_eq!(SourcePlace::Rom(i32::MAX as u32).code(), i32::MAX);
+        assert_eq!(
+            SourcePlace::Rom(i32::MAX as u32 + 1).code(),
+            SOURCE_UNKNOWN,
+            "an offset no code can hold is unknown"
+        );
+        assert_eq!(SourcePlace::WorkRam.code(), -2);
+        assert_eq!(SourcePlace::CartridgeRam.code(), -3);
+        assert_eq!(SourcePlace::Coprocessor.code(), -4);
+        assert_eq!(SourcePlace::Unknown.code(), -1);
+        assert_eq!(
+            [
+                SOURCE_UNKNOWN,
+                SOURCE_WORK_RAM,
+                SOURCE_CARTRIDGE_RAM,
+                SOURCE_COPROCESSOR
+            ],
+            [-1, -2, -3, -4]
+        );
+    }
 }

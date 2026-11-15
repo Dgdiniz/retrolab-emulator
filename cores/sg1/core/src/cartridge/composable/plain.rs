@@ -21,8 +21,9 @@
 
 use std::sync::Arc;
 
-use retro_core::cartridge::CartridgeInfo;
+use retro_core::cartridge::{CartridgeInfo, SourcePlace};
 
+use super::byte_source;
 use super::map_plan::{rom_mirror_mask, MapPlan, MapSlot, MapTarget};
 use super::GenesisCartridge;
 
@@ -197,6 +198,34 @@ impl GenesisCartridge for PlainCartridge {
         }
     }
 
+    /// Through the plan, as [`read_bus`](GenesisCartridge::read_bus) reads:
+    /// the SRAM slot reads as [`read_sram`](GenesisCartridge::read_sram)
+    /// does, the ROM showing through while the SRAM is switched off.
+    fn byte_sources(&self, addresses: &[u32]) -> Vec<SourcePlace> {
+        let rom_len = self.rom.len();
+        addresses
+            .iter()
+            .map(|&address| {
+                byte_source::through_plan(
+                    &self.plan,
+                    address,
+                    |offset| byte_source::rom_byte(offset, rom_len),
+                    |offset| {
+                        byte_source::sram_byte(
+                            !self.sram.is_empty(),
+                            self.sram_enabled,
+                            self.sram_start,
+                            offset,
+                            self.rom_mask,
+                            rom_len,
+                        )
+                    },
+                    |_, _| SourcePlace::Coprocessor,
+                )
+            })
+            .collect()
+    }
+
     fn reset(&mut self) {
         self.sram_enabled = self.sram_permanent;
         self.sram_dirty = false;
@@ -308,6 +337,44 @@ mod tests {
             c.read_addr(0x200000),
             0x22,
             "contents preserved across toggle"
+        );
+    }
+
+    #[test]
+    fn a_byte_s_source_follows_the_sram_switch_and_the_mirror() {
+        // 4 MiB ROM with SRAM overlapping at 0x200000, and a 512 KiB ROM
+        // with SRAM beyond it.
+        let rom: Arc<[u8]> = Arc::from(vec![0u8; 0x400000].into_boxed_slice());
+        let mut overlapping =
+            PlainCartridge::with_sram(rom, test_info(0x400000, 0x8000), 0x200000, 0x8000);
+        let addresses = [0x000123, 0x200010, 0x3FFFFF, 0x400000];
+        assert_eq!(
+            overlapping.byte_sources(&addresses),
+            [
+                SourcePlace::Rom(0x123),
+                SourcePlace::Rom(0x200010),
+                SourcePlace::Rom(0x3FFFFF),
+                SourcePlace::Unknown,
+            ],
+            "switched off, the ROM shows through the SRAM window"
+        );
+        overlapping.write_addr(SRAM_CONTROL_ADDR, 0x01);
+        assert_eq!(
+            overlapping.byte_sources(&[0x200010]),
+            [SourcePlace::CartridgeRam]
+        );
+
+        let small = rom_with_marker(0x80000);
+        let permanent =
+            PlainCartridge::with_sram(small, test_info(0x80000, 0x4000), 0x200000, 0x4000);
+        assert_eq!(
+            permanent.byte_sources(&[0x080123, 0x200000, 0x204000]),
+            [
+                SourcePlace::Rom(0x123),
+                SourcePlace::CartridgeRam,
+                SourcePlace::Rom(0x4000),
+            ],
+            "the ROM mirrored past its end; the SRAM beyond it"
         );
     }
 

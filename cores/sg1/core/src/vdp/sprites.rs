@@ -199,6 +199,18 @@ impl SpriteCache {
         self.sprites
             .extend(link_chain(vram, sat_base, max_sprites).map(|(_, sprite)| sprite));
     }
+
+    /// The slot in the sprite table of the list's sprite at `index`. The
+    /// list is the link chain in the order the walk took it, which starts
+    /// at slot 0 and goes on to the slot each sprite's link names, so the
+    /// slot is read back from the sprite before it, and the list keeps no
+    /// slots of its own.
+    pub fn slot_at(&self, index: usize) -> u8 {
+        match index {
+            0 => 0,
+            _ => self.sprites[index - 1].link,
+        }
+    }
 }
 
 impl Default for SpriteCache {
@@ -475,6 +487,21 @@ mod tests {
         // 80 slots in the 40-cell mode reach it.
         let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
         assert_eq!(slots, [0, 5, 70]);
+    }
+
+    #[test]
+    fn the_list_gives_back_the_slot_of_each_of_its_sprites() {
+        let mut vram = vec![0u8; 0x10000];
+        link_slot(&mut vram, 0, 7);
+        link_slot(&mut vram, 7, 3);
+        link_slot(&mut vram, 3, 79);
+        link_slot(&mut vram, 79, 0);
+        let mut cache = SpriteCache::new();
+        cache.build(&vram, 0, 80);
+        let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
+        assert_eq!(slots, [0, 7, 3, 79]);
+        let from_list: Vec<u8> = (0..cache.len()).map(|i| cache.slot_at(i)).collect();
+        assert_eq!(from_list, slots);
     }
 
     #[test]

@@ -76,20 +76,30 @@ impl Ppu {
 
     /// One half of a word written, through the gate: lost while the port
     /// is closed. A write that lands moves the renderer's VRAM generation
-    /// on, which is what tells its tilemap-row cache to rebuild.
-    pub(super) fn vram_write_byte(&mut self, byte_address: u32, value: u8, line: u16) {
+    /// on, which is what tells its tilemap-row cache to rebuild. Returns
+    /// the byte the write replaced, when it landed.
+    pub(super) fn vram_write_byte(
+        &mut self,
+        byte_address: u32,
+        value: u8,
+        line: u16,
+    ) -> Option<u8> {
         if !self.vram_open(line) {
-            return;
+            return None;
         }
         let word = &mut self.vram[(byte_address as usize >> 1) & 0x7fff];
         let [mut low, mut high] = word.to_le_bytes();
+        let replaced;
         if byte_address & 1 == 0 {
+            replaced = low;
             low = value;
         } else {
+            replaced = high;
             high = value;
         }
         *word = u16::from_le_bytes([low, high]);
         self.vram_generation = self.vram_generation.wrapping_add(1);
+        Some(replaced)
     }
 
     /// Fill the read buffer from the word the address names.
@@ -135,13 +145,30 @@ impl Ppu {
 
     /// A write to one half of the addressed word (`$2118` low, `$2119`
     /// high), then the step when this is the half that moves the
-    /// address.
+    /// address. (`Ppu::write_port_noted` takes the same write and notes
+    /// what landed.)
     fn vram_data_write(&mut self, high: bool, value: u8, ctx: &PpuAccessCtx) {
+        self.vram_port_write(high, value, ctx);
+    }
+
+    /// The data write itself: the byte through the gate, then the step.
+    /// Returns the byte address written and the byte it replaced, when the
+    /// write landed.
+    #[inline(always)]
+    pub(super) fn vram_port_write(
+        &mut self,
+        high: bool,
+        value: u8,
+        ctx: &PpuAccessCtx,
+    ) -> Option<(u32, u8)> {
         let at = self.get_vram_byte_address() + u32::from(high);
-        self.vram_write_byte(at, value, ctx.v_scanline);
+        let landed = self
+            .vram_write_byte(at, value, ctx.v_scanline)
+            .map(|replaced| (at, replaced));
         if self.moves_address(high) {
             self.step_address();
         }
+        landed
     }
 
     /// A read of one half of the buffered word (`$2139` low, `$213A`

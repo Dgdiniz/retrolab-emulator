@@ -6,7 +6,8 @@
 //! Nothing here is part of a savestate, and nothing records until the host
 //! asks for it with a [`CaptureRecording`]. With every recorder off, the
 //! one hook is a test of one flag as each line is drawn; the memory ports
-//! carry none.
+//! carry none (the live recorders, in [`super::writes`], are reached through
+//! a path the bus chooses before the port).
 //!
 //! ## The line table
 //!
@@ -43,89 +44,13 @@
 //! hardware would: a line is drawn whole at one dot, so a change in the
 //! middle of a line shows from the next one, as it did the first time.
 
-use std::collections::HashMap;
-
+use retro_core::capture::{
+    arm_recorder, distinct_palettes, CaptureRecording, LinePalettes, TableColumns,
+};
 use retro_core::video::LineStateTable;
 
+use super::writes::LiveRecorders;
 use super::{Ppu, WindowEnable};
-
-/// What the core records while frames run, for a capture to read. All off
-/// by default; a host setting, never part of a savestate.
-///
-/// `line_states` keeps the line table: the settings each line of the
-/// frame was drawn with and the changes to video memory made meanwhile
-/// (`get_line_states`, `line_palettes`, `picture_from_line_states`), from
-/// which the repaint and the layer renders draw the frame again.
-/// `pixel_sources` and `line_sprites` are worked out on demand from that
-/// table on this core, so arming either of them arms the line table too.
-/// `video_memory_sources` and `frame_writes` are kept and reported back;
-/// this core records nothing for them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CaptureRecording {
-    /// Keep the line table.
-    pub line_states: bool,
-    /// Where each pixel of the picture comes from, worked out from the
-    /// line table.
-    pub pixel_sources: bool,
-    /// The sprites each line drew, worked out from the line table.
-    pub line_sprites: bool,
-    /// Where each byte of video memory was written from.
-    pub video_memory_sources: bool,
-    /// The changes the frame made to video memory.
-    pub frame_writes: bool,
-}
-
-impl CaptureRecording {
-    /// Whether this setting needs the line table.
-    pub fn wants_line_table(&self) -> bool {
-        self.line_states || self.pixel_sources || self.line_sprites
-    }
-}
-
-/// Writes one setting of a line as table columns: a name and a value, or
-/// a name and a value per element.
-trait TableColumns {
-    /// Push the names of the columns of a setting called `name`.
-    fn push_names(name: &str, names: &mut Vec<String>);
-    /// Push the values, one per column, in the order of the names.
-    fn push_values(&self, values: &mut Vec<u32>);
-}
-
-impl TableColumns for bool {
-    fn push_names(name: &str, names: &mut Vec<String>) {
-        names.push(name.to_string());
-    }
-    fn push_values(&self, values: &mut Vec<u32>) {
-        values.push(u32::from(*self));
-    }
-}
-
-impl TableColumns for u8 {
-    fn push_names(name: &str, names: &mut Vec<String>) {
-        names.push(name.to_string());
-    }
-    fn push_values(&self, values: &mut Vec<u32>) {
-        values.push(u32::from(*self));
-    }
-}
-
-impl TableColumns for u16 {
-    fn push_names(name: &str, names: &mut Vec<String>) {
-        names.push(name.to_string());
-    }
-    fn push_values(&self, values: &mut Vec<u32>) {
-        values.push(u32::from(*self));
-    }
-}
-
-impl TableColumns for u32 {
-    fn push_names(name: &str, names: &mut Vec<String>) {
-        names.push(name.to_string());
-    }
-    fn push_values(&self, values: &mut Vec<u32>) {
-        values.push(*self);
-    }
-}
 
 impl TableColumns for WindowEnable {
     fn push_names(name: &str, names: &mut Vec<String>) {
@@ -143,195 +68,142 @@ impl TableColumns for WindowEnable {
     }
 }
 
-impl<T: TableColumns, const N: usize> TableColumns for [T; N] {
-    fn push_names(name: &str, names: &mut Vec<String>) {
-        for index in 0..N {
-            T::push_names(&format!("{name}[{index}]"), names);
-        }
+retro_core::line_state! {
+    /// The settings one line of the picture was drawn with: every register
+    /// the renderer reads, as the PPU stores it, taken when the line is
+    /// drawn, and put back and written as columns from this one list. A
+    /// register the renderer reads must be listed here, or a frame drawn
+    /// again from its lines would draw it from the register as it stands.
+    ///
+    /// Left out, because drawing the lines in order from line 1 builds them
+    /// again: the frame-wide hires and interlace state, the rows vertical
+    /// mosaic repeats, and the caches of decoded VRAM. Left out too, as the
+    /// host's and not the game's: the debugger's layer mask, the single
+    /// layer a layer render draws and the overscan crop the host shows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    pub struct LineState for Ppu {
+        /// Forced blank (INIDISP bit 7).
+        display_disable: bool = display_disable,
+        /// Master brightness `0..=15` (INIDISP bits 0-3).
+        display_brightness: u8 = display_brightness,
+        /// The sprite size pair selector (OBSEL bits 5-7).
+        obj_base_size: u8 = obj_base_size,
+        /// The gap between the two sprite character tables (OBSEL bits 3-4).
+        obj_name_select: u8 = obj_name_select,
+        /// Byte address of the first sprite character table (OBSEL bits 0-2).
+        obj_tiledata_addr: u32 = obj_tiledata_addr,
+        /// The sprite the evaluator starts from (the priority rotation of
+        /// OAMADDH bit 7).
+        oam_first_sprite: u8 = oam_first_sprite,
+        /// Background mode `0..=7` (BGMODE bits 0-2).
+        bgmode: u8 = bgmode,
+        /// Mode 1's BG3 priority lift (BGMODE bit 3).
+        bg3_priority: bool = bg3_priority,
+        /// 16x16 tiles, per background (BGMODE bits 4-7).
+        bg_tile_size: [bool; 4] = bg_tile_size,
+        /// Mosaic block size in pixels, `1..=16` (MOSAIC bits 4-7, plus 1).
+        mosaic_size: u8 = mosaic_size,
+        /// Mosaic on, per background (MOSAIC bits 0-3).
+        bg_mosaic_enable: [bool; 4] = bg_mosaic_enable,
+        /// Tilemap byte address, per background (BGnSC).
+        bg_screen_addr: [u32; 4] = bg_screen_addr,
+        /// Tilemap size `0..=3`, per background (BGnSC bits 0-1).
+        bg_screen_size: [u8; 4] = bg_screen_size,
+        /// Character byte address, per background (BG12NBA, BG34NBA).
+        bg_tiledata_addr: [u32; 4] = bg_tiledata_addr,
+        /// Horizontal scroll, per background, as written (BGnHOFS).
+        bg_hoffset: [u16; 4] = bg_hoffset,
+        /// Vertical scroll, per background, as written (BGnVOFS).
+        bg_voffset: [u16; 4] = bg_voffset,
+        /// Mode 7 screen over (M7SEL bits 6-7).
+        mode7_repeat: u8 = mode7_repeat,
+        /// Mode 7 vertical flip (M7SEL bit 1).
+        mode7_vflip: bool = mode7_vflip,
+        /// Mode 7 horizontal flip (M7SEL bit 0).
+        mode7_hflip: bool = mode7_hflip,
+        /// Mode 7 matrix A, signed 8.8 fixed point as written (M7A).
+        mode7_matrix_a: u16 = m7a,
+        /// Mode 7 matrix B (M7B).
+        mode7_matrix_b: u16 = m7b,
+        /// Mode 7 matrix C (M7C).
+        mode7_matrix_c: u16 = m7c,
+        /// Mode 7 matrix D (M7D).
+        mode7_matrix_d: u16 = m7d,
+        /// Mode 7 centre X, as written (M7X).
+        mode7_centre_x: u16 = m7x,
+        /// Mode 7 centre Y, as written (M7Y).
+        mode7_centre_y: u16 = m7y,
+        /// Mode 7 horizontal scroll, as written (BG1HOFS through Mode 7's
+        /// latch).
+        mode7_hoffset: u16 = mode7_hoffset,
+        /// Mode 7 vertical scroll, as written.
+        mode7_voffset: u16 = mode7_voffset,
+        /// Mode 7's second background (SETINI bit 6).
+        mode7_extbg: bool = mode7_extbg,
+        /// Window enables and inversions per layer: BG1, BG2, BG3, BG4,
+        /// sprites, colour (W12SEL, W34SEL, WOBJSEL).
+        window_enable: [WindowEnable; 6] = window_enable,
+        /// Left edge of window 1 (WH0).
+        window_one_left: u8 = window_one_left,
+        /// Right edge of window 1 (WH1).
+        window_one_right: u8 = window_one_right,
+        /// Left edge of window 2 (WH2).
+        window_two_left: u8 = window_two_left,
+        /// Right edge of window 2 (WH3).
+        window_two_right: u8 = window_two_right,
+        /// How the two windows combine, per layer in the same order (WBGLOG,
+        /// WOBJLOG).
+        window_combine: [u8; 6] = window_combine,
+        /// Backgrounds on the main screen (TM bits 0-3).
+        bg_main_enable: [bool; 4] = bg_main_enable,
+        /// Sprites on the main screen (TM bit 4).
+        obj_main_enable: bool = obj_main_enable,
+        /// Backgrounds on the sub screen (TS bits 0-3).
+        bg_sub_enable: [bool; 4] = bg_sub_enable,
+        /// Sprites on the sub screen (TS bit 4).
+        obj_sub_enable: bool = obj_sub_enable,
+        /// The windows clip these backgrounds on the main screen (TMW bits
+        /// 0-3).
+        bg_main_window_disable: [bool; 4] = bg_main_window_disable,
+        /// The windows clip the sprites on the main screen (TMW bit 4).
+        obj_main_window_disable: bool = obj_main_window_disable,
+        /// The windows clip these backgrounds on the sub screen (TSW bits 0-3).
+        bg_sub_window_disable: [bool; 4] = bg_sub_window_disable,
+        /// The windows clip the sprites on the sub screen (TSW bit 4).
+        obj_sub_window_disable: bool = obj_sub_window_disable,
+        /// Where the main screen shows its pixels (CGWSEL bits 6-7).
+        col_main_mask: u8 = col_main_mask,
+        /// Where colour math may run (CGWSEL bits 4-5).
+        col_sub_mask: u8 = col_sub_mask,
+        /// Colour math takes the sub screen instead of the fixed colour
+        /// (CGWSEL bit 1).
+        addsub_mode: bool = addsub_mode,
+        /// Direct colour for the 256-colour backgrounds (CGWSEL bit 0).
+        direct_color: bool = direct_color,
+        /// Colour math subtracts (CGADSUB bit 7).
+        color_math_subtract: bool = color_math_subtract,
+        /// Colour math halves its result (CGADSUB bit 6).
+        color_math_halve: bool = color_math_halve,
+        /// Colour math on the backdrop (CGADSUB bit 5).
+        color_math_back_enable: bool = color_math_back_enable,
+        /// Colour math on sprites (CGADSUB bit 4).
+        color_math_oam_enable: bool = color_math_oam_enable,
+        /// Colour math on each background (CGADSUB bits 0-3).
+        color_math_bg_enable: [bool; 4] = color_math_bg_enable,
+        /// The fixed colour, BGR555 (COLDATA).
+        fixed_color: u16 = fixed_color,
+        /// Pseudo-hires (SETINI bit 3). The renderer does not draw it; it is
+        /// kept so the line's state is whole.
+        pseudo_hires: bool = pseudo_hires,
+        /// Overscan, 239 visible lines (SETINI bit 2).
+        overscan: bool = overscan,
+        /// Sprite interlace (SETINI bit 1).
+        obj_interlace: bool = obj_interlace,
+        /// Screen interlace (SETINI bit 0), latched for the frame at line 1.
+        interlace: bool = interlace,
+        /// The interlace field the line was drawn in.
+        field: bool = field,
     }
-    fn push_values(&self, values: &mut Vec<u32>) {
-        for element in self {
-            element.push_values(values);
-        }
-    }
-}
-
-/// Declares [`LineState`] from one list of settings, each named as the
-/// table names it and paired with the field of [`Ppu`] that stores it, so
-/// that taking a line's state, putting it back and writing it as columns
-/// can never disagree on what a line holds.
-macro_rules! line_state {
-    ($( $(#[$doc:meta])* $name:ident : $ty:ty = $field:ident ),* $(,)?) => {
-        /// The settings one line of the picture was drawn with: every
-        /// register the renderer reads, as the PPU stores it, taken when
-        /// the line is drawn. A register the renderer reads must be listed
-        /// here, or a frame drawn again from its lines would draw it from
-        /// the register as it stands.
-        ///
-        /// Left out, because drawing the lines in order from line 1 builds
-        /// them again: the frame-wide hires and interlace state, the rows
-        /// vertical mosaic repeats, and the caches of decoded VRAM. Left out
-        /// too, as the host's and not the game's: the debugger's layer mask,
-        /// the single layer a layer render draws and the overscan crop the
-        /// host shows.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-        pub struct LineState {
-            $( $(#[$doc])* pub $name: $ty, )*
-        }
-
-        impl LineState {
-            /// The settings as the PPU holds them now.
-            pub(crate) fn capture(ppu: &Ppu) -> Self {
-                Self { $( $name: ppu.$field, )* }
-            }
-
-            /// Put these settings into the PPU, as they were when they
-            /// were taken.
-            pub(crate) fn apply(&self, ppu: &mut Ppu) {
-                $( ppu.$field = self.$name; )*
-            }
-
-            /// The names of the columns a line's settings fill in a table,
-            /// in order: a setting kept per background or per layer gives
-            /// a column per element (`bg_hoffset[0]`), a window selection
-            /// a column per flag (`window_enable[2].w1_enable`).
-            pub fn column_names() -> Vec<String> {
-                let mut names = Vec::new();
-                $( <$ty as TableColumns>::push_names(stringify!($name), &mut names); )*
-                names
-            }
-
-            /// Push this line's values, one per column of
-            /// [`Self::column_names`].
-            pub fn push_row(&self, values: &mut Vec<u32>) {
-                $( self.$name.push_values(values); )*
-            }
-        }
-    };
-}
-
-line_state! {
-    /// Forced blank (INIDISP bit 7).
-    display_disable: bool = display_disable,
-    /// Master brightness `0..=15` (INIDISP bits 0-3).
-    display_brightness: u8 = display_brightness,
-    /// The sprite size pair selector (OBSEL bits 5-7).
-    obj_base_size: u8 = obj_base_size,
-    /// The gap between the two sprite character tables (OBSEL bits 3-4).
-    obj_name_select: u8 = obj_name_select,
-    /// Byte address of the first sprite character table (OBSEL bits 0-2).
-    obj_tiledata_addr: u32 = obj_tiledata_addr,
-    /// The sprite the evaluator starts from (the priority rotation of
-    /// OAMADDH bit 7).
-    oam_first_sprite: u8 = oam_first_sprite,
-    /// Background mode `0..=7` (BGMODE bits 0-2).
-    bgmode: u8 = bgmode,
-    /// Mode 1's BG3 priority lift (BGMODE bit 3).
-    bg3_priority: bool = bg3_priority,
-    /// 16x16 tiles, per background (BGMODE bits 4-7).
-    bg_tile_size: [bool; 4] = bg_tile_size,
-    /// Mosaic block size in pixels, `1..=16` (MOSAIC bits 4-7, plus 1).
-    mosaic_size: u8 = mosaic_size,
-    /// Mosaic on, per background (MOSAIC bits 0-3).
-    bg_mosaic_enable: [bool; 4] = bg_mosaic_enable,
-    /// Tilemap byte address, per background (BGnSC).
-    bg_screen_addr: [u32; 4] = bg_screen_addr,
-    /// Tilemap size `0..=3`, per background (BGnSC bits 0-1).
-    bg_screen_size: [u8; 4] = bg_screen_size,
-    /// Character byte address, per background (BG12NBA, BG34NBA).
-    bg_tiledata_addr: [u32; 4] = bg_tiledata_addr,
-    /// Horizontal scroll, per background, as written (BGnHOFS).
-    bg_hoffset: [u16; 4] = bg_hoffset,
-    /// Vertical scroll, per background, as written (BGnVOFS).
-    bg_voffset: [u16; 4] = bg_voffset,
-    /// Mode 7 screen over (M7SEL bits 6-7).
-    mode7_repeat: u8 = mode7_repeat,
-    /// Mode 7 vertical flip (M7SEL bit 1).
-    mode7_vflip: bool = mode7_vflip,
-    /// Mode 7 horizontal flip (M7SEL bit 0).
-    mode7_hflip: bool = mode7_hflip,
-    /// Mode 7 matrix A, signed 8.8 fixed point as written (M7A).
-    mode7_matrix_a: u16 = m7a,
-    /// Mode 7 matrix B (M7B).
-    mode7_matrix_b: u16 = m7b,
-    /// Mode 7 matrix C (M7C).
-    mode7_matrix_c: u16 = m7c,
-    /// Mode 7 matrix D (M7D).
-    mode7_matrix_d: u16 = m7d,
-    /// Mode 7 centre X, as written (M7X).
-    mode7_centre_x: u16 = m7x,
-    /// Mode 7 centre Y, as written (M7Y).
-    mode7_centre_y: u16 = m7y,
-    /// Mode 7 horizontal scroll, as written (BG1HOFS through Mode 7's
-    /// latch).
-    mode7_hoffset: u16 = mode7_hoffset,
-    /// Mode 7 vertical scroll, as written.
-    mode7_voffset: u16 = mode7_voffset,
-    /// Mode 7's second background (SETINI bit 6).
-    mode7_extbg: bool = mode7_extbg,
-    /// Window enables and inversions per layer: BG1, BG2, BG3, BG4,
-    /// sprites, colour (W12SEL, W34SEL, WOBJSEL).
-    window_enable: [WindowEnable; 6] = window_enable,
-    /// Left edge of window 1 (WH0).
-    window_one_left: u8 = window_one_left,
-    /// Right edge of window 1 (WH1).
-    window_one_right: u8 = window_one_right,
-    /// Left edge of window 2 (WH2).
-    window_two_left: u8 = window_two_left,
-    /// Right edge of window 2 (WH3).
-    window_two_right: u8 = window_two_right,
-    /// How the two windows combine, per layer in the same order (WBGLOG,
-    /// WOBJLOG).
-    window_combine: [u8; 6] = window_combine,
-    /// Backgrounds on the main screen (TM bits 0-3).
-    bg_main_enable: [bool; 4] = bg_main_enable,
-    /// Sprites on the main screen (TM bit 4).
-    obj_main_enable: bool = obj_main_enable,
-    /// Backgrounds on the sub screen (TS bits 0-3).
-    bg_sub_enable: [bool; 4] = bg_sub_enable,
-    /// Sprites on the sub screen (TS bit 4).
-    obj_sub_enable: bool = obj_sub_enable,
-    /// The windows clip these backgrounds on the main screen (TMW bits
-    /// 0-3).
-    bg_main_window_disable: [bool; 4] = bg_main_window_disable,
-    /// The windows clip the sprites on the main screen (TMW bit 4).
-    obj_main_window_disable: bool = obj_main_window_disable,
-    /// The windows clip these backgrounds on the sub screen (TSW bits 0-3).
-    bg_sub_window_disable: [bool; 4] = bg_sub_window_disable,
-    /// The windows clip the sprites on the sub screen (TSW bit 4).
-    obj_sub_window_disable: bool = obj_sub_window_disable,
-    /// Where the main screen shows its pixels (CGWSEL bits 6-7).
-    col_main_mask: u8 = col_main_mask,
-    /// Where colour math may run (CGWSEL bits 4-5).
-    col_sub_mask: u8 = col_sub_mask,
-    /// Colour math takes the sub screen instead of the fixed colour
-    /// (CGWSEL bit 1).
-    addsub_mode: bool = addsub_mode,
-    /// Direct colour for the 256-colour backgrounds (CGWSEL bit 0).
-    direct_color: bool = direct_color,
-    /// Colour math subtracts (CGADSUB bit 7).
-    color_math_subtract: bool = color_math_subtract,
-    /// Colour math halves its result (CGADSUB bit 6).
-    color_math_halve: bool = color_math_halve,
-    /// Colour math on the backdrop (CGADSUB bit 5).
-    color_math_back_enable: bool = color_math_back_enable,
-    /// Colour math on sprites (CGADSUB bit 4).
-    color_math_oam_enable: bool = color_math_oam_enable,
-    /// Colour math on each background (CGADSUB bits 0-3).
-    color_math_bg_enable: [bool; 4] = color_math_bg_enable,
-    /// The fixed colour, BGR555 (COLDATA).
-    fixed_color: u16 = fixed_color,
-    /// Pseudo-hires (SETINI bit 3). The renderer does not draw it; it is
-    /// kept so the line's state is whole.
-    pseudo_hires: bool = pseudo_hires,
-    /// Overscan, 239 visible lines (SETINI bit 2).
-    overscan: bool = overscan,
-    /// Sprite interlace (SETINI bit 1).
-    obj_interlace: bool = obj_interlace,
-    /// Screen interlace (SETINI bit 0), latched for the frame at line 1.
-    interlace: bool = interlace,
-    /// The interlace field the line was drawn in.
-    field: bool = field,
 }
 
 /// One logged change to video memory: where it is, the value it replaced,
@@ -725,6 +597,110 @@ impl LineRecorder {
     }
 }
 
+impl LineRecorder {
+    /// OAM as each line of the table read it, worked out on a copy (see
+    /// [`ReplayedMemory`]). `now` is OAM as it stands, the start when the
+    /// table never took its copy.
+    pub(crate) fn sprite_table_by_line(&self, now: &[u8; 0x220]) -> ReplayedMemory<[u8; 0x220]> {
+        let start = if self.copy.taken { &self.copy.oam } else { now };
+        ReplayedMemory::new(
+            Box::new(*start),
+            self.sprite_table.changes.clone(),
+            swap_sprite_byte,
+        )
+    }
+
+    /// VRAM as each line of the table read it, worked out on a copy (see
+    /// [`ReplayedMemory`]). `now` is VRAM as it stands, the start when the
+    /// table never took its copy.
+    pub(crate) fn vram_by_line(&self, now: &[u16; 0x8000]) -> ReplayedMemory<[u16; 0x8000]> {
+        let start = if self.copy.taken {
+            &*self.copy.vram
+        } else {
+            now
+        };
+        let mut memory: Box<[u16; 0x8000]> = vec![0u16; 0x8000]
+            .into_boxed_slice()
+            .try_into()
+            .expect("vram copy alloc 32K words");
+        memory.copy_from_slice(start);
+        ReplayedMemory::new(memory, self.vram.changes.clone(), swap_vram_byte)
+    }
+}
+
+/// One video memory as each line of a line table read it, worked out on a
+/// copy, so the PPU's own memory is not touched and a reader that walks the
+/// frame line by line (its sprite lists, its offset-per-tile columns) needs
+/// no more than a shared borrow.
+///
+/// It starts from the table's copy of the memory as the last line read it
+/// and undoes the memory's log, newest first; [`Self::advance_to`] then
+/// redoes it line by line, as a frame drawn again does in place. A log that
+/// filled up was emptied, so such a memory stays as the last line read it.
+pub(crate) struct ReplayedMemory<M: 'static> {
+    memory: Box<M>,
+    changes: Vec<MemoryChange>,
+    next: usize,
+    swap: fn(&mut M, u16, &mut u16),
+}
+
+impl<M: 'static> ReplayedMemory<M> {
+    /// Wind `memory` back through `changes` with `swap`, newest first.
+    fn new(
+        mut memory: Box<M>,
+        mut changes: Vec<MemoryChange>,
+        swap: fn(&mut M, u16, &mut u16),
+    ) -> Self {
+        for change in changes.iter_mut().rev() {
+            swap(&mut memory, change.address, &mut change.value);
+        }
+        Self {
+            memory,
+            changes,
+            next: 0,
+            swap,
+        }
+    }
+
+    /// A memory as it stands, the same for every line: the frame read from
+    /// the registers and the memory as they stand.
+    pub(crate) fn as_it_stands(memory: Box<M>, swap: fn(&mut M, u16, &mut u16)) -> Self {
+        Self::new(memory, Vec::new(), swap)
+    }
+
+    /// Redo every change made before line `index` of the table was drawn,
+    /// so the memory is as that line read it. Lines are visited in order.
+    pub(crate) fn advance_to(&mut self, index: usize) {
+        while let Some(change) = self.changes.get_mut(self.next) {
+            if usize::from(change.before_line) > index {
+                break;
+            }
+            (self.swap)(&mut self.memory, change.address, &mut change.value);
+            self.next += 1;
+        }
+    }
+
+    /// The memory as the line last advanced to read it.
+    pub(crate) fn memory(&self) -> &M {
+        &self.memory
+    }
+}
+
+/// OAM as it stands, as a [`ReplayedMemory`] with nothing to replay.
+pub(crate) fn sprite_table_as_it_stands(oam: &[u8; 0x220]) -> ReplayedMemory<[u8; 0x220]> {
+    ReplayedMemory::as_it_stands(Box::new(*oam), swap_sprite_byte)
+}
+
+/// VRAM as it stands, as a [`ReplayedMemory`] with nothing to replay.
+pub(crate) fn vram_as_it_stands(vram: &[u16; 0x8000]) -> ReplayedMemory<[u16; 0x8000]> {
+    let mut memory: Box<[u16; 0x8000]> = vec![0u16; 0x8000]
+        .into_boxed_slice()
+        .try_into()
+        .expect("vram copy alloc 32K words");
+    memory.copy_from_slice(vram);
+    ReplayedMemory::as_it_stands(memory, swap_vram_byte)
+}
+
 /// Redo the changes of `log` from `*next` on that came before line `index`
 /// was drawn, swapping each into memory with `swap`. Returns whether any
 /// was redone.
@@ -745,21 +721,9 @@ fn replay_log(
     *next != start
 }
 
-/// The palettes the lines of a frame were drawn with (`Ppu::line_palettes`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinePalettes {
-    /// Colours in each palette: the 256 of CGRAM.
-    pub colours_per_palette: u32,
-    /// The palettes, one after the other, each pushed once, in CGRAM's own
-    /// BGR555 words (`0BBBBBGGGGGRRRRR`).
-    pub palettes: Vec<u16>,
-    /// For each row of the line table, the palette its line was drawn with.
-    pub palette_of_line: Vec<u16>,
-}
-
 /// The recorders the host armed, kept beside the PPU's state and never in a
 /// savestate.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Recorders {
     /// What the host asked to record.
     recording: CaptureRecording,
@@ -768,22 +732,54 @@ pub(crate) struct Recorders {
     /// The number of the frame the lines drawn next belong to: the frames
     /// finished, plus one.
     frame: u64,
+    /// A live recorder or a debugger watch is armed: the bus then sends
+    /// the PPU's writes through the path that notes what the ports took
+    /// (`Ppu::notes_port_writes`). The same as `live.is_some()`, kept as a
+    /// flag for a one-load test.
+    pub(crate) on: bool,
+    /// A live recorder is armed: the writers name themselves.
+    pub(crate) recording_writes: bool,
+    /// The live recorders and the debugger's watch, while any is armed.
+    pub(crate) live: Option<Box<LiveRecorders>>,
+}
+
+impl Default for Recorders {
+    fn default() -> Self {
+        Self {
+            recording: CaptureRecording::default(),
+            lines: None,
+            // No frame finished yet: the lines drawn next belong to frame 1.
+            frame: 1,
+            on: false,
+            recording_writes: false,
+            live: None,
+        }
+    }
+}
+
+impl Recorders {
+    /// The number of the frame being built, which every recorded write
+    /// carries.
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame
+    }
 }
 
 impl Ppu {
     /// Arm or disarm the recorders ([`CaptureRecording`]). Turning the line
     /// table on mid-frame keeps the lines still to come, but such a table
     /// does not hold its frame from line 1 and is not drawn from; the next
-    /// frame's is. Turning it off drops it.
+    /// frame's is. Turning it off drops it. The two live recorders start
+    /// empty when turned on and are dropped when turned off.
     pub fn set_capture_recording(&mut self, recording: CaptureRecording) {
         self.recorders.recording = recording;
-        match (recording.wants_line_table(), self.recorders.lines.is_some()) {
-            (true, false) => {
-                self.recorders.lines = Some(Box::new(LineRecorder::new(self.recorders.frame)));
-            }
-            (false, true) => self.recorders.lines = None,
-            _ => {}
-        }
+        let frame = self.recorders.frame;
+        arm_recorder(
+            &mut self.recorders.lines,
+            recording.wants_line_table(),
+            || Box::new(LineRecorder::new(frame)),
+        );
+        self.arm_write_recorders(recording);
     }
 
     /// What the recorders were asked to record.
@@ -980,26 +976,13 @@ impl Ppu {
         for change in log.changes.iter_mut().rev() {
             swap_colour(&mut cgram, change.address, &mut change.value);
         }
-        let mut palettes: Vec<u16> = Vec::new();
-        let mut index_of: HashMap<[u16; 0x100], u16> = HashMap::new();
-        let mut palette_of_line = Vec::with_capacity(table.lines.len());
         let mut next = 0usize;
-        for line in 0..table.lines.len() {
+        Some(distinct_palettes((0..table.lines.len()).map(|line| {
             replay_log(&mut log, line, &mut next, |address, value| {
                 swap_colour(&mut cgram, address, value)
             });
-            let count = index_of.len() as u16;
-            let index = *index_of.entry(cgram).or_insert_with(|| {
-                palettes.extend_from_slice(&cgram);
-                count
-            });
-            palette_of_line.push(index);
-        }
-        Some(LinePalettes {
-            colours_per_palette: 0x100,
-            palettes,
-            palette_of_line,
-        })
+            Some(cgram)
+        })))
     }
 }
 

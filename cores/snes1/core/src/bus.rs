@@ -81,6 +81,8 @@ mod wmdata;
 
 use std::sync::Arc;
 
+use retro_core::capture::{CaptureRecording, WriteOrigin};
+use retro_core::cartridge::SourcePlace;
 use retro_core::cpu::Addressable;
 
 use crate::apu::Apu;
@@ -278,9 +280,16 @@ pub struct SnesBus {
     pc_trace: Option<(std::collections::VecDeque<u32>, usize)>,
     /// `PBR:PC` of the instruction currently executing, stamped onto
     /// each [`IoAccess`] and pushed into [`Self::pc_trace`]. `system.rs`
-    /// refreshes it before stepping the CPU, but only while a
-    /// diagnostic trace is enabled, the fast path never writes it.
+    /// refreshes it before stepping the CPU, but only while
+    /// [`Self::diag_on`] says something reads it; the fast path never
+    /// writes it.
     trace_pc: u32,
+    /// A diagnostic trace is on, or a recorder of the PPU wants the
+    /// processor named as the writer of its stores: the one flag
+    /// `system.rs` tests before each instruction to stamp
+    /// [`Self::trace_pc`]. Kept up by every call that turns one of them on
+    /// or off ([`Self::refresh_diag_on`]).
+    diag_on: bool,
     /// Opt-in watch on a single WRAM cell: `(wram_offset, ring)`. Records
     /// every read/write that resolves to that physical WRAM offset,
     /// through the `$7E/$7F` direct banks *or* the low-8 KiB mirror in
@@ -427,6 +436,14 @@ pub enum BusDebugEvent {
     ApuPortWrite { port: u8 },
 }
 
+/// Whether a B-bus page address is one of the PPU's three data ports
+/// (`$2104` OAMDATA, `$2118/$2119` VMDATA, `$2122` CGDATA), the writes the
+/// recorders of video memory note.
+#[inline]
+fn is_noted_port(addr24: u32) -> bool {
+    matches!(addr24 & 0xFFFF, 0x2104 | 0x2118 | 0x2119 | 0x2122)
+}
+
 /// Whether a CPU address reaches a PPU register: `$2100-$213F` of the
 /// system-area B-bus window (banks `$00-$3F` / `$80-$BF`), the range
 /// [`classify_b_bus_write`] reports as PPU register writes.
@@ -492,6 +509,7 @@ impl SnesBus {
             io_trace: None,
             pc_trace: None,
             trace_pc: 0,
+            diag_on: false,
             addr_watch: None,
             cached_h_dot: 0,
             cached_v_scanline: 0,
@@ -829,11 +847,13 @@ impl SnesBus {
             entries: std::collections::VecDeque::new(),
             cap: cap.max(1),
         });
+        self.refresh_diag_on();
     }
 
     /// Stop capturing the I/O trace and discard whatever was buffered.
     pub fn disable_io_trace(&mut self) {
         self.io_trace = None;
+        self.refresh_diag_on();
     }
 
     /// Start capturing the instruction-PC ring buffer, retaining the
@@ -841,24 +861,60 @@ impl SnesBus {
     /// `cap` of 0 is clamped to 1. Enabling clears any prior capture.
     pub fn enable_pc_trace(&mut self, cap: usize) {
         self.pc_trace = Some((std::collections::VecDeque::new(), cap.max(1)));
+        self.refresh_diag_on();
     }
 
     /// Drain and return the captured PC ring buffer (oldest first),
     /// leaving capture disabled. Empty when capture was never enabled.
     pub fn take_pc_trace(&mut self) -> Vec<u32> {
-        self.pc_trace
+        let ring = self
+            .pc_trace
             .take()
             .map(|(ring, _)| ring.into_iter().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.refresh_diag_on();
+        ring
     }
 
     /// `true` while any diagnostic trace (I/O, PC, or address watch) is
-    /// active. `system.rs` checks this before stamping
-    /// [`Self::set_trace_pc`] so the fast path pays nothing when all
-    /// are off.
+    /// active, or a recorder of the PPU wants the processor named as the
+    /// writer of its stores. `system.rs` checks this before stamping
+    /// [`Self::set_trace_pc`], so the fast path pays one test of one flag
+    /// when all are off.
     #[inline]
     pub fn diag_trace_enabled(&self) -> bool {
-        self.io_trace.is_some() || self.pc_trace.is_some() || self.addr_watch.is_some()
+        self.diag_on
+    }
+
+    /// Recompute [`Self::diag_on`] from what is on.
+    fn refresh_diag_on(&mut self) {
+        self.diag_on = self.io_trace.is_some()
+            || self.pc_trace.is_some()
+            || self.addr_watch.is_some()
+            || self.b_bus.ppu().records_writes();
+    }
+
+    /// Choose what the PPU records while frames run ([`CaptureRecording`]),
+    /// and keep the processor named as the writer of its stores while a live
+    /// recorder needs it. The way to arm the recorders on a bus: arming them
+    /// on the PPU alone leaves the processor's address unstamped.
+    pub fn set_capture_recording(&mut self, recording: CaptureRecording) {
+        self.b_bus.ppu_mut().set_capture_recording(recording);
+        self.refresh_diag_on();
+    }
+
+    /// The debugger is about to write through the bus
+    /// (`SnesEmulator::write_memory_debug`): the PPU puts what its ports
+    /// take down to the debugger until [`Self::end_debugger_writes`].
+    pub fn begin_debugger_writes(&mut self) {
+        self.b_bus.ppu_mut().set_writer(WriteOrigin::DEBUGGER);
+    }
+
+    /// The debugger's writes are done: the processor writes again, from the
+    /// instruction last stamped.
+    pub fn end_debugger_writes(&mut self) {
+        let pc = self.trace_pc;
+        self.b_bus.ppu_mut().set_writer(WriteOrigin::processor(pc));
     }
 
     /// Start watching the WRAM cell that `addr` resolves to (via
@@ -875,23 +931,29 @@ impl SnesBus {
                 },
             ));
         }
+        self.refresh_diag_on();
     }
 
     /// Drain and return the captured address-watch ring buffer (oldest
     /// first), leaving the watch disabled. Empty when never enabled.
     pub fn take_addr_watch(&mut self) -> Vec<IoAccess> {
-        self.addr_watch
+        let accesses = self
+            .addr_watch
             .take()
             .map(|(_, buf)| buf.entries.into_iter().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.refresh_diag_on();
+        accesses
     }
 
     /// Record the `PBR:PC` of the instruction about to execute: stamped
-    /// onto any [`IoAccess`] it produces, and pushed into the PC ring
-    /// buffer when that capture is active.
+    /// onto any [`IoAccess`] it produces, pushed into the PC ring buffer
+    /// when that capture is active, and named to the PPU as the writer of
+    /// the stores the instruction makes.
     #[inline]
     pub fn set_trace_pc(&mut self, pc: u32) {
         self.trace_pc = pc;
+        self.b_bus.ppu_mut().set_writer(WriteOrigin::processor(pc));
         if let Some((ring, cap)) = self.pc_trace.as_mut() {
             if ring.len() == *cap {
                 ring.pop_front();
@@ -903,10 +965,13 @@ impl SnesBus {
     /// Drain and return the captured access ring buffer (oldest first),
     /// leaving capture disabled. Empty when capture was never enabled.
     pub fn take_io_trace(&mut self) -> Vec<IoAccess> {
-        self.io_trace
+        let accesses = self
+            .io_trace
             .take()
             .map(|buf| buf.entries.into_iter().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.refresh_diag_on();
+        accesses
     }
 
     /// Append one access to the ring buffer, evicting the oldest entry
@@ -1235,6 +1300,57 @@ impl SnesBus {
     /// the memory map and ROM/SRAM regions.
     pub fn cartridge_plan(&self) -> Option<&MapPlan> {
         self.cartridge_plan.as_deref()
+    }
+
+    /// What an A-bus address reads, through the page table and the
+    /// cartridge's map plan as they stand, the way a read of it is routed:
+    /// work RAM (`$7E-$7F`, and the low 8 KiB of a system bank), a byte of
+    /// the cartridge's ROM image (the image the cartridge holds: the copier
+    /// header stripped, padded to a power of two), the cartridge's RAM, a
+    /// coprocessor's window, or nothing it can name. Pure: it reads the
+    /// mapping and changes nothing.
+    ///
+    /// The Super FX's and the Cx4's ROM windows reach the image through the
+    /// chip with the plain ROM geometry, so they name the image's byte; the
+    /// SA-1's, the S-DD1's and the SPC7110's ROM windows go through the
+    /// chip's own banks, so they name the coprocessor. The Super FX's and
+    /// the Cx4's cartridge RAM, the SA-1's BW-RAM and the SPC7110's SRAM
+    /// name the cartridge's RAM.
+    pub fn source_place(&self, address: u32) -> SourcePlace {
+        let addr24 = address & 0x00FF_FFFF;
+        let low = addr24 & 0xFFFF;
+        let plan_place = || match self.cartridge_plan.as_deref() {
+            Some(plan) => plan
+                .resolve(addr24)
+                .map_or(SourcePlace::Unknown, |resolved| {
+                    let slot = &plan.slots[resolved.slot_index as usize];
+                    target_place(slot.target, resolved.target_offset)
+                }),
+            None => SourcePlace::Unknown,
+        };
+        match self.page_table[(addr24 >> 12) as usize] {
+            PageHandler::Wram | PageHandler::WramMirror => SourcePlace::WorkRam,
+            PageHandler::Cartridge { slot_index } => {
+                let Some(plan) = self.cartridge_plan.as_deref() else {
+                    return SourcePlace::Unknown;
+                };
+                match plan.slots.get(usize::from(slot_index)) {
+                    Some(slot) if slot.contains(addr24) => {
+                        target_place(slot.target, slot.compute_target_offset(addr24))
+                    }
+                    _ => SourcePlace::Unknown,
+                }
+            }
+            PageHandler::BBus if self.cart_claims_bbus_mmio && (0x2200..=0x23FF).contains(&low) => {
+                plan_place()
+            }
+            PageHandler::CpuMmio
+                if self.cart_claims_expansion_mmio && (0x4800..=0x48FF).contains(&low) =>
+            {
+                plan_place()
+            }
+            _ => SourcePlace::Unknown,
+        }
     }
 
     /// Battery SRAM bytes of the installed cartridge, or `None` when no
@@ -1769,14 +1885,25 @@ impl SnesBus {
     }
 
     /// Core write dispatch. MDR is updated *before* the dispatch
-    /// so an open-bus write still leaves the value latched.
+    /// so an open-bus write still leaves the value latched. With `NOTE`, a
+    /// write to one of the PPU's three data ports goes through the path that
+    /// notes what it takes ([`Ppu::write_port_noted`]); every other write,
+    /// and every write without `NOTE`, is dispatched as it always was. The
+    /// caller chooses once, per write of the processor or per DMA block and
+    /// HDMA line (see [`Self::write_full`]).
     #[inline]
-    fn write_inner(&mut self, addr: u32, value: u8) {
+    fn write_inner<const NOTE: bool>(&mut self, addr: u32, value: u8) {
         let addr24 = addr & 0x00FF_FFFF;
         self.mdr = value;
         match self.page_table[(addr24 >> 12) as usize] {
             PageHandler::Wram => self.wram[(addr24 - 0x7E_0000) as usize] = value,
             PageHandler::WramMirror => self.wram[(addr24 & 0x1FFF) as usize] = value,
+            PageHandler::BBus if NOTE && is_noted_port(addr24) => {
+                let ctx = self.ppu_ctx();
+                self.b_bus
+                    .ppu_mut()
+                    .write_port_noted((addr24 & 0x3F) as u8, value, &ctx);
+            }
             PageHandler::BBus => self.write_b_bus_window(addr24, value),
             PageHandler::CpuMmio => self.write_cpu_mmio(addr24, value),
             PageHandler::Cartridge { slot_index } => {
@@ -1807,22 +1934,59 @@ impl SnesBus {
         self.read_inner(addr)
     }
 
+    /// A write of the processor, or of the debugger through the bus: the
+    /// one test of whether the PPU notes what its ports take
+    /// ([`Ppu::notes_port_writes`]), then the dispatch.
+    #[inline]
+    fn write_tested(&mut self, addr: u32, value: u8) {
+        if self.b_bus.ppu().notes_port_writes() {
+            self.write_inner::<true>(addr, value);
+        } else {
+            self.write_inner::<false>(addr, value);
+        }
+    }
+
     /// Fastest write tier. Mirror of [`SnesBus::read_fast`].
     #[inline(always)]
     pub fn write_fast(&mut self, addr: u32, value: u8) {
-        self.write_inner(addr, value);
+        self.write_tested(addr, value);
     }
 
     /// Light-instrumentation write tier. Mirror of
     /// [`SnesBus::read_light`].
     pub fn write_light(&mut self, addr: u32, value: u8) {
-        self.write_inner(addr, value);
+        self.write_tested(addr, value);
     }
 
     /// Full-instrumentation write tier. Mirror of
     /// [`SnesBus::read_full`].
     pub fn write_full(&mut self, addr: u32, value: u8) {
-        self.write_inner(addr, value);
+        self.write_tested(addr, value);
+    }
+}
+
+/// What a map-plan target holds at `offset` into its slot.
+fn target_place(target: MapTarget, offset: u32) -> SourcePlace {
+    use crate::cartridge::{
+        CX4_RAM_BASE, CX4_ROM_BASE, SA1_BWRAM_BASE, SA1_BWRAM_LINEAR_BASE, SA1_CHIP_ID,
+        SPC7110_CHIP_ID, SPC7110_SRAM_BASE, SUPERFX_CHIP_ID, SUPERFX_RAM_BASE, SUPERFX_ROM_BASE,
+    };
+    match target {
+        MapTarget::Rom { base_offset } => SourcePlace::Rom(base_offset.wrapping_add(offset)),
+        MapTarget::Sram { .. } => SourcePlace::CartridgeRam,
+        MapTarget::ChipMmio { chip_id, base } => match (chip_id, base) {
+            // The chip address is the base plus the slot offset; these two
+            // chips keep the plain ROM geometry, so the offset is the image's.
+            (SUPERFX_CHIP_ID, SUPERFX_ROM_BASE) | (CX4_CHIP_ID, CX4_ROM_BASE) => {
+                SourcePlace::Rom(offset)
+            }
+            (SUPERFX_CHIP_ID, SUPERFX_RAM_BASE)
+            | (CX4_CHIP_ID, CX4_RAM_BASE)
+            | (SA1_CHIP_ID, SA1_BWRAM_BASE | SA1_BWRAM_LINEAR_BASE)
+            | (SPC7110_CHIP_ID, SPC7110_SRAM_BASE) => SourcePlace::CartridgeRam,
+            _ => SourcePlace::Coprocessor,
+        },
+        MapTarget::OpenBus => SourcePlace::Unknown,
     }
 }
 

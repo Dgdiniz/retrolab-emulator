@@ -796,10 +796,17 @@ pub enum BuildError {
 /// strip, but once we've decided to strip, the canonical
 /// digest matches the No-Intro form.
 fn strip_smc_if_present(rom: &[u8]) -> &[u8] {
-    if rom.len() >= 512 && rom.len() % 1024 == 512 {
-        &rom[512..]
+    &rom[copier_header_length(rom.len())..]
+}
+
+/// The length of the SMC copier prelude a ROM file of `file_length` bytes
+/// carries: 512 when the length leaves 512 over a whole number of KiB, else
+/// 0. The cartridge's ROM image starts this far into the file.
+pub fn copier_header_length(file_length: usize) -> usize {
+    if file_length >= 512 && file_length % 1024 == 512 {
+        512
     } else {
-        rom
+        0
     }
 }
 

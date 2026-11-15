@@ -10,23 +10,15 @@
 //! as every line was before the table existed. Either way nothing a
 //! savestate holds moves: what drawing changes is kept and put back.
 
-use retro_core::video::PixelImage;
+use retro_core::capture::{NoTrace, PixelTrace, RenderedLayer};
+use retro_core::video::{crop_rgba, PixelImage};
 
 use super::recording::{undo_journal, LineKind, LineRecord, LineTable, PaletteRedraw};
+use super::sources::LineTrace;
 use super::{
     DrawState, RenderLayerMode, Vdp, FRAMEBUFFER_WIDTH, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B,
     LAYER_WINDOW,
 };
-
-/// One layer of the frame drawn again ([`Vdp::render_layer_image`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayerImage {
-    /// The layer: the screen in RGBA, alpha 0 where the layer does not cover.
-    pub image: PixelImage,
-    /// Every line was drawn from the state it was recorded with in the line
-    /// table, not from the state as it is now.
-    pub from_line_states: bool,
-}
 
 /// The state a line drawn from its record replaces: kept before, put back
 /// after. Video memory is copied only when the journal will change it.
@@ -90,7 +82,9 @@ impl Vdp {
     pub fn rerender_current_frame(&mut self) -> bool {
         let kept = DrawState::keep(self);
         let rows = self.timing.visible_scanlines();
-        let from_line_states = self.redraw_rows(rows, |vdp, line, row| vdp.draw_row(line, row));
+        let from_line_states = self.redraw_rows(rows, |vdp, line, row| {
+            vdp.draw_row(line, row, &mut NoTrace::new())
+        });
         kept.restore(self);
         from_line_states
     }
@@ -110,7 +104,7 @@ impl Vdp {
     /// hide the layer asked for. The drawing goes to the line buffers alone,
     /// whose contents are put back after with the rest of `DrawState`: the
     /// framebuffer and everything a savestate holds stay as they were.
-    pub fn render_layer_image(&mut self, layer: usize) -> Option<LayerImage> {
+    pub fn render_layer_image(&mut self, layer: usize) -> Option<RenderedLayer> {
         if layer >= LAYER_COUNT {
             return None;
         }
@@ -127,7 +121,7 @@ impl Vdp {
         self.debug_pixel = debug_pixel;
         self.debug_layer_disable = hidden;
         kept.restore(self);
-        Some(LayerImage {
+        Some(RenderedLayer {
             image: PixelImage {
                 width: width as u32,
                 height: height as u32,
@@ -148,7 +142,9 @@ impl Vdp {
         let kept = DrawState::keep(self);
         let framebuffer = self.framebuffer.clone();
         let previous_mode = std::mem::replace(&mut self.render_layer_mode, mode);
-        self.redraw_rows(height as u16, |vdp, line, row| vdp.draw_row(line, row));
+        self.redraw_rows(height as u16, |vdp, line, row| {
+            vdp.draw_row(line, row, &mut NoTrace::new())
+        });
         let rgba = self.framebuffer_picture(width, height);
         self.render_layer_mode = previous_mode;
         self.framebuffer = framebuffer;
@@ -174,7 +170,9 @@ impl Vdp {
         let height = self.drawn_height() as usize;
         let kept = DrawState::keep(self);
         let framebuffer = self.framebuffer.clone();
-        self.redraw_rows(height as u16, |vdp, line, row| vdp.draw_row(line, row));
+        self.redraw_rows(height as u16, |vdp, line, row| {
+            vdp.draw_row(line, row, &mut NoTrace::new())
+        });
         let rgba = self.framebuffer_picture(width, height);
         self.framebuffer = framebuffer;
         kept.restore(self);
@@ -187,19 +185,19 @@ impl Vdp {
 
     /// The framebuffer's first `height` rows, each cut to `width` pixels.
     fn framebuffer_picture(&self, width: usize, height: usize) -> Vec<u8> {
-        let stride = FRAMEBUFFER_WIDTH as usize * 4;
-        let mut rgba = Vec::with_capacity(width * height * 4);
-        for line in 0..height {
-            rgba.extend_from_slice(&self.framebuffer[line * stride..line * stride + width * 4]);
-        }
-        rgba
+        crop_rgba(
+            &self.framebuffer,
+            FRAMEBUFFER_WIDTH,
+            width as u32,
+            height as u32,
+        )
     }
 
     /// Draw the lines `0..rows` again with `draw`, each from its record in
     /// the line table while one is armed (`Some`), otherwise from the state
     /// as it is now (`None`), and return whether every line had a record.
     /// Nothing is recorded meanwhile: the recording is set aside.
-    fn redraw_rows(
+    pub(super) fn redraw_rows(
         &mut self,
         rows: u16,
         mut draw: impl FnMut(&mut Vdp, u16, Option<&LineRecord>),
@@ -348,10 +346,17 @@ impl Vdp {
 
     /// Draw line `line` into the framebuffer: from its record, then the
     /// palette writes made while it was on screen, or from the state as it
-    /// is now.
-    fn draw_row(&mut self, line: u16, row: Option<&LineRecord>) {
+    /// is now. With a trace (`T::ON`) it notes where each pixel the line
+    /// shows came from ([`super::sources`]); the redraws that only draw pass
+    /// [`NoTrace`].
+    pub(super) fn draw_row<T: PixelTrace<Notes = LineTrace>>(
+        &mut self,
+        line: u16,
+        row: Option<&LineRecord>,
+        trace: &mut T,
+    ) {
         let Some(row) = row else {
-            self.render_scanline(line);
+            self.render_scanline_with(line, trace);
             return;
         };
         if row.kind == LineKind::DirectColour {
@@ -359,17 +364,23 @@ impl Vdp {
             self.render_blanked_line(line);
             let offset = usize::from(line) * FRAMEBUFFER_WIDTH as usize * 4;
             let width = self.display_width() as usize;
+            if T::ON {
+                trace.notes().blanked(width, self.backdrop_index());
+            }
             for (pair, &word) in row.direct_colours.iter().enumerate() {
                 let (red, green, blue) = Self::convert_genesis_color(word);
                 for x in [pair * 2, pair * 2 + 1] {
                     let at = offset + x * 4;
                     if x < width && at + 3 < self.framebuffer.len() {
                         self.framebuffer[at..at + 4].copy_from_slice(&[red, green, blue, 255]);
+                        if T::ON {
+                            trace.notes().painted(x, word);
+                        }
                     }
                 }
             }
         } else {
-            self.render_scanline(line);
+            self.render_scanline_with(line, trace);
         }
         for change in &row.palette_changes {
             self.cram_rgb[usize::from(change.index)] = Self::convert_genesis_color(change.colour);
@@ -379,9 +390,24 @@ impl Vdp {
                     from,
                     to,
                     shadow_highlight,
-                } => self.remap_columns(line, usize::from(from), usize::from(to), shadow_highlight),
+                } => {
+                    let (from, to) = (usize::from(from), usize::from(to));
+                    self.remap_columns(line, from, to, shadow_highlight);
+                    if T::ON {
+                        trace.notes().remapped(
+                            (&self.line_index, &self.line_sh_op, &self.line_high_pri),
+                            from,
+                            to,
+                            shadow_highlight,
+                        );
+                    }
+                }
                 PaletteRedraw::WholeLine { width, backdrop } => {
-                    self.render_blanked_columns(line, usize::from(width), usize::from(backdrop))
+                    let (width, backdrop) = (usize::from(width), usize::from(backdrop));
+                    self.render_blanked_columns(line, width, backdrop);
+                    if T::ON {
+                        trace.notes().blanked(width, backdrop);
+                    }
                 }
             }
         }
@@ -398,23 +424,34 @@ impl Vdp {
         row: Option<&LineRecord>,
         pixels: &mut [u8],
     ) {
-        let drawn = match row {
-            Some(row) => row.kind == LineKind::Drawn,
-            None => (self.registers[1] & 0x40) != 0,
-        };
-        if !drawn {
+        if !self.row_is_drawn(row) {
             return;
         }
         self.composite_scanline(line);
+        self.colour_row(row, pixels, |vdp, x| vdp.layer_pixel(layer, x));
+    }
+
+    /// Colour `pixels` (one row of a layer's picture) from the line last
+    /// composited: `pixel` gives the colour of column `x`, or `None` where
+    /// the row stays transparent. The columns are coloured with the palette
+    /// the line began with, then again as each palette write made while it
+    /// was on screen coloured them (`row`'s, none for a line drawn from the
+    /// state as it is now).
+    pub(super) fn colour_row(
+        &mut self,
+        row: Option<&LineRecord>,
+        pixels: &mut [u8],
+        pixel: impl Fn(&Vdp, usize) -> Option<(u8, u8, u8)>,
+    ) {
         let columns = (pixels.len() / 4).min(self.display_width() as usize);
-        self.colour_layer_columns(layer, pixels, 0, columns);
+        self.colour_columns(pixels, 0, columns, &pixel);
         for change in row.map_or(&[][..], |row| row.palette_changes.as_slice()) {
             self.cram_rgb[usize::from(change.index)] = Self::convert_genesis_color(change.colour);
             match change.redraw {
                 PaletteRedraw::Nothing => {}
                 PaletteRedraw::Columns { from, to, .. } => {
                     let to = usize::from(to).min(columns);
-                    self.colour_layer_columns(layer, pixels, usize::from(from), to);
+                    self.colour_columns(pixels, usize::from(from), to, &pixel);
                 }
                 PaletteRedraw::WholeLine { .. } => {
                     // The line became the backdrop: no layer covers it, and
@@ -426,11 +463,17 @@ impl Vdp {
         }
     }
 
-    /// Colour the columns `from..to` of `pixels` as `layer` covers them on
-    /// the line last composited, with the palette as it is now.
-    fn colour_layer_columns(&self, layer: usize, pixels: &mut [u8], from: usize, to: usize) {
+    /// Colour the columns `from..to` of `pixels` as `pixel` gives them, with
+    /// the palette as it is now.
+    fn colour_columns(
+        &self,
+        pixels: &mut [u8],
+        from: usize,
+        to: usize,
+        pixel: &impl Fn(&Vdp, usize) -> Option<(u8, u8, u8)>,
+    ) {
         for x in from..to {
-            let colour = match self.layer_pixel(layer, x) {
+            let colour = match pixel(self, x) {
                 Some((red, green, blue)) => [red, green, blue, 255],
                 None => [0; 4],
             };
@@ -441,7 +484,7 @@ impl Vdp {
     /// The colour `layer` gives pixel `x` of the line last composited, or
     /// `None` where the layer is transparent: what the single-layer modes
     /// of `remap_scanline_segment` draw, without their colour key.
-    fn layer_pixel(&self, layer: usize, x: usize) -> Option<(u8, u8, u8)> {
+    pub(super) fn layer_pixel(&self, layer: usize, x: usize) -> Option<(u8, u8, u8)> {
         let index = match layer {
             LAYER_PLANE_A => self.line_plane_a[x],
             LAYER_PLANE_B => self.line_plane_b[x],
@@ -463,8 +506,8 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::super::recording::JOURNAL_CAPACITY;
-    use super::super::CaptureRecording;
     use super::*;
+    use retro_core::capture::CaptureRecording;
 
     /// A VDP with the display on in the 40-cell mode, plane A at `$C000`
     /// with tile 1 (colour 1, red) in column 0 of every row, the scroll
@@ -519,7 +562,7 @@ mod tests {
                 // Two words written by turns, more times than the journal
                 // holds: it fills, and nothing they hold changes.
                 for i in 0..=JOURNAL_CAPACITY {
-                    vdp.note_vram_write(0x0400 + (i % 2) * 2);
+                    vdp.journal_vram_write(0x0400 + (i % 2) * 2);
                 }
             }
         }

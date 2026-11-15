@@ -227,6 +227,208 @@ pub fn sprite_tile_number(
     ((grid + grid_row * 16 + grid_column) & 0x07ff) as u16
 }
 
+/// The most sprites one line keeps: the evaluation's range limit. The
+/// sprite after them sets the range-over flag (STAT77 bit 6).
+pub const SPRITES_PER_LINE: usize = 32;
+
+/// The most 8-pixel sprite tile columns one line draws: its time limit.
+/// The column after them sets the time-over flag (STAT77 bit 7).
+pub const TILE_COLUMNS_PER_LINE: usize = 34;
+
+/// Whether the tile column of a sprite at `x` that starts at `column_x`
+/// (both in the wrapped 9-bit space) is skipped as off screen: it lies
+/// whole in the band past the right edge, `256..512`. The evaluation
+/// fetches every column of a sprite placed exactly at 256, although none
+/// of them shows.
+#[inline]
+#[must_use]
+pub fn column_off_screen(x: u16, column_x: u16) -> bool {
+    x != 256 && column_x >= 256 && column_x + 7 < 512
+}
+
+/// How many of the eight pixels of a tile column starting at `column_x`
+/// fall on the screen's 256 columns, the 9-bit position wrapping at 512.
+#[must_use]
+pub fn column_visible_pixels(column_x: u16) -> u8 {
+    (0..8u16)
+        .filter(|&px| (column_x + px) & 0x1FF < 256)
+        .count() as u8
+}
+
+/// What the sprite evaluation of one line keeps and drops: the one rule
+/// the STAT77 flags, the line's sprite list and the painter share.
+///
+/// The evaluation walks the 128 sprites from the first sprite (the
+/// priority rotation) and keeps the first [`SPRITES_PER_LINE`] that fall
+/// on the line, in the order it met them; the next one sets
+/// `over_range`. It then fetches the tile columns of the kept sprites
+/// backwards, from the last kept to the first, each sprite's columns
+/// left to right in tile order, skipping the off-screen ones
+/// ([`column_off_screen`]); past [`TILE_COLUMNS_PER_LINE`] columns it
+/// drops the rest and sets `over_time`. So the columns dropped belong to
+/// the sprites met first, the ones with the highest priority, which is
+/// the hardware's "too many sprites vanish" order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineBudget {
+    /// The sprites kept, by their slot in the table, in the order the
+    /// evaluation met them; the first `kept_count` entries are used.
+    pub kept: [u8; SPRITES_PER_LINE],
+    /// How many sprites the line keeps.
+    pub kept_count: u8,
+    /// For each kept sprite: its tile columns the line draws.
+    pub columns_drawn: [u8; SPRITES_PER_LINE],
+    /// For each kept sprite: its tile columns the time limit dropped.
+    pub columns_dropped: [u8; SPRITES_PER_LINE],
+    /// For each kept sprite: its tile columns skipped as off screen.
+    pub columns_off_screen: [u8; SPRITES_PER_LINE],
+    /// More sprites than the line keeps fell on it (STAT77 bit 6).
+    pub over_range: bool,
+    /// More tile columns than the line draws were wanted (STAT77 bit 7).
+    pub over_time: bool,
+}
+
+impl LineBudget {
+    /// The sprites kept, by slot, in the order the evaluation met them.
+    #[must_use]
+    pub fn kept(&self) -> &[u8] {
+        &self.kept[..usize::from(self.kept_count)]
+    }
+}
+
+/// Evaluate the sprites of one line: see [`LineBudget`]. `line` is the
+/// line counted from 0, as [`sprite_on_scanline`] takes it.
+///
+/// With `over_range` set, the walk goes on past the kept sprites and
+/// pushes, in the order it meets them, every further sprite that falls on
+/// the line, the ones the range limit dropped whole; it changes nothing
+/// else. Without it, the walk stops at the first of them, as the flags
+/// need no more.
+#[must_use]
+pub fn line_budget(
+    oam: &[u8; 0x220],
+    first_sprite: u8,
+    base_size: u8,
+    obj_interlace: bool,
+    line: u16,
+    over_range: Option<&mut Vec<u8>>,
+) -> LineBudget {
+    evaluate_line::<true>(
+        oam,
+        first_sprite,
+        base_size,
+        obj_interlace,
+        line,
+        over_range,
+    )
+}
+
+/// The two STAT77 flags of one line, `(over_range, over_time)`, by the
+/// rule of [`line_budget`]: the same evaluation, stopping as soon as both
+/// flags are known and keeping no account of the sprites, as the frame
+/// loops need it on every line.
+#[inline(always)]
+#[must_use]
+pub fn line_flags(
+    oam: &[u8; 0x220],
+    first_sprite: u8,
+    base_size: u8,
+    obj_interlace: bool,
+    line: u16,
+) -> (bool, bool) {
+    let budget = evaluate_line::<false>(oam, first_sprite, base_size, obj_interlace, line, None);
+    (budget.over_range, budget.over_time)
+}
+
+/// The evaluation of [`line_budget`]; with `ACCOUNT` false it keeps no
+/// per-sprite counts and stops the fetch at the first dropped column,
+/// which is all [`line_flags`] needs.
+#[inline(always)]
+fn evaluate_line<const ACCOUNT: bool>(
+    oam: &[u8; 0x220],
+    first_sprite: u8,
+    base_size: u8,
+    obj_interlace: bool,
+    line: u16,
+    mut over_range: Option<&mut Vec<u8>>,
+) -> LineBudget {
+    let mut budget = LineBudget {
+        kept: [0xFF; SPRITES_PER_LINE],
+        kept_count: 0,
+        columns_drawn: [0; SPRITES_PER_LINE],
+        columns_dropped: [0; SPRITES_PER_LINE],
+        columns_off_screen: [0; SPRITES_PER_LINE],
+        over_range: false,
+        over_time: false,
+    };
+
+    // The range evaluation.
+    for i in 0..128usize {
+        let slot = (usize::from(first_sprite) + i) & 0x7F;
+        let s = parse_sprite(oam, slot, base_size, obj_interlace);
+        if !sprite_on_scanline(&s, line, obj_interlace) {
+            continue;
+        }
+        let count = usize::from(budget.kept_count);
+        if count >= SPRITES_PER_LINE {
+            budget.over_range = true;
+            match over_range.as_deref_mut() {
+                Some(dropped) => dropped.push(slot as u8),
+                None => break,
+            }
+            continue;
+        }
+        budget.kept[count] = slot as u8;
+        budget.kept_count += 1;
+    }
+
+    // The tile fetch, backwards over the kept sprites.
+    let mut columns = 0usize;
+    'sprites: for k in (0..usize::from(budget.kept_count)).rev() {
+        let s = parse_sprite(oam, usize::from(budget.kept[k]), base_size, obj_interlace);
+        for tx in 0..u16::from(s.width >> 3) {
+            let column_x = (s.x + (tx << 3)) & 0x1FF;
+            if column_off_screen(s.x, column_x) {
+                if ACCOUNT {
+                    budget.columns_off_screen[k] += 1;
+                }
+            } else if columns >= TILE_COLUMNS_PER_LINE {
+                budget.over_time = true;
+                if !ACCOUNT {
+                    break 'sprites;
+                }
+                budget.columns_dropped[k] += 1;
+            } else {
+                columns += 1;
+                if ACCOUNT {
+                    budget.columns_drawn[k] += 1;
+                }
+            }
+        }
+    }
+    budget
+}
+
+/// How many pixels of sprite `s` the line shows on the screen's 256
+/// columns when it draws the first `columns_drawn` of its fetched tile
+/// columns (the off-screen ones are never fetched), in tile order.
+#[must_use]
+pub fn drawn_pixels(s: &SpriteAttrs, columns_drawn: u8) -> u8 {
+    let mut left = columns_drawn;
+    let mut pixels = 0u8;
+    for tx in 0..u16::from(s.width >> 3) {
+        if left == 0 {
+            break;
+        }
+        let column_x = (s.x + (tx << 3)) & 0x1FF;
+        if column_off_screen(s.x, column_x) {
+            continue;
+        }
+        left -= 1;
+        pixels += column_visible_pixels(column_x);
+    }
+    pixels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +708,161 @@ mod tests {
         // name_select index adds another (idx<<13) bytes = idx*256 tiles.
         let t2 = sprite_tile_number(0, 1, 0, true, false, 8, 0, 0);
         assert_eq!(t2, 256 + 256);
+    }
+
+    /// Put sprite `slot` at `(x, y)`, its X bit 8 and size bit from
+    /// `large`, the other fields zero.
+    fn place(oam: &mut [u8; 0x220], slot: usize, x: u16, y: u8, large: bool) {
+        oam[slot * 4] = x as u8;
+        oam[slot * 4 + 1] = y;
+        let shift = (slot & 3) * 2;
+        let bits = u8::from(x >= 256) | (u8::from(large) << 1);
+        let high = &mut oam[0x200 + (slot >> 2)];
+        *high = (*high & !(0x03 << shift)) | (bits << shift);
+    }
+
+    /// Every sprite parked off the screen's lines.
+    fn parked_oam() -> [u8; 0x220] {
+        let mut oam = empty_oam();
+        for slot in 0..128 {
+            place(&mut oam, slot, 0, 0xF0, false);
+        }
+        oam
+    }
+
+    #[test]
+    fn forty_sprites_on_a_line_keep_thirty_two_and_drop_eight_whole() {
+        let mut oam = parked_oam();
+        for slot in 0..40 {
+            place(&mut oam, slot, (slot * 6) as u16, 50, false);
+        }
+        let mut dropped = Vec::new();
+        let budget = line_budget(&oam, 0, 0, false, 50, Some(&mut dropped));
+        assert_eq!(budget.kept(), (0..32u8).collect::<Vec<_>>().as_slice());
+        assert_eq!(dropped, (32..40u8).collect::<Vec<_>>());
+        assert!(budget.over_range);
+        assert!(!budget.over_time, "32 eight-pixel sprites fetch 32 columns");
+        assert!(budget.columns_drawn[..32].iter().all(|&c| c == 1));
+
+        // Without the list the flags are the same.
+        let flags_only = line_budget(&oam, 0, 0, false, 50, None);
+        assert_eq!(flags_only, budget);
+
+        // The rotation starts the walk at another sprite: from sprite 20,
+        // sprites 20-39 and 0-11 are kept, 12-19 dropped.
+        dropped.clear();
+        let rotated = line_budget(&oam, 20, 0, false, 50, Some(&mut dropped));
+        let kept: Vec<u8> = (20..40u8).chain(0..12).collect();
+        assert_eq!(rotated.kept(), kept.as_slice());
+        assert_eq!(dropped, (12..20u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ten_wide_sprites_draw_thirty_four_columns_and_lose_six_of_the_first() {
+        // Selector 1: small 8x8, large 32x32; ten large sprites on line 10
+        // want 40 columns.
+        let mut oam = parked_oam();
+        for slot in 0..10 {
+            place(&mut oam, slot, (slot * 20) as u16, 10, true);
+        }
+        let budget = line_budget(&oam, 0, 1, false, 10, None);
+        assert_eq!(budget.kept_count, 10);
+        assert!(budget.over_time);
+        assert!(!budget.over_range);
+        let drawn: u32 = budget.columns_drawn.iter().map(|&c| u32::from(c)).sum();
+        assert_eq!(drawn, 34);
+        // The fetch runs from the last kept sprite back to the first, so
+        // the sprites met first lose their columns: sprite 0 all four,
+        // sprite 1 the last two of its four.
+        assert_eq!(
+            &budget.columns_dropped[..10],
+            &[4, 2, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(&budget.columns_drawn[..10], &[0, 2, 4, 4, 4, 4, 4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn off_screen_columns_are_not_counted() {
+        // Selector 1, large 32x32 sprites at x = 240: the first two of
+        // their four columns show (240..255), the other two lie in
+        // 256..271 and are skipped. Twenty of them want 40 columns on
+        // screen, past the limit.
+        let mut oam = parked_oam();
+        for slot in 0..20 {
+            place(&mut oam, slot, 240, 0, true);
+        }
+        let budget = line_budget(&oam, 0, 1, false, 0, None);
+        assert!(budget.columns_off_screen[..20].iter().all(|&c| c == 2));
+        let drawn: u32 = budget.columns_drawn.iter().map(|&c| u32::from(c)).sum();
+        assert_eq!(drawn, 34, "the skipped columns cost nothing");
+        assert!(budget.over_time);
+
+        // Seventeen of them fit: 34 columns on screen, none dropped.
+        let mut oam = parked_oam();
+        for slot in 0..17 {
+            place(&mut oam, slot, 240, 0, true);
+        }
+        let budget = line_budget(&oam, 0, 1, false, 0, None);
+        assert!(!budget.over_time);
+        assert!(budget.columns_dropped.iter().all(|&c| c == 0));
+
+        // A sprite at x = 256 has its columns fetched although none shows.
+        let mut oam = parked_oam();
+        place(&mut oam, 0, 256, 0, true);
+        let budget = line_budget(&oam, 0, 1, false, 0, None);
+        assert_eq!(budget.columns_drawn[0], 4);
+        let s = parse_sprite(&oam, 0, 1, false);
+        assert_eq!(drawn_pixels(&s, 4), 0);
+    }
+
+    #[test]
+    fn the_flags_alone_are_the_budgets_flags() {
+        let mut state = 0xF1A6_5EEDu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let mut oam = parked_oam();
+            let line = (next() % 224) as u16;
+            for slot in 0..128 {
+                let y = line.wrapping_sub((next() % 40) as u16) as u8;
+                let y = if next() % 3 == 0 {
+                    (next() % 256) as u8
+                } else {
+                    y
+                };
+                place(&mut oam, slot, (next() % 512) as u16, y, next() % 2 == 0);
+            }
+            let first = (next() % 128) as u8;
+            let size = (next() % 8) as u8;
+            let interlace = next() % 4 == 0;
+            let budget = line_budget(&oam, first, size, interlace, line, None);
+            assert_eq!(
+                line_flags(&oam, first, size, interlace, line),
+                (budget.over_range, budget.over_time)
+            );
+        }
+    }
+
+    #[test]
+    fn drawn_pixels_count_what_falls_on_the_screen() {
+        let mut oam = parked_oam();
+        // 16 wide at x = 250: the first column shows 250..255, the
+        // second (258..265) lies past the right edge and is skipped.
+        place(&mut oam, 0, 250, 0, false);
+        let s = parse_sprite(&oam, 0, 3, false);
+        assert_eq!(s.width, 16);
+        assert_eq!(drawn_pixels(&s, 2), 6);
+        // 16 wide at x = 505 (-7): 505..511 off, 512 -> 0 on; then 1..8.
+        place(&mut oam, 1, 505, 0, false);
+        let s = parse_sprite(&oam, 1, 3, false);
+        assert_eq!(drawn_pixels(&s, 2), 9);
+        assert_eq!(drawn_pixels(&s, 1), 1, "only the first column drawn");
+        assert_eq!(column_visible_pixels(0), 8);
+        assert_eq!(column_visible_pixels(252), 4);
+        assert_eq!(column_visible_pixels(256), 0);
     }
 }

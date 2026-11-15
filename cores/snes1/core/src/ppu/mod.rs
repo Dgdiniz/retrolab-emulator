@@ -35,6 +35,9 @@
 //! | [`colormath`]| pure colour add/sub arithmetic (no `&self`)                              |
 //! | [`render`]   | per-scanline raster, Modes 0-7, mosaic, OBJ, sub-screen, windows, colour math |
 //! | [`record`]   | what a capture asks to record: the settings each line was drawn with, the writes to video memory |
+//! | [`trace`]    | where each pixel of the held frame came from: a redraw that notes it, and the chosen sprites drawn alone |
+//! | [`line_reads`] | what each line of the held frame did, without drawing: the sprites it met, its window masks, its offset-per-tile columns |
+//! | [`writes`]   | who wrote video memory, recorded live: the origin of every VRAM byte, the log of each frame's transfers and palette and sprite-table writes, and the debugger's palette and tile events |
 //! | `mod.rs`     | struct, [`PpuAccessCtx`], [`Ppu::reset`], [`Ppu::read_reg`] / [`Ppu::write_reg`] dispatch |
 //!
 //! ## Access context
@@ -57,16 +60,22 @@ mod debug;
 pub use debug::{
     BgLayout, PpuSettings, SpriteDescriptor, SpriteTileSettings, TileSetSource, ViewerImage,
 };
+pub mod line_reads;
 pub mod mode7;
+pub use line_reads::{OffsetPerTileTable, WindowMasks};
 pub mod oam;
 pub mod record;
-pub use record::{CaptureRecording, LinePalettes, LineState};
+pub use record::LineState;
 pub mod regs;
 pub mod render;
 pub mod sprite;
 pub mod tile;
+pub mod trace;
+pub use trace::TracedFrame;
 pub mod vram;
 pub mod window;
+pub mod writes;
+pub use writes::{EventWatch, PpuDebugEvent};
 
 use crate::ppu::render::{BgRowBuffer, BgRowPixel, MAX_OUTPUT_ROWS};
 
@@ -1022,8 +1031,10 @@ impl Ppu {
         self.line_hires = [false; MAX_OUTPUT_ROWS];
 
         // The line table described the frame before the load, and its logs
-        // the memory the load replaced; the recorders stay armed.
+        // the memory the load replaced, as the live recorders did; the
+        // recorders stay armed.
         self.drop_recorded_frame();
+        self.forget_recorded_writes();
     }
 
     /// Reset to the canonical PPU power-on state. Memories are
@@ -1163,9 +1174,11 @@ impl Ppu {
         // Sprite-tile cache rides the same generation reset.
         self.sprite_tile_cache.reset();
 
-        // A line table describes a frame drawn before the reset; the
-        // recorders stay armed.
+        // A line table describes a frame drawn before the reset, and the
+        // live recorders the writes made before it; the recorders stay
+        // armed.
         self.drop_recorded_frame();
+        self.forget_recorded_writes();
     }
 
     /// Force every per-BG tilemap-row cache to miss on the next

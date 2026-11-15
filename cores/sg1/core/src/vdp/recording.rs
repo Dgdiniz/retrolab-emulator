@@ -2,10 +2,17 @@
 //! capture can read how each line of the picture was drawn and draw the
 //! picture again the way it was drawn.
 //!
-//! Nothing is recorded until a host arms it ([`Vdp::set_capture_recording`]):
-//! until then `Vdp::recording` is `None`, and each place that records costs
-//! one check of it. None of it is in a savestate, and drawing a picture
-//! again from it moves nothing a savestate holds.
+//! Nothing is recorded until a host arms it ([`Vdp::set_capture_recording`],
+//! with retro-core's [`CaptureRecording`]): until then `Vdp::recording` is
+//! `None`, and each place that records costs one check of it. None of it is
+//! in a savestate, and drawing a picture again from it moves nothing a
+//! savestate holds. This core records all five recorders, and each reads
+//! back as it was asked. The line table is recorded while frames run; where
+//! each pixel came from and the sprites each line held are worked out from
+//! it on demand ([`Vdp::pixel_sources`], [`Vdp::line_sprites`]), so asking
+//! for either keeps the line table as `line_states` does. Who wrote each
+//! byte of VRAM and each frame's writes are recorded as the writes are made
+//! ([`super::writes`]).
 //!
 //! The line table keeps, for each line of the picture, what drawing the
 //! line read besides video memory: the 24 registers, the horizontal scroll
@@ -17,32 +24,14 @@
 //! keeps each VRAM word the frame wrote, with the value the word held
 //! before, so going back through it puts VRAM back as any line read it.
 
-use std::collections::HashMap;
-
+use retro_core::capture::{
+    distinct_palettes, CaptureRecording, LinePalettes, NO_COLUMN, NO_PALETTE,
+};
 use retro_core::video::LineStateTable;
 
 use super::sprites::SpriteCache;
+use super::writes::LiveWrites;
 use super::Vdp;
-
-/// What the core records while frames run, for a capture to read. All off
-/// by default; never part of a savestate.
-///
-/// This core records the line states; the other four read false whatever a
-/// host asks for.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CaptureRecording {
-    /// The settings each line of the picture was drawn with, and what
-    /// drawing the picture again from them needs.
-    pub line_states: bool,
-    /// Where each pixel of the picture came from.
-    pub pixel_sources: bool,
-    /// The sprites each line held and what became of each.
-    pub line_sprites: bool,
-    /// What wrote each word of video memory.
-    pub video_memory_sources: bool,
-    /// The transfers and the palette and sprite table writes of each frame.
-    pub frame_writes: bool,
-}
 
 /// How a line of the picture was drawn: the `kind` column of the line
 /// table.
@@ -60,35 +49,6 @@ pub enum LineKind {
     DirectColour = 3,
 }
 
-/// The `palette` column, and `LinePalettes::palette_of_line`, of a line
-/// nothing was recorded of.
-pub const NO_PALETTE: u16 = 0xFFFF;
-
-/// The column a palette write coloured its line again from, in
-/// `LinePalettes::changes`, when it coloured nothing again.
-pub const NO_COLUMN: u16 = 0xFFFF;
-
-/// The palettes the lines of the picture were drawn with, as the line table
-/// names them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinePalettes {
-    /// The colours of each palette: 64, the four lines of sixteen of CRAM.
-    pub colours_per_palette: u32,
-    /// Each palette a line began with, once, in the order the lines first
-    /// used it: `colours_per_palette` CRAM words (`0000 BBB0 GGG0 RRR0`) each.
-    pub palettes: Vec<u16>,
-    /// For each row of the line table, the palette its line began with, an
-    /// index into `palettes`, or [`NO_PALETTE`] for a line nothing was
-    /// recorded of.
-    pub palette_of_line: Vec<u16>,
-    /// The palette writes made while each line was on screen, row by row
-    /// and in order, five values each: the row; the column the write
-    /// coloured the line again from, or [`NO_COLUMN`]; the colour index; the
-    /// colour word; and 1 when the write coloured the whole line again (the
-    /// display was off and it changed the backdrop colour), else 0.
-    pub changes: Vec<u16>,
-}
-
 /// The most lines a picture has: 240, the PAL console's 30-cell lines.
 const MOST_LINES: usize = 240;
 
@@ -103,11 +63,27 @@ const VERTICAL_SCROLL_WORDS: usize = 40;
 /// horizontal scroll.
 pub(super) const JOURNAL_CAPACITY: usize = 65_536;
 
-/// What the VDP keeps while a host has armed something, in
-/// `Vdp::recording`.
+/// What the VDP keeps while a host has armed something, or the debugger
+/// watches writes to video memory, in `Vdp::recording`.
 pub(super) struct Recording {
-    /// The line table, while line states are armed.
+    /// What is armed: what the host asked for that this core records.
+    pub(super) armed: CaptureRecording,
+    /// The line table, while something that needs it is armed.
     pub(super) lines: Option<LineTable>,
+    /// Who wrote each byte of VRAM, the frame writes and the debugger's
+    /// event watch, each while armed.
+    pub(super) live: LiveWrites,
+}
+
+impl Recording {
+    /// A recording of what `armed` asks for, its line table not yet made.
+    pub(super) fn new(armed: CaptureRecording) -> Self {
+        Self {
+            armed,
+            lines: None,
+            live: LiveWrites::default(),
+        }
+    }
 }
 
 /// The line table: one row for each line of the picture, the journal of
@@ -307,26 +283,16 @@ impl LineTable {
         row.recorded() && row.frame == self.frame && !self.journal_full
     }
 
-    /// Each distinct palette the rows began with, in the order the rows
-    /// first used it, and the index of each row's (or [`NO_PALETTE`]) for
-    /// the first `rows` rows.
-    fn distinct_palettes(&self, rows: usize) -> (Vec<[u16; 64]>, Vec<u16>) {
-        let mut seen: HashMap<[u16; 64], u16> = HashMap::new();
-        let mut palettes = Vec::new();
-        let mut of_line = Vec::with_capacity(rows);
-        for row in &self.rows[..rows] {
-            if !row.recorded() {
-                of_line.push(NO_PALETTE);
-                continue;
-            }
-            let next = palettes.len() as u16;
-            let index = *seen.entry(row.palette).or_insert_with(|| {
-                palettes.push(row.palette);
-                next
-            });
-            of_line.push(index);
-        }
-        (palettes, of_line)
+    /// The palettes the first `rows` rows began with, each once in the order
+    /// the rows first used it, and each row's index into them, or
+    /// [`NO_PALETTE`] for a row nothing was recorded of
+    /// ([`distinct_palettes`]); no palette writes yet.
+    fn palettes_of_rows(&self, rows: usize) -> LinePalettes {
+        distinct_palettes(
+            self.rows[..rows]
+                .iter()
+                .map(|row| row.recorded().then_some(row.palette)),
+        )
     }
 }
 
@@ -355,49 +321,58 @@ fn line_state_columns() -> Vec<String> {
 
 impl Vdp {
     /// Arm or disarm what is recorded while frames run, for a capture to
-    /// read, and return what is now armed: only the line states are
-    /// recorded by this core, so the other flags come back false.
+    /// read, and return what is now armed: all of it, as asked. The pixel
+    /// sources and line sprites are worked out from the line table on
+    /// demand, so any of those three keeps the table; who wrote each byte
+    /// of VRAM and the frame writes are recorded as the writes are made.
     ///
-    /// Arming allocates the line table (about 100 KiB) and nothing more
-    /// until frames run; disarming everything drops it, after which the
-    /// renderer pays one check per place that records. Arming in the middle
-    /// of a frame records the lines drawn from then on; the lines above
-    /// stay unrecorded until the next frame draws them.
+    /// Arming allocates the line table (about 100 KiB), the sources of VRAM
+    /// (512 KiB) and the record of frame writes (grown as writes come, up
+    /// to [`super::writes::MOST_RECORDS`] records of 32 bytes), each as
+    /// asked, and nothing more until frames run; a recorder turned on starts
+    /// empty, one already on keeps what it holds. Disarming everything drops
+    /// them, after which each place that records pays one check. Arming in
+    /// the middle of a frame records the lines drawn from then on; the
+    /// lines above stay unrecorded until the next frame draws them.
     pub fn set_capture_recording(&mut self, wanted: CaptureRecording) -> CaptureRecording {
-        let armed = CaptureRecording {
-            line_states: wanted.line_states,
-            ..CaptureRecording::default()
-        };
-        if armed.line_states {
-            let frame = self.frame_being_drawn;
-            let current_list = self
-                .sprite_cache_valid
-                .then(|| self.current_sprite_list(frame, 0));
-            let recording = self
-                .recording
-                .get_or_insert_with(|| Box::new(Recording { lines: None }));
-            if recording.lines.is_none() {
-                let mut table = LineTable::new(frame);
-                // The lines drawn from now on in this frame draw from the
-                // list the renderer already parsed.
-                table.sprite_lists.extend(current_list);
-                recording.lines = Some(table);
-            }
-        } else if let Some(recording) = self.recording.as_deref_mut() {
-            recording.lines = None;
-        }
-        if armed == CaptureRecording::default() {
+        let armed = wanted;
+        let watching = self
+            .recording
+            .as_deref()
+            .is_some_and(|recording| recording.live.watching());
+        if armed == CaptureRecording::default() && !watching {
             self.recording = None;
+            return armed;
         }
+        let frame = self.frame_being_drawn;
+        let new_table = (armed.wants_line_table() && self.line_table().is_none()).then(|| {
+            let mut table = LineTable::new(frame);
+            // The lines drawn from now on in this frame draw from the list
+            // the renderer already parsed.
+            if self.sprite_cache_valid {
+                table.sprite_lists.push(self.current_sprite_list(frame, 0));
+            }
+            table
+        });
+        let recording = self
+            .recording
+            .get_or_insert_with(|| Box::new(Recording::new(armed)));
+        recording.armed = armed;
+        if !armed.wants_line_table() {
+            recording.lines = None;
+        } else if new_table.is_some() {
+            recording.lines = new_table;
+        }
+        recording.live.arm(armed);
         armed
     }
 
-    /// What is recorded while frames run.
+    /// What is recorded while frames run: what a host asked for that this
+    /// core records ([`Self::set_capture_recording`]).
     pub fn capture_recording(&self) -> CaptureRecording {
-        CaptureRecording {
-            line_states: self.line_table().is_some(),
-            ..CaptureRecording::default()
-        }
+        self.recording
+            .as_deref()
+            .map_or_else(CaptureRecording::default, |recording| recording.armed)
     }
 
     /// Set the number of the frame being drawn, which every record of it
@@ -420,8 +395,11 @@ impl Vdp {
     /// armed: the machine changed under it (a reset, a savestate load).
     pub(super) fn clear_recorded_frames(&mut self) {
         let frame = self.frame_being_drawn;
-        if let Some(table) = self.line_table_mut() {
-            table.clear(frame);
+        if let Some(recording) = self.recording.as_deref_mut() {
+            if let Some(table) = recording.lines.as_mut() {
+                table.clear(frame);
+            }
+            recording.live.clear();
         }
     }
 
@@ -441,6 +419,9 @@ impl Vdp {
     /// about to read besides video memory. Line 0 begins a new picture.
     #[inline(never)]
     pub(super) fn record_line(&mut self, line: u16, kind: LineKind) {
+        if self.line_table().is_none() {
+            return;
+        }
         let frame = self.frame_being_drawn;
         let mode = self.registers[11] & 0x03;
         let scroll_table = usize::from(self.registers[13] & 0x3F) << 10;
@@ -471,16 +452,10 @@ impl Vdp {
         row.direct_colours.clear();
     }
 
-    /// Note that the VRAM word at `byte_address` is about to be written.
-    #[inline(always)]
-    pub(super) fn note_vram_write(&mut self, byte_address: usize) {
-        if self.recording.is_some() {
-            self.journal_vram_write(byte_address);
-        }
-    }
-
-    #[inline(never)]
-    fn journal_vram_write(&mut self, byte_address: usize) {
+    /// Journal the VRAM word at `byte_address`, about to be written, while
+    /// the line table is armed. The write paths call this from their hooks
+    /// ([`super::writes`]), which check `Vdp::recording` first.
+    pub(super) fn journal_vram_write(&mut self, byte_address: usize) {
         let line = self.timing.scanline;
         let word = (byte_address >> 1) & 0x7FFF;
         let before = u16::from_be_bytes([self.vram[word * 2], self.vram[word * 2 + 1]]);
@@ -489,31 +464,30 @@ impl Vdp {
         }
     }
 
-    /// Note that `count` VRAM words are about to be written, the first at
-    /// `first` and each next one `step` bytes on: a transfer, before it
-    /// writes any of them.
-    #[inline(always)]
-    pub(super) fn note_vram_transfer(&mut self, first: u16, step: u16, count: usize) {
-        if self.recording.is_some() {
-            let mut address = first;
-            for _ in 0..count {
-                self.journal_vram_write(usize::from(address));
-                address = address.wrapping_add(step);
-            }
+    /// Journal `count` VRAM words about to be written, the first at `first`
+    /// and each next one `step` bytes on: a transfer, before it writes any
+    /// of them.
+    pub(super) fn journal_vram_transfer(&mut self, first: u16, step: u16, count: usize) {
+        if self.line_table().is_none() {
+            return;
+        }
+        let mut address = first;
+        for _ in 0..count {
+            self.journal_vram_write(usize::from(address));
+            address = address.wrapping_add(step);
         }
     }
 
-    /// Note a palette write: colour `index` became `colour`, and the write
-    /// coloured again what `redraw` says of the line the beam is on.
-    #[inline(always)]
-    pub(super) fn note_palette_change(&mut self, index: usize, colour: u16, redraw: PaletteRedraw) {
-        if self.recording.is_some() {
-            self.record_palette_change(index, colour, redraw);
-        }
-    }
-
-    #[inline(never)]
-    fn record_palette_change(&mut self, index: usize, colour: u16, redraw: PaletteRedraw) {
+    /// Note a palette write in the line table: colour `index` became
+    /// `colour`, and the write coloured again what `redraw` says of the
+    /// line the beam is on. The write paths call this from their hook
+    /// ([`Vdp::note_palette_change`]), which checks `Vdp::recording` first.
+    pub(super) fn record_line_palette_change(
+        &mut self,
+        index: usize,
+        colour: u16,
+        redraw: PaletteRedraw,
+    ) {
         let line = self.timing.scanline;
         if self.timing.in_vblank || line >= self.timing.visible_scanlines() {
             return;
@@ -547,6 +521,9 @@ impl Vdp {
     /// Note that the renderer parsed its sprite list for line `line`.
     #[inline(never)]
     pub(super) fn record_sprite_list(&mut self, line: u16) {
+        if self.line_table().is_none() {
+            return;
+        }
         let frame = self.frame_being_drawn;
         let list = self.current_sprite_list(frame, line);
         if let Some(table) = self.line_table_mut() {
@@ -615,7 +592,7 @@ impl Vdp {
         let table = self.line_table()?;
         let rows = usize::from(self.timing.visible_scanlines()).min(table.rows.len());
         let columns = line_state_columns();
-        let (_, palette_of_line) = table.distinct_palettes(rows);
+        let palette_of_line = table.palettes_of_rows(rows).palette_of_line;
         let mut values = Vec::with_capacity(rows * columns.len());
         for (line, row) in table.rows[..rows].iter().enumerate() {
             values.push(line as u32);
@@ -656,10 +633,18 @@ impl Vdp {
     /// The palettes the lines of the picture began with, each once, and
     /// the palette writes made while each was on screen ([`LinePalettes`]);
     /// `None` while line states are not armed.
+    ///
+    /// This core's palettes are the whole of CRAM, 64 colours of
+    /// `0000 BBB0 GGG0 RRR0`. It records the palette writes: `changes` is
+    /// five values a write, row by row and in order: the row; the column
+    /// the write coloured the line again from, or [`NO_COLUMN`]; the colour
+    /// index; the colour word; and 1 when the write coloured the whole line
+    /// again (the display was off and it changed the backdrop colour), else
+    /// 0.
     pub fn line_palettes(&self) -> Option<LinePalettes> {
         let table = self.line_table()?;
         let rows = usize::from(self.timing.visible_scanlines()).min(table.rows.len());
-        let (palettes, palette_of_line) = table.distinct_palettes(rows);
+        let mut palettes = table.palettes_of_rows(rows);
         let mut changes = Vec::new();
         for (line, row) in table.rows[..rows].iter().enumerate() {
             if !row.recorded() {
@@ -680,12 +665,8 @@ impl Vdp {
                 ]);
             }
         }
-        Some(LinePalettes {
-            colours_per_palette: 64,
-            palettes: palettes.concat(),
-            palette_of_line,
-            changes,
-        })
+        palettes.changes = Some(changes);
+        Some(palettes)
     }
 }
 

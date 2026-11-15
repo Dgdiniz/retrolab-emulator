@@ -48,14 +48,14 @@ pub use debugger::{
 };
 pub use ppu::tile::TilemapEntry;
 pub use ppu::{
-    window_layer, CaptureRecording, LinePalettes, LineState, Ppu, PpuAccessCtx, PpuSettings,
-    SpriteDescriptor, TileSetSource, ViewerImage, WindowEnable,
+    window_layer, EventWatch, LineState, OffsetPerTileTable, Ppu, PpuAccessCtx, PpuDebugEvent,
+    PpuSettings, SpriteDescriptor, TileSetSource, ViewerImage, WindowEnable, WindowMasks,
 };
 pub use savestate::{SnesSaveState, SNES_SAVESTATE_VERSION};
 pub use scheduler::{
     schedule_frame_events, EventKind, HEventScheduler, ScheduledEvent, TimingProfile,
 };
-pub use system::{FrameSnapshot, SnesEmulator};
+pub use system::{SnesEmulator, SnesSnapshotConsole};
 pub use system_regs::{SystemRegWriteFx, SystemRegs};
 #[cfg(feature = "chip-cx4")]
 pub use trace_format::format_trace_line_cx4;

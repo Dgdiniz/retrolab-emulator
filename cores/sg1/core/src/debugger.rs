@@ -7,6 +7,8 @@ use retro_core::debug::expr::ExprContext;
 use retro_core::*;
 use std::collections::{HashSet, VecDeque};
 
+use crate::vdp::{VideoEvent, VideoEventWatch, WriteTarget};
+
 /// 68K address space used by the coverage bitmap. The Genesis 68000
 /// has a 24-bit address bus -> 16 MiB. We size the bitmap to the full
 /// range so any PC the CPU could legally execute from has a slot.
@@ -27,8 +29,9 @@ const MAX_CALL_STACK_DEPTH: usize = 100;
 /// core's private taxonomy, paired with the matching [`GenesisEvent`]
 /// constructor and advertised through
 /// [`GenesisDebugger::available_events`]. The `param` field disambiguates
-/// within a class (a scanline); the paramless classes (VBlank/VInt/HInt)
-/// report `param == 0`, so a breakpoint stored with `param == 0` or
+/// within a class (a scanline, a memory, a colour, a tile); the paramless
+/// classes (VBlank/VInt/HInt, a transfer into the sprite table) report
+/// `param == 0`, so a breakpoint stored with `param == 0` or
 /// [`retro_core::types::BREAKPOINT_PARAM_ANY`] matches them. Mirrors the
 /// SNES core's `snes_events` module.
 pub mod genesis_events {
@@ -40,6 +43,19 @@ pub mod genesis_events {
     pub const HINT: u32 = 3;
     /// A scanline was reached; `param` is the VDP `V` counter.
     pub const SCANLINE: u32 = 4;
+    /// A transfer from 68000 memory, a fill or a copy has written all its
+    /// data; `param` is the memory written: 0 VRAM, 1 CRAM, 2 VSRAM.
+    pub const TRANSFER_COMPLETE: u32 = 5;
+    /// A colour of CRAM was written, through the data port, by a transfer
+    /// or by a fill; `param` is the colour, 0-63.
+    pub const PALETTE_WRITE: u32 = 6;
+    /// A transfer from 68000 memory, a fill or a copy wrote into the
+    /// sprite table (paramless).
+    pub const SPRITE_TABLE_TRANSFER: u32 = 7;
+    /// A write changed a byte of a tile in VRAM; `param` is the tile,
+    /// 0-2047, 32 bytes each, as the tile viewer numbers them. Writing the
+    /// bytes a tile already holds does not count.
+    pub const TILE_REWRITTEN: u32 = 8;
 }
 
 /// A Genesis debug event that an `Event` breakpoint can match.
@@ -60,6 +76,15 @@ pub enum GenesisEvent {
     HInt,
     /// A scanline was reached (`V` counter).
     Scanline(u16),
+    /// A transfer, a fill or a copy has written all its data into the
+    /// memory named (0 VRAM, 1 CRAM, 2 VSRAM).
+    TransferComplete(u8),
+    /// A colour of CRAM (0-63) was written.
+    PaletteWrite(u8),
+    /// A transfer, a fill or a copy wrote into the sprite table.
+    SpriteTableTransfer,
+    /// A write changed a byte of the tile (0-2047).
+    TileRewritten(u16),
 }
 
 impl GenesisEvent {
@@ -72,6 +97,25 @@ impl GenesisEvent {
             GenesisEvent::VInt => (genesis_events::VINT, 0),
             GenesisEvent::HInt => (genesis_events::HINT, 0),
             GenesisEvent::Scanline(v) => (genesis_events::SCANLINE, v as u32),
+            GenesisEvent::TransferComplete(target) => {
+                (genesis_events::TRANSFER_COMPLETE, u32::from(target))
+            }
+            GenesisEvent::PaletteWrite(colour) => {
+                (genesis_events::PALETTE_WRITE, u32::from(colour))
+            }
+            GenesisEvent::SpriteTableTransfer => (genesis_events::SPRITE_TABLE_TRANSFER, 0),
+            GenesisEvent::TileRewritten(tile) => (genesis_events::TILE_REWRITTEN, u32::from(tile)),
+        }
+    }
+}
+
+impl From<VideoEvent> for GenesisEvent {
+    fn from(event: VideoEvent) -> Self {
+        match event {
+            VideoEvent::TransferComplete(target) => Self::TransferComplete(target as u8),
+            VideoEvent::PaletteWrite(colour) => Self::PaletteWrite(colour),
+            VideoEvent::SpriteTableTransfer => Self::SpriteTableTransfer,
+            VideoEvent::TileRewritten(tile) => Self::TileRewritten(tile),
         }
     }
 }
@@ -934,12 +978,58 @@ impl GenesisDebugger {
 
     /// Check whether a hardware [`GenesisEvent`] matches an armed `Event`
     /// breakpoint. The frame-loop hook sites (VBlank / VInt / HInt /
-    /// scanline) call this so the host can break on a raster/interrupt
-    /// event, not just a PC or memory address. Mirrors
+    /// scanline) and the steps (the interrupts taken, the writes to video
+    /// memory) call this so the host can break on a raster, interrupt or
+    /// video event, not just a PC or memory address. Mirrors
     /// `SnesDebugger::check_event`.
     pub fn check_event(&mut self, event: GenesisEvent) -> bool {
         let (code, param) = event.to_code_param();
         self.breakpoints.check_event(code, param)
+    }
+
+    /// What the enabled event breakpoints on writes to video memory ask the
+    /// VDP to raise (a transfer finished, a palette colour written, a
+    /// transfer into the sprite table, a tile rewritten), or `None` when
+    /// none does. A param of [`BREAKPOINT_PARAM_ANY`] watches every value; a
+    /// param no event carries watches nothing. Whether a raised event stops
+    /// is still [`Self::check_event`]'s to say (hit counts, conditions).
+    pub fn video_event_watch(&self) -> Option<VideoEventWatch> {
+        let mut watch = VideoEventWatch::default();
+        for bp in self.breakpoints.list() {
+            let BreakpointType::Event { code, param } = bp.breakpoint.bp_type else {
+                continue;
+            };
+            if !bp.enabled {
+                continue;
+            }
+            let any = param == BREAKPOINT_PARAM_ANY;
+            match code {
+                genesis_events::TRANSFER_COMPLETE => {
+                    for target in [WriteTarget::Vram, WriteTarget::Cram, WriteTarget::Vsram] {
+                        if any || param == target as u32 {
+                            watch.transfers_into(target);
+                        }
+                    }
+                }
+                genesis_events::PALETTE_WRITE if any => {
+                    watch.every_palette_colour();
+                }
+                genesis_events::PALETTE_WRITE => {
+                    watch.palette_colour(param);
+                }
+                genesis_events::SPRITE_TABLE_TRANSFER => {
+                    watch.sprite_table();
+                }
+                genesis_events::TILE_REWRITTEN if any => {
+                    watch.every_tile();
+                }
+                genesis_events::TILE_REWRITTEN => {
+                    watch.tile(param);
+                }
+                _ => {}
+            }
+        }
+        (!watch.is_empty()).then_some(watch)
     }
 }
 
@@ -983,9 +1073,13 @@ impl DebuggerCore for GenesisDebugger {
     }
 
     /// The Genesis event taxonomy (see [`genesis_events`]). The interrupt
-    /// classes (VBlank / VInt / HInt) are paramless; `Scanline` carries a
-    /// free-form `V`-counter param. The hook sites live in the
-    /// `run_frame_debug_light` / `run_frame` tiers.
+    /// classes (VBlank / VInt / HInt) and a transfer into the sprite table
+    /// are paramless; `Scanline` carries a free-form `V`-counter param, a
+    /// transfer's end the memory it wrote, a palette write its colour and a
+    /// rewritten tile its number. The hook sites live in the
+    /// `run_frame_debug_light` / `run_frame` tiers and their steps; none
+    /// runs on the loop a player runs, so a breakpoint on any of them moves
+    /// the frame onto the light debugger loop.
     fn available_events(&self) -> Vec<EventClass> {
         let paramless = |code: u32, label: &str, description: &str| EventClass {
             code,
@@ -1015,6 +1109,47 @@ impl DebuggerCore for GenesisDebugger {
                 label: "Scanline".to_string(),
                 description: Some("A rendered scanline matched the V counter".to_string()),
                 param_label: Some("Scanline (V)".to_string()),
+                param_options: Vec::new(),
+            },
+            EventClass {
+                code: genesis_events::TRANSFER_COMPLETE,
+                label: "Transfer complete".to_string(),
+                description: Some(
+                    "A DMA from 68000 memory, a fill or a copy has written all its data"
+                        .to_string(),
+                ),
+                param_label: Some("Memory".to_string()),
+                param_options: [(0, "VRAM"), (1, "CRAM"), (2, "VSRAM")]
+                    .into_iter()
+                    .map(|(value, label)| EventParamOption {
+                        value,
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+            EventClass {
+                code: genesis_events::PALETTE_WRITE,
+                label: "Palette write".to_string(),
+                description: Some(
+                    "A CRAM colour was written, through the data port, by a DMA or by a fill"
+                        .to_string(),
+                ),
+                param_label: Some("Colour (0-63)".to_string()),
+                param_options: Vec::new(),
+            },
+            paramless(
+                genesis_events::SPRITE_TABLE_TRANSFER,
+                "Sprite table transfer",
+                "A DMA from 68000 memory, a fill or a copy wrote into the sprite table",
+            ),
+            EventClass {
+                code: genesis_events::TILE_REWRITTEN,
+                label: "Tile rewritten".to_string(),
+                description: Some(
+                    "A write changed the bytes of a tile in VRAM (writing the same bytes again does not count)"
+                        .to_string(),
+                ),
+                param_label: Some("Tile (0-2047)".to_string()),
                 param_options: Vec::new(),
             },
         ]
@@ -1475,18 +1610,34 @@ mod tests {
                 genesis_events::VINT,
                 genesis_events::HINT,
                 genesis_events::SCANLINE,
+                genesis_events::TRANSFER_COMPLETE,
+                genesis_events::PALETTE_WRITE,
+                genesis_events::SPRITE_TABLE_TRANSFER,
+                genesis_events::TILE_REWRITTEN,
             ]
         );
-        // Only the scanline class carries a selectable param.
-        let scanline = events
+        // The classes with a param say what it selects; the memory a
+        // transfer wrote is a choice of three.
+        let with_param = [
+            genesis_events::SCANLINE,
+            genesis_events::TRANSFER_COMPLETE,
+            genesis_events::PALETTE_WRITE,
+            genesis_events::TILE_REWRITTEN,
+        ];
+        for event in &events {
+            assert_eq!(
+                event.param_label.is_some(),
+                with_param.contains(&event.code),
+                "{}",
+                event.label
+            );
+        }
+        let transfer = events
             .iter()
-            .find(|e| e.code == genesis_events::SCANLINE)
+            .find(|e| e.code == genesis_events::TRANSFER_COMPLETE)
             .unwrap();
-        assert!(scanline.param_label.is_some());
-        assert!(events
-            .iter()
-            .filter(|e| e.code != genesis_events::SCANLINE)
-            .all(|e| e.param_label.is_none()));
+        let values: Vec<u32> = transfer.param_options.iter().map(|o| o.value).collect();
+        assert_eq!(values, [0, 1, 2]);
     }
 
     #[test]
@@ -1507,6 +1658,82 @@ mod tests {
             GenesisEvent::Scanline(224).to_code_param(),
             (genesis_events::SCANLINE, 224)
         );
+        assert_eq!(
+            GenesisEvent::TransferComplete(1).to_code_param(),
+            (genesis_events::TRANSFER_COMPLETE, 1)
+        );
+        assert_eq!(
+            GenesisEvent::PaletteWrite(63).to_code_param(),
+            (genesis_events::PALETTE_WRITE, 63)
+        );
+        assert_eq!(
+            GenesisEvent::SpriteTableTransfer.to_code_param(),
+            (genesis_events::SPRITE_TABLE_TRANSFER, 0)
+        );
+        assert_eq!(
+            GenesisEvent::TileRewritten(2047).to_code_param(),
+            (genesis_events::TILE_REWRITTEN, 2047)
+        );
+        assert_eq!(
+            GenesisEvent::from(VideoEvent::TransferComplete(WriteTarget::Vsram)),
+            GenesisEvent::TransferComplete(2)
+        );
+    }
+
+    fn event_breakpoint(debugger: &mut GenesisDebugger, code: u32, param: u32) -> BreakpointId {
+        debugger.add_breakpoint(Breakpoint {
+            address: 0,
+            bp_type: BreakpointType::Event { code, param },
+            cpu_id: None,
+            condition: None,
+        })
+    }
+
+    #[test]
+    fn the_video_watch_holds_what_the_enabled_breakpoints_ask() {
+        let mut debugger = create_test_debugger();
+        assert!(debugger.video_event_watch().is_none());
+        // Breakpoints on other events ask the VDP for nothing.
+        event_breakpoint(&mut debugger, genesis_events::VBLANK, 0);
+        event_breakpoint(&mut debugger, genesis_events::SCANLINE, 10);
+        assert!(debugger.video_event_watch().is_none());
+
+        let colour = event_breakpoint(&mut debugger, genesis_events::PALETTE_WRITE, 5);
+        let mut expected = VideoEventWatch::default();
+        expected.palette_colour(5);
+        assert_eq!(debugger.video_event_watch(), Some(expected.clone()));
+
+        event_breakpoint(&mut debugger, genesis_events::TRANSFER_COMPLETE, 1);
+        event_breakpoint(&mut debugger, genesis_events::TILE_REWRITTEN, 7);
+        event_breakpoint(&mut debugger, genesis_events::SPRITE_TABLE_TRANSFER, 0);
+        expected
+            .transfers_into(WriteTarget::Cram)
+            .tile(7)
+            .sprite_table();
+        assert_eq!(debugger.video_event_watch(), Some(expected.clone()));
+
+        // A disabled breakpoint asks for nothing; one on any value, for all.
+        debugger.enable_breakpoint(colour, false);
+        let mut without_colour = VideoEventWatch::default();
+        without_colour
+            .transfers_into(WriteTarget::Cram)
+            .tile(7)
+            .sprite_table();
+        assert_eq!(debugger.video_event_watch(), Some(without_colour));
+        event_breakpoint(
+            &mut debugger,
+            genesis_events::TRANSFER_COMPLETE,
+            BREAKPOINT_PARAM_ANY,
+        );
+        let watch = debugger.video_event_watch().unwrap();
+        let mut every_target = VideoEventWatch::default();
+        every_target
+            .transfers_into(WriteTarget::Vram)
+            .transfers_into(WriteTarget::Cram)
+            .transfers_into(WriteTarget::Vsram)
+            .tile(7)
+            .sprite_table();
+        assert_eq!(watch, every_target);
     }
 
     #[test]

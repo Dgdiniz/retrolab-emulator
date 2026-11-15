@@ -879,7 +879,7 @@ mod debugger_state_tests {
     fn available_events_lists_the_snes_taxonomy() {
         let d = SnesDebugger::new(test_sysinfo());
         let events = d.available_events();
-        assert_eq!(events.len(), 9, "all nine SNES event classes advertised");
+        assert_eq!(events.len(), 12, "all twelve SNES event classes advertised");
         // VBlank is paramless.
         let vblank = events.iter().find(|e| e.label == "VBlank").unwrap();
         assert!(vblank.param_label.is_none());

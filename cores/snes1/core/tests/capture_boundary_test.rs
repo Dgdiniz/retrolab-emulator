@@ -10,11 +10,12 @@
 //! frame must not. The main loop reads the APU's first port without end,
 //! so the APU is caught up all through the frame.
 
+use retro_core::capture::{CaptureCore, FrameSnapshot};
 use retro_core::cpu::Addressable;
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
 use snes1_core::apu::Apu;
 use snes1_core::debugger::snes_events;
-use snes1_core::{FrameSnapshot, SnesEmulator};
+use snes1_core::{SnesEmulator, SnesSnapshotConsole};
 
 // -------------------------------------------------------------
 // The program
@@ -105,7 +106,7 @@ fn rgba(colour: u16) -> [u8; 4] {
 }
 
 /// The top-left pixel of a snapshot's picture.
-fn first_pixel(snapshot: &FrameSnapshot) -> [u8; 4] {
+fn first_pixel(snapshot: &FrameSnapshot<SnesSnapshotConsole>) -> [u8; 4] {
     snapshot.framebuffer[..4].try_into().unwrap()
 }
 
@@ -572,14 +573,14 @@ fn a_savestate_at_the_boundary_is_taken_once_the_frame_is_finished() {
     // A paused debugger does not stop the finish: a savestate never holds
     // a frame stopped at the boundary.
     held.set_execution_mode(ExecutionMode::Paused);
-    let saved = held.save_state_finishing_held_frame();
+    let saved = held.save_state_at_frame_end();
     assert!(!held.at_capture_boundary());
     whole.run_frame();
     whole.run_frame();
     assert_eq!(saved, whole.save_state());
 
     // Anywhere else the save path saves the machine as it stands.
-    assert_eq!(whole.save_state_finishing_held_frame(), whole.save_state());
+    assert_eq!(whole.save_state_at_frame_end(), whole.save_state());
 }
 
 #[test]

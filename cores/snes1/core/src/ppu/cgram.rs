@@ -64,16 +64,26 @@ impl Ppu {
         self.cgram_addr = u16::from(value) << 1;
     }
 
-    /// `$2122` CGDATA.
+    /// `$2122` CGDATA. (`Ppu::write_port_noted` takes the same write and
+    /// notes the colour it completes.)
     pub(super) fn write_2122(&mut self, value: u8, ctx: &PpuAccessCtx) {
+        self.cgram_port_write(value, ctx);
+    }
+
+    /// The data write itself: a low half waits in the latch, a high half
+    /// completes the colour. Returns the colour completed.
+    #[inline(always)]
+    pub(super) fn cgram_port_write(&mut self, value: u8, ctx: &PpuAccessCtx) -> Option<usize> {
         let odd = self.cgram_addr & 1 != 0;
         let target = self.cgram_target(ctx);
         self.step_cgram_address();
         if odd {
             let colour = usize::from(target >> 1) & 0xff;
             self.cgram[colour] = u16::from_le_bytes([self.cgram_latchdata, value & 0x7f]);
+            Some(colour)
         } else {
             self.cgram_latchdata = value;
+            None
         }
     }
 

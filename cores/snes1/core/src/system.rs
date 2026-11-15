@@ -26,24 +26,31 @@ use std::collections::VecDeque;
 
 use retro_core::audio::AudioDebugger;
 use retro_core::audio::{AudioRingBuffer, LinearResampler};
+use retro_core::capture::{
+    CaptureCore, CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites,
+    PixelSources, RenderedLayer, VideoMemorySources,
+};
+use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN};
 use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
 use retro_core::input::{GenericInputManager, KeyboardInputProvider};
-use retro_core::video::{ExportError, PixelImage, VideoDebugger, VideoRegister};
+use retro_core::video::{
+    crop_rgba, equals_cropped_rgba, LineStateTable, PixelImage, VideoDebugger,
+};
 use retro_core::*;
 use wdc65816::instructions::FLAG_I;
 use wdc65816::Wdc65816;
 
 use crate::debugger::{
-    cpu_state_65816, cpu_state_spc700, SnesDebugger, SnesEvent, TraceEntryBinary65816,
+    cpu_state_65816, cpu_state_spc700, snes_events, SnesDebugger, SnesEvent, TraceEntryBinary65816,
 };
 use crate::trace_format::{effective_address, EffRegs};
 
 use crate::bus::{BusDebugEvent, IoAccess, SnesBus};
 use crate::cartridge::{
-    detect_preset_with_threshold, detected_manifest, rom_sha256, try_parse_header,
-    CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset, PresetKind, SnesHeader,
-    HEADER_CANDIDATES,
+    copier_header_length, detect_preset_with_threshold, detected_manifest, rom_sha256,
+    try_parse_header, CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset,
+    PresetKind, SnesHeader, HEADER_CANDIDATES,
 };
 use crate::controller::{
     default_gamepad_mapping, default_keyboard_mapping, input_state_to_snes_pad,
@@ -90,38 +97,16 @@ const AUTO_JOYPAD_CYCLES: u64 = 5360;
 /// any instruction phase.
 const NMI_DELIVERY_MAX_INSNS: u8 = 3;
 
-/// What a capture reads, copied out of the core: a frame's picture, and
-/// the video memory and PPU settings it was drawn from
-/// ([`SnesEmulator::capture_frame_snapshot`]).
-///
-/// Taken at a capture boundary the picture and the memory belong to the
-/// same frame. Taken anywhere else, after a whole frame for one, VRAM,
-/// CGRAM and OAM may already hold what the game uploaded in the vertical
-/// blank for the next frame, while the picture shows the frame before;
-/// `at_boundary` says which.
+/// The SNES's part of a frame snapshot ([`FrameSnapshot::console`],
+/// [`CaptureCore::capture_frame_snapshot`]): the sprite table and the PPU's
+/// settings the picture was drawn with. The snapshot's `vram` is VRAM, 64
+/// KiB, each 16-bit word low byte first; its `palette` CGRAM, 256 BGR555
+/// colours (`0BBBBBGGGGGRRRRR`); its `registers` the list
+/// `VideoDebugger::get_registers` reports.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct FrameSnapshot {
-    /// The frame's number: the count [`SnesEmulator::frame_count`] reports
-    /// once this frame is complete. At a capture boundary the frame is not
-    /// counted yet, so this is one more than `frame_count`; a snapshot of
-    /// the same frame taken after it ran whole carries the same number.
-    pub frame: u64,
-    /// Whether the core was stopped at a capture boundary.
-    pub at_boundary: bool,
-    /// Width of the picture, in pixels, as `DisplayInfo` reports it.
-    pub width: u32,
-    /// Height of the picture, in pixels.
-    pub height: u32,
-    /// The picture, RGBA8888, `width * height * 4` bytes, row-major.
-    pub framebuffer: Vec<u8>,
-    /// VRAM, 64 KiB, each 16-bit word low byte first.
-    pub vram: Vec<u8>,
-    /// CGRAM, 256 BGR555 colours (`0BBBBBGGGGGRRRRR`).
-    pub palette: Vec<u16>,
+pub struct SnesSnapshotConsole {
     /// OAM, 544 bytes: the 512-byte table, then the 32-byte high table.
     pub oam: Vec<u8>,
-    /// The register list `VideoDebugger::get_registers` reports.
-    pub registers: Vec<VideoRegister>,
     /// The PPU's settings, structured.
     pub ppu_settings: crate::ppu::PpuSettings,
 }
@@ -221,11 +206,10 @@ pub struct SnesEmulator {
     show_overscan: bool,
 
     /// What the host asked the core to record while frames run, for a
-    /// capture to read ([`crate::ppu::CaptureRecording`]). Kept here, as
-    /// `show_overscan` is, so it survives the bus rebuild in
-    /// [`EmulatorCore::load_rom`]: `reset` applies it again. A host
-    /// setting, never part of a savestate.
-    capture_recording: crate::ppu::CaptureRecording,
+    /// capture to read ([`CaptureRecording`]). Kept here, as `show_overscan`
+    /// is, so it survives the bus rebuild in [`EmulatorCore::load_rom`]:
+    /// `reset` applies it again. A host setting, never part of a savestate.
+    capture_recording: CaptureRecording,
 
     /// Breakpoints, coverage, tracing, and cached CPU-state snapshots.
     /// Drives execution-tier selection in [`Self::run_frame`].
@@ -290,7 +274,8 @@ pub struct SnesEmulator {
     /// `true` on the normal play path.
     present: bool,
 
-    /// Set for the length of a [`Self::run_to_capture_boundary`] call:
+    /// Set for the length of a
+    /// [`run_to_capture_boundary`](CaptureCore::run_to_capture_boundary) call:
     /// the frame loops then stop in front of the frame's `VBlankStart`.
     capture_boundary_requested: bool,
     /// The core is stopped at a capture boundary: the frame's active
@@ -386,7 +371,7 @@ impl SnesEmulator {
             last_unsupported_chip: None,
             cartridge_manifest_override: None,
             show_overscan: false,
-            capture_recording: crate::ppu::CaptureRecording::default(),
+            capture_recording: CaptureRecording::default(),
             debugger,
             debug_armed: false,
             pending_break: false,
@@ -438,22 +423,6 @@ impl SnesEmulator {
     /// Whether the full overscan frame is exposed (vs cropped to 224).
     pub fn show_overscan_enabled(&self) -> bool {
         self.show_overscan
-    }
-
-    /// Choose what the core records while frames run, for a capture to
-    /// read ([`crate::ppu::CaptureRecording`]). Applies at once and
-    /// survives a ROM load and a reset; a host setting, never part of a
-    /// savestate, and nothing it records changes what the game does. A line
-    /// table armed in the middle of a frame does not hold that frame from
-    /// its line 1, so the frame it describes whole is the next one.
-    pub fn set_capture_recording(&mut self, recording: crate::ppu::CaptureRecording) {
-        self.capture_recording = recording;
-        self.bus.ppu_mut().set_capture_recording(recording);
-    }
-
-    /// What the core was asked to record.
-    pub fn capture_recording(&self) -> crate::ppu::CaptureRecording {
-        self.capture_recording
     }
 
     /// Stage a cartridge manifest applied on the next
@@ -1048,34 +1017,6 @@ impl SnesEmulator {
         self.bus.ppu_mut().write_oam_debug(byte_address, bytes);
     }
 
-    /// Re-render the held frame from the present PPU state (VRAM / CGRAM /
-    /// OAM / registers + the debugger layer mask) into the framebuffer,
-    /// without advancing emulation.
-    ///
-    /// Mirrors the live per-frame sequence: walk every visible scanline
-    /// through [`crate::ppu::Ppu::render_scanline`] (starting at line 1 so
-    /// the per-frame reset fires and the `in_active_scanline` gate drops
-    /// the lines past the active region) then run
-    /// [`crate::ppu::Ppu::finalize_frame`] for the hires/overscan
-    /// normalisation. Only meaningful while paused, a running core
-    /// repaints on its own next frame, but a paused one never would, so a
-    /// host that toggles a layer calls this to see the change at once.
-    ///
-    /// The sprite range and time flags and the evaluator's OAM address,
-    /// which drawing moves and a savestate holds, are put back as they
-    /// were, so a repaint leaves the state hash where it was.
-    pub fn repaint_held_frame(&mut self) {
-        self.bus.ppu_mut().redraw_frame(&mut self.framebuffer);
-    }
-
-    /// The held frame drawn again with only `layer` in it (`0..=3` BG1-4,
-    /// `4` OBJ), alpha-keyed: see [`crate::ppu::Ppu::render_layer`].
-    /// Emulation does not advance, the framebuffer the host shows is left
-    /// as it was, and so is everything a savestate holds.
-    pub fn render_layer(&mut self, layer: u32) -> Result<PixelImage, ExportError> {
-        self.bus.ppu_mut().render_layer(layer as usize)
-    }
-
     /// Whether a repaint or a layer render made now draws the frame from
     /// its line table, each line with its own settings and the video
     /// memory it read ([`crate::ppu::Ppu::draws_from_line_states`]), rather
@@ -1084,69 +1025,67 @@ impl SnesEmulator {
         self.bus.ppu().draws_from_line_states()
     }
 
-    /// The settings each line of the frame drawn last was drawn with, when
-    /// the line table is kept (`VideoDebugger::get_line_states`).
-    pub fn line_states(&self) -> Option<retro_core::video::LineStateTable> {
-        self.bus.ppu().get_line_states()
-    }
-
-    /// The palettes the lines of the line table were drawn with
-    /// ([`crate::ppu::Ppu::line_palettes`]).
-    pub fn line_palettes(&self) -> Option<crate::ppu::LinePalettes> {
-        self.bus.ppu().line_palettes()
-    }
-
-    /// The frame's picture drawn again from its line table
-    /// ([`crate::ppu::Ppu::picture_from_line_states`]), cropped as the
-    /// picture is. Emulation does not advance, the framebuffer the host
-    /// shows is left as it was, and so is everything a savestate holds.
-    pub fn picture_from_line_states(&mut self) -> Option<PixelImage> {
-        self.bus.ppu_mut().picture_from_line_states()
-    }
-
     /// The PPU's settings, structured ([`crate::ppu::PpuSettings`]).
     pub fn ppu_settings(&self) -> crate::ppu::PpuSettings {
         self.bus.ppu().settings()
     }
 
-    /// Copies of the frame's picture and of the video memory and settings
-    /// it was drawn from ([`FrameSnapshot`]). Taken at a capture boundary
-    /// ([`Self::run_to_capture_boundary`]) the two describe the same
-    /// frame; anywhere else the memory may already hold what the game
-    /// uploaded in the vertical blank for the next frame, which
-    /// `at_boundary` tells the host.
-    pub fn capture_frame_snapshot(&self) -> FrameSnapshot {
-        let (width, height) = {
-            let display = &self.system_info.display;
-            (
-                display.width.min(self.framebuffer.width),
-                display.height.min(self.framebuffer.height),
+    /// Whether a game is loaded: the readers of the held frame answer
+    /// nothing before one is.
+    fn game_loaded(&self) -> bool {
+        self.bus.cartridge_ref().is_some()
+    }
+
+    /// The number a snapshot of the picture the host holds carries
+    /// ([`FrameSnapshot::frame`]): the frames finished, plus one while the
+    /// frame is held at its capture boundary. A frame stopped elsewhere,
+    /// at a breakpoint, is numbered by the frames finished.
+    fn picture_frame(&self) -> u64 {
+        if self.held_at_capture_boundary {
+            self.frame_count + 1
+        } else {
+            self.frame_count
+        }
+    }
+
+    /// The picture the host holds, as
+    /// [`capture_frame_snapshot`](CaptureCore::capture_frame_snapshot) crops
+    /// it: `(width, height)`.
+    fn picture_size(&self) -> (u32, u32) {
+        let display = &self.system_info.display;
+        (
+            display.width.min(self.framebuffer.width),
+            display.height.min(self.framebuffer.height),
+        )
+    }
+
+    /// Whether `rgba`, `width` x `height`, is the picture the host holds,
+    /// byte for byte.
+    fn is_held_picture(&self, width: u32, height: u32, rgba: &[u8]) -> bool {
+        (width, height) == self.picture_size()
+            && equals_cropped_rgba(
+                &self.framebuffer.data,
+                self.framebuffer.width,
+                width,
+                height,
+                rgba,
             )
-        };
-        let stride = self.framebuffer.width as usize * 4;
-        let row_bytes = width as usize * 4;
-        let mut framebuffer = Vec::with_capacity(row_bytes * height as usize);
-        for y in 0..height as usize {
-            framebuffer
-                .extend_from_slice(&self.framebuffer.data[y * stride..y * stride + row_bytes]);
-        }
-        let ppu = self.bus.ppu();
-        FrameSnapshot {
-            frame: if self.held_at_capture_boundary {
-                self.frame_count + 1
-            } else {
-                self.frame_count
-            },
-            at_boundary: self.held_at_capture_boundary,
-            width,
-            height,
-            framebuffer,
-            vram: ppu.get_vram().to_vec(),
-            palette: ppu.cgram().to_vec(),
-            oam: ppu.oam().to_vec(),
-            registers: ppu.get_registers(),
-            ppu_settings: ppu.settings(),
-        }
+    }
+
+    /// Each line's window masks ([`crate::ppu::Ppu::window_masks`]), the
+    /// frame numbered as a frame snapshot numbers its picture. `None` when
+    /// no game is loaded.
+    pub fn window_masks(&self) -> Option<crate::ppu::WindowMasks> {
+        self.game_loaded()
+            .then(|| self.bus.ppu().window_masks(self.picture_frame()))
+    }
+
+    /// The offset-per-tile columns of the held frame
+    /// ([`crate::ppu::Ppu::offset_per_tile_table`]), the frame numbered as
+    /// a frame snapshot numbers its picture. `None` when no game is loaded.
+    pub fn offset_per_tile(&self) -> Option<crate::ppu::OffsetPerTileTable> {
+        self.game_loaded()
+            .then(|| self.bus.ppu().offset_per_tile_table(self.picture_frame()))
     }
 
     /// A [`crate::cartridge::SnesCartridgeDebugger`] bound to the live
@@ -1211,8 +1150,10 @@ impl SnesEmulator {
     ///
     /// A write to a PPU register is not one the frame made: until the next
     /// frame's line 1, a repaint and a layer render draw from the registers
-    /// as they stand, which show it, rather than from the line table.
+    /// as they stand, which show it, rather than from the line table. What
+    /// the PPU's data ports take from it is put down to the debugger.
     pub fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
+        self.bus.begin_debugger_writes();
         for (i, &byte) in data.iter().enumerate() {
             let at = addr.wrapping_add(i as u32);
             if crate::bus::is_ppu_register_address(at) {
@@ -1220,6 +1161,7 @@ impl SnesEmulator {
             }
             self.bus.write(at, byte);
         }
+        self.bus.end_debugger_writes();
     }
 
     /// Run one 65C816 instruction, returning the master clocks it
@@ -1285,9 +1227,19 @@ impl SnesEmulator {
         if dma_mask != 0 {
             delta += self.bus.run_general_dma(dma_mask);
             // A general-DMA block just ran: match a `DmaStart` event
-            // breakpoint (only armed when one exists).
-            if self.debug_armed && self.debugger.check_event(SnesEvent::DmaStart) {
-                self.pending_break = true;
+            // breakpoint for the whole `$420B` write, and a `DmaDone` for
+            // each channel it ran, by the channel's B-bus port (only armed
+            // when one exists).
+            if self.debug_armed {
+                if self.debugger.check_event(SnesEvent::DmaStart) {
+                    self.pending_break = true;
+                }
+                for channel in (0..8).filter(|c| dma_mask & (1 << c) != 0) {
+                    let port = self.bus.dma().channels[channel].b_bus_port;
+                    if self.debugger.check_event(SnesEvent::DmaDone(port)) {
+                        self.pending_break = true;
+                    }
+                }
             }
         }
         // A `$4200` NMI-enable 0->1 edge while the `$4210` flag is still
@@ -1485,7 +1437,10 @@ impl SnesEmulator {
                 self.bus
                     .system_regs_mut()
                     .tick(stolen.min(u32::MAX as u64) as u32);
-                if self.debug_armed && self.debugger.check_event(SnesEvent::HdmaStart) {
+                if self.debug_armed
+                    && (self.debugger.check_event(SnesEvent::HdmaStart)
+                        | self.drain_ppu_debug_events())
+                {
                     self.pending_break = true;
                 }
             }
@@ -1506,6 +1461,11 @@ impl SnesEmulator {
                 self.bus
                     .system_regs_mut()
                     .tick(stolen.min(u32::MAX as u64) as u32);
+                // A palette colour or a tile the line's HDMA wrote: the
+                // break waits for the rest of the batch.
+                if self.debug_armed && self.drain_ppu_debug_events() {
+                    self.pending_break = true;
+                }
             }
             EventKind::VBlankStart => {
                 // A frame held at the capture boundary finished its
@@ -1950,72 +1910,11 @@ impl SnesEmulator {
         self.present = true;
     }
 
-    /// Run to the next capture boundary and stop there: the moment the
-    /// frame's active display has been drawn, in front of its
-    /// `VBlankStart`. The framebuffer is final there (the hires and
-    /// overscan normalisation done, `DisplayInfo` synced) while VRAM,
-    /// CGRAM, OAM and the registers still hold what the picture was drawn
-    /// from: no NMI is delivered and nothing of the vertical blank has run,
-    /// so the game's uploads for the next frame have not landed.
-    ///
-    /// Held at a boundary already, the call first finishes that frame,
-    /// then runs the next one to its boundary, so each call advances
-    /// exactly one frame. A frame in progress that is past its
-    /// `VBlankStart` (a breakpoint stopped it in the vertical blank) is
-    /// run to its end and the next one to its boundary.
-    ///
-    /// The loops are the ones a frame call picks, by the same tier
-    /// selection, and breakpoints stop where they stop: a breakpoint that
-    /// hits on the way leaves the frame paused there instead, which
-    /// [`Self::at_capture_boundary`] then reports as `false`. While the
-    /// debugger is paused or stepping the call does what a frame call
-    /// does then.
-    ///
-    /// The rest of a held frame runs on the next frame call (`run_frame`,
-    /// `run_frame_headless`), which finishes that frame and returns, on
-    /// the next boundary call (`run_until_vblank` is one), on the next
-    /// step, which leaves the boundary first (`leave_capture_boundary`),
-    /// or on the save path ([`Self::save_state_finishing_held_frame`]). A
-    /// reset, a ROM load or a state load drops it.
-    pub fn run_to_capture_boundary(&mut self) {
-        self.sync_spc_trace_enable();
-        self.sync_gsu_trace_enable();
-        self.sync_debug_arm();
-        let tier = self.debugger.execution_tier();
-        if tier == ExecutionTier::FullDebug {
-            self.run_frame_full();
-            return;
-        }
-        if self.held_at_capture_boundary {
-            self.run_frame_on_tier(tier);
-            if self.frame_call_stopped() {
-                // A breakpoint stopped the rest of the held frame.
-                return;
-            }
-        }
-        self.capture_boundary_requested = true;
-        // At most two frames: the rest of a frame already past its
-        // `VBlankStart`, then the next frame up to its own.
-        for _ in 0..2 {
-            self.run_frame_on_tier(tier);
-            if self.frame_call_stopped() {
-                break;
-            }
-        }
-        self.capture_boundary_requested = false;
-    }
-
     /// Whether the frame call just made stopped before its frame's end, at
     /// the capture boundary or at a breakpoint (which pauses the debugger,
     /// even one that hit in the batch that ended the frame).
     fn frame_call_stopped(&self) -> bool {
         self.frame_in_progress() || self.debugger.get_execution_mode() != ExecutionMode::Running
-    }
-
-    /// Whether the core is stopped at a capture boundary (see
-    /// [`Self::run_to_capture_boundary`]).
-    pub fn at_capture_boundary(&self) -> bool {
-        self.held_at_capture_boundary
     }
 
     /// Run the rest of the frame held at the capture boundary, as a frame
@@ -2032,15 +1931,6 @@ impl SnesEmulator {
         self.sync_debug_arm();
         let tier = self.debugger.running_tier();
         self.run_frame_on_tier(tier);
-    }
-
-    /// A savestate of the machine, taken once the frame held at a capture
-    /// boundary, if any, is finished ([`Self::finish_held_frame`]): the
-    /// host's save path, so a savestate never holds a frame stopped at the
-    /// boundary. Anywhere else it is [`EmulatorCore::save_state`].
-    pub fn save_state_finishing_held_frame(&mut self) -> Vec<u8> {
-        self.finish_held_frame();
-        EmulatorCore::save_state(self)
     }
 
     /// Run the frame in progress, or the next one, on the fast or the
@@ -2421,6 +2311,50 @@ impl SnesEmulator {
         self.debug_armed = armed;
         self.bus.set_debug_armed(armed);
         self.bus.apu_mut().set_dsp_event_recording(armed);
+        let watch = if armed {
+            self.video_memory_watch()
+        } else {
+            None
+        };
+        self.bus.ppu_mut().set_event_watch(watch);
+    }
+
+    /// The palette colours and the tiles the enabled `PaletteWrite` and
+    /// `TileChange` event breakpoints watch, or `None` when there is none:
+    /// the PPU then tests one bit per write instead of the breakpoint list.
+    fn video_memory_watch(&self) -> Option<crate::ppu::EventWatch> {
+        let mut watch = crate::ppu::EventWatch::new();
+        let mut any = false;
+        for info in self.debugger.list_breakpoints() {
+            if !info.enabled {
+                continue;
+            }
+            if let BreakpointType::Event { code, param } = info.breakpoint.bp_type {
+                match code {
+                    snes_events::PALETTE_WRITE => watch.watch_colour(param),
+                    snes_events::TILE_CHANGE => watch.watch_tile(param),
+                    _ => continue,
+                }
+                any = true;
+            }
+        }
+        any.then_some(watch)
+    }
+
+    /// Drain the palette and tile events the PPU raised and match them
+    /// against their event breakpoints. Returns `true` when any matched;
+    /// every event is checked, so the hit counts stay right.
+    fn drain_ppu_debug_events(&mut self) -> bool {
+        let mut hit = false;
+        let debugger = &mut self.debugger;
+        self.bus.ppu_mut().drain_debug_events(|event| {
+            let event = match event {
+                crate::ppu::PpuDebugEvent::PaletteWrite(colour) => SnesEvent::PaletteWrite(colour),
+                crate::ppu::PpuDebugEvent::TileChange(tile) => SnesEvent::TileChange(tile),
+            };
+            hit |= debugger.check_event(event);
+        });
+        hit
     }
 
     /// Drain the bus's recorded CPU accesses and match them against
@@ -2432,7 +2366,9 @@ impl SnesEmulator {
         self.debug_event_scratch
             .extend_from_slice(self.bus.debug_events());
         self.bus.clear_debug_events();
-        let mut hit = false;
+        // The palette and tile events the instruction's stores and its
+        // general DMA raised in the PPU.
+        let mut hit = self.drain_ppu_debug_events();
         for ev in &self.debug_event_scratch {
             let matched = match *ev {
                 BusDebugEvent::Read { addr, value } => self
@@ -2728,10 +2664,12 @@ impl EmulatorCore for SnesEmulator {
         // value, a no-op).
         self.bus.ppu_mut().set_show_overscan(self.show_overscan);
         // The same for what the host asked to record; a line table kept
-        // across the reset would describe a frame from before it.
+        // across the reset would describe a frame from before it, and so
+        // would the live recorders.
+        self.bus.set_capture_recording(self.capture_recording);
         let ppu = self.bus.ppu_mut();
-        ppu.set_capture_recording(self.capture_recording);
         ppu.drop_recorded_frame();
+        ppu.forget_recorded_writes();
         ppu.set_recording_frame(1);
         // The bus reset zeroes the PPU register file -> bgmode 0
         // (non-hires) + overscan off -> resync the public display
@@ -2863,7 +2801,7 @@ impl EmulatorCore for SnesEmulator {
     }
 
     /// Run to the start of vertical blanking and stop there: the capture
-    /// boundary ([`SnesEmulator::run_to_capture_boundary`]), on the loop
+    /// boundary ([`CaptureCore::run_to_capture_boundary`]), on the loop
     /// [`EmulatorCore::run_frame`] picks.
     fn run_until_vblank(&mut self) {
         self.run_to_capture_boundary();
@@ -3043,7 +2981,7 @@ impl EmulatorCore for SnesEmulator {
         // capture boundary: it saves that frame as it stands, its
         // `VBlankStart` still queued, and a load goes on with it (the
         // saved clock says the frame is in progress). A host saves through
-        // `save_state_finishing_held_frame`, which finishes it first.
+        // `CaptureCore::save_state_at_frame_end`, which finishes it first.
         //
         // Shared with `state_hash` so the hashed payload is exactly the
         // bytes persisted here (minus the envelope + compression).
@@ -3164,6 +3102,244 @@ impl EmulatorCore for SnesEmulator {
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
+    }
+}
+
+/// The capture contract over the mechanism this file keeps: the boundary
+/// stop in the frame loops (`capture_boundary_requested`,
+/// `held_at_capture_boundary`), the PPU's line table and traced redraw, and
+/// its live recorders of video memory.
+impl CaptureCore for SnesEmulator {
+    type SnapshotConsole = SnesSnapshotConsole;
+
+    /// Applies at once and survives a ROM load and a reset. On this core the
+    /// line table is kept for any of `line_states`, `pixel_sources` and
+    /// `line_sprites` (the other two are worked out from it), and
+    /// `video_memory_sources` and `frame_writes` arm the PPU's two live
+    /// recorders.
+    fn set_capture_recording(&mut self, wanted: CaptureRecording) {
+        self.capture_recording = wanted;
+        self.bus.set_capture_recording(wanted);
+    }
+
+    fn capture_recording(&self) -> CaptureRecording {
+        self.capture_recording
+    }
+
+    /// Run to the next capture boundary and stop there: the moment the
+    /// frame's active display has been drawn, in front of its
+    /// `VBlankStart`. The framebuffer is final there (the hires and
+    /// overscan normalisation done, `DisplayInfo` synced) while VRAM,
+    /// CGRAM, OAM and the registers still hold what the picture was drawn
+    /// from: no NMI is delivered and nothing of the vertical blank has run,
+    /// so the game's uploads for the next frame have not landed.
+    ///
+    /// Held at a boundary already, the call first finishes that frame,
+    /// then runs the next one to its boundary, so each call advances
+    /// exactly one frame. A frame in progress that is past its
+    /// `VBlankStart` (a breakpoint stopped it in the vertical blank) is
+    /// run to its end and the next one to its boundary.
+    ///
+    /// The loops are the ones a frame call picks, by the same tier
+    /// selection, and breakpoints stop where they stop: a breakpoint that
+    /// hits on the way leaves the frame paused there instead, which
+    /// [`Self::at_capture_boundary`] then reports as `false`. While the
+    /// debugger is paused or stepping the call does what a frame call
+    /// does then.
+    ///
+    /// The rest of a held frame runs on the next frame call (`run_frame`,
+    /// `run_frame_headless`), which finishes that frame and returns, on
+    /// the next boundary call (`run_until_vblank` is one), on the next
+    /// step, which leaves the boundary first (`leave_capture_boundary`),
+    /// or on the save path ([`Self::save_state_at_frame_end`]). A reset, a
+    /// ROM load or a state load drops it.
+    fn run_to_capture_boundary(&mut self) {
+        self.sync_spc_trace_enable();
+        self.sync_gsu_trace_enable();
+        self.sync_debug_arm();
+        let tier = self.debugger.execution_tier();
+        if tier == ExecutionTier::FullDebug {
+            self.run_frame_full();
+            return;
+        }
+        if self.held_at_capture_boundary {
+            self.run_frame_on_tier(tier);
+            if self.frame_call_stopped() {
+                // A breakpoint stopped the rest of the held frame.
+                return;
+            }
+        }
+        self.capture_boundary_requested = true;
+        // At most two frames: the rest of a frame already past its
+        // `VBlankStart`, then the next frame up to its own.
+        for _ in 0..2 {
+            self.run_frame_on_tier(tier);
+            if self.frame_call_stopped() {
+                break;
+            }
+        }
+        self.capture_boundary_requested = false;
+    }
+
+    fn at_capture_boundary(&self) -> bool {
+        self.held_at_capture_boundary
+    }
+
+    /// The frame held at a capture boundary, if any, is finished first
+    /// ([`Self::finish_held_frame`]): on the loop the breakpoints and traces
+    /// select as if the debugger were running, whatever its mode, so a
+    /// breakpoint in the rest of the frame stops the finish and the save is
+    /// taken where it stopped. Anywhere else it is
+    /// [`EmulatorCore::save_state`].
+    fn save_state_at_frame_end(&mut self) -> Vec<u8> {
+        self.finish_held_frame();
+        EmulatorCore::save_state(self)
+    }
+
+    /// The console's part is OAM and the PPU's settings
+    /// ([`SnesSnapshotConsole`]). A frame stopped by a breakpoint anywhere
+    /// but at its capture boundary is numbered by the frames finished.
+    fn capture_frame_snapshot(&self) -> FrameSnapshot<SnesSnapshotConsole> {
+        let (width, height) = self.picture_size();
+        let ppu = self.bus.ppu();
+        FrameSnapshot {
+            frame: self.picture_frame(),
+            at_boundary: self.held_at_capture_boundary,
+            width,
+            height,
+            framebuffer: crop_rgba(
+                &self.framebuffer.data,
+                self.framebuffer.width,
+                width,
+                height,
+            ),
+            vram: ppu.get_vram().to_vec(),
+            palette: ppu.cgram().to_vec(),
+            registers: ppu.get_registers(),
+            console: SnesSnapshotConsole {
+                oam: ppu.oam().to_vec(),
+                ppu_settings: ppu.settings(),
+            },
+        }
+    }
+
+    /// Mirrors the live per-frame sequence (`Ppu::redraw_frame`): every
+    /// visible line through the renderer, from line 1 so the per-frame
+    /// resets run, then `finalize_frame`'s hires and overscan normalisation.
+    /// The sprite range and time flags and the evaluator's OAM address,
+    /// which drawing moves and a savestate holds, are put back as they were,
+    /// so a repaint leaves the state hash where it was. The frame is drawn
+    /// from the line table only when the table holds the whole frame and no
+    /// register was edited since ([`Self::draws_from_line_states`]), and the
+    /// answer says so.
+    fn repaint_held_frame(&mut self) -> bool {
+        let from_line_states = self.draws_from_line_states();
+        self.bus.ppu_mut().redraw_frame(&mut self.framebuffer);
+        from_line_states
+    }
+
+    /// `layer` is `0..=3` for BG1-4 and `4` for the sprites
+    /// ([`crate::ppu::Ppu::render_layer`]): drawn at the master brightness,
+    /// without colour math, whatever the screens, the windows and the
+    /// debugger's layer mask say.
+    fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer> {
+        let from_line_states = self.draws_from_line_states();
+        let image = self.bus.ppu_mut().render_layer(layer as usize).ok()?;
+        Some(RenderedLayer {
+            image,
+            from_line_states,
+        })
+    }
+
+    /// Answers only when the line table holds a whole frame, from its line 1
+    /// to its finished picture ([`crate::ppu::Ppu::picture_from_line_states`]).
+    fn picture_from_line_states(&mut self) -> Option<PixelImage> {
+        self.bus.ppu_mut().picture_from_line_states()
+    }
+
+    /// A debugger edit of video memory since the table's line 1 clears
+    /// [`LineStateTable::memory_exact`].
+    fn line_states(&self) -> Option<LineStateTable> {
+        self.bus.ppu().get_line_states()
+    }
+
+    /// One palette of the 256 CGRAM colours for each distinct CGRAM a line
+    /// read ([`crate::ppu::Ppu::line_palettes`]); this core records no
+    /// palette writes within a line.
+    fn line_palettes(&self) -> Option<LinePalettes> {
+        self.bus.ppu().line_palettes()
+    }
+
+    /// The planes as [`crate::ppu::TracedFrame`] documents them, the sub
+    /// screen's included.
+    fn pixel_sources(&mut self, planes: u32) -> Option<PixelSources> {
+        if !self.game_loaded() {
+            return None;
+        }
+        let frame = self.picture_frame();
+        let traced = self.bus.ppu_mut().pixel_sources(planes);
+        let matches_picture = self.is_held_picture(traced.width, traced.height, &traced.picture);
+        Some(traced.into_sources(frame, matches_picture))
+    }
+
+    /// The fates and line flags this core gives are listed on
+    /// [`crate::ppu::Ppu::line_sprites`].
+    fn line_sprites(&mut self) -> Option<LineSprites> {
+        self.game_loaded()
+            .then(|| self.bus.ppu().line_sprites(self.picture_frame()))
+    }
+
+    /// The sprite table has 128 slots ([`crate::ppu::Ppu::render_sprites`]).
+    fn render_sprites(&mut self, selection: &[u8]) -> Option<RenderedLayer> {
+        if !self.game_loaded() {
+            return None;
+        }
+        let mut chosen = [false; 128];
+        for (flag, &byte) in chosen.iter_mut().zip(selection) {
+            *flag = byte != 0;
+        }
+        let from_line_states = self.draws_from_line_states();
+        let image = self.bus.ppu_mut().render_sprites(&chosen);
+        Some(RenderedLayer {
+            image,
+            from_line_states,
+        })
+    }
+
+    /// VRAM's 64 KiB, the record of each byte as `crate::ppu::writes`
+    /// documents it.
+    fn video_memory_sources(&self) -> Option<&VideoMemorySources> {
+        self.bus.ppu().video_memory_sources()
+    }
+
+    /// The records as `crate::ppu::writes` documents them, at most
+    /// [`crate::ppu::writes::FRAME_WRITES_CAP`] a take.
+    fn take_frame_writes(&mut self) -> Option<FrameWrites> {
+        self.bus.ppu_mut().take_frame_writes()
+    }
+
+    /// Each address is an A-bus address, routed as a read of it is
+    /// ([`SnesBus::source_place`]). The ROM offset counts from the file's
+    /// first byte, the copier header of a file that carries one included;
+    /// an offset into the zeroes padding a ROM to a power of two is unknown.
+    /// Work RAM is -2; the cartridge's RAM (SRAM, BW-RAM, Game Pak RAM) -3;
+    /// a coprocessor's registers or memory, or ROM the SA-1, the S-DD1 or
+    /// the SPC7110 reach through banks of their own, -4 (the Super FX's and
+    /// the Cx4's ROM windows give the ROM's offset); open bus, the B bus
+    /// and the 5A22's registers -1.
+    fn resolve_sources(&self, addresses: &[u32]) -> Vec<i32> {
+        let header = copier_header_length(self.rom_size);
+        let data = self.rom_size - header;
+        addresses
+            .iter()
+            .map(|&address| match self.bus.source_place(address) {
+                SourcePlace::Rom(offset) if (offset as usize) < data => {
+                    SourcePlace::Rom(offset + header as u32).code()
+                }
+                SourcePlace::Rom(_) => SOURCE_UNKNOWN,
+                place => place.code(),
+            })
+            .collect()
     }
 }
 

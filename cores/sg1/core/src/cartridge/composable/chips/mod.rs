@@ -26,7 +26,7 @@ pub mod eeprom;
 pub mod jcart;
 pub mod svp;
 
-pub use bank_mapper::BankMapperChip;
+pub use bank_mapper::{bank_table_of, BankMapperChip, BankTable};
 pub use eeprom::EepromChip;
 pub use jcart::JCartChip;
 pub use svp::SvpCoprocessor;

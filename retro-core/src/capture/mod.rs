@@ -1,0 +1,308 @@
+//! The capture contract: what a host asks a core to record while frames run,
+//! and what it reads back about the frame held on screen.
+//!
+//! A host captures a frame where its picture is drawn and its vertical blank
+//! has not begun, the capture boundary: there the video memory, the palette
+//! and the registers still hold what the picture was drawn from. What a core
+//! records while frames run ([`CaptureRecording`]) is a host setting: never
+//! part of a savestate, and nothing the machine does depends on it.
+//!
+//! The shapes, codes and logs a core hands over are written once here: where
+//! each pixel came from ([`PixelSources`], [`planes`], [`layer`],
+//! [`tile_value`]), the sprites each line held ([`LineSprites`],
+//! [`SpriteFate`], [`line_flags`]), who wrote each byte of video memory
+//! ([`VideoMemorySources`], [`WriteOrigin`], [`Writer`]), what each frame
+//! wrote ([`FrameWrite`], [`FrameWrites`], [`WriteLog`]), the line table's
+//! helpers ([`LinePalettes`], [`distinct_palettes`], [`TableColumns`],
+//! [`line_state!`](crate::line_state)) and the frame snapshot
+//! ([`FrameSnapshot`], [`RenderedLayer`]). A core keeps its mechanism: where
+//! it records, the fields of a line's settings, how it draws a frame again
+//! and how it reaches the boundary. [`CaptureCore`] is what a host calls.
+
+use serde::{Deserialize, Serialize};
+
+use crate::emulator::EmulatorCore;
+use crate::video::{LineStateTable, PixelImage};
+
+mod frame;
+mod lines;
+mod pixels;
+mod sprites;
+mod writes;
+
+pub use frame::{FrameSnapshot, RenderedLayer};
+pub use lines::{distinct_palettes, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE};
+pub use pixels::{drawn_by, layer, planes, tile_value, NoTrace, PixelSources, PixelTrace, NO_CELL};
+pub use sprites::{line_flags, LineSprites, SpriteFate, LINE_SPRITES_STRIDE};
+pub use writes::{
+    FrameWrite, FrameWrites, VideoMemorySources, WriteKind, WriteLog, WriteOrigin, Writer,
+    WORDS_PER_RECORD,
+};
+
+/// What a core records while frames run, for a capture to read. All off by
+/// default; a host setting, never part of a savestate.
+///
+/// `line_states` keeps the line table: the settings each line of the picture
+/// was drawn with, from which a core draws the frame again as it was drawn.
+/// A core that works the pixel sources and the line sprites out of that
+/// table on demand keeps it for either of them too ([`Self::wants_line_table`]).
+/// `video_memory_sources` and `frame_writes` are recorded as the writes land:
+/// who wrote each byte of video memory, and the log of each frame's
+/// transfers and palette and sprite-table writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureRecording {
+    /// The settings each line of the picture was drawn with, and what
+    /// drawing the picture again from them needs.
+    pub line_states: bool,
+    /// Where each pixel of the picture came from ([`PixelSources`]).
+    pub pixel_sources: bool,
+    /// The sprites each line held and what became of each ([`LineSprites`]).
+    pub line_sprites: bool,
+    /// What wrote each byte of video memory, and in which frame
+    /// ([`VideoMemorySources`]).
+    pub video_memory_sources: bool,
+    /// The transfers and the palette and sprite-table writes since the last
+    /// take ([`FrameWrites`]).
+    pub frame_writes: bool,
+}
+
+impl CaptureRecording {
+    /// Whether what is asked for needs the line table: the line states, or
+    /// the pixel sources or line sprites a core works out from it.
+    pub fn wants_line_table(&self) -> bool {
+        self.line_states || self.pixel_sources || self.line_sprites
+    }
+}
+
+/// Arm or disarm one recorder kept in `slot`: one `wanted` and absent is made
+/// with `make` and starts as `make` builds it (empty); one not wanted is
+/// dropped; one wanted and present keeps what it holds.
+pub fn arm_recorder<T>(slot: &mut Option<T>, wanted: bool, make: impl FnOnce() -> T) {
+    match (wanted, slot.is_some()) {
+        (true, false) => *slot = Some(make()),
+        (false, true) => *slot = None,
+        _ => {}
+    }
+}
+
+/// What a host calls to capture the frame a core holds: the recording, the
+/// capture boundary, the snapshot, the frame drawn again, and the readers of
+/// what was recorded.
+///
+/// None of it advances emulation unless it says so, and none of it moves
+/// anything a savestate or the state hash reads: a frame drawn again puts
+/// back what drawing it changed. Where the cores differ today the method
+/// says so; that rule is each core's own until one rule is chosen.
+pub trait CaptureCore: EmulatorCore {
+    /// The console's part of a frame snapshot.
+    type SnapshotConsole;
+
+    /// Ask the core to record what `wanted` names while frames run. A host
+    /// setting: never part of a savestate, kept across a reset, a ROM load
+    /// and a savestate load, and nothing the machine does depends on it. A
+    /// recorder turned on starts empty, one already on keeps what it holds,
+    /// one turned off is dropped. A line table armed in the middle of a frame
+    /// holds that frame only from there on.
+    fn set_capture_recording(&mut self, wanted: CaptureRecording);
+
+    /// What the core records while frames run: what the host asked for that
+    /// this core records.
+    fn capture_recording(&self) -> CaptureRecording;
+
+    /// Run to the next capture boundary and stop there: the frame's picture
+    /// drawn and its vertical blank not begun, so the video memory, the
+    /// palette and the registers still hold what the picture was drawn from.
+    /// A frame already held at its boundary is finished first, so each call
+    /// moves the game on one frame. The frame loop is the one a frame call
+    /// picks, and a breakpoint stops where it stops, leaving the core held at
+    /// no boundary. The frame stays held until the next frame call runs the
+    /// rest of it; a reset, a ROM load and a savestate load drop it.
+    fn run_to_capture_boundary(&mut self);
+
+    /// Whether the core is held at a capture boundary.
+    fn at_capture_boundary(&self) -> bool;
+
+    /// A savestate taken where a frame ends: a frame held part of the way
+    /// through is finished first, so a host's save never holds half a frame.
+    /// A host saves through this: [`EmulatorCore::save_state`] takes `&self`
+    /// and cannot finish a frame.
+    ///
+    /// How the rest of the frame runs is each core's own today. The Mega
+    /// Drive core finishes any held frame on the loop a player runs, so no
+    /// breakpoint stops it, and its `save_state` returns no bytes while a
+    /// frame is held. The SNES core finishes a frame held at the capture
+    /// boundary on the loop the debugger's state picks, so a breakpoint in
+    /// the rest of the frame stops it and the save is taken where it stopped.
+    fn save_state_at_frame_end(&mut self) -> Vec<u8>;
+
+    /// Copies of the picture the host shows and of the video memory, the
+    /// palette and the registers it was drawn from ([`FrameSnapshot`]). At a
+    /// capture boundary both belong to the frame held there; anywhere else
+    /// the memory may already hold what the game wrote for the next frame,
+    /// which [`FrameSnapshot::at_boundary`] tells the host.
+    ///
+    /// [`FrameSnapshot::frame`] numbers the picture: the frames finished,
+    /// plus one while the frame is held at its capture boundary, so a
+    /// snapshot taken there and one taken after the same frame ran whole
+    /// carry the same number. A frame held elsewhere (stopped by an event
+    /// breakpoint) is numbered by each core's own rule today: the Mega
+    /// Drive core adds one for any held frame, the SNES core only at the
+    /// capture boundary.
+    fn capture_frame_snapshot(&self) -> FrameSnapshot<Self::SnapshotConsole>;
+
+    /// Draw the held frame again into the framebuffer the host shows, with
+    /// the debugger's layer mask, from the line table where it holds the
+    /// frame, without advancing emulation: after a host toggles a layer or
+    /// edits video memory while paused, the change shows at once. Returns
+    /// whether every line was drawn from the line table.
+    ///
+    /// What that answer covers is each core's own today: the Mega Drive core
+    /// draws each line the table holds from it and any other from the state
+    /// as it stands, line by line; the SNES core draws from the table only
+    /// when it holds the whole frame.
+    fn repaint_held_frame(&mut self) -> bool;
+
+    /// One layer of the held frame drawn alone, alpha-keyed: `layer` is an id
+    /// of the core's layer list (the ids the debugger's layer toggles use),
+    /// `None` for any other. A pixel the layer covers is opaque, in the
+    /// layer's own colour; every other pixel is 0 in all four bytes, the
+    /// backdrop's included. Drawn from the line table where it holds the
+    /// frame, as [`RenderedLayer::from_line_states`] says.
+    fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer>;
+
+    /// The picture drawn again from the line table into a buffer of its own,
+    /// cut as the picture the host shows is.
+    ///
+    /// When it answers is each core's own today: the Mega Drive core answers
+    /// whenever the line table is kept, drawing the lines it does not hold
+    /// from the state as it stands; the SNES core answers only when the
+    /// table holds a whole frame, from its first line to its finished
+    /// picture.
+    fn picture_from_line_states(&mut self) -> Option<PixelImage>;
+
+    /// The settings each line of the frame was drawn with, while the line
+    /// table is kept ([`LineStateTable`]): one column per setting, in the
+    /// core's own names, one row per line.
+    ///
+    /// After a debugger edit of video memory,
+    /// [`LineStateTable::memory_exact`] follows each core's own rule today:
+    /// the Mega Drive core keeps it, the edit patched into every recorded
+    /// line; the SNES core clears it.
+    fn line_states(&self) -> Option<LineStateTable>;
+
+    /// The palettes the lines of the line table were drawn with
+    /// ([`LinePalettes`]), while the line table is kept.
+    fn line_palettes(&self) -> Option<LinePalettes>;
+
+    /// Where each pixel of the held frame came from, in the planes `planes`
+    /// asks for (bits of [`planes`]; other bits are ignored); `None` while no
+    /// game is loaded. The frame is drawn again with a trace, from the line
+    /// table where it holds the frame; [`PixelSources::matches_picture`]
+    /// says whether that picture is the one the host holds.
+    fn pixel_sources(&mut self, planes: u32) -> Option<PixelSources>;
+
+    /// The sprites each line of the held frame met and what became of each
+    /// ([`LineSprites`]); `None` while no game is loaded.
+    fn line_sprites(&mut self) -> Option<LineSprites>;
+
+    /// The chosen sprites of the held frame drawn alone, as the frame drew
+    /// them (after each line's limits and priority among sprites), alpha-keyed
+    /// as [`Self::render_layer`] draws; `None` while no game is loaded.
+    /// `selection` holds one flag a slot of the sprite table:
+    /// `selection[slot] != 0` chooses the sprite, and a short array chooses
+    /// nothing past its end.
+    fn render_sprites(&mut self, selection: &[u8]) -> Option<RenderedLayer>;
+
+    /// Who wrote each byte of video memory, and in which frame, while video
+    /// memory sources are recorded ([`VideoMemorySources`]). Turned on it
+    /// starts empty; a reset, a savestate load and a ROM load empty it.
+    fn video_memory_sources(&self) -> Option<&VideoMemorySources>;
+
+    /// The writes recorded since the last take, the log then empty, while
+    /// frame writes are recorded ([`FrameWrites`]). Taken at each capture
+    /// boundary, they are what built the frame held there: the uploads of
+    /// the vertical blank before it and the writes made while its picture was
+    /// drawn. Turned on the log starts empty; a reset, a savestate load and a
+    /// ROM load empty it.
+    fn take_frame_writes(&mut self) -> Option<FrameWrites>;
+
+    /// For each address, as a write origin's source holds it (bits 24-31 are
+    /// ignored), where a read of it comes from now, through the cartridge's
+    /// mapping as it stands: the offset into the ROM file, or a negative code
+    /// ([`crate::cartridge::SourcePlace::code`]). Reads the mapping and
+    /// changes nothing.
+    fn resolve_sources(&self, addresses: &[u32]) -> Vec<i32>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_line_table_is_wanted_by_the_three_readers_that_need_it() {
+        let none = CaptureRecording::default();
+        assert!(!none.wants_line_table());
+        for wanted in [
+            CaptureRecording {
+                line_states: true,
+                ..none
+            },
+            CaptureRecording {
+                pixel_sources: true,
+                ..none
+            },
+            CaptureRecording {
+                line_sprites: true,
+                ..none
+            },
+        ] {
+            assert!(wanted.wants_line_table());
+        }
+        for live in [
+            CaptureRecording {
+                video_memory_sources: true,
+                ..none
+            },
+            CaptureRecording {
+                frame_writes: true,
+                ..none
+            },
+        ] {
+            assert!(!live.wants_line_table());
+        }
+    }
+
+    #[test]
+    fn a_recorder_is_made_when_wanted_kept_while_wanted_and_dropped_after() {
+        let mut slot: Option<Vec<u32>> = None;
+        let mut made = 0;
+        arm_recorder(&mut slot, false, || {
+            made += 1;
+            Vec::new()
+        });
+        assert_eq!((slot.clone(), made), (None, 0), "not wanted, not made");
+
+        arm_recorder(&mut slot, true, || {
+            made += 1;
+            Vec::new()
+        });
+        assert_eq!((slot.clone(), made), (Some(Vec::new()), 1));
+
+        slot.as_mut().expect("armed").push(7);
+        arm_recorder(&mut slot, true, || {
+            made += 1;
+            Vec::new()
+        });
+        assert_eq!(
+            (slot.clone(), made),
+            (Some(vec![7]), 1),
+            "one already on keeps what it holds"
+        );
+
+        arm_recorder(&mut slot, false, || {
+            made += 1;
+            Vec::new()
+        });
+        assert_eq!((slot, made), (None, 1), "one turned off is dropped");
+    }
+}

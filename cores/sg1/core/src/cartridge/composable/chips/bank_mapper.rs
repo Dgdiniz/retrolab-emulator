@@ -105,29 +105,9 @@ impl BankMapperChip {
         Self::new(rom, BankMapperKind::Codemasters)
     }
 
-    /// Resolve a ROM-window address to a bank number under the current table.
-    fn bank_for(&self, addr: u32) -> u8 {
-        let slot = ((addr >> 19) & 0x07) as usize;
-        match self.kind {
-            BankMapperKind::Sega => self.banks[slot],
-            BankMapperKind::Ssf2 => {
-                if slot == 7 {
-                    self.banks[0] // the latched high bank
-                } else {
-                    slot as u8
-                }
-            }
-            BankMapperKind::Codemasters => {
-                let region = ((addr >> 19) & 0x03) as usize;
-                self.banks[region]
-            }
-        }
-    }
-
     /// Translate a ROM-window address to a physical ROM offset.
     fn physical_offset(&self, addr: u32) -> usize {
-        let bank = self.bank_for(addr) as usize;
-        bank * BANK_SIZE + (addr & BANK_OFFSET_MASK) as usize
+        physical_offset(self.kind, &self.banks, addr)
     }
 
     /// Clamp a written bank number to the real ROM size.
@@ -138,6 +118,68 @@ impl BankMapperChip {
     /// The live bank table (for the debugger).
     pub fn banks(&self) -> &[u8] {
         &self.banks
+    }
+}
+
+/// Resolve a ROM-window address to a bank number under the table `banks`
+/// of a mapper of `kind`.
+fn bank_for(kind: BankMapperKind, banks: &[u8], addr: u32) -> u8 {
+    let slot = ((addr >> 19) & 0x07) as usize;
+    match kind {
+        BankMapperKind::Sega => banks[slot],
+        BankMapperKind::Ssf2 => {
+            if slot == 7 {
+                banks[0] // the latched high bank
+            } else {
+                slot as u8
+            }
+        }
+        BankMapperKind::Codemasters => {
+            let region = ((addr >> 19) & 0x03) as usize;
+            banks[region]
+        }
+    }
+}
+
+/// Translate a ROM-window address to a physical ROM offset under the table
+/// `banks` of a mapper of `kind`.
+fn physical_offset(kind: BankMapperKind, banks: &[u8], addr: u32) -> usize {
+    let bank = bank_for(kind, banks, addr) as usize;
+    bank * BANK_SIZE + (addr & BANK_OFFSET_MASK) as usize
+}
+
+/// A bank mapper's table as it stands, read from the chip without changing
+/// it ([`bank_table_of`]): what a ROM-window read reaches, for a debugger
+/// naming the ROM bytes behind an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankTable {
+    kind: BankMapperKind,
+    banks: Vec<u8>,
+}
+
+impl BankTable {
+    /// The ROM file offset a read of the ROM-window address `addr` (the
+    /// chip's offset) reaches, as the chip reads it.
+    pub fn physical_offset(&self, addr: u32) -> usize {
+        physical_offset(self.kind, &self.banks, addr)
+    }
+}
+
+/// The bank table of `chip` when it is a bank mapper, read from the state
+/// it saves (the scheme and the banks set), else `None`. Nothing in the
+/// chip changes: its accesses are not counted.
+pub fn bank_table_of(chip: &dyn Coprocessor) -> Option<BankTable> {
+    let ExpansionChipType::Custom(CUSTOM_SEGA | CUSTOM_SSF2 | CUSTOM_CODEMASTERS) =
+        chip.info().chip_type
+    else {
+        return None;
+    };
+    match bincode::deserialize::<GenesisCoprocessorState>(&chip.serialize()).ok()? {
+        GenesisCoprocessorState::BankMapper(state) => Some(BankTable {
+            kind: state.kind,
+            banks: state.banks,
+        }),
+        _ => None,
     }
 }
 
@@ -353,6 +395,41 @@ mod tests {
         assert_eq!(st.registers.len(), 8);
         assert_eq!(st.registers[0].name, "BANK0");
         assert_eq!(m.label(), "SEGA mapper");
+    }
+
+    #[test]
+    fn the_table_read_from_a_mapper_reaches_what_the_chip_reads() {
+        let mut sega = BankMapperChip::sega(rom(16));
+        sega.observe_write(0xA130F6, 11);
+        let mut ssf2 = BankMapperChip::ssf2(rom(9));
+        ssf2.observe_write(0xA130F1, 0x01);
+        let mut codemasters = BankMapperChip::codemasters(rom(8));
+        codemasters.write(0x08000, 5, 0);
+        for chip in [&mut sega, &mut ssf2, &mut codemasters] {
+            let accesses = chip.accesses();
+            let table = bank_table_of(&*chip).expect("a bank mapper");
+            assert_eq!(
+                chip.accesses(),
+                accesses,
+                "reading the table counts no access"
+            );
+            for slot in 0..8u32 {
+                let address = slot * 0x80000 + 0x1234;
+                assert_eq!(
+                    table.physical_offset(address),
+                    chip.physical_offset(address),
+                    "slot {slot}"
+                );
+            }
+        }
+        assert_eq!(sega.physical_offset(0x30_0010), 11 * BANK_SIZE + 0x10);
+        assert_eq!(ssf2.physical_offset(0x38_0000), 8 * BANK_SIZE);
+    }
+
+    #[test]
+    fn another_chip_has_no_bank_table() {
+        let eeprom = crate::cartridge::composable::EepromChip::new(128);
+        assert!(bank_table_of(&eeprom).is_none());
     }
 
     #[test]

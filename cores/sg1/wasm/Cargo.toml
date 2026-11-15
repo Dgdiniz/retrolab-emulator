@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 retro-core = { path = "../../../retro-core" }
+retro-wasm = { path = "../../../retro-wasm" }
 sg1-core = { path = "../core" }
 wasm-bindgen = "0.2"
 serde = { workspace = true }
@@ -23,6 +24,7 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+retro-wasm = { path = "../../../retro-wasm", features = ["test-support"] }
 
 [package.metadata.wasm-pack.profile.release]
 # Rust/LLVM emit bulk-memory + non-trapping float-to-int ops by default

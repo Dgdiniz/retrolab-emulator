@@ -7,6 +7,7 @@
 //! debugging, and display.
 
 pub mod audio;
+pub mod capture;
 pub mod cartridge;
 pub mod cpu;
 pub mod debug;

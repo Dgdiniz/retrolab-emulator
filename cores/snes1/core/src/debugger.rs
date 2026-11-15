@@ -116,6 +116,20 @@ pub mod snes_events {
     /// An SPC700 write to an S-DSP register (via `$F3` DSPDATA);
     /// `param` is the DSP register index (`$00-$7F`).
     pub const DSP_REG_WRITE: u32 = 9;
+    /// A general DMA channel finished its block; `param` is the channel's
+    /// B-bus port (`$18` VRAM, `$22` palette, `$04` sprite table, `$80`
+    /// work RAM). One event per channel of a `$420B` write, checked after
+    /// the whole write's blocks ran, in the same place as [`DMA_START`].
+    pub const DMA_DONE: u32 = 10;
+    /// A colour was written into CGRAM by the processor, a DMA or an HDMA
+    /// (not by the debugger); `param` is the colour, 0-255. An HDMA's
+    /// writes pause after the line's batch of events.
+    pub const PALETTE_WRITE: u32 = 11;
+    /// A write into VRAM changed a byte of a tile; `param` is the tile in
+    /// 4bpp tiles, the VRAM word address divided by 16 (0-2047), the tile
+    /// viewer's numbering. Writing the same bytes again does not count,
+    /// nor do the debugger's writes.
+    pub const TILE_CHANGE: u32 = 12;
 }
 
 /// A SNES debug event that can be matched by an `Event` breakpoint.
@@ -145,6 +159,12 @@ pub enum SnesEvent {
     ApuPortWrite(u8),
     /// An S-DSP register (`$00-$7F`) was written by the SPC700.
     DspRegisterWrite(u8),
+    /// A general DMA channel finished its block (its B-bus port).
+    DmaDone(u8),
+    /// A colour was written into CGRAM (the colour, 0-255).
+    PaletteWrite(u8),
+    /// A write into VRAM changed a tile (in 4bpp tiles, 0-2047).
+    TileChange(u16),
 }
 
 impl SnesEvent {
@@ -162,6 +182,9 @@ impl SnesEvent {
             SnesEvent::PpuRegisterWrite(reg) => (snes_events::PPU_REG_WRITE, reg as u32),
             SnesEvent::ApuPortWrite(port) => (snes_events::APU_PORT_WRITE, port as u32),
             SnesEvent::DspRegisterWrite(reg) => (snes_events::DSP_REG_WRITE, reg as u32),
+            SnesEvent::DmaDone(port) => (snes_events::DMA_DONE, u32::from(port)),
+            SnesEvent::PaletteWrite(colour) => (snes_events::PALETTE_WRITE, u32::from(colour)),
+            SnesEvent::TileChange(tile) => (snes_events::TILE_CHANGE, u32::from(tile)),
         }
     }
 }
@@ -968,8 +991,9 @@ impl DebuggerCore for SnesDebugger {
 
     /// The SNES event taxonomy (see [`snes_events`]). Paramless classes
     /// (VBlank/NMI/IRQ/DMA/HDMA) advertise no param; the rest carry a
-    /// free-form numeric param (scanline, register index) except APU
-    /// ports, which enumerate their four mailboxes.
+    /// free-form numeric param (scanline, register index, colour, tile)
+    /// except APU ports, which enumerate their four mailboxes, and DMA done,
+    /// which enumerates the ports of the four memories a DMA fills.
     fn available_events(&self) -> Vec<EventClass> {
         let paramless = |code: u32, label: &str, description: &str| EventClass {
             code,
@@ -1032,6 +1056,39 @@ impl DebuggerCore for SnesDebugger {
                 "S-DSP register write",
                 "SPC700 write to an S-DSP register",
                 "DSP register ($00-$7F)",
+            ),
+            EventClass {
+                code: snes_events::DMA_DONE,
+                label: "DMA done".to_string(),
+                description: Some(
+                    "A general DMA channel finished its block, by the B-bus port it wrote"
+                        .to_string(),
+                ),
+                param_label: Some("B-bus port".to_string()),
+                param_options: [
+                    (0x18, "VRAM ($2118)"),
+                    (0x22, "Palette ($2122)"),
+                    (0x04, "Sprite table ($2104)"),
+                    (0x80, "Work RAM ($2180)"),
+                ]
+                .into_iter()
+                .map(|(value, label)| EventParamOption {
+                    value,
+                    label: label.to_string(),
+                })
+                .collect(),
+            },
+            numeric(
+                snes_events::PALETTE_WRITE,
+                "Palette write",
+                "A colour written into CGRAM by the processor, a DMA or an HDMA",
+                "Colour (0-255)",
+            ),
+            numeric(
+                snes_events::TILE_CHANGE,
+                "Tile changed",
+                "A write into VRAM changed a tile's bytes (the same bytes written again do not count)",
+                "Tile (4bpp, 0-2047)",
             ),
         ]
     }

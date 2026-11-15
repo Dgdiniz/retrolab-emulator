@@ -91,7 +91,7 @@ impl Vdp {
     /// The bytes of VRAM the renderer parses its sprite list from: the
     /// table register 5 places, 80 entries of 8 bytes in the 40-cell mode
     /// and 64 in the 32-cell mode, as `rebuild_sprite_cache` reads it.
-    fn sprite_table_bytes(&self) -> Range<usize> {
+    pub(super) fn sprite_table_bytes(&self) -> Range<usize> {
         let base = usize::from(self.sat_base());
         base..base + usize::from(self.sprite_table_slots()) * 8
     }
@@ -145,6 +145,9 @@ impl Vdp {
             let at = (start + offset) % VRAM_BYTES;
             self.vram[at] = value;
             sprite_table_written |= sprite_table.contains(&at);
+        }
+        if self.recording.is_some() {
+            self.note_debugger_vram_store(start, bytes.len());
         }
         if sprite_table_written {
             self.invalidate_sprite_cache();
@@ -341,10 +344,6 @@ impl VideoDebugger for Vdp {
 
     fn toggle_layer(&mut self, layer_id: u32, visible: bool) {
         self.set_layer_debug_disabled(layer_id as usize, !visible);
-    }
-
-    fn repaint(&mut self) {
-        self.rerender_current_frame();
     }
 
     /// The settings each line of the picture was drawn with, while line

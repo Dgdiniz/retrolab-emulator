@@ -12,12 +12,17 @@
 //! - **light-trace**: 65C816 tracing on (LightDebug tier + trace recording);
 //!   the trace buffer is drained each time it asks to flush so memory stays
 //!   bounded, exactly like a host draining it per frame.
+//! - **fast-recording**: the Fast tier with the two live recorders armed
+//!   (who wrote each byte of VRAM, and the frame-write log), the log taken
+//!   after every frame as a host takes it: what recording costs the play
+//!   loop.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
+use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
 use snes1_core::SnesEmulator;
 
@@ -34,6 +39,9 @@ pub enum TierArg {
     Light,
     /// LightDebug with 65C816 tracing active.
     LightTrace,
+    /// Fast path with the two live recorders armed and their log taken
+    /// every frame.
+    FastRecording,
 }
 
 #[derive(Args, Debug)]
@@ -75,6 +83,7 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     let run_fast = matches!(args.mode, TierArg::All | TierArg::Fast);
     let run_light = matches!(args.mode, TierArg::All | TierArg::Light);
     let run_trace = matches!(args.mode, TierArg::All | TierArg::LightTrace);
+    let run_recording = matches!(args.mode, TierArg::All | TierArg::FastRecording);
 
     if run_fast {
         let r = bench_tier(&mut emu, "fast", args.frames, |_| {}, false);
@@ -109,6 +118,22 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         );
         print_result(&r);
     }
+    if run_recording {
+        let r = bench_tier(
+            &mut emu,
+            "fast+recording",
+            args.frames,
+            |emu| {
+                emu.set_capture_recording(CaptureRecording {
+                    video_memory_sources: true,
+                    frame_writes: true,
+                    ..Default::default()
+                })
+            },
+            false,
+        );
+        print_result(&r);
+    }
 
     Ok(())
 }
@@ -134,6 +159,9 @@ fn bench_tier(
             let _ = emu.debugger().get_trace_flush_data(0);
             let _ = emu.debugger().get_trace_flush_data(1);
         }
+        // A host takes the frame's writes as it goes; nothing when the log
+        // is not recorded.
+        let _ = emu.take_frame_writes();
     }
     let elapsed = start.elapsed();
     let master_cycles = emu.master_cycles().saturating_sub(cycles_before);
@@ -146,9 +174,11 @@ fn bench_tier(
     }
 }
 
-/// Drop all breakpoints + tracing and return to `Running` so the next tier
-/// starts from a clean slate (and the core re-derives its tier from scratch).
+/// Drop all breakpoints, tracing and recording and return to `Running` so
+/// the next tier starts from a clean slate (and the core re-derives its
+/// tier from scratch).
 fn make_clean(emu: &mut SnesEmulator) {
+    emu.set_capture_recording(CaptureRecording::default());
     emu.reset();
     let dbg = emu.debugger();
     let ids: Vec<_> = dbg.list_breakpoints().iter().map(|b| b.id).collect();

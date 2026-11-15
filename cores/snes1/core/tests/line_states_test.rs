@@ -8,11 +8,12 @@
 //! the picture the frame left, while one drawn from the registers as they
 //! stand is not. Recording must change nothing the machine does.
 
+use retro_core::capture::{layer, planes, CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
 use retro_core::video::LineStateTable;
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode, Framebuffer};
 use snes1_core::debugger::snes_events;
-use snes1_core::{CaptureRecording, SnesBus, SnesEmulator};
+use snes1_core::{SnesBus, SnesEmulator};
 
 // -------------------------------------------------------------
 // Helpers
@@ -403,10 +404,68 @@ fn the_hdma_path_is_recorded() {
 }
 
 #[test]
+fn the_pixel_sources_of_a_raster_effect_describe_its_picture() {
+    let mut emu = hdma_scene_at_boundary();
+    let state = emu.state_hash();
+    let shown = picture(&emu);
+    let found = emu
+        .pixel_sources(planes::MAIN | planes::SUB_SCREEN)
+        .expect("a game is loaded");
+    assert!(found.matches_picture);
+    assert_eq!(found.frame, 3, "the number a snapshot gives the picture");
+    let sources = &found;
+    assert!(sources.from_line_states);
+    assert_eq!((sources.width, sources.height), (256, 224));
+    let layer = sources.layer.as_ref().unwrap();
+    let cell = sources.cell.as_ref().unwrap();
+    let at = |x: u32, y: u32| (y * 256 + x) as usize;
+    // Line 100 (row 99): window 1 clips BG1 inside it, where the backdrop
+    // shows; outside it, BG1 from the map column the line's scroll reads.
+    let (left, right) = hdma_window(100);
+    assert_eq!(layer[at(u32::from(left) + 1, 99)] & layer::WHAT_DREW, 0);
+    let x = u32::from(right) + 2;
+    assert_eq!(layer[at(x, 99)] & layer::WHAT_DREW, 1);
+    let screen_x = (x + u32::from(hdma_scroll(100))) & 0xFF;
+    assert_eq!(
+        u32::from(cell[at(x, 99)]),
+        0x0400 + (100 / 8) * 32 + screen_x / 8,
+        "the map entry of line 100's own scroll"
+    );
+    assert_eq!(emu.state_hash(), state);
+    assert_eq!(picture(&emu), shown);
+
+    // The window masks of each line are the window HDMA wrote for it.
+    let masks = emu.window_masks().expect("a game is loaded");
+    assert_eq!(masks.frame, 3);
+    assert!(masks.from_line_states);
+    for (row, &line) in masks.lines.iter().enumerate() {
+        let (left, right) = hdma_window(line);
+        let bg1 = &masks.masks[row * 256..row * 256 + 32];
+        for x in 0..256usize {
+            let inside = x >= usize::from(left) && x <= usize::from(right);
+            assert_eq!(
+                bg1[x >> 3] & (1 << (x & 7)) != 0,
+                inside,
+                "line {line} dot {x}"
+            );
+        }
+    }
+
+    // With no table kept, the frame is read from the registers as they
+    // stand: the raster effect is lost, and the pass says so.
+    emu.set_capture_recording(CaptureRecording::default());
+    let flat = emu.pixel_sources(planes::LAYER).unwrap();
+    assert!(!flat.from_line_states);
+    assert!(!flat.matches_picture);
+    assert!(!emu.window_masks().unwrap().from_line_states);
+    assert_eq!(emu.state_hash(), state);
+}
+
+#[test]
 fn a_layer_render_keeps_the_raster_effect() {
     let mut emu = hdma_scene_at_boundary();
     assert!(emu.draws_from_line_states());
-    let layer = emu.render_layer(0).expect("BG1");
+    let layer = emu.render_layer(0).expect("BG1").image;
     assert_eq!((layer.width, layer.height), (256, 224));
     for y in 0..224 {
         for x in [0u32, 7, 100, 255] {
@@ -421,7 +480,7 @@ fn a_layer_render_keeps_the_raster_effect() {
     // with the scroll the last HDMA line wrote, the one for line 225.
     assert_eq!(emu.ppu().bg_hoffset(0), hdma_scroll(225));
     emu.set_capture_recording(CaptureRecording::default());
-    let flat = emu.render_layer(0).expect("BG1");
+    let flat = emu.render_layer(0).expect("BG1").image;
     assert_ne!(flat.rgba, layer.rgba);
     for y in [0u32, 100, 223] {
         assert_eq!(
@@ -618,6 +677,42 @@ fn memory_a_line_saw_is_put_back() {
     assert_eq!(picture(&emu), shown);
     assert_eq!(video_memory(&emu), memory);
     assert_eq!(emu.state_hash(), state);
+}
+
+#[test]
+fn each_line_lists_its_sprites_as_the_sprite_table_stood_for_it() {
+    let mut emu = mid_frame_memory(line_states_on());
+    emu.run_frame();
+    emu.run_frame();
+    emu.run_to_capture_boundary();
+    let sprites = emu.line_sprites().expect("a game is loaded");
+    assert!(sprites.from_line_states);
+    let sources = emu.pixel_sources(planes::MAIN).unwrap();
+    assert!(sources.matches_picture);
+    let cell = sources.cell.as_ref().unwrap();
+    let layer = sources.layer.as_ref().unwrap();
+    // Sprite 1 spans lines 97-104; the IRQ at line 100 moves it to x 192.
+    let mut places = Vec::new();
+    for line in 97..=104u16 {
+        let row = sprites
+            .lines
+            .chunks(4)
+            .find(|row| row[0] == line)
+            .expect("the line is listed");
+        let (first, count) = (usize::from(row[1]), usize::from(row[2]));
+        let entry = (first..first + count)
+            .find(|&i| sprites.slots[i] == 1)
+            .expect("sprite 1 is on the line");
+        let x = sprites.x[entry];
+        places.push(x);
+        // Where the line drew, the sprite's pixels name it.
+        let at = (u32::from(line - 1) * 256 + x as u32) as usize;
+        if layer[at] & layer::WHAT_DREW != layer::NOTHING {
+            assert_eq!(cell[at], 1, "line {line}: sprite 1 at x {x}");
+        }
+    }
+    assert_eq!(places.first(), Some(&i16::from(SPRITE_X)));
+    assert_eq!(places.last(), Some(&0xC0));
 }
 
 #[test]
@@ -1044,9 +1139,18 @@ fn every_register_written_down_the_frame_is_drawn_again() {
             let memory = video_memory(&emu);
             let state = emu.state_hash();
             assert_eq!(redrawn(&mut emu), shown, "{bases:02x?} frame {frame}");
+            // The redraw that notes where each pixel came from draws it too.
+            let found = emu
+                .pixel_sources(planes::MAIN | planes::SUB_SCREEN)
+                .unwrap();
+            assert!(found.matches_picture, "{bases:02x?} frame {frame}");
+            let _ = emu.line_sprites();
+            let _ = emu.window_masks();
+            let _ = emu.offset_per_tile();
+            let _ = emu.render_sprites(&[1; 128]);
             assert_eq!(video_memory(&emu), memory);
             assert_eq!(emu.state_hash(), state);
-            let layer = emu.render_layer(0).expect("BG1");
+            let layer = emu.render_layer(0).expect("BG1").image;
             assert_eq!((layer.width, layer.height), (shown.0, shown.1));
             if frame == 3 {
                 emu.set_capture_recording(CaptureRecording::default());

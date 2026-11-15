@@ -20,14 +20,16 @@
 //! produces a new frame and expose that buffer (and the active
 //! dimensions) through the framebuffer accessors.
 
+use retro_core::capture::CaptureCore;
 use retro_core::cartridge::CartridgeDebugger;
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
-use retro_core::video::PixelImage;
 use retro_core::*;
+use retro_wasm::js::{map_as_object, plain_object, set_property, uint16_array, uint8_array};
 use snes1_core::{
-    format_trace_line_65816, format_trace_line_spc700, parse_manifest, CaptureRecording,
-    CoprocessorMode, SnesEmulator, TileSetSource, TraceEntryBinary65816, TraceEntryBinarySpc700,
-    TRACE_ENTRY_SIZE_65816, TRACE_ENTRY_SIZE_CX4, TRACE_ENTRY_SIZE_GSU, TRACE_ENTRY_SIZE_SPC700,
+    format_trace_line_65816, format_trace_line_spc700, parse_manifest, CoprocessorMode,
+    SnesEmulator, SnesSnapshotConsole, TileSetSource, TraceEntryBinary65816,
+    TraceEntryBinarySpc700, TRACE_ENTRY_SIZE_65816, TRACE_ENTRY_SIZE_CX4, TRACE_ENTRY_SIZE_GSU,
+    TRACE_ENTRY_SIZE_SPC700,
 };
 #[cfg(feature = "chip-cx4")]
 use snes1_core::{format_trace_line_cx4, TraceEntryBinaryCx4};
@@ -68,62 +70,17 @@ pub fn init() {
     console_error_panic_hook::set_once();
 }
 
-/// Serialize a value with maps rendered as plain JS objects.
-///
-/// The default `serde_wasm_bindgen` serializer emits a Rust `HashMap` as an ES
-/// `Map`, which a plain-object `x[key]` read on the JS side (e.g. the netplay
-/// input folder) silently reads as `undefined`. The mapping getters here are
-/// typed `Record<...>` on the JS side, so honour that contract.
-///
-/// Object keys must be text: a map with number keys is refused by the
-/// serializer, so callers pass gamepad maps through
-/// [`gamepad_map_with_text_keys`] first. A refusal returns `undefined`
-/// instead of panicking, because a panic here leaves the whole emulator
-/// refusing every later call.
-fn map_as_object<T: serde::Serialize>(value: &T) -> JsValue {
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
-    value.serialize(&serializer).unwrap_or(JsValue::UNDEFINED)
-}
-
-/// A plain JS object with these properties, in this order.
-fn plain_object(entries: &[(&str, JsValue)]) -> JsValue {
-    let obj = js_sys::Object::new();
-    for (key, value) in entries {
-        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
-    }
-    obj.into()
-}
-
-/// An RGBA image as `{ width, height, data: Uint8Array }`, the data copied.
-fn image_object(image: &PixelImage) -> JsValue {
-    plain_object(&[
-        ("width", JsValue::from_f64(f64::from(image.width))),
-        ("height", JsValue::from_f64(f64::from(image.height))),
-        (
-            "data",
-            js_sys::Uint8Array::from(image.rgba.as_slice()).into(),
-        ),
-    ])
-}
-
-/// The property names of [`CaptureRecording`]'s fields, as JS reads them.
-const RECORDING_KEYS: [&str; 5] = [
-    "lineStates",
-    "pixelSources",
-    "lineSprites",
-    "videoMemorySources",
-    "frameWrites",
-];
-
-/// The fields of a [`CaptureRecording`] in the order of [`RECORDING_KEYS`].
-fn recording_flags(recording: &mut CaptureRecording) -> [&mut bool; 5] {
-    [
-        &mut recording.line_states,
-        &mut recording.pixel_sources,
-        &mut recording.line_sprites,
-        &mut recording.video_memory_sources,
-        &mut recording.frame_writes,
-    ]
+/// The SNES's keys of a frame snapshot (`captureFrameSnapshot`), after
+/// `palette`: `oam`, a `Uint8Array` copy of OAM as `getOam` returns it, and
+/// `ppuSettings`, the PPU's settings as `getPpuSettings` returns them, a
+/// plain object.
+fn snapshot_console(console: &SnesSnapshotConsole, snapshot: &js_sys::Object) {
+    set_property(snapshot, "oam", &uint8_array(&console.oam));
+    set_property(
+        snapshot,
+        "ppuSettings",
+        &map_as_object(&console.ppu_settings),
+    );
 }
 
 /// Read a gamepad button map sent from JS: a `Map` with number keys, or a
@@ -375,229 +332,54 @@ impl RetroEmulator {
         self.refresh_present();
     }
 
-    // ===== Capture =====
+    // ===== Capture: the readers only this core has =====
 
-    /// Run to the next capture boundary and stop there: the frame's
-    /// active display drawn and its picture final, nothing of the vertical
-    /// blank run yet, so VRAM, CGRAM, OAM and the registers still hold what
-    /// the picture was drawn from. Held at a boundary already, the call
-    /// finishes that frame first, so each call advances exactly one frame.
-    /// The tier a frame call picks runs it, and a breakpoint stops it where
-    /// it stops (`atCaptureBoundary` is then `false`). Any other frame call
-    /// made at the boundary runs the rest of the held frame and returns;
-    /// a step leaves the boundary first; `saveState` finishes the frame
-    /// before it saves.
-    #[wasm_bindgen(js_name = runToCaptureBoundary)]
-    pub fn run_to_capture_boundary(&mut self) {
-        self.snes.run_to_capture_boundary();
-        self.refresh_present();
-    }
-
-    /// Whether the core is stopped at a capture boundary.
-    #[wasm_bindgen(js_name = atCaptureBoundary)]
-    pub fn at_capture_boundary(&self) -> bool {
-        self.snes.at_capture_boundary()
-    }
-
-    /// A frame's picture and the video memory and settings it was drawn
-    /// from, all copies (never views into WASM memory):
-    /// `{ frame, atBoundary, width, height, framebuffer: Uint8Array (RGBA
-    /// of the picture, packed), vram: Uint8Array (as getVram), palette:
-    /// Uint16Array (CGRAM, as getCgram), oam: Uint8Array (as getOam),
-    /// registers (as getPpuRegisters), ppuSettings (as getPpuSettings) }`.
-    /// At a capture boundary the picture and the memory belong to the same
-    /// frame; anywhere else (`atBoundary` false) the memory may already
-    /// hold the game's uploads for the next frame. `frame` is the number
-    /// `getFrameNumber` reports once this picture's frame is complete.
-    /// The snapshot and the objects in it are plain objects.
-    #[wasm_bindgen(js_name = captureFrameSnapshot)]
-    pub fn capture_frame_snapshot(&self) -> JsValue {
-        let snapshot = self.snes.capture_frame_snapshot();
-        let obj = js_sys::Object::new();
-        let set = |key: &str, value: &JsValue| {
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
-        };
-        set("frame", &JsValue::from_f64(snapshot.frame as f64));
-        set("atBoundary", &JsValue::from_bool(snapshot.at_boundary));
-        set("width", &JsValue::from_f64(f64::from(snapshot.width)));
-        set("height", &JsValue::from_f64(f64::from(snapshot.height)));
-        set(
-            "framebuffer",
-            &js_sys::Uint8Array::from(snapshot.framebuffer.as_slice()).into(),
-        );
-        set(
-            "vram",
-            &js_sys::Uint8Array::from(snapshot.vram.as_slice()).into(),
-        );
-        set(
-            "palette",
-            &js_sys::Uint16Array::from(snapshot.palette.as_slice()).into(),
-        );
-        set(
-            "oam",
-            &js_sys::Uint8Array::from(snapshot.oam.as_slice()).into(),
-        );
-        set("registers", &map_as_object(&snapshot.registers));
-        set("ppuSettings", &map_as_object(&snapshot.ppu_settings));
-        obj.into()
-    }
-
-    /// The held frame drawn again with only one layer in it, by the ids
-    /// `getLayerInfo` and `toggleLayer` use (0-3 BG1-4, 4 OBJ):
-    /// `{ width, height, data: Uint8Array }`, RGBA the size of the frame's
-    /// picture, alpha 0 on every pixel the layer does not cover (the
-    /// backdrop's included), or `null` for an unknown id. The layer is
-    /// drawn as the frame draws it, at the master brightness, whatever the
-    /// screens, the window clips and the debugger's layer mask say; colour
-    /// math is not applied. Emulation does not advance, the framebuffer
-    /// the host shows is left as it was, and so is everything a savestate
-    /// holds.
-    ///
-    /// `fromLineStates` says whether the layer was drawn from the frame's
-    /// line table (each line with its own settings and the video memory it
-    /// read, so a raster effect comes out as the frame drew it: see
-    /// `setCaptureRecording`) or from the registers as they stand.
-    #[wasm_bindgen(js_name = renderLayer)]
-    pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
-        let from_line_states = self.snes.draws_from_line_states();
-        match self.snes.render_layer(layer_id) {
-            Ok(img) => {
-                let obj = image_object(&img);
-                let _ = js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("fromLineStates"),
-                    &JsValue::from_bool(from_line_states),
-                );
-                obj
-            }
-            Err(_) => JsValue::NULL,
-        }
-    }
-
-    /// Choose what the core records while frames run, for a capture to
-    /// read: `options` is `{ lineStates?, pixelSources?, lineSprites?,
-    /// videoMemorySources?, frameWrites? }`, booleans; a key left out keeps
-    /// its value. All off at first; kept across `loadRom` and `reset`,
-    /// never in a savestate, and nothing recorded changes what the game
-    /// does. `lineStates` keeps the line table (`getLineStates`,
-    /// `getLinePalettes`, `pictureFromLineStates`), from which
-    /// `repaintFrame` and `renderLayer` then draw the frame again; on this
-    /// core `pixelSources` and `lineSprites` are worked out from that table,
-    /// so either of them keeps it too. This core records nothing for
-    /// `videoMemorySources` and `frameWrites`. A table armed in the middle
-    /// of a frame holds that frame only from there; the next frame's is
-    /// whole.
-    #[wasm_bindgen(js_name = setCaptureRecording)]
-    pub fn set_capture_recording(&mut self, options: JsValue) {
-        let mut recording = self.snes.capture_recording();
-        for (key, flag) in RECORDING_KEYS.iter().zip(recording_flags(&mut recording)) {
-            let given = js_sys::Reflect::get(&options, &JsValue::from_str(key))
-                .ok()
-                .and_then(|value| value.as_bool());
-            if let Some(on) = given {
-                *flag = on;
-            }
-        }
-        self.snes.set_capture_recording(recording);
-    }
-
-    /// What the core records: `{ lineStates, pixelSources, lineSprites,
-    /// videoMemorySources, frameWrites }`, a plain object of booleans.
-    #[wasm_bindgen(js_name = getCaptureRecording)]
-    pub fn get_capture_recording(&self) -> JsValue {
-        let mut recording = self.snes.capture_recording();
-        let entries: Vec<(&str, JsValue)> = RECORDING_KEYS
-            .iter()
-            .zip(recording_flags(&mut recording))
-            .map(|(key, flag)| (*key, JsValue::from_bool(*flag)))
-            .collect();
-        plain_object(&entries)
-    }
-
-    /// The settings each line of the frame drawn last was drawn with, when
-    /// `lineStates` is recorded: `null`, or `{ frame, fromFirstLine,
-    /// complete, memoryExact, rowsPerLine, firstRowLine, columns: string[],
-    /// values: Uint32Array }`. `columns` names each value of a row: `line`
-    /// (the scanline, 1 for the first drawn) and then every setting the
-    /// renderer reads, in the core's own names (`bg_hoffset[0]`,
-    /// `window_enable[2].w1_enable`, `mode7_matrix_a`...), raw as stored;
-    /// `values` holds the rows one after the other. `frame` is the number
-    /// `captureFrameSnapshot` gives the same frame. `fromFirstLine` and
-    /// `complete` say the table holds the frame from its first line to its
-    /// finished picture; `memoryExact` that the video memory can be put
-    /// back as each line read it (no log filled up, no debugger edit since);
-    /// `rowsPerLine` (1, or 2 for a woven or doubled hires frame) and
-    /// `firstRowLine` (1, or 8 when the overscan lines are cropped) map the
-    /// lines to the picture's rows. Copies, never views into WASM memory.
-    #[wasm_bindgen(js_name = getLineStates)]
-    pub fn get_line_states(&self) -> JsValue {
-        let Some(table) = self.snes.line_states() else {
+    /// Each line's window masks: `null` when no game is loaded, else
+    /// `{ frame, fromLineStates, lines: Uint16Array, masks: Uint8Array }`.
+    /// `lines` lists every line the frame drew, in order; `masks` holds 8
+    /// masks a line of 32 bytes: the window regions of BG1, BG2, BG3, BG4
+    /// and the sprites (where the layer's combined windows cover, whether or
+    /// not the screens clip the layer there), the colour window's region,
+    /// where the main screen keeps its pixels and where colour math may run.
+    /// Bit `x & 7` of byte `x >> 3` is dot `x`; in a hires line output
+    /// column `k` is dot `k >> 1`. Copies.
+    #[wasm_bindgen(js_name = getWindowMasks)]
+    pub fn get_window_masks(&self) -> JsValue {
+        let Some(masks) = self.snes.window_masks() else {
             return JsValue::NULL;
         };
-        let columns = js_sys::Array::new();
-        for name in &table.columns {
-            columns.push(&JsValue::from_str(name));
-        }
+        plain_object(&[
+            ("frame", JsValue::from_f64(masks.frame as f64)),
+            ("fromLineStates", JsValue::from_bool(masks.from_line_states)),
+            ("lines", uint16_array(&masks.lines)),
+            ("masks", uint8_array(&masks.masks)),
+        ])
+    }
+
+    /// The offset-per-tile columns of the held frame: `null` when no game is
+    /// loaded, else `{ frame, fromLineStates, lines: Uint16Array, columns,
+    /// scroll: Uint16Array, replaced: Uint8Array }`. One row for each line
+    /// drawn in Mode 2, 4 or 6 outside forced blank (two for a line of an
+    /// interlaced hires frame, one for each background line it wove);
+    /// `lines` names each row's line. `columns` tile columns a row: 33, or
+    /// 65 when a row is Mode 6. Per row, per background (BG1, BG2), per
+    /// column: `scroll` holds the horizontal then the vertical tilemap
+    /// coordinate the column was fetched at, absolute (the scroll already in
+    /// them); `replaced` bit 0 BG3 replaced the horizontal scroll, bit 1 the
+    /// vertical, bit 7 the column lies past the line's end. Copies.
+    #[wasm_bindgen(js_name = getOffsetPerTile)]
+    pub fn get_offset_per_tile(&self) -> JsValue {
+        let Some(table) = self.snes.offset_per_tile() else {
+            return JsValue::NULL;
+        };
         plain_object(&[
             ("frame", JsValue::from_f64(table.frame as f64)),
-            ("fromFirstLine", JsValue::from_bool(table.from_first_line)),
-            ("complete", JsValue::from_bool(table.complete)),
-            ("memoryExact", JsValue::from_bool(table.memory_exact)),
-            (
-                "rowsPerLine",
-                JsValue::from_f64(f64::from(table.rows_per_line)),
-            ),
-            (
-                "firstRowLine",
-                JsValue::from_f64(f64::from(table.first_row_line)),
-            ),
-            ("columns", columns.into()),
-            (
-                "values",
-                js_sys::Uint32Array::from(table.values.as_slice()).into(),
-            ),
+            ("fromLineStates", JsValue::from_bool(table.from_line_states)),
+            ("lines", uint16_array(&table.lines)),
+            ("columns", JsValue::from_f64(f64::from(table.columns))),
+            ("scroll", uint16_array(&table.scroll)),
+            ("replaced", uint8_array(&table.replaced)),
         ])
-    }
-
-    /// The palettes the lines of the line table were drawn with: `null`, or
-    /// `{ coloursPerPalette, palettes: Uint16Array, paletteOfLine:
-    /// Uint16Array }`. `palettes` holds each distinct CGRAM a line read
-    /// once, `coloursPerPalette` (256) colours apiece, in CGRAM's own BGR555
-    /// words; `paletteOfLine` has one entry per row of `getLineStates`, the
-    /// palette that line was drawn with. Copies.
-    #[wasm_bindgen(js_name = getLinePalettes)]
-    pub fn get_line_palettes(&self) -> JsValue {
-        let Some(palettes) = self.snes.line_palettes() else {
-            return JsValue::NULL;
-        };
-        plain_object(&[
-            (
-                "coloursPerPalette",
-                JsValue::from_f64(f64::from(palettes.colours_per_palette)),
-            ),
-            (
-                "palettes",
-                js_sys::Uint16Array::from(palettes.palettes.as_slice()).into(),
-            ),
-            (
-                "paletteOfLine",
-                js_sys::Uint16Array::from(palettes.palette_of_line.as_slice()).into(),
-            ),
-        ])
-    }
-
-    /// The frame's picture drawn again from its line table, each line with
-    /// its own settings and the video memory it read: `null` when the
-    /// table does not hold a whole frame, or `{ width, height, data:
-    /// Uint8Array }`, RGBA cropped as the picture is. It equals the picture
-    /// the frame left unless `memoryExact` is false. Does not advance, does
-    /// not touch the framebuffer, leaves the state hash alone.
-    #[wasm_bindgen(js_name = pictureFromLineStates)]
-    pub fn picture_from_line_states(&mut self) -> JsValue {
-        match self.snes.picture_from_line_states() {
-            Some(image) => image_object(&image),
-            None => JsValue::NULL,
-        }
     }
 
     /// The PPU's settings in the core's own field names (`PpuSettings`),
@@ -1051,7 +833,7 @@ impl RetroEmulator {
     /// savestate never holds it.
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&mut self) -> Vec<u8> {
-        let state = self.snes.save_state_finishing_held_frame();
+        let state = self.snes.save_state_at_frame_end();
         self.refresh_present();
         state
     }
@@ -1154,7 +936,8 @@ impl RetroEmulator {
     }
 
     /// Catalog of event classes this core can break on (VBlank, NMI, IRQ,
-    /// DMA/HDMA start, scanline, PPU/APU/DSP register writes), for the
+    /// DMA/HDMA start, scanline, PPU/APU/DSP register writes, a DMA channel
+    /// done by its port, a palette colour written, a tile changed), for the
     /// event breakpoint picker.
     #[wasm_bindgen(js_name = getAvailableEvents)]
     pub fn get_available_events(&mut self) -> JsValue {
@@ -1936,25 +1719,6 @@ impl RetroEmulator {
         self.snes.video_debugger().toggle_layer(layer_id, visible);
     }
 
-    /// Re-render the held frame plus the debugger layer mask, without
-    /// advancing emulation: from the frame's line table when it holds the
-    /// frame (`setCaptureRecording`), each line with its own settings and
-    /// the video memory it read, else from the present PPU state. The host
-    /// calls this after a `toggleLayer` while paused so the canvas reflects
-    /// the change at once (a running core repaints on its own next frame; a
-    /// paused one never would). Drives
-    /// [`SnesEmulator::repaint_held_frame`], the SNES equivalent of `sg1`'s
-    /// `repaintFrame`.
-    #[wasm_bindgen(js_name = repaintFrame)]
-    pub fn repaint_frame(&mut self) {
-        self.snes.repaint_held_frame();
-        // Re-pack the freshly rendered active rectangle so the next
-        // framebuffer read sees the repaint (the live loop refreshes the
-        // present buffer after each frame; a paused repaint must do it
-        // explicitly).
-        self.refresh_present();
-    }
-
     /// Mute/unmute one S-DSP voice (0-7) in the debugger without altering
     /// the game's key-on state.
     #[wasm_bindgen(js_name = muteDspChannel)]
@@ -1978,6 +1742,18 @@ impl RetroEmulator {
         self.snes.audio_debugger().get_waveform(channel, samples)
     }
 }
+
+// The capture methods every core exports the same way (`runToCaptureBoundary`,
+// `captureFrameSnapshot`, `renderLayer`, `getPixelSources`, `takeFrameWrites`
+// and the rest), over `CaptureCore` on the emulator; `refresh_present` runs
+// after the two that run or redraw a frame, so the packed framebuffer shows
+// it.
+retro_wasm::capture_bindings!(
+    RetroEmulator,
+    snes,
+    console = snapshot_console,
+    after_frame = refresh_present
+);
 
 #[cfg(test)]
 mod tests {
@@ -2054,8 +1830,18 @@ mod tests {
     /// A 128 KiB LoROM that loops at `$00:8000`, named by `title`, so two
     /// titles make two ROMs with different hashes.
     fn synth_lorom(title: &str) -> Vec<u8> {
+        lorom_running(title, &[0x80, 0xFE], &[]) // BRA -2
+    }
+
+    /// A 128 KiB LoROM named by `title` that runs `program` from `$00:8000`,
+    /// with each `(address, bytes)` of `data` at that address of bank `$00`.
+    fn lorom_running(title: &str, program: &[u8], data: &[(u16, &[u8])]) -> Vec<u8> {
         let mut rom = vec![0u8; 0x2_0000];
-        rom[..2].copy_from_slice(&[0x80, 0xFE]); // BRA -2
+        rom[..program.len()].copy_from_slice(program);
+        for (address, bytes) in data {
+            let at = usize::from(address - 0x8000);
+            rom[at..at + bytes.len()].copy_from_slice(bytes);
+        }
         let header = 0x7FB0;
         let name = format!("{title:<21}");
         rom[header + 0x10..header + 0x25].copy_from_slice(&name.as_bytes()[..21]);
@@ -2129,7 +1915,7 @@ mod tests {
         let mut emu = RetroEmulator::new("snes").unwrap();
         let events: Vec<EventClass> =
             serde_wasm_bindgen::from_value(emu.get_available_events()).unwrap();
-        assert_eq!(events.len(), 9);
+        assert_eq!(events.len(), 12);
         // The first VBlank event can back an event breakpoint.
         let code = events[0].code;
         let id = emu.add_event_breakpoint(code, 0xFFFF_FFFF);
@@ -2583,7 +2369,7 @@ mod tests {
         let flags = |emu: &RetroEmulator| -> Vec<Option<bool>> {
             let switch = emu.get_capture_recording();
             assert_plain_object(&switch, "lineStates");
-            RECORDING_KEYS
+            retro_wasm::capture::RECORDING_KEYS
                 .iter()
                 .map(|key| property(&switch, key).as_bool())
                 .collect()
@@ -2687,6 +2473,337 @@ mod tests {
         assert_eq!(from_line_states(&mut emu), Some(false));
     }
 
+    /// The typed array under `key`, which must be a `T`.
+    fn typed<T: JsCast>(object: &JsValue, key: &str) -> T {
+        property(object, key)
+            .dyn_into()
+            .unwrap_or_else(|_| panic!("{key} is not the typed array it should be"))
+    }
+
+    /// Whether `object` has a property `key`.
+    fn has(object: &JsValue, key: &str) -> bool {
+        js_sys::Reflect::has(object, &JsValue::from_str(key)).unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    fn the_pixel_sources_are_a_plain_object_of_copies() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        assert!(
+            idle.get_pixel_sources(None).is_null(),
+            "no game, no sources"
+        );
+
+        let mut emu = recording_a_red_screen();
+        let sources = emu.get_pixel_sources(None);
+        assert_plain_object(&sources, "layer");
+        assert_eq!(property(&sources, "frame").as_f64(), Some(2.0));
+        assert_eq!(property(&sources, "width").as_f64(), Some(256.0));
+        assert_eq!(property(&sources, "height").as_f64(), Some(224.0));
+        assert_eq!(property(&sources, "fromLineStates").as_bool(), Some(true));
+        assert_eq!(property(&sources, "matchesPicture").as_bool(), Some(true));
+        let pixels = 256 * 224;
+        // A red backdrop and no layer: the backdrop drew every pixel, no
+        // colour math, no character, no cell.
+        let layer: js_sys::Uint16Array = typed(&sources, "layer");
+        assert_eq!(layer.length(), pixels);
+        assert!(layer.to_vec().iter().all(|&value| value == 0x0070));
+        let colour: js_sys::Uint16Array = typed(&sources, "colour");
+        assert_eq!(colour.length(), pixels);
+        let tile: js_sys::Uint32Array = typed(&sources, "tile");
+        assert_eq!(tile.length(), pixels);
+        let cell: js_sys::Uint16Array = typed(&sources, "cell");
+        assert!(cell.to_vec().iter().all(|&value| value == 0xFFFF));
+        assert!(!has(&sources, "subLayer") && !has(&sources, "subColour"));
+
+        layer.set_index(0, 7);
+        let again: js_sys::Uint16Array = typed(&emu.get_pixel_sources(None), "layer");
+        assert_eq!(again.get_index(0), 0x0070, "a copy, not a view");
+
+        // The layer and the sub screen alone.
+        let some = emu.get_pixel_sources(Some(1 | 16));
+        assert_plain_object(&some, "subLayer");
+        let sub_layer: js_sys::Uint8Array = typed(&some, "subLayer");
+        assert_eq!(sub_layer.length(), pixels);
+        assert!(
+            sub_layer.to_vec().iter().all(|&value| value == 7),
+            "no colour math: the line built no sub screen"
+        );
+        let sub_colour: js_sys::Uint16Array = typed(&some, "subColour");
+        assert_eq!(sub_colour.length(), pixels);
+        let _: js_sys::Uint16Array = typed(&some, "layer");
+        for key in ["colour", "tile", "cell"] {
+            assert!(!has(&some, key), "{key} was not asked for");
+        }
+    }
+
+    /// A machine running [`synth_lorom`] with the line table kept and the
+    /// sprites shown over a red backdrop: OAM is all zero, so all 128
+    /// sprites sit at (0, 0) as 8x8 sprites of character 0, which is
+    /// filled with colour 1 (green in sprite palette 0). Held at the
+    /// capture boundary of its second frame.
+    fn recording_sprites() -> RetroEmulator {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("LINE SPRITES")).unwrap();
+        emu.set_capture_recording(recording_options(&[("lineStates", true)]));
+        emu.write_cgram(0, &[0x001F]);
+        emu.write_cgram(129, &[0x03E0]);
+        // Character 0, 4bpp: plane 0 set on every row, the rest clear.
+        emu.write_vram(0, &[0x00FF; 8]);
+        emu.write_memory_debug(0x212C, &[0x10]);
+        emu.write_memory_debug(0x2100, &[0x0F]);
+        emu.run_to_capture_boundary();
+        emu.run_to_capture_boundary();
+        emu
+    }
+
+    #[wasm_bindgen_test]
+    fn the_line_sprites_are_a_plain_object_of_copies() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        assert!(idle.get_line_sprites().is_null(), "no game, no sprites");
+
+        let mut emu = recording_sprites();
+        let sprites = emu.get_line_sprites();
+        assert_plain_object(&sprites, "drawnWidth");
+        assert_eq!(property(&sprites, "frame").as_f64(), Some(2.0));
+        assert_eq!(property(&sprites, "fromLineStates").as_bool(), Some(true));
+        let lines: js_sys::Uint16Array = typed(&sprites, "lines");
+        assert_eq!(lines.length(), 224 * 4);
+        let slots: js_sys::Uint8Array = typed(&sprites, "slots");
+        let fates: js_sys::Uint8Array = typed(&sprites, "fates");
+        let x: js_sys::Int16Array = typed(&sprites, "x");
+        let width: js_sys::Uint8Array = typed(&sprites, "width");
+        let drawn: js_sys::Uint8Array = typed(&sprites, "drawnWidth");
+        // Lines 1-8 meet all 128 sprites: 32 kept and drawn whole, 96 over
+        // the range limit; the other lines meet none.
+        let entries = 8 * 128;
+        for column in [
+            slots.length(),
+            fates.length(),
+            x.length(),
+            width.length(),
+            drawn.length(),
+        ] {
+            assert_eq!(column, entries);
+        }
+        let lines = lines.to_vec();
+        assert_eq!(&lines[..4], &[1, 0, 128, 1], "line 1, over range");
+        assert_eq!(&lines[8 * 4..9 * 4], &[9, entries as u16, 0, 0]);
+        let fates = fates.to_vec();
+        assert!(fates[..32].iter().all(|&fate| fate == 0));
+        assert!(fates[32..128].iter().all(|&fate| fate == 3));
+        assert_eq!(&slots.to_vec()[..3], &[0, 1, 2]);
+        assert!(drawn.to_vec()[..32].iter().all(|&pixels| pixels == 8));
+        assert!(width.to_vec().iter().all(|&pixels| pixels == 8));
+
+        x.set_index(0, 99);
+        let again: js_sys::Int16Array = typed(&emu.get_line_sprites(), "x");
+        assert_eq!(again.get_index(0), 0, "a copy, not a view");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_sprite_render_draws_the_chosen_sprites_after_priority() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        assert!(idle.render_sprites(&[1]).is_null(), "no game, no render");
+
+        let mut emu = recording_sprites();
+        let alpha_at = |image: &JsValue, x: u32, y: u32| -> u8 {
+            let data: js_sys::Uint8Array = typed(image, "data");
+            data.get_index((y * 256 + x) * 4 + 3)
+        };
+        let every = emu.render_sprites(&[1u8; 128]);
+        assert_plain_object(&every, "fromLineStates");
+        assert_eq!(property(&every, "width").as_f64(), Some(256.0));
+        assert_eq!(property(&every, "height").as_f64(), Some(224.0));
+        assert_eq!(property(&every, "fromLineStates").as_bool(), Some(true));
+        let data: js_sys::Uint8Array = typed(&every, "data");
+        assert_eq!(data.length(), 256 * 224 * 4);
+        assert_eq!(alpha_at(&every, 0, 0), 0xFF);
+        assert_eq!(alpha_at(&every, 8, 0), 0);
+        assert_eq!(alpha_at(&every, 0, 8), 0);
+        // Slot 0 is in front of the others at (0, 0): chosen alone it
+        // shows; slot 1 alone shows nothing, being behind slot 0.
+        assert_eq!(alpha_at(&emu.render_sprites(&[1]), 0, 0), 0xFF);
+        assert_eq!(alpha_at(&emu.render_sprites(&[0, 1]), 0, 0), 0);
+        assert_eq!(alpha_at(&emu.render_sprites(&[]), 0, 0), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_window_masks_are_a_plain_object_of_copies() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        assert!(idle.get_window_masks().is_null(), "no game, no masks");
+
+        let emu = recording_a_red_screen();
+        let masks = emu.get_window_masks();
+        assert_plain_object(&masks, "masks");
+        assert_eq!(property(&masks, "frame").as_f64(), Some(2.0));
+        assert_eq!(property(&masks, "fromLineStates").as_bool(), Some(true));
+        let lines: js_sys::Uint16Array = typed(&masks, "lines");
+        assert_eq!(lines.length(), 224);
+        assert_eq!(lines.get_index(0), 1);
+        let bytes: js_sys::Uint8Array = typed(&masks, "masks");
+        assert_eq!(bytes.length(), 224 * 8 * 32);
+        // No window on: the six regions are empty; the main screen is kept
+        // and colour math allowed everywhere.
+        let line = bytes.to_vec()[..256].to_vec();
+        assert!(line[..6 * 32].iter().all(|&byte| byte == 0));
+        assert!(line[6 * 32..].iter().all(|&byte| byte == 0xFF));
+    }
+
+    #[wasm_bindgen_test]
+    fn the_offset_per_tile_columns_are_a_plain_object_of_copies() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        assert!(idle.get_offset_per_tile().is_null(), "no game, no columns");
+
+        let mut emu = recording_a_red_screen();
+        let table = emu.get_offset_per_tile();
+        assert_plain_object(&table, "replaced");
+        assert_eq!(property(&table, "fromLineStates").as_bool(), Some(true));
+        assert_eq!(property(&table, "columns").as_f64(), Some(33.0));
+        let lines: js_sys::Uint16Array = typed(&table, "lines");
+        assert_eq!(lines.length(), 0, "Mode 0 has no offset-per-tile");
+
+        // Mode 2 from the next frame on.
+        emu.write_memory_debug(0x2105, &[0x02]);
+        emu.run_to_capture_boundary();
+        let table = emu.get_offset_per_tile();
+        assert_eq!(property(&table, "frame").as_f64(), Some(3.0));
+        let lines: js_sys::Uint16Array = typed(&table, "lines");
+        assert_eq!(lines.length(), 224);
+        let scroll: js_sys::Uint16Array = typed(&table, "scroll");
+        assert_eq!(scroll.length(), 224 * 2 * 33 * 2);
+        let replaced: js_sys::Uint8Array = typed(&table, "replaced");
+        assert_eq!(replaced.length(), 224 * 2 * 33);
+        // No scroll: column 32 starts at dot 256, past the line.
+        assert_eq!(replaced.get_index(32), 0x80);
+        assert_eq!(replaced.get_index(0), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_video_memory_sources_are_a_plain_object_of_copies() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        assert!(
+            idle.get_video_memory_sources().is_null(),
+            "not recorded, no sources"
+        );
+
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("VRAM SOURCES")).unwrap();
+        emu.set_capture_recording(recording_options(&[("videoMemorySources", true)]));
+        assert_eq!(
+            property(&emu.get_capture_recording(), "videoMemorySources").as_bool(),
+            Some(true)
+        );
+        let sources = emu.get_video_memory_sources();
+        assert_plain_object(&sources, "origins");
+        let origins: js_sys::Uint32Array = typed(&sources, "origins");
+        let frames: js_sys::Uint32Array = typed(&sources, "frames");
+        assert_eq!(origins.length(), 0x1_0000);
+        assert_eq!(frames.length(), 0x1_0000);
+        assert!(
+            origins.to_vec().iter().all(|&origin| origin == 0),
+            "empty when turned on"
+        );
+
+        // A debugger write straight into VRAM, then one through the port
+        // (the reset state is forced blank: the port is open).
+        emu.write_vram(0x10, &[1, 2]);
+        emu.write_memory_debug(0x2115, &[0x80]);
+        emu.write_memory_debug(0x2116, &[0x00, 0x10]);
+        emu.write_memory_debug(0x2118, &[0xAA]);
+        let sources = emu.get_video_memory_sources();
+        let origins: js_sys::Uint32Array = typed(&sources, "origins");
+        let frames: js_sys::Uint32Array = typed(&sources, "frames");
+        for byte in [0x20, 0x21, 0x2000] {
+            assert_eq!(
+                origins.get_index(byte),
+                0x4000_0000,
+                "byte {byte:#x}: the debugger"
+            );
+            assert_eq!(frames.get_index(byte), 1, "byte {byte:#x}: frame 1");
+        }
+        assert_eq!(origins.get_index(0x2001), 0, "not written");
+
+        origins.set_index(0x20, 7);
+        let again: js_sys::Uint32Array = typed(&emu.get_video_memory_sources(), "origins");
+        assert_eq!(again.get_index(0x20), 0x4000_0000, "a copy, not a view");
+    }
+
+    #[wasm_bindgen_test]
+    fn resolving_sources_answers_an_int32_array_of_rom_offsets_and_codes() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("RESOLVE SOURCES")).unwrap();
+        let addresses = [
+            0x00_8000u32,
+            0x81_8123,
+            0x7E_0040,
+            0x00_1FFF,
+            0x00_2100,
+            0x40_0000,
+        ];
+        let resolved = emu.resolve_sources(&addresses);
+        let value: JsValue = resolved.clone().into();
+        assert!(value.is_instance_of::<js_sys::Int32Array>());
+        assert_eq!(
+            resolved.to_vec(),
+            vec![0, 0x8123, -2, -2, -1, -1],
+            "ROM, its mirror, work RAM, its mirror, the B bus, open bus"
+        );
+        resolved.set_index(0, 99);
+        assert_eq!(emu.resolve_sources(&addresses).get_index(0), 0, "a copy");
+        assert_eq!(emu.resolve_sources(&[]).length(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_frame_writes_are_a_plain_object_of_copies_emptied_by_a_take() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        assert!(
+            idle.take_frame_writes().is_null(),
+            "not recorded, no writes"
+        );
+
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&synth_lorom("FRAME WRITES")).unwrap();
+        emu.set_capture_recording(recording_options(&[("frameWrites", true)]));
+        // Two colours from work RAM into CGRAM by a DMA on channel 0, run at
+        // the end of the next instruction.
+        emu.write_memory_debug(0x7E_0000, &[0x1F, 0x00, 0xE0, 0x03]);
+        emu.write_memory_debug(0x2121, &[0x00]);
+        emu.write_memory_debug(0x4300, &[0x00, 0x22, 0x00, 0x00, 0x7E, 0x04, 0x00]);
+        emu.write_memory_debug(0x420B, &[0x01]);
+        let _ = emu.step();
+
+        let writes = emu.take_frame_writes();
+        assert_plain_object(&writes, "records");
+        assert_eq!(property(&writes, "wordsPerRecord").as_f64(), Some(8.0));
+        assert_eq!(property(&writes, "dropped").as_f64(), Some(0.0));
+        let records: js_sys::Uint32Array = typed(&writes, "records");
+        assert_eq!(records.length(), 8, "one DMA block");
+        let words = records.to_vec();
+        assert_eq!(words[0], 1, "a DMA block on channel 0, A to B, unit 0");
+        assert_eq!(words[1], 1, "frame 1");
+        assert_eq!(words[3], 0x7E_0000);
+        assert_eq!(words[4], 0x22 | (4 << 8));
+        assert_eq!((words[5], words[6]), (0, 1), "colours 0 to 1");
+
+        records.set_index(0, 0);
+        let again = emu.take_frame_writes();
+        let records: js_sys::Uint32Array = typed(&again, "records");
+        assert_eq!(records.length(), 0, "a take empties the log");
+    }
+
+    #[wasm_bindgen_test]
+    fn the_event_catalogue_lists_the_video_memory_events() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        let events = js_sys::Array::from(&emu.get_available_events());
+        let codes: Vec<f64> = events
+            .iter()
+            .map(|event| property(&event, "code").as_f64().unwrap())
+            .collect();
+        for code in [10.0, 11.0, 12.0] {
+            assert!(codes.contains(&code), "event {code} listed");
+        }
+    }
+
     #[wasm_bindgen_test]
     fn write_oam_reads_back_and_moves_a_sprite() {
         let mut emu = RetroEmulator::new("snes").unwrap();
@@ -2706,5 +2823,689 @@ mod tests {
             emu.get_oam().iter().all(|&byte| byte == 1),
             "a buffer longer than OAM is cut to it"
         );
+    }
+
+    /// The few 65C816 instructions the capture program needs, assembled in
+    /// emulation mode, the code starting at `$00:8000`.
+    #[derive(Default)]
+    struct Code(Vec<u8>);
+
+    impl Code {
+        /// The address of the next instruction.
+        fn here(&self) -> u16 {
+            0x8000 + self.0.len() as u16
+        }
+
+        /// Append `bytes` as they are.
+        fn op(&mut self, bytes: &[u8]) -> &mut Self {
+            self.0.extend_from_slice(bytes);
+            self
+        }
+
+        /// `LDA #value`, `STA address`.
+        fn store(&mut self, address: u16, value: u8) -> &mut Self {
+            let [low, high] = address.to_le_bytes();
+            self.op(&[0xA9, value, 0x8D, low, high])
+        }
+
+        /// `STZ address`.
+        fn zero(&mut self, address: u16) -> &mut Self {
+            let [low, high] = address.to_le_bytes();
+            self.op(&[0x9C, low, high])
+        }
+
+        /// `LDA from`, `STA to`.
+        fn copy(&mut self, from: u16, to: u16) -> &mut Self {
+            let [from_low, from_high] = from.to_le_bytes();
+            let [to_low, to_high] = to.to_le_bytes();
+            self.op(&[0xAD, from_low, from_high, 0x8D, to_low, to_high])
+        }
+
+        /// A DMA channel's A-bus address, `$00:address`, into the three
+        /// registers from `register` on.
+        fn source(&mut self, register: u16, address: u16) -> &mut Self {
+            let [low, high] = address.to_le_bytes();
+            self.store(register, low)
+                .store(register + 1, high)
+                .zero(register + 2)
+        }
+
+        /// A branch, `opcode`, to `target`.
+        fn branch(&mut self, opcode: u8, target: u16) -> &mut Self {
+            let offset = i32::from(target) - i32::from(self.here()) - 2;
+            self.op(&[opcode, offset as i8 as u8])
+        }
+    }
+
+    /// Where the capture program's tables sit in bank `$00`.
+    const PROGRAM_PALETTE: u16 = 0x9000;
+    const PROGRAM_CHARACTERS: u16 = 0x9020;
+    const PROGRAM_MAP: u16 = 0x9060;
+    const PROGRAM_SCROLLS: u16 = 0x90A0;
+
+    /// A program that draws, moves a sprite and writes video memory. It
+    /// loads sixteen colours (for the backgrounds, then for the sprites), two
+    /// characters and the first row of BG1's map by DMA, shows BG1 in Mode 1
+    /// and the sprites, and scrolls BG1 line by line by HDMA (32 lines at 4,
+    /// then 16 lines at 0, 2, ..., 30). In each vertical blank it counts a
+    /// frame in work RAM and, through the ports, moves sprite 0 to that x,
+    /// writes the count into the map entry at word `$0420` and into colour 2.
+    fn capture_program_rom() -> Vec<u8> {
+        let mut code = Code::default();
+        code.op(&[0x78]); // SEI
+        code.zero(0x2121).store(0x4300, 0x00).store(0x4301, 0x22);
+        code.source(0x4302, PROGRAM_PALETTE)
+            .store(0x4305, 32)
+            .zero(0x4306)
+            .store(0x420B, 0x01);
+        code.store(0x2121, 0x80)
+            .source(0x4302, PROGRAM_PALETTE)
+            .store(0x4305, 32)
+            .store(0x420B, 0x01);
+        code.store(0x2115, 0x80).zero(0x2116).zero(0x2117);
+        code.store(0x4300, 0x01).store(0x4301, 0x18);
+        code.source(0x4302, PROGRAM_CHARACTERS)
+            .store(0x4305, 64)
+            .store(0x420B, 0x01);
+        code.zero(0x2116).store(0x2117, 0x04);
+        code.source(0x4302, PROGRAM_MAP)
+            .store(0x4305, 64)
+            .store(0x420B, 0x01);
+        code.store(0x2105, 0x01)
+            .store(0x2107, 0x04)
+            .zero(0x210B)
+            .store(0x212C, 0x11)
+            .zero(0x2101);
+        // Sprite 0 at (16, 32), character 1, priority 3.
+        code.zero(0x2102).zero(0x2103);
+        code.store(0x2104, 16)
+            .store(0x2104, 32)
+            .store(0x2104, 0x01)
+            .store(0x2104, 0x30);
+        code.store(0x4310, 0x02)
+            .store(0x4311, 0x0D)
+            .source(0x4312, PROGRAM_SCROLLS)
+            .store(0x420C, 0x02);
+        code.store(0x2100, 0x0F);
+        let wait_for_blank = code.here();
+        code.op(&[0xAD, 0x12, 0x42]).branch(0x10, wait_for_blank); // LDA $4212, BPL
+        code.op(&[0xEE, 0x00, 0x00]); // INC $0000
+        code.zero(0x2102)
+            .zero(0x2103)
+            .copy(0x0000, 0x2104)
+            .store(0x2104, 32);
+        code.store(0x2116, 0x20)
+            .store(0x2117, 0x04)
+            .copy(0x0000, 0x2118)
+            .zero(0x2119);
+        code.store(0x2121, 0x02).copy(0x0000, 0x2122).zero(0x2122);
+        let wait_for_lines = code.here();
+        code.op(&[0xAD, 0x12, 0x42]).branch(0x30, wait_for_lines); // LDA $4212, BMI
+        code.branch(0x80, wait_for_blank); // BRA
+
+        let palette: Vec<u8> = [
+            0x2800u16, 0x03FF, 0x7C1F, 0x001F, 0x03E0, 0x7C00, 0x7FFF, 0x0421, 0x0842, 0x0C63,
+            0x1084, 0x14A5, 0x18C6, 0x1CE7, 0x2108, 0x2529,
+        ]
+        .iter()
+        .flat_map(|colour| colour.to_le_bytes())
+        .collect();
+        let mut characters = [0u8; 64];
+        for row in 0..8 {
+            characters[2 * row] = 0xFF >> row;
+            characters[2 * row + 1] = 1 << row;
+            characters[32 + 2 * row] = if row % 2 == 0 { 0xAA } else { 0x55 };
+            characters[32 + 2 * row + 1] = 0xF0;
+            characters[48 + 2 * row] = 0x0F;
+        }
+        let map: Vec<u8> = (0u16..32)
+            .flat_map(|entry| {
+                let word = (entry & 1)
+                    | (((entry >> 1) & 7) << 10)
+                    | (((entry >> 2) & 1) << 13)
+                    | (((entry >> 3) & 1) << 14)
+                    | (((entry >> 4) & 1) << 15);
+                word.to_le_bytes()
+            })
+            .collect();
+        let mut scrolls = vec![0x20, 0x04, 0x00, 0x90];
+        for line in 0..16u8 {
+            scrolls.extend([2 * line, 0x00]);
+        }
+        scrolls.push(0x00);
+        lorom_running(
+            "CAPTURE PROGRAM",
+            &code.0,
+            &[
+                (PROGRAM_PALETTE, &palette),
+                (PROGRAM_CHARACTERS, &characters),
+                (PROGRAM_MAP, &map),
+                (PROGRAM_SCROLLS, &scrolls),
+            ],
+        )
+    }
+
+    /// The capture program with every recorder armed before its first frame,
+    /// held at the capture boundary of its third frame.
+    fn running_the_capture_program() -> RetroEmulator {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&capture_program_rom()).unwrap();
+        emu.set_capture_recording(recording_options(&[
+            ("lineStates", true),
+            ("pixelSources", true),
+            ("lineSprites", true),
+            ("videoMemorySources", true),
+            ("frameWrites", true),
+        ]));
+        for _ in 0..3 {
+            emu.run_to_capture_boundary();
+        }
+        emu
+    }
+
+    /// What `shape` says of each value.
+    fn shapes(values: &[JsValue]) -> Vec<String> {
+        values.iter().map(retro_wasm::test_support::shape).collect()
+    }
+
+    #[wasm_bindgen_test]
+    fn the_capture_boundary_reads_as_before() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        emu.load_rom(&capture_program_rom()).unwrap();
+        let mut held = vec![JsValue::from_bool(emu.at_capture_boundary())];
+        emu.run_to_capture_boundary();
+        held.push(JsValue::from_bool(emu.at_capture_boundary()));
+        emu.run_frame();
+        held.push(JsValue::from_bool(emu.at_capture_boundary()));
+        let expected = ["false", "true", "false"];
+        assert_eq!(shapes(&held), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_frame_snapshot_reads_as_before() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        let emu = running_the_capture_program();
+        let expected = [
+            concat!(
+                "{atBoundary: false, frame: 0, framebuffer: Uint8Array(len 229376, ",
+                "fnv1a64 0xc9b1e505f9a82325), height: 224, oam: Uint8Array(len 544, ",
+                "fnv1a64 0x9986ba9af2021da5), palette: Uint16Array(len 256, ",
+                "fnv1a64 0x7da144b97d054b25), ppuSettings: {addsub_mode: false, ",
+                "bg3_priority: false, bg_main_enable: [false, false, false, false], ",
+                "bg_main_window_disable: [false, false, false, false], ",
+                "bg_mosaic_enable: [false, false, false, false], bg_sub_enable: [false, ",
+                "false, false, false], bg_sub_window_disable: [false, false, false, ",
+                "false], bg_tile_size: [false, false, false, false], bgmode: 0, ",
+                "col_main_mask: 0, col_sub_mask: 0, color_math_back_enable: false, ",
+                "color_math_bg_enable: [false, false, false, false], ",
+                "color_math_halve: false, color_math_oam_enable: false, ",
+                "color_math_subtract: false, direct_color: false, display_brightness: 0, ",
+                "display_disable: true, field: false, fixed_color: 0, interlace: false, ",
+                "mode7_centre: [0, 0], mode7_extbg: false, mode7_hflip: false, ",
+                "mode7_hoffset: 0, mode7_matrix: [0, 0, 0, 0], mode7_repeat: 0, ",
+                "mode7_vflip: false, mode7_voffset: 0, mosaic_size: 1, obj_base_size: 0, ",
+                "obj_interlace: false, obj_main_enable: false, ",
+                "obj_main_window_disable: false, obj_name_select: 0, ",
+                "obj_sub_enable: false, obj_sub_window_disable: false, ",
+                "obj_tiledata_addr: 0, overscan: false, pseudo_hires: false, ",
+                "sprite_tiles: {first_table_base_word: 0, large_height: 16, ",
+                "large_width: 16, second_table_base_word: 4096, small_height: 8, ",
+                "small_width: 8}, window_combine: [0, 0, 0, 0, 0, 0], ",
+                "window_enable: [{w1_enable: false, w1_invert: false, w2_enable: false, ",
+                "w2_invert: false}, {w1_enable: false, w1_invert: false, ",
+                "w2_enable: false, w2_invert: false}, {w1_enable: false, ",
+                "w1_invert: false, w2_enable: false, w2_invert: false}, ",
+                "{w1_enable: false, w1_invert: false, w2_enable: false, ",
+                "w2_invert: false}, {w1_enable: false, w1_invert: false, ",
+                "w2_enable: false, w2_invert: false}, {w1_enable: false, ",
+                "w1_invert: false, w2_enable: false, w2_invert: false}], ",
+                "window_one_left: 0, window_one_right: 0, window_two_left: 0, ",
+                "window_two_right: 0}, registers: [{description: \"BG mode + tile size\", ",
+                "index: 8453, name: \"BGMODE\", value: 0}, ",
+                "{description: \"Main screen designation\", index: 8492, name: \"TM\", ",
+                "value: 0}, {description: \"Sub screen designation\", index: 8493, ",
+                "name: \"TS\", value: 0}, {description: \"Mode 7 settings\", index: 8474, ",
+                "name: \"M7SEL\", value: 0}, {description: \"Mode 7 matrix A\", index: 8475, ",
+                "name: \"M7A\", value: 0}, {description: \"Mode 7 matrix B\", index: 8476, ",
+                "name: \"M7B\", value: 0}, {description: \"Mode 7 matrix C\", index: 8477, ",
+                "name: \"M7C\", value: 0}, {description: \"Mode 7 matrix D\", index: 8478, ",
+                "name: \"M7D\", value: 0}, {description: \"Mode 7 centre X\", index: 8479, ",
+                "name: \"M7X\", value: 0}, {description: \"Mode 7 centre Y\", index: 8480, ",
+                "name: \"M7Y\", value: 0}, {description: \"BG1 horizontal scroll\", ",
+                "index: 8461, name: \"BG1HOFS\", value: 0}, ",
+                "{description: \"BG1 vertical scroll\", index: 8462, name: \"BG1VOFS\", ",
+                "value: 0}], vram: Uint8Array(len 65536, fnv1a64 0xeb05052ea5b62325), ",
+                "width: 256}",
+            ),
+            concat!(
+                "{atBoundary: true, frame: 3, framebuffer: Uint8Array(len 229376, ",
+                "fnv1a64 0x75f379eed654dafa), height: 224, oam: Uint8Array(len 544, ",
+                "fnv1a64 0xb3c3b956cfe107de), palette: Uint16Array(len 256, ",
+                "fnv1a64 0x82bce97466c89cfc), ppuSettings: {addsub_mode: false, ",
+                "bg3_priority: false, bg_main_enable: [true, false, false, false], ",
+                "bg_main_window_disable: [false, false, false, false], ",
+                "bg_mosaic_enable: [false, false, false, false], bg_sub_enable: [false, ",
+                "false, false, false], bg_sub_window_disable: [false, false, false, ",
+                "false], bg_tile_size: [false, false, false, false], bgmode: 1, ",
+                "col_main_mask: 0, col_sub_mask: 0, color_math_back_enable: false, ",
+                "color_math_bg_enable: [false, false, false, false], ",
+                "color_math_halve: false, color_math_oam_enable: false, ",
+                "color_math_subtract: false, direct_color: false, ",
+                "display_brightness: 15, display_disable: false, field: false, ",
+                "fixed_color: 0, interlace: false, mode7_centre: [0, 0], ",
+                "mode7_extbg: false, mode7_hflip: false, mode7_hoffset: 30, ",
+                "mode7_matrix: [0, 0, 0, 0], mode7_repeat: 0, mode7_vflip: false, ",
+                "mode7_voffset: 0, mosaic_size: 1, obj_base_size: 0, ",
+                "obj_interlace: false, obj_main_enable: true, ",
+                "obj_main_window_disable: false, obj_name_select: 0, ",
+                "obj_sub_enable: false, obj_sub_window_disable: false, ",
+                "obj_tiledata_addr: 0, overscan: false, pseudo_hires: false, ",
+                "sprite_tiles: {first_table_base_word: 0, large_height: 16, ",
+                "large_width: 16, second_table_base_word: 4096, small_height: 8, ",
+                "small_width: 8}, window_combine: [0, 0, 0, 0, 0, 0], ",
+                "window_enable: [{w1_enable: false, w1_invert: false, w2_enable: false, ",
+                "w2_invert: false}, {w1_enable: false, w1_invert: false, ",
+                "w2_enable: false, w2_invert: false}, {w1_enable: false, ",
+                "w1_invert: false, w2_enable: false, w2_invert: false}, ",
+                "{w1_enable: false, w1_invert: false, w2_enable: false, ",
+                "w2_invert: false}, {w1_enable: false, w1_invert: false, ",
+                "w2_enable: false, w2_invert: false}, {w1_enable: false, ",
+                "w1_invert: false, w2_enable: false, w2_invert: false}], ",
+                "window_one_left: 0, window_one_right: 0, window_two_left: 0, ",
+                "window_two_right: 0}, registers: [{description: \"BG mode + tile size\", ",
+                "index: 8453, name: \"BGMODE\", value: 1}, ",
+                "{description: \"Main screen designation\", index: 8492, name: \"TM\", ",
+                "value: 17}, {description: \"Sub screen designation\", index: 8493, ",
+                "name: \"TS\", value: 0}, {description: \"Mode 7 settings\", index: 8474, ",
+                "name: \"M7SEL\", value: 0}, {description: \"Mode 7 matrix A\", index: 8475, ",
+                "name: \"M7A\", value: 0}, {description: \"Mode 7 matrix B\", index: 8476, ",
+                "name: \"M7B\", value: 0}, {description: \"Mode 7 matrix C\", index: 8477, ",
+                "name: \"M7C\", value: 0}, {description: \"Mode 7 matrix D\", index: 8478, ",
+                "name: \"M7D\", value: 0}, {description: \"Mode 7 centre X\", index: 8479, ",
+                "name: \"M7X\", value: 0}, {description: \"Mode 7 centre Y\", index: 8480, ",
+                "name: \"M7Y\", value: 0}, {description: \"BG1 horizontal scroll\", ",
+                "index: 8461, name: \"BG1HOFS\", value: 30}, ",
+                "{description: \"BG1 vertical scroll\", index: 8462, name: \"BG1VOFS\", ",
+                "value: 0}], vram: Uint8Array(len 65536, fnv1a64 0x15727000ffe79428), ",
+                "width: 256}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[idle.capture_frame_snapshot(), emu.capture_frame_snapshot()]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_layer_renders_read_as_before() {
+        let mut emu = running_the_capture_program();
+        let layers: Vec<JsValue> = (0..=5).map(|layer| emu.render_layer(layer)).collect();
+        let expected = [
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0xc995b76295b606ea), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0xb293664dc5b90c09), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0x85068eaa1516ba85), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0xc9b1e505f9a82325), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0x59b321ddc659a405), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            "null",
+        ];
+        assert_eq!(shapes(&layers), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_recording_reads_as_before() {
+        let mut emu = RetroEmulator::new("snes").unwrap();
+        let mut read = vec![emu.get_capture_recording()];
+        emu.set_capture_recording(recording_options(&[
+            ("lineStates", true),
+            ("videoMemorySources", true),
+        ]));
+        read.push(emu.get_capture_recording());
+        emu.set_capture_recording(recording_options(&[
+            ("lineStates", false),
+            ("frameWrites", true),
+        ]));
+        read.push(emu.get_capture_recording());
+        let expected = [
+            concat!(
+                "{frameWrites: false, lineSprites: false, lineStates: false, ",
+                "pixelSources: false, videoMemorySources: false}",
+            ),
+            concat!(
+                "{frameWrites: false, lineSprites: false, lineStates: true, ",
+                "pixelSources: false, videoMemorySources: true}",
+            ),
+            concat!(
+                "{frameWrites: true, lineSprites: false, lineStates: false, ",
+                "pixelSources: false, videoMemorySources: true}",
+            ),
+        ];
+        assert_eq!(shapes(&read), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_line_states_read_as_before() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        let emu = running_the_capture_program();
+        let expected = [
+            "null",
+            concat!(
+                "{columns: [\"line\", \"display_disable\", \"display_brightness\", ",
+                "\"obj_base_size\", \"obj_name_select\", \"obj_tiledata_addr\", ",
+                "\"oam_first_sprite\", \"bgmode\", \"bg3_priority\", \"bg_tile_size[0]\", ",
+                "\"bg_tile_size[1]\", \"bg_tile_size[2]\", \"bg_tile_size[3]\", \"mosaic_size\", ",
+                "\"bg_mosaic_enable[0]\", \"bg_mosaic_enable[1]\", \"bg_mosaic_enable[2]\", ",
+                "\"bg_mosaic_enable[3]\", \"bg_screen_addr[0]\", \"bg_screen_addr[1]\", ",
+                "\"bg_screen_addr[2]\", \"bg_screen_addr[3]\", \"bg_screen_size[0]\", ",
+                "\"bg_screen_size[1]\", \"bg_screen_size[2]\", \"bg_screen_size[3]\", ",
+                "\"bg_tiledata_addr[0]\", \"bg_tiledata_addr[1]\", \"bg_tiledata_addr[2]\", ",
+                "\"bg_tiledata_addr[3]\", \"bg_hoffset[0]\", \"bg_hoffset[1]\", ",
+                "\"bg_hoffset[2]\", \"bg_hoffset[3]\", \"bg_voffset[0]\", \"bg_voffset[1]\", ",
+                "\"bg_voffset[2]\", \"bg_voffset[3]\", \"mode7_repeat\", \"mode7_vflip\", ",
+                "\"mode7_hflip\", \"mode7_matrix_a\", \"mode7_matrix_b\", \"mode7_matrix_c\", ",
+                "\"mode7_matrix_d\", \"mode7_centre_x\", \"mode7_centre_y\", \"mode7_hoffset\", ",
+                "\"mode7_voffset\", \"mode7_extbg\", \"window_enable[0].w1_enable\", ",
+                "\"window_enable[0].w1_invert\", \"window_enable[0].w2_enable\", ",
+                "\"window_enable[0].w2_invert\", \"window_enable[1].w1_enable\", ",
+                "\"window_enable[1].w1_invert\", \"window_enable[1].w2_enable\", ",
+                "\"window_enable[1].w2_invert\", \"window_enable[2].w1_enable\", ",
+                "\"window_enable[2].w1_invert\", \"window_enable[2].w2_enable\", ",
+                "\"window_enable[2].w2_invert\", \"window_enable[3].w1_enable\", ",
+                "\"window_enable[3].w1_invert\", \"window_enable[3].w2_enable\", ",
+                "\"window_enable[3].w2_invert\", \"window_enable[4].w1_enable\", ",
+                "\"window_enable[4].w1_invert\", \"window_enable[4].w2_enable\", ",
+                "\"window_enable[4].w2_invert\", \"window_enable[5].w1_enable\", ",
+                "\"window_enable[5].w1_invert\", \"window_enable[5].w2_enable\", ",
+                "\"window_enable[5].w2_invert\", \"window_one_left\", \"window_one_right\", ",
+                "\"window_two_left\", \"window_two_right\", \"window_combine[0]\", ",
+                "\"window_combine[1]\", \"window_combine[2]\", \"window_combine[3]\", ",
+                "\"window_combine[4]\", \"window_combine[5]\", \"bg_main_enable[0]\", ",
+                "\"bg_main_enable[1]\", \"bg_main_enable[2]\", \"bg_main_enable[3]\", ",
+                "\"obj_main_enable\", \"bg_sub_enable[0]\", \"bg_sub_enable[1]\", ",
+                "\"bg_sub_enable[2]\", \"bg_sub_enable[3]\", \"obj_sub_enable\", ",
+                "\"bg_main_window_disable[0]\", \"bg_main_window_disable[1]\", ",
+                "\"bg_main_window_disable[2]\", \"bg_main_window_disable[3]\", ",
+                "\"obj_main_window_disable\", \"bg_sub_window_disable[0]\", ",
+                "\"bg_sub_window_disable[1]\", \"bg_sub_window_disable[2]\", ",
+                "\"bg_sub_window_disable[3]\", \"obj_sub_window_disable\", \"col_main_mask\", ",
+                "\"col_sub_mask\", \"addsub_mode\", \"direct_color\", \"color_math_subtract\", ",
+                "\"color_math_halve\", \"color_math_back_enable\", \"color_math_oam_enable\", ",
+                "\"color_math_bg_enable[0]\", \"color_math_bg_enable[1]\", ",
+                "\"color_math_bg_enable[2]\", \"color_math_bg_enable[3]\", \"fixed_color\", ",
+                "\"pseudo_hires\", \"overscan\", \"obj_interlace\", \"interlace\", \"field\"], ",
+                "complete: true, firstRowLine: 1, frame: 3, fromFirstLine: true, ",
+                "memoryExact: true, rowsPerLine: 1, values: Uint32Array(len 27328, ",
+                "fnv1a64 0x512f8064a14a9c85)}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[idle.get_line_states(), emu.get_line_states()]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_line_palettes_read_as_before() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        let emu = running_the_capture_program();
+        let expected = [
+            "null",
+            concat!(
+                "{coloursPerPalette: 256, paletteOfLine: Uint16Array(len 224, ",
+                "fnv1a64 0xddedd579bea76625), palettes: Uint16Array(len 256, ",
+                "fnv1a64 0x82bce97466c89cfc)}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[idle.get_line_palettes(), emu.get_line_palettes()]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_picture_from_the_line_states_reads_as_before() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        let mut emu = running_the_capture_program();
+        let expected = [
+            "null",
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0x75f379eed654dafa), height: 224, ",
+                "width: 256}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[
+                idle.picture_from_line_states(),
+                emu.picture_from_line_states()
+            ]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_pixel_sources_read_as_before() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        let mut emu = running_the_capture_program();
+        let mut sources = vec![idle.get_pixel_sources(None)];
+        for planes in [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(4),
+            Some(8),
+            Some(16),
+            Some(15),
+            Some(31),
+            Some(0x8000_0011),
+        ] {
+            sources.push(emu.get_pixel_sources(planes));
+        }
+        let expected = [
+            "null",
+            concat!(
+                "{cell: Uint16Array(len 57344, fnv1a64 0x2abaaefb122acfa1), ",
+                "colour: Uint16Array(len 57344, fnv1a64 0x80879d5b3e4821fd), frame: 3, ",
+                "fromLineStates: true, height: 224, layer: Uint16Array(len 57344, ",
+                "fnv1a64 0x6e92b53c2738661d), matchesPicture: true, ",
+                "tile: Uint32Array(len 57344, fnv1a64 0x5e95f5527dac8199), width: 256}",
+            ),
+            "{frame: 3, fromLineStates: true, height: 224, matchesPicture: true, width: 256}",
+            concat!(
+                "{frame: 3, fromLineStates: true, height: 224, ",
+                "layer: Uint16Array(len 57344, fnv1a64 0x6e92b53c2738661d), ",
+                "matchesPicture: true, width: 256}",
+            ),
+            concat!(
+                "{colour: Uint16Array(len 57344, fnv1a64 0x80879d5b3e4821fd), frame: 3, ",
+                "fromLineStates: true, height: 224, matchesPicture: true, width: 256}",
+            ),
+            concat!(
+                "{frame: 3, fromLineStates: true, height: 224, matchesPicture: true, ",
+                "tile: Uint32Array(len 57344, fnv1a64 0x5e95f5527dac8199), width: 256}",
+            ),
+            concat!(
+                "{cell: Uint16Array(len 57344, fnv1a64 0x2abaaefb122acfa1), frame: 3, ",
+                "fromLineStates: true, height: 224, matchesPicture: true, width: 256}",
+            ),
+            concat!(
+                "{frame: 3, fromLineStates: true, height: 224, matchesPicture: true, ",
+                "subColour: Uint16Array(len 57344, fnv1a64 0x045b5aaabee52325), ",
+                "subLayer: Uint8Array(len 57344, fnv1a64 0xa7ceef1ebf7f8325), width: 256}",
+            ),
+            concat!(
+                "{cell: Uint16Array(len 57344, fnv1a64 0x2abaaefb122acfa1), ",
+                "colour: Uint16Array(len 57344, fnv1a64 0x80879d5b3e4821fd), frame: 3, ",
+                "fromLineStates: true, height: 224, layer: Uint16Array(len 57344, ",
+                "fnv1a64 0x6e92b53c2738661d), matchesPicture: true, ",
+                "tile: Uint32Array(len 57344, fnv1a64 0x5e95f5527dac8199), width: 256}",
+            ),
+            concat!(
+                "{cell: Uint16Array(len 57344, fnv1a64 0x2abaaefb122acfa1), ",
+                "colour: Uint16Array(len 57344, fnv1a64 0x80879d5b3e4821fd), frame: 3, ",
+                "fromLineStates: true, height: 224, layer: Uint16Array(len 57344, ",
+                "fnv1a64 0x6e92b53c2738661d), matchesPicture: true, ",
+                "subColour: Uint16Array(len 57344, fnv1a64 0x045b5aaabee52325), ",
+                "subLayer: Uint8Array(len 57344, fnv1a64 0xa7ceef1ebf7f8325), ",
+                "tile: Uint32Array(len 57344, fnv1a64 0x5e95f5527dac8199), width: 256}",
+            ),
+            concat!(
+                "{frame: 3, fromLineStates: true, height: 224, ",
+                "layer: Uint16Array(len 57344, fnv1a64 0x6e92b53c2738661d), ",
+                "matchesPicture: true, subColour: Uint16Array(len 57344, ",
+                "fnv1a64 0x045b5aaabee52325), subLayer: Uint8Array(len 57344, ",
+                "fnv1a64 0xa7ceef1ebf7f8325), width: 256}",
+            ),
+        ];
+        assert_eq!(shapes(&sources), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_line_sprites_read_as_before() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        let mut emu = running_the_capture_program();
+        let expected = [
+            "null",
+            concat!(
+                "{drawnWidth: Uint8Array(len 1024, fnv1a64 0x967865f30558c925), ",
+                "fates: Uint8Array(len 1024, fnv1a64 0xb9c6dee5fd4ffedd), frame: 3, ",
+                "fromLineStates: true, lines: Uint16Array(len 896, ",
+                "fnv1a64 0xc2b4dc5df408de2c), slots: Uint8Array(len 1024, ",
+                "fnv1a64 0x13c81b8067849c25), width: Uint8Array(len 1024, ",
+                "fnv1a64 0x80e6ac3166837325), x: Int16Array(len 1024, ",
+                "fnv1a64 0x41d05ddfe959cc65)}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[idle.get_line_sprites(), emu.get_line_sprites()]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_sprite_renders_read_as_before() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        let mut emu = running_the_capture_program();
+        let renders = [
+            idle.render_sprites(&[1]),
+            emu.render_sprites(&[]),
+            emu.render_sprites(&[1, 0, 1]),
+            emu.render_sprites(&[1; 128]),
+        ];
+        let expected = [
+            "null",
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0xc9b1e505f9a82325), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0x472177febf22ec05), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+            concat!(
+                "{data: Uint8Array(len 229376, fnv1a64 0x59b321ddc659a405), ",
+                "fromLineStates: true, height: 224, width: 256}",
+            ),
+        ];
+        assert_eq!(shapes(&renders), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_video_memory_sources_read_as_before() {
+        let idle = RetroEmulator::new("snes").unwrap();
+        let emu = running_the_capture_program();
+        let expected = [
+            "null",
+            concat!(
+                "{frames: Uint32Array(len 65536, fnv1a64 0x7e0954272f497645), ",
+                "origins: Uint32Array(len 65536, fnv1a64 0x1d5aaafb91b9d8e8)}",
+            ),
+        ];
+        assert_eq!(
+            shapes(&[
+                idle.get_video_memory_sources(),
+                emu.get_video_memory_sources()
+            ]),
+            expected
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_resolved_sources_read_as_before() {
+        let emu = running_the_capture_program();
+        let addresses = [
+            0x00_8000u32,
+            u32::from(PROGRAM_PALETTE),
+            0x81_9020,
+            0x7E_0000,
+            0x00_0000,
+            0x00_2100,
+            0x40_0000,
+            0xFF_FFFF,
+            0xFF00_8000,
+        ];
+        let resolved = [
+            JsValue::from(emu.resolve_sources(&addresses)),
+            JsValue::from(emu.resolve_sources(&[])),
+        ];
+        let expected = [
+            "Int32Array(len 9, fnv1a64 0x906e57eb2f638fa2)",
+            "Int32Array(len 0, fnv1a64 0xcbf29ce484222325)",
+        ];
+        assert_eq!(shapes(&resolved), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn the_frame_writes_read_as_before() {
+        let mut idle = RetroEmulator::new("snes").unwrap();
+        let mut emu = running_the_capture_program();
+        let writes = [
+            idle.take_frame_writes(),
+            emu.take_frame_writes(),
+            emu.take_frame_writes(),
+        ];
+        let expected = [
+            "null",
+            concat!(
+                "{dropped: 0, records: Uint32Array(len 1384, ",
+                "fnv1a64 0x0bd0b238c49f8713), wordsPerRecord: 8}",
+            ),
+            concat!(
+                "{dropped: 0, records: Uint32Array(len 0, fnv1a64 0xcbf29ce484222325), ",
+                "wordsPerRecord: 8}",
+            ),
+        ];
+        assert_eq!(shapes(&writes), expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_repaint_draws_as_before() {
+        let mut emu = running_the_capture_program();
+        emu.toggle_layer(0, false);
+        emu.repaint_frame();
+        let mut pictures: Vec<JsValue> = vec![emu.get_framebuffer_data().into()];
+        emu.toggle_layer(0, true);
+        emu.toggle_layer(4, false);
+        emu.repaint_frame();
+        pictures.push(emu.get_framebuffer_data().into());
+        let expected = [
+            "Uint8ClampedArray(len 229376, fnv1a64 0x0f7bd3c3a27b6475)",
+            "Uint8ClampedArray(len 229376, fnv1a64 0x5aa9123884e96d52)",
+        ];
+        assert_eq!(shapes(&pictures), expected);
     }
 }

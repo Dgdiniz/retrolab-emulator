@@ -38,15 +38,21 @@
 //! mid-frame switches the renderer on/off for the extra rows
 //! without rescheduling.
 
-use retro_core::video::{ExportError, PixelImage};
+use retro_core::capture::{tile_value, NoTrace, PixelTrace};
+use retro_core::video::{crop_rgba, ExportError, PixelImage};
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
 use crate::ppu::sprite;
 use crate::ppu::tile::{
-    build_tilemap_row, compute_offset_per_tile, decode_tile_2bpp_row, decode_tile_4bpp_row,
-    decode_tile_8bpp_row, fetch_bg_tilemap_entry, hires_adjacent_tile_offset, mode7_clip,
-    mode7_sample, sign_extend_13, tilemap_masks, TilemapEntry,
+    bg_tilemap_word_index, build_tilemap_row, compute_offset_per_tile, decode_tile_2bpp_row,
+    decode_tile_4bpp_row, decode_tile_8bpp_row, fetch_bg_tilemap_entry, hires_adjacent_tile_offset,
+    mode7_clip, mode7_sample, mode7_sample_at, offset_per_tile, sign_extend_13, tilemap_masks,
+    TilemapEntry,
+};
+use crate::ppu::trace::{
+    colour_value, mode7_origin, pixel_layer, source_code, BgOrigin, FrameTrace, MathOutcome,
+    ObjOrigin, PictureShape,
 };
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::window_layer;
@@ -132,7 +138,7 @@ pub(crate) type ObjRowBuffer = [ObjRowPixel; NORMAL_SCANLINE_WIDTH];
 /// math enable lookup (`color_math_bg_enable` / `color_math_oam_enable`
 /// / `color_math_back_enable`) in the colour-math stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PixelSource {
+pub(crate) enum PixelSource {
     /// Nothing opaque landed here, the backdrop (CGRAM 0) shows
     /// through, or for the sub-screen the fixed colour stands in.
     Backdrop,
@@ -145,11 +151,11 @@ enum PixelSource {
 /// One fully-resolved column of a single screen (main or sub): the
 /// final colour plus the metadata the colour-math stage needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScreenPixel {
+pub(crate) struct ScreenPixel {
     /// 15-bit BGR colour after priority resolution + window clip.
-    color: u16,
+    pub(crate) color: u16,
     /// Layer that produced `color`.
-    source: PixelSource,
+    pub(crate) source: PixelSource,
     /// `true` for an OBJ pixel in palettes 0-3, those never take
     /// part in colour math regardless of the CGADSUB OBJ bit.
     color_exempt: bool,
@@ -161,7 +167,7 @@ struct ScreenPixel {
 /// hires path composites all 512 BG positions and the output picks
 /// the sub screen on even columns and the main screen on odd columns
 /// (the order the chip emits them in).
-type ScreenRow = [ScreenPixel; MAX_SCANLINE_WIDTH];
+pub(crate) type ScreenRow = [ScreenPixel; MAX_SCANLINE_WIDTH];
 
 /// Per-screen window-clip tables for the five clippable layers
 /// (BG1-4 + OBJ), indexed `0..=3` for BG and `4` for OBJ. `true` at
@@ -189,6 +195,19 @@ impl Ppu {
     /// in a single frame. The per-row work lives in
     /// [`Ppu::render_output_line`].
     pub fn render_scanline(&mut self, scanline: u16, fb: &mut Framebuffer) {
+        self.draw_scanline(scanline, fb, &mut NoTrace::<FrameTrace>::new());
+    }
+
+    /// [`Self::render_scanline`], noting where each pixel came from in
+    /// `trace` when it takes notes. The frame loops draw with [`NoTrace`],
+    /// whose `ON` is false, so every note sits behind `if T::ON` and their
+    /// code is the renderer's alone.
+    pub(crate) fn draw_scanline<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        scanline: u16,
+        fb: &mut Framebuffer,
+        trace: &mut T,
+    ) {
         if scanline == 0 || !self.in_active_scanline(scanline) {
             return;
         }
@@ -254,12 +273,12 @@ impl Ppu {
             let r0 = u32::from(scanline - 1) * 2;
             self.mark_line_hires(r0, true);
             self.mark_line_hires(r0 + 1, true);
-            self.render_output_line(scanline * 2 - 1, scanline, r0, fb);
-            self.render_output_line(scanline * 2, scanline, r0 + 1, fb);
+            self.render_output_line(scanline * 2 - 1, scanline, r0, fb, trace);
+            self.render_output_line(scanline * 2, scanline, r0 + 1, fb, trace);
         } else {
             let fb_row = u32::from(scanline - 1);
             self.mark_line_hires(fb_row, hires);
-            self.render_output_line(scanline, scanline, fb_row, fb);
+            self.render_output_line(scanline, scanline, fb_row, fb, trace);
         }
     }
 
@@ -280,7 +299,14 @@ impl Ppu {
     /// the Mode 5/6 interlace path emit two woven rows per scanline
     /// (doubled `vy`, shared `obj_line`) while the normal path emits
     /// one.
-    fn render_output_line(&mut self, vy: u16, obj_line: u16, fb_row: u32, fb: &mut Framebuffer) {
+    fn render_output_line<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        vy: u16,
+        obj_line: u16,
+        fb_row: u32,
+        fb: &mut Framebuffer,
+        trace: &mut T,
+    ) {
         // The host framebuffer must be at least as tall as the active
         // region (448 with hires interlace) or the trailing rows clip
         // here.
@@ -290,7 +316,7 @@ impl Ppu {
         // A single-layer render draws its one layer instead of the
         // composite (see `render_layer`); never set during play.
         if let Some(layer) = self.isolated_layer {
-            self.render_isolated_line(layer, vy, obj_line, fb_row, fb);
+            self.render_isolated_line(layer, vy, obj_line, fb_row, fb, trace);
             return;
         }
 
@@ -308,6 +334,11 @@ impl Ppu {
             write_black_scanline(fb_row, fb, output_width);
             for bg in 0..4 {
                 self.previous_bg_rows[bg] = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
+            }
+            if T::ON {
+                trace
+                    .notes()
+                    .note_blank_row(fb_row, (fb.width as usize).min(output_width));
             }
             return;
         }
@@ -342,21 +373,21 @@ impl Ppu {
         if self.bgmode == 7 {
             let bg1 = self.bg_main_enable[0];
             let bg2 = self.mode7_extbg && self.bg_main_enable[1];
-            self.render_mode7_rows(vy, &mut main_rows, bg1, bg2);
+            self.render_mode7_rows(vy, &mut main_rows, bg1, bg2, trace);
         } else {
             for bg_id in 0..4 {
                 if !bg_visible_in_mode(self.bgmode, bg_id) {
                     continue;
                 }
                 if self.bg_main_enable[bg_id] {
-                    self.render_bg_row(bg_id, vy, &mut main_rows[bg_id], hires);
+                    self.render_bg_row(bg_id, vy, &mut main_rows[bg_id], hires, trace);
                 }
                 // The sub plane feeds the hires interleave and the
                 // colour-math addend; it is only walked when one of
                 // those needs it, so the no-colour-math non-hires path
                 // never pays for the second render.
                 if self.bg_sub_enable[bg_id] && need_sub {
-                    self.render_bg_row(bg_id, vy, &mut sub_rows[bg_id], hires);
+                    self.render_bg_row(bg_id, vy, &mut sub_rows[bg_id], hires, trace);
                 }
             }
         }
@@ -375,8 +406,11 @@ impl Ppu {
         // plane. The sub plane is intentionally not mosaicked, the
         // vertical-mosaic replay buffer tracks the main plane only and
         // mosaicked-sub-screen colour math is vanishingly rare.
+        if T::ON {
+            trace.notes().begin_main_screen();
+        }
         for (bg_id, row) in main_rows.iter_mut().enumerate() {
-            self.apply_mosaic_for_bg(bg_id, vy, row, output_width);
+            self.apply_mosaic_for_bg(bg_id, vy, row, output_width, trace);
         }
 
         // Step 3: snapshot each main BG row for next-line vmosaic.
@@ -384,12 +418,15 @@ impl Ppu {
         // buffer stays consistent when the mode toggles between
         // hires and non-hires across frames.
         self.previous_bg_rows.copy_from_slice(&main_rows);
+        if T::ON {
+            trace.notes().keep_previous();
+        }
 
         // Step 3.5: evaluate sprites once into a 256-wide OBJ row. The
         // walk is skipped entirely when OBJ is off on both screens.
         let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
         if (self.obj_main_enable || self.obj_sub_enable) && !self.layer_debug_disabled(LAYER_OBJ) {
-            self.render_obj_row(obj_line, &mut obj_row);
+            self.render_obj_row(obj_line, &mut obj_row, trace);
         }
 
         // Step 4: composite each enabled screen by the per-mode
@@ -429,6 +466,12 @@ impl Ppu {
                 *dst = px.color;
             }
             self.write_scanline_normal(fb_row, &row, fb);
+            if T::ON {
+                let width = (fb.width as usize).min(NORMAL_SCANLINE_WIDTH);
+                trace
+                    .notes()
+                    .note_row(fb_row, width, false, &main_composite, None, false);
+            }
             return;
         }
 
@@ -462,19 +505,73 @@ impl Ppu {
             // 512-wide line.
             let mut line = [0u16; MAX_SCANLINE_WIDTH];
             for (k, cell) in line.iter_mut().enumerate() {
-                *cell = if k & 1 == 1 {
+                *cell = if T::ON {
+                    let (colour, outcome) = if k & 1 == 1 {
+                        self.resolve_pixel_explained(
+                            k,
+                            &main_composite,
+                            &sub_composite,
+                            &col_main,
+                            &col_sub,
+                        )
+                    } else {
+                        self.resolve_pixel_explained(
+                            k,
+                            &sub_composite,
+                            &main_composite,
+                            &col_main,
+                            &col_sub,
+                        )
+                    };
+                    trace.notes().math[k] = outcome;
+                    colour
+                } else if k & 1 == 1 {
                     self.resolve_pixel(k, &main_composite, &sub_composite, &col_main, &col_sub)
                 } else {
                     self.resolve_pixel(k, &sub_composite, &main_composite, &col_main, &col_sub)
                 };
             }
             self.write_scanline_hires(fb_row, &line, fb);
+            if T::ON {
+                let width = (fb.width as usize).min(MAX_SCANLINE_WIDTH);
+                trace.notes().note_row(
+                    fb_row,
+                    width,
+                    true,
+                    &main_composite,
+                    Some(&sub_composite),
+                    true,
+                );
+            }
         } else {
             let mut row = [0u16; MAX_SCANLINE_WIDTH];
             for (x, cell) in row.iter_mut().enumerate().take(NORMAL_SCANLINE_WIDTH) {
-                *cell = self.resolve_pixel(x, &main_composite, &sub_composite, &col_main, &col_sub);
+                *cell = if T::ON {
+                    let (colour, outcome) = self.resolve_pixel_explained(
+                        x,
+                        &main_composite,
+                        &sub_composite,
+                        &col_main,
+                        &col_sub,
+                    );
+                    trace.notes().math[x] = outcome;
+                    colour
+                } else {
+                    self.resolve_pixel(x, &main_composite, &sub_composite, &col_main, &col_sub)
+                };
             }
             self.write_scanline_normal(fb_row, &row, fb);
+            if T::ON {
+                let width = (fb.width as usize).min(NORMAL_SCANLINE_WIDTH);
+                trace.notes().note_row(
+                    fb_row,
+                    width,
+                    false,
+                    &main_composite,
+                    Some(&sub_composite),
+                    true,
+                );
+            }
         }
     }
 
@@ -596,12 +693,34 @@ impl Ppu {
         col_main: &[bool],
         col_sub: &[bool],
     ) -> u16 {
+        self.resolve_pixel_explained(x, shown, addend, col_main, col_sub)
+            .0
+    }
+
+    /// [`Self::resolve_pixel`], saying too what colour math did: the one
+    /// rule the picture and a traced redraw share.
+    #[inline(always)]
+    fn resolve_pixel_explained(
+        &self,
+        x: usize,
+        shown: &ScreenRow,
+        addend: &ScreenRow,
+        col_main: &[bool],
+        col_sub: &[bool],
+    ) -> (u16, MathOutcome) {
         let pixel = shown[x];
         let colour = if col_main[x] { pixel.color } else { 0 };
+        let blacked = !col_main[x];
         let takes_part =
             col_sub[x] && !pixel.color_exempt && self.color_math_enabled_for(pixel.source);
         if !takes_part {
-            return colour;
+            return (
+                colour,
+                MathOutcome {
+                    blacked,
+                    ..MathOutcome::NONE
+                },
+            );
         }
         let addend_is_backdrop =
             self.addsub_mode && matches!(addend[x].source, PixelSource::Backdrop);
@@ -611,11 +730,26 @@ impl Ppu {
             self.fixed_color
         };
         let halve = self.color_math_halve && col_main[x] && !addend_is_backdrop;
-        if self.color_math_subtract {
+        let result = if self.color_math_subtract {
             color_sub(colour, addend_colour, halve)
         } else {
             color_add(colour, addend_colour, halve)
-        }
+        };
+        let addend_code = if self.addsub_mode {
+            source_code(addend[x].source)
+        } else {
+            pixel_layer::ADDEND_FIXED_COLOUR
+        };
+        (
+            result,
+            MathOutcome {
+                blacked,
+                applied: true,
+                halved: halve,
+                subtracted: self.color_math_subtract,
+                addend: addend_code as u8,
+            },
+        )
     }
 
     /// Fill a row buffer with a single BG's tile output. `hires`
@@ -623,7 +757,14 @@ impl Ppu {
     /// the 512-wide hires path (Modes 5/6); in hires every tilemap
     /// entry covers 16 BG-pixels and is paired with its right-side
     /// neighbour via [`hires_adjacent_tile_offset`].
-    fn render_bg_row(&mut self, bg_id: usize, scanline: u16, row: &mut BgRowBuffer, hires: bool) {
+    fn render_bg_row<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        bg_id: usize,
+        scanline: u16,
+        row: &mut BgRowBuffer,
+        hires: bool,
+        trace: &mut T,
+    ) {
         let bpp = bpp_for_bg(self.bgmode, bg_id);
         let palette_offset = palette_offset_for_bg(self.bgmode, bg_id);
         let base_hoffset = self.bg_hoffset[bg_id];
@@ -707,24 +848,43 @@ impl Ppu {
             // the column / scanline; the other modes
             // add it here. Either branch yields absolute coordinates that
             // must not be offset by `x` / `scanline` again.
+            let mut offset_replaced = false;
             let (screen_x, screen_y) = if matches!(self.bgmode, 2 | 4 | 6) {
                 let bg3_screen_addr = self.bg_screen_addr[2];
                 let bg3_screen_size = self.bg_screen_size[2];
                 let bg3_hoffset = self.bg_hoffset[2];
                 let bg3_voffset = self.bg_voffset[2];
-                compute_offset_per_tile(
-                    self.vram(),
-                    bg3_screen_addr,
-                    bg3_screen_size,
-                    bg3_hoffset,
-                    bg3_voffset,
-                    self.bgmode,
-                    bg_id as u8,
-                    x,
-                    h_scroll,
-                    base_voffset,
-                    scanline,
-                )
+                if T::ON {
+                    let scroll = offset_per_tile(
+                        self.vram(),
+                        bg3_screen_addr,
+                        bg3_screen_size,
+                        bg3_hoffset,
+                        bg3_voffset,
+                        self.bgmode,
+                        bg_id as u8,
+                        x,
+                        h_scroll,
+                        base_voffset,
+                        scanline,
+                    );
+                    offset_replaced = scroll.horizontal_replaced || scroll.vertical_replaced;
+                    (scroll.hoffset, scroll.voffset)
+                } else {
+                    compute_offset_per_tile(
+                        self.vram(),
+                        bg3_screen_addr,
+                        bg3_screen_size,
+                        bg3_hoffset,
+                        bg3_voffset,
+                        self.bgmode,
+                        bg_id as u8,
+                        x,
+                        h_scroll,
+                        base_voffset,
+                        scanline,
+                    )
+                }
             } else {
                 (
                     x.wrapping_add(h_scroll),
@@ -783,6 +943,13 @@ impl Ppu {
             };
 
             let row_in_tile = (screen_y & 7) as u8;
+            // The map entry's VRAM word, for a traced redraw's notes.
+            let cell = if T::ON {
+                bg_tilemap_word_index(screen_addr, screen_size, screen_x, screen_y, hires, tile16)
+                    as u16
+            } else {
+                0
+            };
             let pixels = match last_decode {
                 Some((t, fh, fv, r, px))
                     if t == effective_tile
@@ -833,6 +1000,9 @@ impl Ppu {
             // Skip into the tile to consume the fractional scroll
             // (`screen_x & 7` pixels into the decoded row).
             let skip = (screen_x & 7) as usize;
+            // Where this character's pixels start on the line: a traced
+            // redraw works out each pixel's place in the decoded row from it.
+            let first_x = x;
             for &pixel in &pixels[skip..8] {
                 if x >= row_width {
                     break;
@@ -855,6 +1025,46 @@ impl Ppu {
                         opaque: true,
                         priority: entry.priority,
                     };
+                    if T::ON {
+                        // The decoded row is in screen order: a flipped
+                        // character is read from its far column.
+                        let column = skip + usize::from(x - first_x);
+                        let read_column = if entry.flip_h { 7 - column } else { column };
+                        let read_row = if entry.flip_v {
+                            7 - row_in_tile
+                        } else {
+                            row_in_tile
+                        };
+                        let character = u32::from(effective_tile & 0x03FF);
+                        let start =
+                            (tile_data_addr >> 1).wrapping_add(character * u32::from(bpp) * 4);
+                        let index = if direct_color {
+                            pixel
+                        } else {
+                            cgram_index(palette_offset, entry.palette, pixel, bpp)
+                        };
+                        let mut flags = 0;
+                        if direct_color {
+                            flags |= pixel_layer::DIRECT_COLOUR;
+                        }
+                        if entry.priority {
+                            flags |= 1 << pixel_layer::PRIORITY_SHIFT;
+                        }
+                        if offset_replaced {
+                            flags |= pixel_layer::OFFSET_REPLACED;
+                        }
+                        trace.notes().fetch[bg_id][x as usize] = BgOrigin {
+                            tile: tile_value(
+                                start,
+                                character,
+                                u32::from(read_row),
+                                read_column as u32,
+                            ),
+                            cell,
+                            colour: colour_value(index, entry.palette, bpp),
+                            flags,
+                        };
+                    }
                 }
                 x = x.wrapping_add(1);
             }
@@ -902,54 +1112,21 @@ impl Ppu {
     /// stay display-gated while STAT77 reads back correctly when OBJ is
     /// off-screen or the line is blanked.
     ///
-    /// The two passes use the identical range/tile-cap logic as
-    /// `render_obj_row` (33rd sprite -> range-over, 35th tile column ->
-    /// time-over, with the same off-screen tile-column skip) so the flags
-    /// agree exactly with what the painted path would have reported.
+    /// The evaluation is [`sprite::line_flags`], the rule of
+    /// [`sprite::line_budget`] that the painter's caps and the line's
+    /// sprite list share (33rd sprite -> range-over, 35th tile column ->
+    /// time-over, the same off-screen tile-column skip), so the flags agree
+    /// exactly with what the painted path draws.
     fn eval_obj_overflow(&mut self, scanline: u16) {
-        let line = scanline.wrapping_sub(1);
-        let obj_interlace = self.obj_interlace;
-        let base_size = self.obj_base_size;
-
-        // Pass 1: range eval, gather up to 32 in-range sprites; the
-        // 33rd sets range-over.
-        let mut items: [u8; 32] = [0xFF; 32];
-        let mut item_count = 0usize;
-        for i in 0..128usize {
-            let idx = (usize::from(self.oam_first_sprite) + i) & 0x7F;
-            let s = sprite::parse_sprite(self.oam(), idx, base_size, obj_interlace);
-            if !sprite::sprite_on_scanline(&s, line, obj_interlace) {
-                continue;
-            }
-            if item_count >= 32 {
-                self.sprite_range_over = true;
-                break;
-            }
-            items[item_count] = idx as u8;
-            item_count += 1;
-        }
-
-        // Pass 2: tile-budget eval, count 8px tile columns in the same
-        // reverse order as the painter; the 35th sets time-over. The
-        // off-screen 256..512 skip mirrors `render_obj_row` so the tile
-        // count matches the painted path exactly.
-        let mut tile_count = 0usize;
-        'items: for i in (0..item_count).rev() {
-            let idx = usize::from(items[i]);
-            let s = sprite::parse_sprite(self.oam(), idx, base_size, obj_interlace);
-            let tiles_wide = u16::from(s.width >> 3);
-            for tx in 0..tiles_wide {
-                let sx0 = (s.x + (tx << 3)) & 0x1FF;
-                if s.x != 256 && sx0 >= 256 && (sx0 + 7) < 512 {
-                    continue;
-                }
-                if tile_count >= 34 {
-                    self.sprite_time_over = true;
-                    break 'items;
-                }
-                tile_count += 1;
-            }
-        }
+        let (over_range, over_time) = sprite::line_flags(
+            self.oam(),
+            self.oam_first_sprite,
+            self.obj_base_size,
+            self.obj_interlace,
+            scanline.wrapping_sub(1),
+        );
+        self.sprite_range_over |= over_range;
+        self.sprite_time_over |= over_time;
     }
 
     /// Evaluate OAM for `scanline` and rasterise the visible sprites
@@ -980,7 +1157,12 @@ impl Ppu {
     /// already absorbed by the vcounter being 1-indexed, see the
     /// Mode 7 note in [`Self::render_mode7_rows`] for the same offset
     /// reasoning).
-    fn render_obj_row(&mut self, scanline: u16, obj_row: &mut ObjRowBuffer) {
+    fn render_obj_row<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        scanline: u16,
+        obj_row: &mut ObjRowBuffer,
+        trace: &mut T,
+    ) {
         *obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
 
         let line = scanline.wrapping_sub(1);
@@ -1066,6 +1248,19 @@ impl Ppu {
                             prio: s.priority,
                             palette: s.palette,
                         };
+                        if T::ON {
+                            trace.notes().obj[sx as usize] = ObjOrigin {
+                                tile: tile_value(
+                                    u32::from(tile_number) << 4,
+                                    u32::from(tile_number),
+                                    row_in_tile as u32,
+                                    col as u32,
+                                ),
+                                colour: colour_value(cgram_idx as u8, s.palette, 4),
+                                slot: idx as u8,
+                                priority: s.priority,
+                            };
+                        }
                     }
                 }
             }
@@ -1113,12 +1308,13 @@ impl Ppu {
     /// [`sign_extend_13`] reads the centre / scroll registers;
     /// [`mode7_clip`] is the separate clip applied to the
     /// scroll-minus-centre differences.
-    fn render_mode7_rows(
+    fn render_mode7_rows<T: PixelTrace<Notes = FrameTrace>>(
         &self,
         scanline: u16,
         main_rows: &mut [BgRowBuffer; 4],
         bg1: bool,
         bg2: bool,
+        trace: &mut T,
     ) {
         let a = self.m7a as i16 as i32;
         let b = self.m7b as i16 as i32;
@@ -1166,8 +1362,17 @@ impl Ppu {
             let px = base_x.wrapping_add(a.wrapping_mul(xf)) >> 8;
             let py = base_y.wrapping_add(c.wrapping_mul(xf)) >> 8;
 
-            let Some(byte) = mode7_sample(self.vram(), px, py, self.mode7_repeat) else {
-                continue;
+            // A traced redraw notes where the byte came from too.
+            let (byte, sample) = if T::ON {
+                let Some(sample) = mode7_sample_at(self.vram(), px, py, self.mode7_repeat) else {
+                    continue;
+                };
+                (sample.byte, Some(sample))
+            } else {
+                let Some(byte) = mode7_sample(self.vram(), px, py, self.mode7_repeat) else {
+                    continue;
+                };
+                (byte, None)
             };
 
             // BG1: the full 8-bit value indexes CGRAM, or runs
@@ -1184,6 +1389,11 @@ impl Ppu {
                     opaque: true,
                     priority: false,
                 };
+                if T::ON {
+                    if let Some(sample) = sample {
+                        trace.notes().fetch[0][x] = mode7_origin(sample, byte, direct, false);
+                    }
+                }
             }
 
             // BG2 (EXTBG): low 7 bits = colour index, bit 7 =
@@ -1197,6 +1407,12 @@ impl Ppu {
                         opaque: true,
                         priority: byte & 0x80 != 0,
                     };
+                    if T::ON {
+                        if let Some(sample) = sample {
+                            trace.notes().fetch[1][x] =
+                                mode7_origin(sample, idx, false, byte & 0x80 != 0);
+                        }
+                    }
                 }
             }
         }
@@ -1223,12 +1439,13 @@ impl Ppu {
     /// and 512-wide (hires) rows. The vertical replay copies the
     /// full 512-wide previous-row buffer regardless so the cold
     /// tail stays consistent if the mode flips mid-frame.
-    fn apply_mosaic_for_bg(
+    fn apply_mosaic_for_bg<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         bg_id: usize,
         scanline: u16,
         row: &mut BgRowBuffer,
         width: usize,
+        trace: &mut T,
     ) {
         if !self.bg_mosaic_enable[bg_id] || self.mosaic_size <= 1 {
             return;
@@ -1237,6 +1454,9 @@ impl Ppu {
         let is_fresh_row = scanline.wrapping_sub(1).is_multiple_of(n);
         if !is_fresh_row {
             *row = self.previous_bg_rows[bg_id];
+            if T::ON {
+                trace.notes().repeat_previous(bg_id);
+            }
             return;
         }
         // H-mosaic on the fresh row: replicate the leftmost pixel
@@ -1248,6 +1468,9 @@ impl Ppu {
             let end = (x + n_us).min(width);
             for slot in &mut row[x..end] {
                 *slot = src;
+            }
+            if T::ON {
+                trace.notes().repeat_block(bg_id, x, end);
             }
             x += n_us;
         }
@@ -1392,7 +1615,9 @@ impl Ppu {
     ///    the `frame_hires` guard.
     ///
     /// A no-op when the frame was lo-res and overscan is off (or shown).
-    pub(crate) fn finalize_frame(&self, fb: &mut Framebuffer) {
+    /// The emulator runs it as it finishes each frame's picture; a host that
+    /// drives the PPU line by line runs it after the frame's last line.
+    pub fn finalize_frame(&self, fb: &mut Framebuffer) {
         // Steps 1+2: hires normalization. Guard against a framebuffer
         // narrower than the hires line; the production allocation is
         // always 512 wide, but staying safe avoids an out-of-bounds
@@ -1534,7 +1759,7 @@ impl Ppu {
     pub(crate) fn redraw_frame(&mut self, fb: &mut Framebuffer) {
         let keeps = RedrawKeeps::take(self);
         let from_table = self.draws_from_line_states();
-        self.draw_frame_again(fb, from_table);
+        self.draw_frame_again(fb, from_table, &mut NoTrace::<FrameTrace>::new());
         keeps.put_back(self);
     }
 
@@ -1574,7 +1799,7 @@ impl Ppu {
         }
         let from_table = self.draws_from_line_states();
         self.isolated_layer = Some(layer);
-        let image = self.picture_drawn_again(from_table);
+        let image = self.picture_drawn_again(from_table, &mut NoTrace::<FrameTrace>::new());
         self.isolated_layer = None;
         Ok(image)
     }
@@ -1597,30 +1822,27 @@ impl Ppu {
             .lines
             .as_deref()
             .is_some_and(record::LineRecorder::holds_whole_frame);
-        whole.then(|| self.picture_drawn_again(true))
+        whole.then(|| self.picture_drawn_again(true, &mut NoTrace::<FrameTrace>::new()))
     }
 
     /// Draw the frame again into a buffer of its own and crop it to the
     /// picture's size, leaving the held frame's display state, and the
     /// state a savestate holds, as they were.
-    fn picture_drawn_again(&mut self, from_table: bool) -> PixelImage {
+    pub(crate) fn picture_drawn_again<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        from_table: bool,
+        trace: &mut T,
+    ) -> PixelImage {
         let keeps = RedrawKeeps::take(self);
         let picture = HeldPicture::take(self);
         let mut fb = Framebuffer::new(MAX_SCANLINE_WIDTH as u32, MAX_OUTPUT_ROWS as u32);
-        let (width, height) = self.draw_frame_again(&mut fb, from_table);
+        let (width, height) = self.draw_frame_again(&mut fb, from_table, trace);
         picture.put_back(self);
         keeps.put_back(self);
-
-        let stride = fb.width as usize * 4;
-        let row_bytes = width as usize * 4;
-        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
-        for y in 0..height as usize {
-            rgba.extend_from_slice(&fb.data[y * stride..y * stride + row_bytes]);
-        }
         PixelImage {
             width,
             height,
-            rgba,
+            rgba: crop_rgba(&fb.data, fb.width, width, height),
         }
     }
 
@@ -1628,20 +1850,30 @@ impl Ppu {
     /// when `from_table` (the caller has checked that it holds the frame),
     /// else from the registers as they stand; return the size of the
     /// picture. The registers and the line table are left as they were.
-    fn draw_frame_again(&mut self, fb: &mut Framebuffer, from_table: bool) -> (u32, u32) {
+    /// A `trace` that takes notes has its planes normalised as the picture
+    /// is, while the frame's own display state still stands.
+    fn draw_frame_again<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        fb: &mut Framebuffer,
+        from_table: bool,
+        trace: &mut T,
+    ) -> (u32, u32) {
         // Taken out for the length of the redraw, so that the lines drawn
         // again are not recorded over the frame's own.
         let mut table = self.recorders.lines.take();
         let live = match table.as_deref_mut() {
-            Some(table) if from_table => Some(self.draw_lines_from_table(table, fb)),
+            Some(table) if from_table => Some(self.draw_lines_from_table(table, fb, trace)),
             _ => {
                 for scanline in 1..FIRST_LINE_PAST_OVERSCAN {
-                    self.render_scanline(scanline, fb);
+                    self.draw_scanline(scanline, fb, trace);
                 }
                 None
             }
         };
         self.finalize_frame(fb);
+        if T::ON {
+            trace.notes().normalize(&PictureShape::of(self));
+        }
         let size = self.active_display_size();
         if let Some(live) = live {
             live.apply(self);
@@ -1658,10 +1890,11 @@ impl Ppu {
     /// before, for the caller to put back once the picture is finished;
     /// until then the overscan bit is the one the picture was finished
     /// with.
-    fn draw_lines_from_table(
+    fn draw_lines_from_table<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         table: &mut record::LineRecorder,
         fb: &mut Framebuffer,
+        trace: &mut T,
     ) -> record::LineState {
         let live = record::LineState::capture(self);
         table.catch_up(&self.video_memory_now());
@@ -1675,7 +1908,7 @@ impl Ppu {
             }
             let (line, state) = table.lines()[index];
             state.apply(self);
-            self.render_scanline(line, fb);
+            self.draw_scanline(line, fb, trace);
         }
         if table.replay_through(usize::MAX, &mut cursor, &mut self.video_memory()) {
             self.vram_moved();
@@ -1698,13 +1931,14 @@ impl Ppu {
     /// [`Self::render_output_line`] up to the composite: the same row
     /// fetch, the same mosaic replay (kept in `previous_bg_rows` for the
     /// pass), the same 256-dot sprite row widened to a hires line.
-    fn render_isolated_line(
+    fn render_isolated_line<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         layer: usize,
         vy: u16,
         obj_line: u16,
         fb_row: u32,
         fb: &mut Framebuffer,
+        trace: &mut T,
     ) {
         let hires = is_hires_mode(self.bgmode);
         let output_width = if hires {
@@ -1736,10 +1970,12 @@ impl Ppu {
 
         if layer == LAYER_OBJ {
             let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-            self.render_obj_row(obj_line, &mut obj_row);
+            self.render_obj_row(obj_line, &mut obj_row, trace);
             for x in 0..visible_w {
-                let pixel = obj_row[if hires { x >> 1 } else { x }];
-                if pixel.opaque {
+                let column = if hires { x >> 1 } else { x };
+                let pixel = obj_row[column];
+                // A sprite render draws the chosen sprites alone.
+                if pixel.opaque && (!T::ON || trace.notes().draws_sprite_at(column)) {
                     put(x, pixel.color);
                 }
             }
@@ -1751,13 +1987,25 @@ impl Ppu {
             // The affine plane is BG1, and BG2 too with EXTBG; there is
             // no BG3 or BG4 in Mode 7.
             let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-            self.render_mode7_rows(vy, &mut rows, layer == 0, layer == 1 && self.mode7_extbg);
+            self.render_mode7_rows(
+                vy,
+                &mut rows,
+                layer == 0,
+                layer == 1 && self.mode7_extbg,
+                trace,
+            );
             row = rows[layer];
         } else if bg_visible_in_mode(self.bgmode, layer) {
-            self.render_bg_row(layer, vy, &mut row, hires);
+            self.render_bg_row(layer, vy, &mut row, hires, trace);
         }
-        self.apply_mosaic_for_bg(layer, vy, &mut row, output_width);
+        if T::ON {
+            trace.notes().begin_main_row(layer);
+        }
+        self.apply_mosaic_for_bg(layer, vy, &mut row, output_width, trace);
         self.previous_bg_rows[layer] = row;
+        if T::ON {
+            trace.notes().keep_previous_row(layer);
+        }
         for (x, pixel) in row.iter().enumerate().take(visible_w) {
             if pixel.opaque {
                 put(x, pixel.color);
@@ -2616,7 +2864,7 @@ mod tests {
         ppu.cgram[0x42] = 0x1234;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows, true, false);
+        ppu.render_mode7_rows(1, &mut rows, true, false, &mut NoTrace::<FrameTrace>::new());
 
         assert!(rows[0][0].opaque);
         assert_eq!(rows[0][0].color, 0x1234);
@@ -2637,7 +2885,7 @@ mod tests {
         ppu.cgram[0x03] = 0x5555;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows, true, true);
+        ppu.render_mode7_rows(1, &mut rows, true, true, &mut NoTrace::<FrameTrace>::new());
 
         // BG1 uses the full 8-bit value at low priority.
         assert!(rows[0][0].opaque);
@@ -2662,7 +2910,7 @@ mod tests {
         ppu.cgram[0x07] = 0x7FFF;
 
         let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
-        ppu.render_mode7_rows(1, &mut rows, true, false);
+        ppu.render_mode7_rows(1, &mut rows, true, false, &mut NoTrace::<FrameTrace>::new());
 
         assert!(rows[0][0].opaque);
         assert_eq!(rows[0][0].color, direct_color_word(0x07, 0));
@@ -2714,7 +2962,7 @@ mod tests {
         let mut ppu = mode1_cache_ppu();
         let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         // Scanline 1 -> screen_y 0 -> tile row 0.
-        ppu.render_bg_row(0, 1, &mut row, false);
+        ppu.render_bg_row(0, 1, &mut row, false, &mut NoTrace::<FrameTrace>::new());
         // Column 0 (x 0..7) = tile 1 = colour index 1 = cgram[1].
         assert!(row[0].opaque && row[7].opaque);
         assert_eq!(row[0].color, 0x1111);
@@ -2732,12 +2980,12 @@ mod tests {
         let mut rebuilt = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
 
         // First render builds the cache (cold miss).
-        ppu.render_bg_row(0, 1, &mut cold, false);
+        ppu.render_bg_row(0, 1, &mut cold, false, &mut NoTrace::<FrameTrace>::new());
         // Second render of the same scanline hits the warm cache.
-        ppu.render_bg_row(0, 1, &mut warm, false);
+        ppu.render_bg_row(0, 1, &mut warm, false, &mut NoTrace::<FrameTrace>::new());
         // Forcing a miss must reproduce the identical output.
         ppu.invalidate_tilemap_caches();
-        ppu.render_bg_row(0, 1, &mut rebuilt, false);
+        ppu.render_bg_row(0, 1, &mut rebuilt, false, &mut NoTrace::<FrameTrace>::new());
 
         assert_eq!(&cold[..256], &warm[..256], "cache hit diverged from build");
         assert_eq!(
@@ -2753,10 +3001,10 @@ mod tests {
         let mut band0 = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         let mut band1 = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         // Scanline 1 -> tile row 0 -> column 0 = tile 1 = cgram[1].
-        ppu.render_bg_row(0, 1, &mut band0, false);
+        ppu.render_bg_row(0, 1, &mut band0, false, &mut NoTrace::<FrameTrace>::new());
         // Scanline 9 -> screen_y 8 -> tile row 1 -> column 0 = tile 2 =
         // cgram[2]. A stale ty-0 row would still report cgram[1].
-        ppu.render_bg_row(0, 9, &mut band1, false);
+        ppu.render_bg_row(0, 9, &mut band1, false, &mut NoTrace::<FrameTrace>::new());
         assert_eq!(band0[0].color, 0x1111);
         assert_eq!(band1[0].color, 0x2222, "ty rollover must rebuild the row");
     }
@@ -2766,7 +3014,7 @@ mod tests {
         let mut ppu = mode1_cache_ppu();
         ppu.bgmode = 2; // offset-per-tile -> direct fetch, no caching
         let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-        ppu.render_bg_row(0, 1, &mut row, false);
+        ppu.render_bg_row(0, 1, &mut row, false, &mut NoTrace::<FrameTrace>::new());
         assert!(
             !ppu.bg_tilemap_row_cache[0].valid,
             "offset-per-tile must not populate the tilemap-row cache"
@@ -2807,8 +3055,8 @@ mod tests {
 
         let mut top = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         let mut bot = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-        ppu.render_bg_row(0, 1, &mut top, false); // screen_y 0 -> top half
-        ppu.render_bg_row(0, 9, &mut bot, false); // screen_y 8 -> bottom half
+        ppu.render_bg_row(0, 1, &mut top, false, &mut NoTrace::<FrameTrace>::new()); // screen_y 0 -> top half
+        ppu.render_bg_row(0, 9, &mut bot, false, &mut NoTrace::<FrameTrace>::new()); // screen_y 8 -> bottom half
 
         assert_eq!(top[0].color, 0x1111, "x0..7,y0..7 -> TL tile N");
         assert_eq!(top[8].color, 0x2222, "x8..15,y0..7 -> TR tile N+1");
@@ -2852,8 +3100,8 @@ mod tests {
 
         let mut top = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         let mut bot = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-        ppu.render_bg_row(0, 1, &mut top, false);
-        ppu.render_bg_row(0, 9, &mut bot, false);
+        ppu.render_bg_row(0, 1, &mut top, false, &mut NoTrace::<FrameTrace>::new());
+        ppu.render_bg_row(0, 9, &mut bot, false, &mut NoTrace::<FrameTrace>::new());
 
         // Both flips set -> screen TL reads BR char (N+17, idx 4), screen
         // TR reads BL (N+16, idx 3), screen BL reads TR (N+1, idx 2),
@@ -2893,8 +3141,8 @@ mod tests {
 
         let mut top = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
         let mut bot = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-        ppu.render_bg_row(0, 1, &mut top, true); // screen_y 0 -> top half
-        ppu.render_bg_row(0, 9, &mut bot, true); // screen_y 8 -> bottom half
+        ppu.render_bg_row(0, 1, &mut top, true, &mut NoTrace::<FrameTrace>::new()); // screen_y 0 -> top half
+        ppu.render_bg_row(0, 9, &mut bot, true, &mut NoTrace::<FrameTrace>::new()); // screen_y 8 -> bottom half
 
         // 512-dot grid: cols 0..7 = left char, cols 8..15 = right char.
         assert_eq!(top[0].color, 0x1111, "x0..7,y0..7 -> TL tile N");
@@ -2930,7 +3178,7 @@ mod tests {
 
         let top_color = |ppu: &mut Ppu, sy: u16| {
             let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-            ppu.render_bg_row(0, sy, &mut row, true);
+            ppu.render_bg_row(0, sy, &mut row, true, &mut NoTrace::<FrameTrace>::new());
             row[0].color
         };
         assert_eq!(top_color(&mut ppu, 0), 0x1111, "y0 -> block0 top char");
@@ -2967,7 +3215,7 @@ mod tests {
         ppu.cgram[2] = 0x2222;
 
         let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
-        ppu.render_bg_row(0, 1, &mut row, true); // screen_y 0
+        ppu.render_bg_row(0, 1, &mut row, true, &mut NoTrace::<FrameTrace>::new()); // screen_y 0
 
         assert_eq!(row[0].color, 0x1111, "left 8 px -> tile N");
         assert_eq!(row[8].color, 0x2222, "right 8 px -> adjacent tile N+1");
@@ -3000,6 +3248,94 @@ mod tests {
     }
 
     #[test]
+    fn the_painter_draws_the_columns_the_line_budget_keeps() {
+        // Over random sprite tables, each column of the sprite row belongs to
+        // the sprite a painter working from `sprite::line_budget` gives it:
+        // the kept sprites back to front, each its first `columns_drawn`
+        // fetched columns. Every character pixel is opaque, so a painted
+        // column is never left to the sprite behind.
+        use crate::ppu::trace::FrameTrace;
+        let mut state = 0x5EED_0B1Eu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..300 {
+            let mut ppu = obj_test_ppu();
+            ppu.vram.fill(0xFFFF);
+            ppu.obj_base_size = (next() % 8) as u8;
+            ppu.oam_first_sprite = (next() % 128) as u8;
+            let scanline = 1 + (next() % 224) as u16;
+            let line = scanline - 1;
+            for slot in 0..128 {
+                // Most sprites near the line, so the limits are reached.
+                let near = next() % 4 != 0;
+                let y = if near {
+                    line.wrapping_sub((next() % 48) as u16) as u8
+                } else {
+                    (next() % 256) as u8
+                };
+                let x = (next() % 512) as u16;
+                set_sprite(
+                    &mut ppu,
+                    slot,
+                    x as u8,
+                    y,
+                    (next() % 256) as u8,
+                    (next() % 256) as u8,
+                );
+                let shift = (slot & 3) * 2;
+                let bits = u8::from(x >= 256) | (((next() % 2) as u8) << 1);
+                let high = &mut ppu.oam[0x200 + (slot >> 2)];
+                *high = (*high & !(3 << shift)) | (bits << shift);
+            }
+
+            let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+            let mut trace = FrameTrace::new(0, None);
+            ppu.render_obj_row(scanline, &mut obj, &mut trace);
+
+            let budget = sprite::line_budget(
+                &ppu.oam,
+                ppu.oam_first_sprite,
+                ppu.obj_base_size,
+                false,
+                line,
+                None,
+            );
+            let mut expected = [None; NORMAL_SCANLINE_WIDTH];
+            for k in (0..usize::from(budget.kept_count)).rev() {
+                let slot = budget.kept[k];
+                let s = sprite::parse_sprite(&ppu.oam, usize::from(slot), ppu.obj_base_size, false);
+                let mut left = budget.columns_drawn[k];
+                for tx in 0..u16::from(s.width >> 3) {
+                    let column_x = (s.x + (tx << 3)) & 0x1FF;
+                    if sprite::column_off_screen(s.x, column_x) {
+                        continue;
+                    }
+                    if left == 0 {
+                        break;
+                    }
+                    left -= 1;
+                    for px in 0..8 {
+                        let sx = usize::from((column_x + px) & 0x1FF);
+                        if sx < NORMAL_SCANLINE_WIDTH {
+                            expected[sx] = Some(slot);
+                        }
+                    }
+                }
+            }
+            let painted: Vec<Option<u8>> = obj
+                .iter()
+                .enumerate()
+                .map(|(x, pixel)| pixel.opaque.then(|| trace.obj[x].slot))
+                .collect();
+            assert_eq!(painted, expected.to_vec(), "case {case}");
+        }
+    }
+
+    #[test]
     fn render_obj_row_single_8x8_sprite() {
         let mut ppu = obj_test_ppu();
         set_sprite(&mut ppu, 0, 0, 0, 0, 0);
@@ -3009,7 +3345,7 @@ mod tests {
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
         // Scanline 1 -> line 0 -> sprite row 0.
-        ppu.render_obj_row(1, &mut obj);
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
 
         for (x, px) in obj.iter().enumerate().take(8) {
             assert!(px.opaque, "col {x} opaque");
@@ -3028,7 +3364,7 @@ mod tests {
         ppu.cgram[128 + 5 * 16 + 1] = 0x7ABC;
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj);
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
         assert!(obj[0].opaque);
         assert_eq!(obj[0].color, 0x7ABC);
         assert_eq!(obj[0].prio, 3);
@@ -3043,7 +3379,7 @@ mod tests {
         ppu.cgram[129] = 0x1234;
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj);
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
         assert!(obj[7].opaque, "hflip moves the leftmost pixel to column 7");
         assert_eq!(obj[7].color, 0x1234);
         assert!(!obj[0].opaque);
@@ -3055,6 +3391,10 @@ mod tests {
         // (last) must win the overlap pixel the renderer actually paints.
         use retro_core::video::VideoDebugger;
         let mut ppu = obj_test_ppu();
+        // The order lists what a frame showing sprites drew.
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.obj_main_enable = true;
         // Two 8x8 sprites stacked at (0,0): slot 0 palette 0, slot 1
         // palette 1, both lit on row 0 -> they overlap at column 0.
         set_sprite(&mut ppu, 0, 0, 0, 0, 0x00); // palette 0
@@ -3064,7 +3404,7 @@ mod tests {
         ppu.cgram[128 + 16 + 1] = 0x5555; // palette 1 index 1 (slot 1)
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj);
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
 
         let order = ppu.resolved_sprite_render_order();
         let top = order.last().expect("non-empty order");

@@ -221,6 +221,52 @@ pub struct LineStateTable {
     pub values: Vec<u32>,
 }
 
+/// The picture held in the top-left corner of an RGBA framebuffer whose rows
+/// are `source_width` pixels wide: its first `height` rows, each cut to its
+/// first `width` pixels, packed row after row (`width * height * 4` bytes).
+///
+/// `width` is at most `source_width`.
+///
+/// # Panics
+///
+/// When `source` holds fewer than `height` rows.
+pub fn crop_rgba(source: &[u8], source_width: u32, width: u32, height: u32) -> Vec<u8> {
+    let stride = source_width as usize * 4;
+    let row_bytes = width as usize * 4;
+    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height as usize {
+        rgba.extend_from_slice(&source[y * stride..y * stride + row_bytes]);
+    }
+    rgba
+}
+
+/// Whether `rgba` is the picture [`crop_rgba`] would cut out of `source`
+/// (`width` by `height`, rows of `source_width` pixels), byte for byte,
+/// without making the copy: it holds exactly `width * height` pixels and
+/// each of its rows equals the start of the same row of `source`.
+///
+/// `width` is at most `source_width`.
+///
+/// # Panics
+///
+/// When `rgba` has the picture's size and `source` holds fewer than `height`
+/// rows.
+pub fn equals_cropped_rgba(
+    source: &[u8],
+    source_width: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> bool {
+    let stride = source_width as usize * 4;
+    let row_bytes = width as usize * 4;
+    rgba.len() == row_bytes * height as usize
+        && rgba
+            .chunks(row_bytes.max(1))
+            .enumerate()
+            .all(|(y, row)| row == &source[y * stride..y * stride + row_bytes])
+}
+
 /// Video debugging interface for tile-based graphics systems.
 pub trait VideoDebugger {
     /// Get tile data by index.
@@ -255,18 +301,6 @@ pub trait VideoDebugger {
 
     /// Toggle layer visibility.
     fn toggle_layer(&mut self, layer_id: u32, visible: bool);
-
-    /// Re-composite the current frame from the present video state
-    /// (VRAM/palette/registers plus any debugger layer mask) into the
-    /// core's framebuffer, without advancing emulation.
-    ///
-    /// The live frame loop repaints every frame, so this only matters
-    /// while the core is paused: after a host toggles a layer it can call
-    /// `repaint()` to make the change visible immediately instead of
-    /// waiting for the game to resume. Default: no-op, cores that have no
-    /// re-render path (or always composite on framebuffer read) need
-    /// nothing here.
-    fn repaint(&mut self) {}
 
     /// Get raw VRAM.
     fn get_vram(&self) -> &[u8];
@@ -312,5 +346,57 @@ pub trait VideoDebugger {
     /// Default: `None`, a core that keeps no line table.
     fn get_line_states(&self) -> Option<LineStateTable> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A framebuffer 4 pixels wide and 3 rows high, each byte its own index.
+    fn framebuffer() -> Vec<u8> {
+        (0..4 * 3 * 4).map(|byte| byte as u8).collect()
+    }
+
+    #[test]
+    fn a_crop_keeps_the_first_rows_each_cut_to_the_width() {
+        let source = framebuffer();
+        let picture = crop_rgba(&source, 4, 2, 2);
+        assert_eq!(
+            picture,
+            [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]
+        );
+        assert_eq!(crop_rgba(&source, 4, 4, 3), source, "the whole picture");
+        assert!(crop_rgba(&source, 4, 0, 3).is_empty());
+        assert!(crop_rgba(&source, 4, 2, 0).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn a_crop_past_the_last_row_is_a_mistake() {
+        crop_rgba(&framebuffer(), 4, 2, 4);
+    }
+
+    #[test]
+    fn a_picture_equals_its_crop_and_nothing_else() {
+        let source = framebuffer();
+        let picture = crop_rgba(&source, 4, 3, 2);
+        assert!(equals_cropped_rgba(&source, 4, 3, 2, &picture));
+
+        let mut changed = picture.clone();
+        changed[13] ^= 1;
+        assert!(!equals_cropped_rgba(&source, 4, 3, 2, &changed));
+
+        // Another size is another picture, whatever its bytes.
+        assert!(!equals_cropped_rgba(&source, 4, 3, 2, &picture[..12]));
+        assert!(!equals_cropped_rgba(&source, 4, 2, 3, &picture));
+        let mut longer = picture.clone();
+        longer.extend([0; 4]);
+        assert!(!equals_cropped_rgba(&source, 4, 3, 2, &longer));
+
+        // An empty picture is the crop of no pixel.
+        assert!(equals_cropped_rgba(&source, 4, 0, 2, &[]));
+        assert!(equals_cropped_rgba(&source, 4, 3, 0, &[]));
+        assert!(!equals_cropped_rgba(&source, 4, 0, 2, &[1, 2, 3, 4]));
     }
 }

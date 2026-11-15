@@ -11,6 +11,7 @@
 //! type.
 
 pub mod builder;
+pub mod byte_source;
 pub mod cartridge;
 pub mod chips;
 pub mod debug;
@@ -24,8 +25,8 @@ pub mod savestate;
 pub use builder::{build_genesis_cartridge, build_with_manifest, detected_manifest, rom_sha256};
 pub use cartridge::ComposableCartridge;
 pub use chips::{
-    BankMapperChip, EepromChip, JCartChip, SvpCoprocessor, BANK_MAPPER_CHIP_ID, EEPROM_CHIP_ID,
-    JCART_CHIP_ID, SVP_CHIP_ID,
+    bank_table_of, BankMapperChip, BankTable, EepromChip, JCartChip, SvpCoprocessor,
+    BANK_MAPPER_CHIP_ID, EEPROM_CHIP_ID, JCART_CHIP_ID, SVP_CHIP_ID,
 };
 pub use debug::{describe_map_plan, GenesisCartridgeDebugger, MapRegionSummary};
 pub use factory::Sg1ChipFactory;
@@ -38,7 +39,7 @@ pub use savestate::{
     JCartState, SvpState,
 };
 
-use retro_core::cartridge::{CartridgeAudio, CartridgeInfo, ExpansionChipState};
+use retro_core::cartridge::{CartridgeAudio, CartridgeInfo, ExpansionChipState, SourcePlace};
 
 /// A Genesis cartridge as seen by the bus.
 ///
@@ -196,6 +197,35 @@ pub trait GenesisCartridge: Send {
     /// Hardware reset of the cartridge (chips + latches; ROM/SRAM contents
     /// are unaffected).
     fn reset(&mut self) {}
+
+    /// Where the byte a 68000 read of each of `addresses` (in the cartridge
+    /// window, `0x000000-0x7FFFFF`) returns comes from, through the mapping
+    /// as it stands now: the offset in the ROM file it reads (a bank
+    /// mapper's banks as they are set, the ROM mirrored by the slot's
+    /// mask, the ROM showing through switched-off SRAM), the cartridge's
+    /// RAM, a coprocessor, or nothing (open bus, past the end of the ROM).
+    /// Reads the mapping and changes nothing: no chip is clocked or
+    /// counted.
+    ///
+    /// The default walks the plan: a ROM slot names its offset inside the
+    /// ROM [`info`](Self::info) sizes, an SRAM slot the cartridge's RAM, a
+    /// chip's slot the coprocessor. A cartridge that knows more (the SRAM
+    /// switch, a bank mapper's banks) answers for itself.
+    fn byte_sources(&self, addresses: &[u32]) -> Vec<SourcePlace> {
+        let rom_len = self.info().rom_size;
+        addresses
+            .iter()
+            .map(|&address| {
+                byte_source::through_plan(
+                    self.map_plan(),
+                    address,
+                    |offset| byte_source::rom_byte(offset, rom_len),
+                    |_| SourcePlace::CartridgeRam,
+                    |_, _| SourcePlace::Coprocessor,
+                )
+            })
+            .collect()
+    }
 
     /// Read the value a bus-control register (`0xA130F1` /TIME SRAM-enable)
     /// reports. `None` (the default) means the cartridge does not drive that

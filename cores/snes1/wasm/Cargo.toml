@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 retro-core = { path = "../../../retro-core" }
+retro-wasm = { path = "../../../retro-wasm" }
 snes1-core = { path = "../core", default-features = false }
 wasm-bindgen = "0.2"
 serde = { workspace = true }
@@ -36,6 +37,9 @@ nec-lle = ["snes1-core/nec-lle"]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# `retro_wasm::test_support::shape`, which the capture readers' tests hold
+# their JavaScript values to.
+retro-wasm = { path = "../../../retro-wasm", features = ["test-support"] }
 
 [package.metadata.wasm-pack.profile.release]
 # Rust/LLVM emit bulk-memory + non-trapping float-to-int ops by default

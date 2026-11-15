@@ -1,0 +1,23 @@
+[package]
+name = "retro-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings the console cores' WASM crates share"
+
+[features]
+# `test_support::shape`, which the binding crates' tests compare JavaScript
+# values with.
+test-support = []
+
+[dependencies]
+retro-core = { path = "../retro-core" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { workspace = true }
+serde-wasm-bindgen = "0.6"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

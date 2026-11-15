@@ -12,9 +12,13 @@ use crate::io::devices::genesis_3button::Genesis3ButtonDevice;
 use crate::io::devices::genesis_6button::Genesis6ButtonDevice;
 use crate::timing::VideoRegion;
 use crate::vdp::dma::MemoryDma;
-use crate::vdp::{CaptureRecording, LayerImage, LinePalettes};
 use crate::z80::Z80;
+use retro_core::capture::{
+    CaptureCore, CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites,
+    PixelSources, RenderedLayer, VideoMemorySources,
+};
 use retro_core::cpu::Addressable;
+use retro_core::video::{crop_rgba, LineStateTable, PixelImage, VideoDebugger};
 
 use retro_core::*;
 
@@ -100,38 +104,17 @@ pub struct InstructionAccessLog {
     pub dmas: Vec<MemoryDma>,
 }
 
-/// The frame as it stands at a capture boundary, or wherever
-/// [`GenesisEmulator::capture_frame_snapshot`] is called: copies of the
-/// picture the host shows and of the video memory and registers it was
-/// drawn from.
-#[derive(Debug, Clone)]
-pub struct CaptureFrameSnapshot {
-    /// The number of the frame the picture is: the frames finished so far,
-    /// plus one while a frame is held part of the way through (it is
-    /// counted once it ends).
-    pub frame: u64,
-    /// Whether the core is stopped at a capture boundary, where the
-    /// picture and the memory below belong to the same frame.
-    pub at_boundary: bool,
-    /// Width of the picture: 256 or 320.
-    pub width: u32,
-    /// Height of the picture ([`crate::vdp::Vdp::drawn_height`]).
-    pub height: u32,
-    /// The picture the host shows, RGBA, `width * height * 4` bytes.
-    pub framebuffer: Vec<u8>,
-    /// The 64 KiB of VRAM.
-    pub vram: Vec<u8>,
-    /// CRAM: the 64 colours of the four palettes, `0000 BBB0 GGG0 RRR0`.
-    pub palette: Vec<u16>,
+/// What only the Mega Drive has in a frame snapshot
+/// ([`CaptureCore::capture_frame_snapshot`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GenesisSnapshotConsole {
     /// The 64 words of the vertical scroll RAM.
     pub vsram: Vec<u16>,
-    /// The 24 VDP registers.
-    pub registers: Vec<retro_core::video::VideoRegister>,
 }
 
 /// A frame a frame loop left part of the way through, and where it goes on
 /// from. Never part of a savestate: a savestate is always taken where a
-/// frame ends ([`GenesisEmulator::finish_frame_and_save_state`]).
+/// frame ends ([`CaptureCore::save_state_at_frame_end`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeldFrame {
     /// The scanline the frame goes on from.
@@ -338,8 +321,8 @@ pub struct GenesisEmulator {
     held_frame: Option<HeldFrame>,
 
     /// What the host asked the video chip to record while frames run, for a
-    /// capture ([`Self::set_capture_recording`]). A host setting, never
-    /// serialized, applied again whenever the video chip is replaced.
+    /// capture ([`CaptureCore::set_capture_recording`]). A host setting,
+    /// never serialized, applied again whenever the video chip is replaced.
     capture_recording: CaptureRecording,
 }
 
@@ -859,111 +842,19 @@ impl GenesisEmulator {
             .unwrap_or(0)
     }
 
-    /// Re-render the currently held frame from live VDP state, applying the
-    /// debugger's per-layer mask, and refresh the host-visible cached
-    /// framebuffer, all without advancing emulation by a single cycle.
-    ///
-    /// The host reads frames through [`Self::get_framebuffer`], which returns
-    /// the cached copy the run loops refresh once per frame via
-    /// `update_cached_framebuffer`. A paused core never re-composites, so a
-    /// debugger layer toggle (or a VRAM/CRAM edit) would stay invisible until
-    /// the game resumes. Driving the VDP re-render alone is not enough: the
-    /// new pixels land in the VDP's own framebuffer, not the cache the host
-    /// reads, so this re-syncs the cache too. Mirrors the per-frame cache
-    /// refresh the `run_frame*` paths already perform.
-    ///
-    /// Returns whether every line was drawn from the state it was drawn
-    /// with, from the line table ([`Self::set_capture_recording`]).
-    pub fn repaint_held_frame(&mut self) -> bool {
-        let from_line_states = self.bus.vdp_mut().rerender_current_frame();
-        self.update_cached_framebuffer();
-        from_line_states
+    /// The number of the frame the picture is: the frames finished, plus
+    /// one while a frame is held part of the way through (it is counted
+    /// once it ends).
+    fn picture_frame(&self) -> u64 {
+        self.frame_count + u64::from(self.held_frame.is_some())
     }
 
-    /// Ask the video chip to record what the host wants of each frame while
-    /// frames run ([`CaptureRecording`]): this core records the line states,
-    /// the settings each line of the picture was drawn with, with which a
-    /// repaint, a layer and [`Self::picture_from_line_states`] draw each line
-    /// as it was drawn. A host setting: never part of a savestate, kept
-    /// across a reset, a ROM load, a savestate load and a power cycle, and
-    /// nothing the machine does depends on it. Recording only reads; the
-    /// state hash, the picture and the sound are the same either way.
-    pub fn set_capture_recording(&mut self, wanted: CaptureRecording) {
-        self.capture_recording = wanted;
-        self.bus.vdp_mut().set_capture_recording(wanted);
-    }
-
-    /// What the video chip records while frames run: what the host asked
-    /// for that this core records.
-    pub fn capture_recording(&self) -> CaptureRecording {
-        self.bus.vdp().capture_recording()
-    }
-
-    /// The settings each line of the picture was drawn with, as a table
-    /// ([`retro_core::video::LineStateTable`]); `None` while line states are
-    /// not recorded.
-    pub fn line_states(&self) -> Option<retro_core::video::LineStateTable> {
-        retro_core::video::VideoDebugger::get_line_states(self.bus.vdp())
-    }
-
-    /// The palettes the lines of the picture began with, and the palette
-    /// writes made while each was on screen ([`LinePalettes`]); `None`
-    /// while line states are not recorded.
-    pub fn line_palettes(&self) -> Option<LinePalettes> {
-        self.bus.vdp().line_palettes()
-    }
-
-    /// The picture drawn again from the line table into a buffer of its
-    /// own, cut as the host's picture is
-    /// ([`crate::vdp::Vdp::picture_from_line_states`]); `None` while line
-    /// states are not recorded. Nothing runs, and the framebuffer and
-    /// everything a savestate holds stay as they were.
-    pub fn picture_from_line_states(&mut self) -> Option<retro_core::video::PixelImage> {
-        self.bus.vdp_mut().picture_from_line_states()
-    }
-
-    /// Run to the next capture boundary and stop there: the moment the
-    /// frame's picture is drawn and vertical blanking has not begun, so no
-    /// VBlank interrupt is raised or taken and the game's VBlank code has
-    /// uploaded nothing for the next frame. There video memory and the
-    /// framebuffer belong to the same frame ([`Self::capture_frame_snapshot`],
-    /// [`Self::render_layer`]).
-    ///
-    /// The frame stays held there, outside every savestate, until the next
-    /// frame call finishes it (one call is the rest of the frame), a
-    /// savestate is taken ([`Self::finish_frame_and_save_state`] finishes
-    /// it first), or a reset, a savestate load or a ROM load drops it.
-    ///
-    /// A frame already held at its boundary, or past it, is finished first
-    /// and the next frame run to its boundary, so each call moves the game
-    /// on one frame; a frame held before its boundary (at an event
-    /// breakpoint) runs on to it. The frame loop is the one a frame call
-    /// picks ([`GenesisDebugger::execution_tier`]: the loop a player runs
-    /// while no debug feature is armed), and a breakpoint still stops where
-    /// it stops, leaving the core held at no boundary.
-    pub fn run_to_capture_boundary(&mut self) {
-        let frame_loop = self.debugger.execution_tier();
-        self.run_to_capture_boundary_with(frame_loop);
-    }
-
-    /// [`Self::run_to_capture_boundary`] on the frame loop `frame_loop`
-    /// instead of the one the debugger's state picks.
+    /// [`CaptureCore::run_to_capture_boundary`] on the frame loop
+    /// `frame_loop` instead of the one the debugger's state picks.
     pub fn run_to_capture_boundary_with(&mut self, frame_loop: ExecutionTier) {
         if self.run_frame_pass(frame_loop, true) == PassEnd::FrameEnd {
             self.run_frame_pass(frame_loop, true);
         }
-    }
-
-    /// Whether the core is held at a capture boundary
-    /// ([`Self::run_to_capture_boundary`]).
-    pub fn at_capture_boundary(&self) -> bool {
-        matches!(
-            self.held_frame,
-            Some(HeldFrame {
-                reason: HoldReason::CaptureBoundary,
-                ..
-            })
-        )
     }
 
     /// Finish a frame left part of the way through, at a capture boundary
@@ -984,41 +875,6 @@ impl GenesisEmulator {
         true
     }
 
-    /// Save the machine's state where a frame ends: a frame held part of
-    /// the way through is finished first ([`Self::finish_held_frame`]), so
-    /// a savestate never holds a frame half run, which no savestate can
-    /// say where to resume. Every host saves through this:
-    /// [`EmulatorCore::save_state`] takes `&self`, so it cannot finish a
-    /// frame, and refuses while one is held.
-    pub fn finish_frame_and_save_state(&mut self) -> Vec<u8> {
-        self.finish_held_frame();
-        <Self as EmulatorCore>::save_state(self)
-    }
-
-    /// Copies of the picture the host shows and of the video memory and
-    /// registers ([`CaptureFrameSnapshot`]). At a capture boundary both
-    /// belong to the frame held there; elsewhere the memory may already
-    /// hold what the game wrote after the picture was drawn.
-    pub fn capture_frame_snapshot(&self) -> CaptureFrameSnapshot {
-        use retro_core::video::VideoDebugger;
-
-        let (width, height, framebuffer) = self.shown_picture();
-        let vdp = self.bus.vdp();
-        CaptureFrameSnapshot {
-            // The number of the frame the picture is: a frame held part of the
-            // way through is counted once it ends, so it is the next one.
-            frame: self.frame_count + u64::from(self.held_frame.is_some()),
-            at_boundary: self.at_capture_boundary(),
-            width,
-            height,
-            framebuffer,
-            vram: vdp.get_vram().to_vec(),
-            palette: vdp.get_cram().to_vec(),
-            vsram: vdp.get_vsram().to_vec(),
-            registers: vdp.get_registers(),
-        }
-    }
-
     /// The picture the host shows, as [`EmulatorCore::get_display_info`]
     /// sizes it: the framebuffer's rows cut to the lines the VDP draws.
     fn shown_picture(&self) -> (u32, u32, Vec<u8>) {
@@ -1026,26 +882,7 @@ impl GenesisEmulator {
         let display = &self.system_info.display;
         let width = display.width.min(fb.width);
         let height = display.height.min(fb.height);
-        let stride = fb.width as usize * 4;
-        let row_bytes = width as usize * 4;
-        let mut picture = Vec::with_capacity(row_bytes * height as usize);
-        for row in fb.data.chunks_exact(stride).take(height as usize) {
-            picture.extend_from_slice(&row[..row_bytes]);
-        }
-        (width, height, picture)
-    }
-
-    /// One layer of the frame drawn alone, alpha-keyed
-    /// ([`crate::vdp::Vdp::render_layer_image`]); at a capture boundary,
-    /// the frame held there. Each line is drawn from the state it was drawn
-    /// with where the line table holds it, from video memory as it is now
-    /// otherwise; [`LayerImage::from_line_states`] says whether every line
-    /// had its record. `layer` is an id of the layer list (`getLayerInfo`,
-    /// `toggleLayer`), `None` for any other. Nothing runs: the framebuffer
-    /// the host reads, and everything a savestate or [`Self::state_hash`]
-    /// reads, stay as they were.
-    pub fn render_layer(&mut self, layer: u32) -> Option<LayerImage> {
-        self.bus.vdp_mut().render_layer_image(layer as usize)
+        (width, height, crop_rgba(&fb.data, fb.width, width, height))
     }
 
     /// Set controller port button state directly (for CLI input injection).
@@ -2778,6 +2615,7 @@ impl GenesisEmulator {
         self.bus.vdp_mut().tick_dma(total_master_clocks);
         // Advance the deferred-VINT countdown (the request lands part-way into the line)
         self.bus.vdp_mut().tick_vint_delay(total_master_clocks);
+        let video_event = self.video_event_hit();
 
         // Breakpoint check (after execution)
         let new_pc = self.cpu.pc;
@@ -2796,7 +2634,8 @@ impl GenesisEmulator {
             breakpoint_hit: breakpoint_hit_before
                 || breakpoint_hit_after
                 || watchpoint_hit
-                || interrupt_event,
+                || interrupt_event
+                || video_event,
             instruction_executed: true,
         }
     }
@@ -2817,6 +2656,36 @@ impl GenesisEmulator {
             4 => self.debugger.check_event(GenesisEvent::HInt),
             _ => false,
         }
+    }
+
+    /// Whether an event breakpoint stops on a write to video memory made
+    /// during the step just run: a transfer that finished, a palette colour
+    /// written, a transfer into the sprite table, a tile rewritten. The VDP
+    /// raises only what the watch [`Self::arm_video_events`] armed asks
+    /// for, so with no such breakpoint this is one check of nothing raised.
+    /// The stop lands after the instruction that made the write, part of
+    /// the way into a line, as a watchpoint's does; a fill finishing as the
+    /// 68000 runs on stops after the instruction it finished during.
+    fn video_event_hit(&mut self) -> bool {
+        let raised = self.bus.vdp_mut().take_raised_events();
+        let mut hit = false;
+        for event in raised.iter() {
+            hit |= self.debugger.check_event(GenesisEvent::from(event));
+        }
+        hit
+    }
+
+    /// Arm the VDP's watch on writes to video memory from the enabled event
+    /// breakpoints ([`crate::debugger::GenesisDebugger::video_event_watch`]),
+    /// or clear it when none asks. The debugger loops do this as each pass
+    /// begins, and a step the host asks for before it runs.
+    fn arm_video_events(&mut self) {
+        let watch = if self.debugger.has_watchpoints() {
+            self.debugger.video_event_watch()
+        } else {
+            None
+        };
+        self.bus.vdp_mut().set_event_watch(watch);
     }
 
     /// Advance the audio subsystem one frame, and, when `present`, mix and
@@ -3215,6 +3084,8 @@ impl GenesisEmulator {
         let scanlines = self.region.scanlines();
         let has_rom = self.bus.cartridge().is_some();
         let pass = self.start_frame_pass(scanlines, stop_at_boundary);
+        // This loop checks no event breakpoint: the VDP raises none.
+        self.bus.vdp_mut().set_event_watch(None);
 
         // Track 68K overshoot between scanlines. On real hardware, the 68K uses
         // a continuous cycle counter, so if the last instruction of scanline N
@@ -3485,7 +3356,7 @@ impl GenesisEmulator {
     /// Fast frame execution with presentation (audio + framebuffer).
     /// This is the tier the WASM `runFrame` dispatch selects when no
     /// debug features are active. A frame held part of the way through
-    /// ([`Self::run_to_capture_boundary`], an event breakpoint) is finished
+    /// ([`CaptureCore::run_to_capture_boundary`], an event breakpoint) is finished
     /// instead: the call is the rest of that frame.
     pub fn run_frame_fast(&mut self) {
         self.run_frame_fast_inner(true, false);
@@ -3528,6 +3399,7 @@ impl GenesisEmulator {
         let scanlines = self.region.scanlines();
         let has_rom = self.bus.cartridge().is_some();
         let pass = self.start_frame_pass(scanlines, stop_at_boundary);
+        self.arm_video_events();
         let mut m68k_overshoot = pass.overshoot;
         let mut started_line = pass.started;
 
@@ -4057,7 +3929,7 @@ impl Default for GenesisEmulator {
 impl GenesisEmulator {
     /// Step the 68K CPU one instruction (full debug path).
     ///
-    /// A frame held part of the way through ([`Self::run_to_capture_boundary`],
+    /// A frame held part of the way through ([`CaptureCore::run_to_capture_boundary`],
     /// an event breakpoint) keeps the beam where it stopped: the instruction
     /// runs there, its cycles come out of the rest of the held frame
     /// ([`Self::charge_held_frame`]), and the Z80 and the sound chips, which
@@ -4070,6 +3942,12 @@ impl GenesisEmulator {
         use retro_core::cpu::Clockable;
 
         let held = self.held_frame.is_some();
+        // A step the host asks for (not one of the full loop's own, which
+        // armed the watch as its pass began) arms it from the breakpoints
+        // as they are now.
+        if !self.frame_runner_owns_beam {
+            self.arm_video_events();
+        }
 
         // Advance VDP timing BEFORE instruction executes
         // This ensures VDP state is up-to-date when instruction reads VDP registers
@@ -4420,6 +4298,7 @@ impl GenesisEmulator {
         self.bus.vdp_mut().tick_dma(total_master_clocks);
         // Advance the deferred-VINT countdown (the request lands part-way into the line)
         self.bus.vdp_mut().tick_vint_delay(total_master_clocks);
+        let video_event = self.video_event_hit();
 
         // Update debugger state AFTER step to reflect new register values
         self.update_debugger_state();
@@ -4451,7 +4330,8 @@ impl GenesisEmulator {
             breakpoint_hit: breakpoint_hit_before
                 || breakpoint_hit_after
                 || watchpoint_hit
-                || interrupt_event,
+                || interrupt_event
+                || video_event,
             instruction_executed: true,
         }
     }
@@ -4482,6 +4362,7 @@ impl GenesisEmulator {
 
         let scanlines = self.region.scanlines();
         let pass = self.start_frame_pass(scanlines, stop_at_boundary);
+        self.arm_video_events();
         let mut m68k_overshoot = pass.overshoot;
         let mut started_line = pass.started;
 
@@ -5111,8 +4992,8 @@ impl EmulatorCore for GenesisEmulator {
     /// way through (a capture boundary, an event breakpoint) has no place
     /// in a savestate, which cannot say where to resume it, and finishing
     /// it needs `&mut self`: while one is held this returns nothing.
-    /// [`GenesisEmulator::finish_frame_and_save_state`] finishes the frame
-    /// first, and is what every host calls.
+    /// [`CaptureCore::save_state_at_frame_end`] finishes the frame first,
+    /// and is what every host calls.
     fn save_state(&self) -> Vec<u8> {
         use crate::system::savestate::*;
         use retro_core::savestate::{
@@ -5175,6 +5056,165 @@ impl EmulatorCore for GenesisEmulator {
 
     fn disassemble_at(&mut self, addr: u32, count: u32) -> Vec<Instruction> {
         Self::disassemble_at(self, addr, count)
+    }
+}
+
+/// The capture contract on the Mega Drive. The VDP records the line table,
+/// who wrote each byte of VRAM and the frame writes (`vdp::recording`,
+/// `vdp::writes`); the pixel sources, the line sprites and the chosen
+/// sprites are worked out on demand from the line table (`vdp::sources`).
+///
+/// The rules this core keeps where the contract leaves them to the core:
+///
+/// - A frame is numbered by the frames finished, plus one while a frame is
+///   held part of the way through, wherever it is held (at the capture
+///   boundary or at an event breakpoint); the pixel sources and the line
+///   sprites carry that number.
+/// - A save finishes a held frame on the loop a player runs, whatever the
+///   debugger is doing, so no breakpoint stops it;
+///   [`EmulatorCore::save_state`] returns no bytes while a frame is held.
+/// - The repaint draws each line the line table holds from it and every
+///   other line from the state as it stands, and says whether every line
+///   had its record; the picture from the line states answers whenever the
+///   table is kept, drawing the lines it does not hold the same way.
+/// - A debugger edit of video memory is not journaled: a line drawn again
+///   reads it wherever the frame did not write over it later, and an edit
+///   of a colour, a vertical scroll word or the sprite table is patched into
+///   every recorded line, so the table's `memory_exact` stays as it was.
+/// - The pixel sources, the line sprites and the chosen sprites are `None`
+///   while no cartridge is loaded.
+impl CaptureCore for GenesisEmulator {
+    type SnapshotConsole = GenesisSnapshotConsole;
+
+    /// This core records all five recorders, each as asked. The setting is
+    /// applied again to a new VDP (a ROM load that rebuilds the hardware, a
+    /// power cycle).
+    fn set_capture_recording(&mut self, wanted: CaptureRecording) {
+        self.capture_recording = wanted;
+        self.bus.vdp_mut().set_capture_recording(wanted);
+    }
+
+    fn capture_recording(&self) -> CaptureRecording {
+        self.bus.vdp().capture_recording()
+    }
+
+    /// The frame loop is the one the debugger's state picks
+    /// ([`GenesisDebugger::execution_tier`]: the loop a player runs while no
+    /// debug feature is armed); [`GenesisEmulator::run_to_capture_boundary_with`]
+    /// chooses it. A frame held before its boundary (at an event breakpoint)
+    /// runs on to it.
+    fn run_to_capture_boundary(&mut self) {
+        let frame_loop = self.debugger.execution_tier();
+        self.run_to_capture_boundary_with(frame_loop);
+    }
+
+    fn at_capture_boundary(&self) -> bool {
+        matches!(
+            self.held_frame,
+            Some(HeldFrame {
+                reason: HoldReason::CaptureBoundary,
+                ..
+            })
+        )
+    }
+
+    /// A held frame is finished ([`GenesisEmulator::finish_held_frame`]),
+    /// then the state saved.
+    fn save_state_at_frame_end(&mut self) -> Vec<u8> {
+        self.finish_held_frame();
+        <Self as EmulatorCore>::save_state(self)
+    }
+
+    /// The picture cut to the display info (the mode's width by
+    /// [`crate::vdp::Vdp::drawn_height`]), VRAM, CRAM's 64 colours of
+    /// `0000 BBB0 GGG0 RRR0`, the 24 VDP registers, and, as the console's
+    /// part, the vertical scroll RAM's 64 words.
+    fn capture_frame_snapshot(&self) -> FrameSnapshot<GenesisSnapshotConsole> {
+        let (width, height, framebuffer) = self.shown_picture();
+        let vdp = self.bus.vdp();
+        FrameSnapshot {
+            // A frame held part of the way through is counted once it ends,
+            // so its picture is the next one.
+            frame: self.picture_frame(),
+            at_boundary: self.at_capture_boundary(),
+            width,
+            height,
+            framebuffer,
+            vram: vdp.get_vram().to_vec(),
+            palette: vdp.get_cram().to_vec(),
+            registers: vdp.get_registers(),
+            console: GenesisSnapshotConsole {
+                vsram: vdp.get_vsram().to_vec(),
+            },
+        }
+    }
+
+    /// The host reads frames through [`EmulatorCore::get_framebuffer`], the
+    /// cached copy the frame loops refresh once a frame: this refreshes it
+    /// too after the VDP draws the frame again.
+    fn repaint_held_frame(&mut self) -> bool {
+        let from_line_states = self.bus.vdp_mut().rerender_current_frame();
+        self.update_cached_framebuffer();
+        from_line_states
+    }
+
+    /// The layers are those of the debugger's layer list: 0 plane A, 1
+    /// plane B, 2 the window, 3 the sprites
+    /// ([`crate::vdp::Vdp::render_layer_image`]).
+    fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer> {
+        self.bus.vdp_mut().render_layer_image(layer as usize)
+    }
+
+    fn picture_from_line_states(&mut self) -> Option<PixelImage> {
+        self.bus.vdp_mut().picture_from_line_states()
+    }
+
+    fn line_states(&self) -> Option<LineStateTable> {
+        VideoDebugger::get_line_states(self.bus.vdp())
+    }
+
+    fn line_palettes(&self) -> Option<LinePalettes> {
+        self.bus.vdp().line_palettes()
+    }
+
+    /// Packed as `vdp::sources` describes; no sub screen.
+    fn pixel_sources(&mut self, planes: u32) -> Option<PixelSources> {
+        self.bus.cartridge()?;
+        let frame = self.picture_frame();
+        let mut sources = self.bus.vdp_mut().pixel_sources(planes);
+        sources.frame = frame;
+        Some(sources)
+    }
+
+    fn line_sprites(&mut self) -> Option<LineSprites> {
+        self.bus.cartridge()?;
+        let frame = self.picture_frame();
+        let mut sprites = self.bus.vdp_mut().line_sprites();
+        sprites.frame = frame;
+        Some(sprites)
+    }
+
+    /// The sprite table has 80 slots (64 in the 32-cell mode).
+    fn render_sprites(&mut self, selection: &[u8]) -> Option<RenderedLayer> {
+        self.bus.cartridge()?;
+        Some(self.bus.vdp_mut().render_sprites(selection))
+    }
+
+    /// VRAM's 65,536 bytes, as `vdp::writes` describes them.
+    fn video_memory_sources(&self) -> Option<&VideoMemorySources> {
+        self.bus.vdp().video_memory_sources()
+    }
+
+    fn take_frame_writes(&mut self) -> Option<FrameWrites> {
+        self.bus.vdp_mut().take_frame_writes()
+    }
+
+    /// 68000 addresses ([`crate::bus::AddressBus::resolve_sources`]): the
+    /// cartridge window through the cartridge's mapping as it stands (the
+    /// SEGA or SSF2 mapper's banks, the ROM mirrored past its end, the ROM
+    /// showing through switched-off SRAM), work RAM -2, anything else -1.
+    fn resolve_sources(&self, addresses: &[u32]) -> Vec<i32> {
+        self.bus.resolve_sources(addresses)
     }
 }
 

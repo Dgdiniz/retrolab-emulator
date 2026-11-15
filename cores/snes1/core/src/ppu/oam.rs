@@ -21,6 +21,7 @@
 //! Written from fullsnes's OAM port description and Anomie's notes on
 //! the priority rotation; checked against bsnes-plus.
 
+use super::writes::SpriteTableStore;
 use super::{Ppu, PpuAccessCtx};
 
 /// Bytes in the low table; the high table follows.
@@ -105,8 +106,20 @@ impl Ppu {
         self.oam_address_reset();
     }
 
-    /// `$2104` OAMDATA.
+    /// `$2104` OAMDATA. (`Ppu::write_port_noted` takes the same write and
+    /// notes what it stored.)
     pub(super) fn write_2104(&mut self, value: u8, ctx: &PpuAccessCtx) {
+        self.oam_port_write(value, ctx);
+    }
+
+    /// The data write itself: a high-table byte is stored at once, a
+    /// low-table byte waits for its pair. Returns what was stored.
+    #[inline(always)]
+    pub(super) fn oam_port_write(
+        &mut self,
+        value: u8,
+        ctx: &PpuAccessCtx,
+    ) -> Option<SpriteTableStore> {
         let odd = self.oam_addr & 1 != 0;
         let target = self.oam_target(ctx);
         self.step_oam_address();
@@ -115,10 +128,22 @@ impl Ppu {
         }
         if target & LOW_TABLE_LEN != 0 {
             self.oam_write_byte(target, value);
+            Some(SpriteTableStore {
+                first: oam_slot(target),
+                count: 1,
+                value: u16::from(value),
+            })
         } else if odd {
             let first = target & !1;
             self.oam_write_byte(first, self.oam_latchdata);
             self.oam_write_byte(first + 1, value);
+            Some(SpriteTableStore {
+                first,
+                count: 2,
+                value: u16::from_le_bytes([self.oam_latchdata, value]),
+            })
+        } else {
+            None
         }
     }
 

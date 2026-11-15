@@ -3,9 +3,12 @@
 //! This crate provides a generic WASM interface that works with any
 //! `EmulatorCore` implementation.
 
+use retro_core::capture::CaptureCore;
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
 use retro_core::*;
+use retro_wasm::js::{map_as_object, set_property, uint16_array};
 use sg1_core::cartridge::composable::parse_manifest;
+use sg1_core::system::GenesisSnapshotConsole;
 use sg1_core::GenesisEmulator;
 use wasm_bindgen::prelude::*;
 
@@ -30,27 +33,6 @@ fn load_state_refusal(error: LoadStateError) -> JsValue {
     }
 }
 
-/// Serialize a value with maps rendered as plain JS objects.
-///
-/// The default `serde_wasm_bindgen` serializer emits a Rust `HashMap` as an ES
-/// `Map`, which a plain-object `x[key]` read on the JS side (e.g. the netplay
-/// input folder) silently reads as `undefined`. The mapping getters here are
-/// typed `Record<...>` on the JS side, so honour that contract. A
-/// `serde_json` object is a map to the serializer too: every reader that
-/// builds its result as one (the mapper, chip, memory-map, manifest,
-/// coverage and YM2612 readers) goes through here, or the app's viewers,
-/// which read plain objects, would find nothing in it.
-///
-/// Object keys must be text: a map with number keys is refused by the
-/// serializer, so callers pass gamepad maps through
-/// [`gamepad_map_with_text_keys`] first. A refusal returns `undefined`
-/// instead of panicking, because a panic here leaves the whole emulator
-/// refusing every later call.
-fn map_as_object<T: serde::Serialize>(value: &T) -> JsValue {
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
-    value.serialize(&serializer).unwrap_or(JsValue::UNDEFINED)
-}
-
 /// Read a gamepad button map sent from JS: a `Map` with number keys, or a
 /// plain object, whose keys JavaScript always holds as text. `None` when it
 /// is neither, so a malformed map never replaces a working one.
@@ -60,39 +42,6 @@ fn gamepad_map_from_js(value: JsValue) -> Option<std::collections::HashMap<u32, 
     }
     let map: std::collections::HashMap<String, u32> = serde_wasm_bindgen::from_value(value).ok()?;
     gamepad_map_from_text_keys(map)
-}
-
-/// A `Uint8Array` holding a copy of `bytes`, owned by JavaScript: not a
-/// view into this module's memory, which a later call can move or reuse.
-fn bytes_copy(bytes: &[u8]) -> JsValue {
-    let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-    array.copy_from(bytes);
-    array.into()
-}
-
-/// A `Uint16Array` holding a copy of `words` ([`bytes_copy`]).
-fn words_copy(words: &[u16]) -> JsValue {
-    let array = js_sys::Uint16Array::new_with_length(words.len() as u32);
-    array.copy_from(words);
-    array.into()
-}
-
-/// `{ width, height, data: Uint8Array }` for an RGBA picture, its bytes
-/// copied.
-fn picture_object(picture: &retro_core::video::PixelImage) -> js_sys::Object {
-    let obj = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("width"),
-        &JsValue::from_f64(f64::from(picture.width)),
-    );
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("height"),
-        &JsValue::from_f64(f64::from(picture.height)),
-    );
-    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &bytes_copy(&picture.rgba));
-    obj
 }
 
 /// UI badge label for a Genesis mapper. retro-core's `MapperId` enumerates
@@ -246,28 +195,6 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = runUntilVBlank)]
     pub fn run_until_vblank(&mut self) {
         self.genesis.run_until_vblank();
-    }
-
-    /// Run to the next capture boundary and stop there: the frame's picture
-    /// is drawn and vertical blanking has not begun, so video memory and the
-    /// framebuffer belong to the same frame (`captureFrameSnapshot`,
-    /// `renderLayer`). Each call moves the game on one frame: a frame held
-    /// at its boundary is finished first. The loop is the one `runFrame`
-    /// picks, and a breakpoint still stops where it stops.
-    ///
-    /// The frame stays held until the next frame call (`runFrame`,
-    /// `runFrameHeadless`, `runUntilVBlank`), which runs the rest of it;
-    /// `saveState` finishes it before saving; a reset, `loadState` or
-    /// `loadRom` drops it.
-    #[wasm_bindgen(js_name = runToCaptureBoundary)]
-    pub fn run_to_capture_boundary(&mut self) {
-        self.genesis.run_to_capture_boundary();
-    }
-
-    /// Whether the core is held at a capture boundary.
-    #[wasm_bindgen(js_name = atCaptureBoundary)]
-    pub fn at_capture_boundary(&self) -> bool {
-        self.genesis.at_capture_boundary()
     }
 
     // ===== Netplay determinism primitives =====
@@ -574,7 +501,7 @@ impl RetroEmulator {
     /// player runs.
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&mut self) -> Vec<u8> {
-        self.genesis.finish_frame_and_save_state()
+        self.genesis.save_state_at_frame_end()
     }
 
     /// Load emulator state. A savestate made on another ROM is refused
@@ -844,8 +771,16 @@ impl RetroEmulator {
         Ok(())
     }
 
-    /// Catalog of event classes this core can break on (VBlank, VInt,
-    /// HInt, scanline), for the event breakpoint picker.
+    /// Catalog of event classes this core can break on, for the event
+    /// breakpoint picker: 1 VBlank, 2 VInt and 3 HInt (the interrupts the
+    /// 68000 takes), 4 a scanline (param the V counter), 5 a transfer (a
+    /// DMA from 68000 memory, a fill or a copy) finished (param the memory:
+    /// 0 VRAM, 1 CRAM, 2 VSRAM), 6 a palette colour written (param the
+    /// colour, 0-63), 7 a transfer into the sprite table, and 8 a tile
+    /// rewritten (param the tile, 0-2047; writing the bytes it holds again
+    /// does not count). Events 5-8 stop after the instruction that made the
+    /// write. A breakpoint on any of them runs the frame on the light
+    /// debugger loop; with none the loop a player runs checks nothing.
     #[wasm_bindgen(js_name = getAvailableEvents)]
     pub fn get_available_events(&mut self) -> JsValue {
         serde_wasm_bindgen::to_value(&self.genesis.debugger().available_events()).unwrap()
@@ -1562,213 +1497,6 @@ impl RetroEmulator {
             .toggle_layer(layer_id, visible);
     }
 
-    /// Re-composite the current frame into the framebuffer from the present
-    /// VDP state plus the debugger layer mask, without advancing the
-    /// emulator. The host calls this after a `toggleLayer` while paused so
-    /// the canvas reflects the change immediately (a running core repaints
-    /// on its own next frame; a paused one never would). A no-op-equivalent
-    /// when nothing changed, it just re-runs the renderer over the held
-    /// frame.
-    #[wasm_bindgen(js_name = repaintFrame)]
-    pub fn repaint_frame(&mut self) {
-        self.genesis.repaint_held_frame();
-    }
-
-    /// The frame as it stands, as copies: `{ frame, atBoundary, width,
-    /// height, framebuffer, vram, palette, vsram, registers }`. `frame` is
-    /// the frames finished so far (a held frame counts once it finishes);
-    /// `framebuffer` the picture shown, RGBA, `width * height * 4` bytes, as
-    /// `getDisplayInfo` sizes it; `vram` as `getVram` returns it; `palette`
-    /// CRAM's 64 words as `getCram` returns them; `vsram` as `getVsram`
-    /// does; `registers` as `getVdpRegisters` does. At a capture boundary
-    /// (`atBoundary`) the picture and the memory belong to the same frame.
-    /// Every array is the caller's own, never a view into this module's
-    /// memory.
-    #[wasm_bindgen(js_name = captureFrameSnapshot)]
-    pub fn capture_frame_snapshot(&self) -> JsValue {
-        let snapshot = self.genesis.capture_frame_snapshot();
-        let obj = js_sys::Object::new();
-        let set = |key: &str, value: &JsValue| {
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
-        };
-        set("frame", &JsValue::from_f64(snapshot.frame as f64));
-        set("atBoundary", &JsValue::from_bool(snapshot.at_boundary));
-        set("width", &JsValue::from_f64(f64::from(snapshot.width)));
-        set("height", &JsValue::from_f64(f64::from(snapshot.height)));
-        set("framebuffer", &bytes_copy(&snapshot.framebuffer));
-        set("vram", &bytes_copy(&snapshot.vram));
-        set("palette", &words_copy(&snapshot.palette));
-        set("vsram", &words_copy(&snapshot.vsram));
-        set("registers", &map_as_object(&snapshot.registers));
-        obj.into()
-    }
-
-    /// One layer of the frame drawn alone (at a capture boundary, the frame
-    /// held there): `{ width, height, data: Uint8Array, fromLineStates }`,
-    /// RGBA, with alpha 0 wherever the layer does not cover the pixel;
-    /// `null` for a layer id that is none of `getLayerInfo`'s. Colours are
-    /// the layer's palette colours, before shadow and highlight. While line
-    /// states are recorded (`setCaptureRecording`), each line is drawn from
-    /// the state it was drawn with, so a scroll or palette split shows as
-    /// it was drawn; `fromLineStates` says every line was. Otherwise the
-    /// lines are drawn from video memory as it is now. Nothing runs, the
-    /// framebuffer `getFramebuffer` gives stays as it was, and so does
-    /// everything a savestate holds.
-    #[wasm_bindgen(js_name = renderLayer)]
-    pub fn render_layer(&mut self, layer_id: u32) -> JsValue {
-        match self.genesis.render_layer(layer_id) {
-            Some(layer) => {
-                let obj = picture_object(&layer.image);
-                let _ = js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("fromLineStates"),
-                    &JsValue::from_bool(layer.from_line_states),
-                );
-                obj.into()
-            }
-            None => JsValue::NULL,
-        }
-    }
-
-    /// Choose what the core records of each frame while frames run, for a
-    /// capture to read: `options` is `{ lineStates?, pixelSources?,
-    /// lineSprites?, videoMemorySources?, frameWrites? }`, booleans, and a
-    /// key left out keeps its value. A host setting: never part of a
-    /// savestate, kept across a reset, `loadRom` and `loadState`, and
-    /// nothing the game does depends on it. This core records the line
-    /// states; the other four stay false (`getCaptureRecording`).
-    #[wasm_bindgen(js_name = setCaptureRecording)]
-    pub fn set_capture_recording(&mut self, options: JsValue) {
-        let mut wanted = self.genesis.capture_recording();
-        let asked = |key: &str| {
-            js_sys::Reflect::get(&options, &JsValue::from_str(key))
-                .ok()
-                .and_then(|value| value.as_bool())
-        };
-        for (key, flag) in [
-            ("lineStates", &mut wanted.line_states),
-            ("pixelSources", &mut wanted.pixel_sources),
-            ("lineSprites", &mut wanted.line_sprites),
-            ("videoMemorySources", &mut wanted.video_memory_sources),
-            ("frameWrites", &mut wanted.frame_writes),
-        ] {
-            if let Some(on) = asked(key) {
-                *flag = on;
-            }
-        }
-        self.genesis.set_capture_recording(wanted);
-    }
-
-    /// What the core records while frames run: `{ lineStates, pixelSources,
-    /// lineSprites, videoMemorySources, frameWrites }`, a plain object of
-    /// booleans.
-    #[wasm_bindgen(js_name = getCaptureRecording)]
-    pub fn get_capture_recording(&self) -> JsValue {
-        let recording = self.genesis.capture_recording();
-        let obj = js_sys::Object::new();
-        for (key, on) in [
-            ("lineStates", recording.line_states),
-            ("pixelSources", recording.pixel_sources),
-            ("lineSprites", recording.line_sprites),
-            ("videoMemorySources", recording.video_memory_sources),
-            ("frameWrites", recording.frame_writes),
-        ] {
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(on));
-        }
-        obj.into()
-    }
-
-    /// The settings each line of the picture was drawn with, while line
-    /// states are recorded, else `null`: `{ frame, fromFirstLine, complete,
-    /// memoryExact, rowsPerLine, firstRowLine, columns: string[], values:
-    /// Uint32Array }`, the values row after row, `columns.length` to a row,
-    /// one row per line of the picture. The columns: `line`; `frame` (the
-    /// frame the line was drawn in, its low 32 bits); `kind` (0 not
-    /// recorded, 1 drawn, 2 blank with the display off, 3 painted by a CRAM
-    /// transfer with the display off); `exact` (1 when the video memory the
-    /// line read can be given back exactly); `register_0` to `register_23`;
-    /// `plane_a_horizontal_scroll` and `plane_b_horizontal_scroll`;
-    /// `vertical_scroll_0` to `vertical_scroll_39`; `sprite_mask_carried_in`;
-    /// and `palette`, an index into `getLinePalettes().palettes` (65535 for a
-    /// line not recorded). `frame` is numbered as `captureFrameSnapshot`
-    /// numbers its picture. Every array is the caller's own copy.
-    #[wasm_bindgen(js_name = getLineStates)]
-    pub fn get_line_states(&self) -> JsValue {
-        let Some(table) = self.genesis.line_states() else {
-            return JsValue::NULL;
-        };
-        let obj = js_sys::Object::new();
-        let set = |key: &str, value: &JsValue| {
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
-        };
-        set("frame", &JsValue::from_f64(table.frame as f64));
-        set("fromFirstLine", &JsValue::from_bool(table.from_first_line));
-        set("complete", &JsValue::from_bool(table.complete));
-        set("memoryExact", &JsValue::from_bool(table.memory_exact));
-        set(
-            "rowsPerLine",
-            &JsValue::from_f64(f64::from(table.rows_per_line)),
-        );
-        set(
-            "firstRowLine",
-            &JsValue::from_f64(f64::from(table.first_row_line)),
-        );
-        let columns = js_sys::Array::new();
-        for name in &table.columns {
-            columns.push(&JsValue::from_str(name));
-        }
-        set("columns", &columns);
-        let values = js_sys::Uint32Array::new_with_length(table.values.len() as u32);
-        values.copy_from(&table.values);
-        set("values", &values);
-        obj.into()
-    }
-
-    /// The palettes the lines of the picture began with, while line states
-    /// are recorded, else `null`: `{ coloursPerPalette, palettes:
-    /// Uint16Array, paletteOfLine: Uint16Array, changes: Uint16Array }`.
-    /// `palettes` holds each palette once, `coloursPerPalette` (64) CRAM
-    /// words each (`0000 BBB0 GGG0 RRR0`); `paletteOfLine` has one entry per
-    /// row of `getLineStates`, an index into `palettes` (65535 for a line
-    /// not recorded). `changes` lists the palette writes made while each
-    /// line was on screen, five values each: the row, the column the write
-    /// coloured the line again from (65535 when it coloured nothing), the
-    /// colour index, the colour word, and 1 when it coloured the whole line
-    /// again. Every array is the caller's own copy.
-    #[wasm_bindgen(js_name = getLinePalettes)]
-    pub fn get_line_palettes(&self) -> JsValue {
-        let Some(palettes) = self.genesis.line_palettes() else {
-            return JsValue::NULL;
-        };
-        let obj = js_sys::Object::new();
-        let set = |key: &str, value: &JsValue| {
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), value);
-        };
-        set(
-            "coloursPerPalette",
-            &JsValue::from_f64(f64::from(palettes.colours_per_palette)),
-        );
-        set("palettes", &words_copy(&palettes.palettes));
-        set("paletteOfLine", &words_copy(&palettes.palette_of_line));
-        set("changes", &words_copy(&palettes.changes));
-        obj.into()
-    }
-
-    /// The picture drawn again from the line table, while line states are
-    /// recorded, else `null`: `{ width, height, data: Uint8Array }`, RGBA,
-    /// cut as `getFramebuffer`'s picture is. Where the table holds every
-    /// line of the frame and video memory could be given back exactly
-    /// (`getLineStates().complete` and `memoryExact`), it is the frame's
-    /// picture byte for byte. Nothing runs, and the framebuffer and
-    /// everything a savestate holds stay as they were.
-    #[wasm_bindgen(js_name = pictureFromLineStates)]
-    pub fn picture_from_line_states(&mut self) -> JsValue {
-        match self.genesis.picture_from_line_states() {
-            Some(picture) => picture_object(&picture).into(),
-            None => JsValue::NULL,
-        }
-    }
-
     // ===== YM2612 Audio Debugger Methods =====
 
     /// Get YM2612 channel count (always 6).
@@ -2043,6 +1771,15 @@ impl RetroEmulator {
     }
 }
 
+/// Writes the Mega Drive's part of a frame snapshot: `vsram`, a
+/// `Uint16Array` of the vertical scroll RAM's 64 words, as `getVsram` gives
+/// them.
+fn snapshot_console(console: &GenesisSnapshotConsole, snapshot: &js_sys::Object) {
+    set_property(snapshot, "vsram", &uint16_array(&console.vsram));
+}
+
+retro_wasm::capture_bindings!(RetroEmulator, genesis, console = snapshot_console);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,7 +1913,21 @@ mod tests {
         let events: Vec<EventClass> =
             serde_wasm_bindgen::from_value(emu.get_available_events()).unwrap();
         let labels: Vec<&str> = events.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, ["VBlank", "VInt", "HInt", "Scanline"]);
+        assert_eq!(
+            labels,
+            [
+                "VBlank",
+                "VInt",
+                "HInt",
+                "Scanline",
+                "Transfer complete",
+                "Palette write",
+                "Sprite table transfer",
+                "Tile rewritten",
+            ]
+        );
+        let codes: Vec<u32> = events.iter().map(|e| e.code).collect();
+        assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[wasm_bindgen_test]
@@ -2631,15 +2382,30 @@ mod tests {
             Some(true),
             "a key left out keeps its value"
         );
-        emu.set_capture_recording(options(&[("pixelSources", true)]));
+        emu.set_capture_recording(options(&[("pixelSources", true), ("lineSprites", true)]));
         assert_eq!(on(&emu, "lineStates"), Some(true));
+        assert_eq!(on(&emu, "pixelSources"), Some(true), "read back as asked");
+        assert_eq!(on(&emu, "lineSprites"), Some(true), "read back as asked");
+        emu.set_capture_recording(options(&[
+            ("videoMemorySources", true),
+            ("frameWrites", true),
+        ]));
         assert_eq!(
-            on(&emu, "pixelSources"),
-            Some(false),
-            "not recorded by this core"
+            on(&emu, "videoMemorySources"),
+            Some(true),
+            "read back as asked"
         );
+        assert_eq!(on(&emu, "frameWrites"), Some(true), "read back as asked");
         emu.set_capture_recording(options(&[("lineStates", false)]));
         assert_eq!(on(&emu, "lineStates"), Some(false));
+        assert_eq!(on(&emu, "pixelSources"), Some(true));
+        // The pixel sources keep the line table on their own.
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.run_frame();
+        assert!(!emu.get_line_states().is_null());
+        emu.set_capture_recording(options(&[("pixelSources", false), ("lineSprites", false)]));
+        assert!(emu.get_line_states().is_null());
     }
 
     #[wasm_bindgen_test]
@@ -2724,6 +2490,148 @@ mod tests {
         assert!(emu.at_capture_boundary(), "nothing ran");
     }
 
+    /// The typed array `value[key]` holds, its length checked and that it
+    /// is a copy, not a view into this module's memory.
+    fn typed_array<A>(value: &JsValue, key: &str, length: u32) -> A
+    where
+        A: JsCast + AsRef<js_sys::Object>,
+    {
+        let array: A = field(value, key)
+            .dyn_into()
+            .unwrap_or_else(|_| panic!("`{key}` is the typed array named"));
+        let view: &js_sys::Object = array.as_ref();
+        let buffer: js_sys::ArrayBuffer = js_sys::Reflect::get(view, &JsValue::from_str("buffer"))
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(!views_module_memory(&buffer), "`{key}` is a copy");
+        let found = js_sys::Reflect::get(view, &JsValue::from_str("length"))
+            .unwrap()
+            .as_f64();
+        assert_eq!(found, Some(f64::from(length)), "`{key}`'s length");
+        array
+    }
+
+    #[wasm_bindgen_test]
+    fn pixel_sources_are_a_plain_object_of_copies_with_the_planes_asked_for() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        assert!(emu.get_pixel_sources(None).is_null(), "no game loaded");
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.set_capture_recording(options(&[("pixelSources", true)]));
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+
+        let sources = emu.get_pixel_sources(None);
+        assert_plain_object(
+            &sources,
+            &[
+                "frame",
+                "width",
+                "height",
+                "fromLineStates",
+                "matchesPicture",
+                "layer",
+                "colour",
+                "tile",
+                "cell",
+            ],
+            "getPixelSources",
+        );
+        assert_eq!(
+            field(&sources, "frame").as_f64(),
+            Some((emu.get_frame_number() + 1) as f64)
+        );
+        assert_eq!(field(&sources, "width").as_f64(), Some(320.0));
+        assert_eq!(field(&sources, "height").as_f64(), Some(224.0));
+        assert_eq!(field(&sources, "fromLineStates").as_bool(), Some(true));
+        assert_eq!(field(&sources, "matchesPicture").as_bool(), Some(true));
+        let pixels = 320 * 224;
+        typed_array::<js_sys::Uint16Array>(&sources, "layer", pixels);
+        typed_array::<js_sys::Uint16Array>(&sources, "colour", pixels);
+        typed_array::<js_sys::Uint32Array>(&sources, "tile", pixels);
+        typed_array::<js_sys::Uint16Array>(&sources, "cell", pixels);
+
+        // A plane not asked for is not there; bit 16 is ignored.
+        let layer_only = emu.get_pixel_sources(Some(1 | 16));
+        typed_array::<js_sys::Uint16Array>(&layer_only, "layer", pixels);
+        for key in ["colour", "tile", "cell", "subLayer", "subColour"] {
+            assert!(
+                field(&layer_only, key).is_undefined(),
+                "{key} not asked for"
+            );
+        }
+        assert!(emu.at_capture_boundary(), "nothing ran");
+    }
+
+    #[wasm_bindgen_test]
+    fn line_sprites_are_a_plain_object_of_copies_in_columns() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        assert!(emu.get_line_sprites().is_null(), "no game loaded");
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.set_capture_recording(options(&[("lineSprites", true)]));
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+
+        let sprites = emu.get_line_sprites();
+        assert_plain_object(
+            &sprites,
+            &[
+                "frame",
+                "fromLineStates",
+                "lines",
+                "slots",
+                "fates",
+                "x",
+                "width",
+                "drawnWidth",
+            ],
+            "getLineSprites",
+        );
+        assert_eq!(field(&sprites, "fromLineStates").as_bool(), Some(true));
+        let lines: js_sys::Uint16Array = typed_array(&sprites, "lines", 224 * 4);
+        let lines = lines.to_vec();
+        let lines = lines.as_chunks::<4>().0;
+        let entries: u32 = lines.iter().map(|line| u32::from(line[2])).sum();
+        for (row, line) in lines.iter().enumerate() {
+            assert_eq!(usize::from(line[0]), row, "every line in order");
+        }
+        typed_array::<js_sys::Uint8Array>(&sprites, "slots", entries);
+        typed_array::<js_sys::Uint8Array>(&sprites, "fates", entries);
+        typed_array::<js_sys::Int16Array>(&sprites, "x", entries);
+        typed_array::<js_sys::Uint8Array>(&sprites, "width", entries);
+        typed_array::<js_sys::Uint8Array>(&sprites, "drawnWidth", entries);
+    }
+
+    #[wasm_bindgen_test]
+    fn chosen_sprites_drawn_alone_have_the_shape_of_a_layer() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        assert!(emu.render_sprites(&[1; 80]).is_null(), "no game loaded");
+        emu.load_rom(&looping_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.set_capture_recording(options(&[("lineStates", true)]));
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+
+        let all = emu.render_sprites(&[1; 80]);
+        assert_plain_object(
+            &all,
+            &["width", "height", "data", "fromLineStates"],
+            "renderSprites",
+        );
+        assert_eq!(field(&all, "width").as_f64(), Some(320.0));
+        assert_eq!(field(&all, "height").as_f64(), Some(224.0));
+        assert_eq!(field(&all, "fromLineStates").as_bool(), Some(true));
+        let data: js_sys::Uint8Array = typed_array(&all, "data", 320 * 224 * 4);
+        let layer = emu.render_layer(3);
+        let layer_data: js_sys::Uint8Array = field(&layer, "data").dyn_into().unwrap();
+        assert_eq!(data.to_vec(), layer_data.to_vec(), "every slot: the layer");
+        let none = emu.render_sprites(&[]);
+        let none: js_sys::Uint8Array = field(&none, "data").dyn_into().unwrap();
+        assert!(none.to_vec().iter().all(|&byte| byte == 0));
+    }
+
     #[wasm_bindgen_test]
     fn the_sprite_table_stops_where_the_renderer_stops() {
         let mut emu = RetroEmulator::new("genesis").unwrap();
@@ -2781,6 +2689,1031 @@ mod tests {
         assert!(
             emu.get_vsram().iter().all(|&value| value == 1),
             "a buffer longer than VSRAM is cut to it"
+        );
+    }
+
+    /// A ROM whose 68000 stores colour 0 through the data port, then loops.
+    fn colour_store_rom() -> Vec<u8> {
+        let mut rom = synth_genesis_rom("COLOUR STORE");
+        #[rustfmt::skip]
+        let code: [u16; 10] = [
+            0x23FC, 0xC000, 0x0000, 0x00C0, 0x0004, // MOVE.L #$C0000000,($C00004).L
+            0x33FC, 0x0EEE, 0x00C0, 0x0000,         // MOVE.W #$0EEE,($C00000).L
+            0x60FE,                                 // BRA *
+        ];
+        for (i, word) in code.iter().enumerate() {
+            rom[0x400 + i * 2..0x402 + i * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        rom
+    }
+
+    #[wasm_bindgen_test]
+    fn the_writes_to_video_memory_are_plain_objects_of_copies() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&colour_store_rom()).unwrap();
+        assert!(emu.get_video_memory_sources().is_null(), "not recorded");
+        assert!(emu.take_frame_writes().is_null(), "not recorded");
+        emu.set_capture_recording(options(&[
+            ("videoMemorySources", true),
+            ("frameWrites", true),
+        ]));
+        emu.set_execution_mode("Running".to_string());
+        emu.run_frame();
+        emu.write_vram(0x20, &[1, 2]);
+
+        let sources = emu.get_video_memory_sources();
+        assert_plain_object(&sources, &["origins", "frames"], "getVideoMemorySources");
+        let origins: js_sys::Uint32Array = field(&sources, "origins").dyn_into().unwrap();
+        let frames: js_sys::Uint32Array = field(&sources, "frames").dyn_into().unwrap();
+        assert_eq!((origins.length(), frames.length()), (0x1_0000, 0x1_0000));
+        assert!(!views_module_memory(&origins.buffer()));
+        assert!(!views_module_memory(&frames.buffer()));
+        assert_eq!(origins.get_index(0x20) >> 28, 4, "the debugger wrote it");
+        assert_eq!(origins.get_index(0x22), 0, "nothing wrote it");
+
+        let writes = emu.take_frame_writes();
+        assert_plain_object(
+            &writes,
+            &["records", "wordsPerRecord", "dropped"],
+            "takeFrameWrites",
+        );
+        assert_eq!(field(&writes, "wordsPerRecord").as_f64(), Some(8.0));
+        assert_eq!(field(&writes, "dropped").as_f64(), Some(0.0));
+        let records: js_sys::Uint32Array = field(&writes, "records").dyn_into().unwrap();
+        assert!(!views_module_memory(&records.buffer()));
+        assert_eq!(records.length(), 8, "the colour store");
+        assert_eq!(records.get_index(0), 4 | (3 << 16));
+        assert_eq!(records.get_index(4), 1 | (2 << 8));
+        assert_eq!((records.get_index(5), records.get_index(6)), (0, 0x0EEE));
+        let again = emu.take_frame_writes();
+        let again: js_sys::Uint32Array = field(&again, "records").dyn_into().unwrap();
+        assert_eq!(again.length(), 0, "a take empties the record");
+
+        let resolved = emu.resolve_sources(&[0x40C, 0xFF_0000, 0xC0_0000]);
+        assert!(resolved.is_instance_of::<js_sys::Int32Array>());
+        assert!(!views_module_memory(&resolved.buffer()));
+        assert_eq!(resolved.to_vec(), [0x40C, -2, -1]);
+    }
+
+    // ===== What each capture reader returns, whole =====
+    //
+    // Each reader's value on a program that draws, moves its sprites and
+    // writes video memory every way the 68000 can, described in full by
+    // `retro_wasm::test_support::shape` (every key, every value, each typed
+    // array's constructor, length and a hash of its bytes) and held to the
+    // description recorded from these bindings. A change that moves a key,
+    // a value, an array's type or one byte of what a host reads fails here.
+
+    /// Place `words` at `address` of `rom`, high byte first.
+    fn place(rom: &mut [u8], address: usize, words: &[u16]) {
+        for (i, word) in words.iter().enumerate() {
+            let at = address + i * 2;
+            rom[at..at + 2].copy_from_slice(&word.to_be_bytes());
+        }
+    }
+
+    /// A program that draws both planes and 48 sprites, moves two of the
+    /// sprites every frame, and writes video memory every way the 68000
+    /// can. As it boots it sends the tiles, plane A's map, the palette and
+    /// the sprite table by transfer, fills four tiles, copies two of them,
+    /// and stores plane B's cells, a colour, the vertical scroll and a
+    /// sprite's Y through the data port. Its vertical interrupt moves
+    /// sprites 0 and 1, puts colour 1 and plane A's horizontal scroll back
+    /// and sends a tile again by transfer; its horizontal interrupt, every
+    /// 100 lines, changes colour 1 and plane A's horizontal scroll part of
+    /// the way down the picture. The sprites meet the line's sprite limit
+    /// on lines 120 to 127, run out of dots on lines 160 to 167, meet the
+    /// sprite mask on lines 200 to 207 and lie off screen on lines 60 to
+    /// 67.
+    fn capture_shapes_rom() -> Vec<u8> {
+        let mut rom = synth_genesis_rom("CAPTURE SHAPES");
+        place(&mut rom, 0x00, &[0x00FF, 0xFE00]); // the stack
+        place(&mut rom, 0x70, &[0x0000, 0x0700]); // level 4: the horizontal interrupt
+        place(&mut rom, 0x78, &[0x0000, 0x0600]); // level 6: the vertical interrupt
+        #[rustfmt::skip]
+        place(&mut rom, 0x400, &[
+            0x46FC, 0x2700,                 // MOVE.W #$2700,SR
+            0x41F9, 0x00C0, 0x0004,         // LEA $C00004,A0: control port
+            0x43F9, 0x00C0, 0x0000,         // LEA $C00000,A1: data port
+            0x30BC, 0x8014,                 // register 0: horizontal interrupt on
+            0x30BC, 0x8174,                 // register 1: display, vertical interrupt, transfers
+            0x30BC, 0x8230,                 // register 2: plane A at $C000
+            0x30BC, 0x8407,                 // register 4: plane B at $E000
+            0x30BC, 0x8578,                 // register 5: sprites at $F000
+            0x30BC, 0x8700,                 // register 7: backdrop colour 0
+            0x30BC, 0x8A63,                 // register 10: an interrupt every 100 lines
+            0x30BC, 0x8B00,                 // register 11: whole-screen scrolls
+            0x30BC, 0x8C81,                 // register 12: 40 cells
+            0x30BC, 0x8D3F,                 // register 13: horizontal scroll at $FC00
+            0x30BC, 0x8F02,                 // register 15: auto-increment 2
+            0x30BC, 0x9001,                 // register 16: planes of 64 by 32 cells
+            // Tiles 1 to 16 from ROM $1000: 256 words.
+            0x30BC, 0x9300, 0x30BC, 0x9401,
+            0x30BC, 0x9500, 0x30BC, 0x9608, 0x30BC, 0x9700,
+            0x20BC, 0x4020, 0x0080,         // VRAM $0020 by transfer
+            // Plane A's map from ROM $2000: 2048 words.
+            0x30BC, 0x9300, 0x30BC, 0x9408,
+            0x30BC, 0x9500, 0x30BC, 0x9610, 0x30BC, 0x9700,
+            0x20BC, 0x4000, 0x0083,         // VRAM $C000 by transfer
+            // Tiles 20 to 23 filled with colour 3, increment 1.
+            0x30BC, 0x8F01,
+            0x30BC, 0x9380, 0x30BC, 0x9400,
+            0x30BC, 0x9780,                 // fill
+            0x20BC, 0x4280, 0x0080,         // VRAM $0280 by fill
+            0x32BC, 0x3333,                 // MOVE.W #$3333,(A1): starts the fill
+            0x3010,                         // MOVE.W (A0),D0: the status
+            0x0800, 0x0001,                 // BTST #1,D0: a transfer running
+            0x66F8,                         // BNE.S back to the status
+            // Tiles 24 and 25 copied from tiles 20 and 21.
+            0x30BC, 0x9340, 0x30BC, 0x9400,
+            0x30BC, 0x9580, 0x30BC, 0x9602, // from $0280
+            0x30BC, 0x97C0,                 // copy
+            0x20BC, 0x0300, 0x00C0,         // VRAM $0300 by copy
+            0x3010,
+            0x0800, 0x0001,
+            0x66F8,
+            0x30BC, 0x8F02,                 // register 15: auto-increment 2
+            // Eight cells of plane B on row 5, tiles 20 and 24 by turns.
+            0x20BC, 0x6280, 0x0003,         // VRAM $E280
+            0x32BC, 0x0014, 0x32BC, 0x0018, 0x32BC, 0x0014, 0x32BC, 0x0018,
+            0x32BC, 0x0014, 0x32BC, 0x0018, 0x32BC, 0x0014, 0x32BC, 0x0018,
+            // The palette from ROM $1200: 64 words.
+            0x30BC, 0x9340, 0x30BC, 0x9400,
+            0x30BC, 0x9500, 0x30BC, 0x9609, 0x30BC, 0x9700,
+            0x20BC, 0xC000, 0x0080,         // CRAM colour 0 by transfer
+            0x20BC, 0xC002, 0x0000,         // CRAM colour 1
+            0x32BC, 0x000E,                 // MOVE.W #$000E,(A1)
+            0x20BC, 0x4000, 0x0010,         // VSRAM word 0
+            0x32BC, 0x0004,                 // plane A four lines up
+            0x32BC, 0x0000,                 // plane B
+            // The 48 sprites from ROM $1300: 192 words.
+            0x30BC, 0x93C0, 0x30BC, 0x9400,
+            0x30BC, 0x9580, 0x30BC, 0x9609, 0x30BC, 0x9700,
+            0x20BC, 0x7000, 0x0083,         // VRAM $F000 by transfer
+            0x20BC, 0x7000, 0x0003,         // VRAM $F000
+            0x32BC, 0x0098,                 // sprite 0's Y: 24
+            0x46FC, 0x2000,                 // MOVE.W #$2000,SR: interrupts on
+            0x60FE,                         // BRA *
+        ]);
+        #[rustfmt::skip]
+        place(&mut rom, 0x600, &[
+            0x5279, 0x00FF, 0x0000,         // ADDQ.W #1,($FF0000).L: the frames
+            0x3039, 0x00FF, 0x0000,         // MOVE.W ($FF0000).L,D0
+            0x0640, 0x00A0,                 // ADDI.W #$A0,D0
+            0x20BC, 0x7006, 0x0003,         // VRAM $F006: sprite 0's X
+            0x3280,                         // MOVE.W D0,(A1): 32 + the frames
+            0x0640, 0x0028,                 // ADDI.W #40,D0
+            0x20BC, 0x700E, 0x0003,         // VRAM $F00E: sprite 1's X
+            0x3280,                         // MOVE.W D0,(A1)
+            0x20BC, 0xC002, 0x0000,         // CRAM colour 1
+            0x32BC, 0x000E,                 // back to red
+            0x20BC, 0x7C00, 0x0003,         // VRAM $FC00: plane A's horizontal scroll
+            0x32BC, 0x0000,                 // back to 0
+            // Tile 1 sent again, as tile 40: 16 words.
+            0x30BC, 0x9310, 0x30BC, 0x9400,
+            0x30BC, 0x9500, 0x30BC, 0x9608, 0x30BC, 0x9700,
+            0x20BC, 0x4500, 0x0080,         // VRAM $0500 by transfer
+            0x4E73,                         // RTE
+        ]);
+        #[rustfmt::skip]
+        place(&mut rom, 0x700, &[
+            0x20BC, 0xC002, 0x0000,         // CRAM colour 1
+            0x32BC, 0x00E0,                 // green from here on
+            0x20BC, 0x7C00, 0x0003,         // VRAM $FC00
+            0x32BC, 0x0010,                 // plane A sixteen pixels right
+            0x4E73,                         // RTE
+        ]);
+        // Tiles 1 to 16: diagonal stripes of every colour, with gaps.
+        for tile in 0..16usize {
+            for row in 0..8usize {
+                let colour = |x: usize| -> u8 {
+                    if (x + row + tile).is_multiple_of(5) {
+                        0
+                    } else {
+                        ((tile + x * 2 + row) % 15 + 1) as u8
+                    }
+                };
+                for pair in 0..4usize {
+                    rom[0x1000 + tile * 32 + row * 4 + pair] =
+                        (colour(pair * 2) << 4) | colour(pair * 2 + 1);
+                }
+            }
+        }
+        // The palette: 64 colours.
+        for colour in 0..64u16 {
+            let word = ((colour % 8) << 1) | (((colour / 8) % 8) << 5) | (((colour * 3) % 8) << 9);
+            place(&mut rom, 0x1200 + usize::from(colour) * 2, &[word]);
+        }
+        // The sprites, linked in slot order, each (y, size, the table's x).
+        for slot in 0..48u16 {
+            let (y, size, x) = match slot {
+                0..=7 => (
+                    16 + slot * 24,
+                    ((slot % 4) << 2) | (slot % 4),
+                    152 + slot * 36,
+                ),
+                8..=29 => (120, 0, 128 + (slot - 8) * 14),
+                30..=41 => (160, 0b1100, 128 + (slot - 30) * 30),
+                42 => (200, 0, 228),
+                43 => (200, 0, 0),
+                44 => (200, 0, 278),
+                45 => (60, 0, 88),
+                46 => (60, 0b0101, 458),
+                _ => (60, 0, 300),
+            };
+            let link = if slot == 47 { 0 } else { slot + 1 };
+            let pattern = ((slot % 2) << 15)
+                | ((slot % 4) << 13)
+                | ((slot % 3 / 2) << 12)
+                | ((slot % 5 / 4) << 11)
+                | (1 + slot % 16);
+            let entry = [128 + y, (size << 8) | link, pattern, x];
+            place(&mut rom, 0x1300 + usize::from(slot) * 8, &entry);
+        }
+        // Plane A's map, 64 by 32 cells.
+        for row in 0..32u16 {
+            for column in 0..64u16 {
+                let cell = (u16::from(column % 7 == 0) << 15)
+                    | (((row / 8) % 4) << 13)
+                    | (u16::from(column % 3 == 0) << 12)
+                    | (u16::from(row % 5 == 0) << 11)
+                    | (1 + (row + column) % 16);
+                place(
+                    &mut rom,
+                    0x2000 + usize::from(row * 64 + column) * 2,
+                    &[cell],
+                );
+            }
+        }
+        rom
+    }
+
+    /// Every recorder on.
+    const EVERY_RECORDER: [(&str, bool); 5] = [
+        ("lineStates", true),
+        ("pixelSources", true),
+        ("lineSprites", true),
+        ("videoMemorySources", true),
+        ("frameWrites", true),
+    ];
+
+    /// [`capture_shapes_rom`] with `recorded` on from its first frame, run
+    /// five frames and the sixth to its capture boundary.
+    fn held_capture_shapes(recorded: &[(&str, bool)]) -> RetroEmulator {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&capture_shapes_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.set_capture_recording(options(recorded));
+        for _ in 0..5 {
+            emu.run_frame();
+        }
+        emu.run_to_capture_boundary();
+        emu
+    }
+
+    /// Hold each value of `found` to the description recorded for it. When
+    /// they differ, the descriptions found are written to the console as
+    /// the entries of `expected`.
+    fn assert_shapes<S: AsRef<str>>(found: &[(S, JsValue)], expected: &[(&str, &str)]) {
+        let shapes: Vec<(&str, String)> = found
+            .iter()
+            .map(|(what, value)| (what.as_ref(), retro_wasm::test_support::shape(value)))
+            .collect();
+        let shapes: Vec<(&str, &str)> = shapes
+            .iter()
+            .map(|(what, shape)| (*what, shape.as_str()))
+            .collect();
+        if shapes != expected {
+            for (what, shape) in &shapes {
+                console_log!("SHAPE ({what:?}, {shape:?}),");
+            }
+        }
+        assert_eq!(shapes, expected);
+    }
+
+    #[wasm_bindgen_test]
+    fn what_a_frame_snapshot_holds() {
+        let mut emu = held_capture_shapes(&EVERY_RECORDER);
+        let held = emu.capture_frame_snapshot();
+        emu.run_frame();
+        let after_the_frame = emu.capture_frame_snapshot();
+        assert_shapes(
+            &[
+                ("held at the boundary", held),
+                ("after the frame", after_the_frame),
+            ],
+            &[
+                (
+                    "held at the boundary",
+                    "{atBoundary: true, frame: 6, framebuffer: Uint8Array(len 286720, \
+                     fnv1a64 0x90450a1e4b4824fc), height: 224, palette: Uint16Array(len 64, \
+                     fnv1a64 0xd9034ab48a655301), registers: [{description: \"\", index: 0, \
+                     name: \"Mode Register 1\", value: 20}, {description: \"\", index: 1, \
+                     name: \"Mode Register 2\", value: 116}, {description: \"\", index: 2, \
+                     name: \"Plane A Name Table\", value: 48}, {description: \"\", index: 3, \
+                     name: \"Window Name Table\", value: 0}, {description: \"\", index: 4, \
+                     name: \"Plane B Name Table\", value: 7}, {description: \"\", index: 5, \
+                     name: \"Sprite Table\", value: 120}, {description: \"\", index: 6, \
+                     name: \"Sprite Pattern Generator\", value: 0}, {description: \"\", index: 7, \
+                     name: \"Background Color\", value: 0}, {description: \"\", index: 8, \
+                     name: \"Unused ($08)\", value: 0}, {description: \"\", index: 9, \
+                     name: \"Unused ($09)\", value: 0}, {description: \"\", index: 10, \
+                     name: \"H Interrupt Counter\", value: 99}, {description: \"\", index: 11, \
+                     name: \"Mode Register 3\", value: 0}, {description: \"\", index: 12, \
+                     name: \"Mode Register 4\", value: 129}, {description: \"\", index: 13, \
+                     name: \"H Scroll Table\", value: 63}, {description: \"\", index: 14, \
+                     name: \"Plane Pattern Generator\", value: 0}, {description: \"\", index: 15, \
+                     name: \"Auto Increment\", value: 2}, {description: \"\", index: 16, \
+                     name: \"Plane Size\", value: 1}, {description: \"\", index: 17, \
+                     name: \"Window H Position\", value: 0}, {description: \"\", index: 18, \
+                     name: \"Window V Position\", value: 0}, {description: \"\", index: 19, \
+                     name: \"DMA Length Low\", value: 0}, {description: \"\", index: 20, \
+                     name: \"DMA Length High\", value: 0}, {description: \"\", index: 21, \
+                     name: \"DMA Source Low\", value: 16}, {description: \"\", index: 22, \
+                     name: \"DMA Source Mid\", value: 8}, {description: \"\", index: 23, \
+                     name: \"DMA Source High\", value: 0}], vram: Uint8Array(len 65536, \
+                     fnv1a64 0x8a29d79466aa96ef), vsram: Uint16Array(len 64, \
+                     fnv1a64 0xbb0bb9ec6512e521), width: 320}",
+                ),
+                (
+                    "after the frame",
+                    "{atBoundary: false, frame: 6, framebuffer: Uint8Array(len 286720, \
+                     fnv1a64 0x90450a1e4b4824fc), height: 224, palette: Uint16Array(len 64, \
+                     fnv1a64 0x80a6cbe3ccc7196f), registers: [{description: \"\", index: 0, \
+                     name: \"Mode Register 1\", value: 20}, {description: \"\", index: 1, \
+                     name: \"Mode Register 2\", value: 116}, {description: \"\", index: 2, \
+                     name: \"Plane A Name Table\", value: 48}, {description: \"\", index: 3, \
+                     name: \"Window Name Table\", value: 0}, {description: \"\", index: 4, \
+                     name: \"Plane B Name Table\", value: 7}, {description: \"\", index: 5, \
+                     name: \"Sprite Table\", value: 120}, {description: \"\", index: 6, \
+                     name: \"Sprite Pattern Generator\", value: 0}, {description: \"\", index: 7, \
+                     name: \"Background Color\", value: 0}, {description: \"\", index: 8, \
+                     name: \"Unused ($08)\", value: 0}, {description: \"\", index: 9, \
+                     name: \"Unused ($09)\", value: 0}, {description: \"\", index: 10, \
+                     name: \"H Interrupt Counter\", value: 99}, {description: \"\", index: 11, \
+                     name: \"Mode Register 3\", value: 0}, {description: \"\", index: 12, \
+                     name: \"Mode Register 4\", value: 129}, {description: \"\", index: 13, \
+                     name: \"H Scroll Table\", value: 63}, {description: \"\", index: 14, \
+                     name: \"Plane Pattern Generator\", value: 0}, {description: \"\", index: 15, \
+                     name: \"Auto Increment\", value: 2}, {description: \"\", index: 16, \
+                     name: \"Plane Size\", value: 1}, {description: \"\", index: 17, \
+                     name: \"Window H Position\", value: 0}, {description: \"\", index: 18, \
+                     name: \"Window V Position\", value: 0}, {description: \"\", index: 19, \
+                     name: \"DMA Length Low\", value: 0}, {description: \"\", index: 20, \
+                     name: \"DMA Length High\", value: 0}, {description: \"\", index: 21, \
+                     name: \"DMA Source Low\", value: 16}, {description: \"\", index: 22, \
+                     name: \"DMA Source Mid\", value: 8}, {description: \"\", index: 23, \
+                     name: \"DMA Source High\", value: 0}], vram: Uint8Array(len 65536, \
+                     fnv1a64 0x1c28c67504e3498b), vsram: Uint16Array(len 64, \
+                     fnv1a64 0xbb0bb9ec6512e521), width: 320}",
+                ),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_each_layer_drawn_alone_holds() {
+        let mut emu = held_capture_shapes(&EVERY_RECORDER);
+        let mut found = Vec::new();
+        for (what, layer) in [
+            ("plane A", 0),
+            ("plane B", 1),
+            ("window", 2),
+            ("sprites", 3),
+            ("layer 4", 4),
+            ("layer 99", 99),
+        ] {
+            found.push((what, emu.render_layer(layer)));
+        }
+        let mut unrecorded = held_capture_shapes(&[]);
+        found.push(("plane A, nothing recorded", unrecorded.render_layer(0)));
+        assert_shapes(
+            &found,
+            &[
+                (
+                    "plane A",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xbea5713f2915922e), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "plane B",
+                    "{data: Uint8Array(len 286720, fnv1a64 0x4bbb1fba9a66c325), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "window",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xe97846eb7709a325), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "sprites",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xa2af1da2713f146f), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                ("layer 4", "null"),
+                ("layer 99", "null"),
+                (
+                    "plane A, nothing recorded",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xf1ef581015fff896), \
+                     fromLineStates: false, height: 224, width: 320}",
+                ),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_capture_recording_reads_back() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        let mut found = vec![("at first", emu.get_capture_recording())];
+        emu.set_capture_recording(options(&[("lineStates", true), ("frameWrites", true)]));
+        found.push(("two turned on", emu.get_capture_recording()));
+        emu.set_capture_recording(options(&[("pixelSources", true), ("frameWrites", false)]));
+        found.push(("a partial object", emu.get_capture_recording()));
+        emu.set_capture_recording(options(&[]));
+        found.push(("an empty object", emu.get_capture_recording()));
+        emu.set_capture_recording(JsValue::UNDEFINED);
+        found.push(("no object", emu.get_capture_recording()));
+        let not_booleans = js_sys::Object::new();
+        for (key, value) in [
+            ("lineSprites", JsValue::from_f64(1.0)),
+            ("lineStates", JsValue::from_str("false")),
+            ("videoMemorySources", JsValue::NULL),
+        ] {
+            js_sys::Reflect::set(&not_booleans, &JsValue::from_str(key), &value).unwrap();
+        }
+        emu.set_capture_recording(not_booleans.into());
+        found.push(("values that are not booleans", emu.get_capture_recording()));
+        emu.set_capture_recording(options(&EVERY_RECORDER));
+        found.push(("every recorder", emu.get_capture_recording()));
+        assert_shapes(
+            &found,
+            &[
+                (
+                    "at first",
+                    "{frameWrites: false, lineSprites: false, lineStates: false, \
+                     pixelSources: false, videoMemorySources: false}",
+                ),
+                (
+                    "two turned on",
+                    "{frameWrites: true, lineSprites: false, lineStates: true, \
+                     pixelSources: false, videoMemorySources: false}",
+                ),
+                (
+                    "a partial object",
+                    "{frameWrites: false, lineSprites: false, lineStates: true, \
+                     pixelSources: true, videoMemorySources: false}",
+                ),
+                (
+                    "an empty object",
+                    "{frameWrites: false, lineSprites: false, lineStates: true, \
+                     pixelSources: true, videoMemorySources: false}",
+                ),
+                (
+                    "no object",
+                    "{frameWrites: false, lineSprites: false, lineStates: true, \
+                     pixelSources: true, videoMemorySources: false}",
+                ),
+                (
+                    "values that are not booleans",
+                    "{frameWrites: false, lineSprites: false, lineStates: true, \
+                     pixelSources: true, videoMemorySources: false}",
+                ),
+                (
+                    "every recorder",
+                    "{frameWrites: true, lineSprites: true, lineStates: true, pixelSources: true, \
+                     videoMemorySources: true}",
+                ),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_line_states_hold() {
+        let recorded = held_capture_shapes(&EVERY_RECORDER);
+        let for_the_sprites = held_capture_shapes(&[("lineSprites", true)]);
+        let unrecorded = held_capture_shapes(&[]);
+        assert_shapes(
+            &[
+                ("recorded", recorded.get_line_states()),
+                (
+                    "kept for the line sprites",
+                    for_the_sprites.get_line_states(),
+                ),
+                ("not recorded", unrecorded.get_line_states()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register_0\", \
+                     \"register_1\", \"register_2\", \"register_3\", \"register_4\", \
+                     \"register_5\", \"register_6\", \"register_7\", \"register_8\", \
+                     \"register_9\", \"register_10\", \"register_11\", \"register_12\", \
+                     \"register_13\", \"register_14\", \"register_15\", \"register_16\", \
+                     \"register_17\", \"register_18\", \"register_19\", \"register_20\", \
+                     \"register_21\", \"register_22\", \"register_23\", \
+                     \"plane_a_horizontal_scroll\", \"plane_b_horizontal_scroll\", \
+                     \"vertical_scroll_0\", \"vertical_scroll_1\", \"vertical_scroll_2\", \
+                     \"vertical_scroll_3\", \"vertical_scroll_4\", \"vertical_scroll_5\", \
+                     \"vertical_scroll_6\", \"vertical_scroll_7\", \"vertical_scroll_8\", \
+                     \"vertical_scroll_9\", \"vertical_scroll_10\", \"vertical_scroll_11\", \
+                     \"vertical_scroll_12\", \"vertical_scroll_13\", \"vertical_scroll_14\", \
+                     \"vertical_scroll_15\", \"vertical_scroll_16\", \"vertical_scroll_17\", \
+                     \"vertical_scroll_18\", \"vertical_scroll_19\", \"vertical_scroll_20\", \
+                     \"vertical_scroll_21\", \"vertical_scroll_22\", \"vertical_scroll_23\", \
+                     \"vertical_scroll_24\", \"vertical_scroll_25\", \"vertical_scroll_26\", \
+                     \"vertical_scroll_27\", \"vertical_scroll_28\", \"vertical_scroll_29\", \
+                     \"vertical_scroll_30\", \"vertical_scroll_31\", \"vertical_scroll_32\", \
+                     \"vertical_scroll_33\", \"vertical_scroll_34\", \"vertical_scroll_35\", \
+                     \"vertical_scroll_36\", \"vertical_scroll_37\", \"vertical_scroll_38\", \
+                     \"vertical_scroll_39\", \"sprite_mask_carried_in\", \"palette\"], \
+                     complete: true, firstRowLine: 0, frame: 6, fromFirstLine: true, \
+                     memoryExact: true, rowsPerLine: 1, values: Uint32Array(len 16128, \
+                     fnv1a64 0x6ff1a0129c1a30e5)}",
+                ),
+                (
+                    "kept for the line sprites",
+                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register_0\", \
+                     \"register_1\", \"register_2\", \"register_3\", \"register_4\", \
+                     \"register_5\", \"register_6\", \"register_7\", \"register_8\", \
+                     \"register_9\", \"register_10\", \"register_11\", \"register_12\", \
+                     \"register_13\", \"register_14\", \"register_15\", \"register_16\", \
+                     \"register_17\", \"register_18\", \"register_19\", \"register_20\", \
+                     \"register_21\", \"register_22\", \"register_23\", \
+                     \"plane_a_horizontal_scroll\", \"plane_b_horizontal_scroll\", \
+                     \"vertical_scroll_0\", \"vertical_scroll_1\", \"vertical_scroll_2\", \
+                     \"vertical_scroll_3\", \"vertical_scroll_4\", \"vertical_scroll_5\", \
+                     \"vertical_scroll_6\", \"vertical_scroll_7\", \"vertical_scroll_8\", \
+                     \"vertical_scroll_9\", \"vertical_scroll_10\", \"vertical_scroll_11\", \
+                     \"vertical_scroll_12\", \"vertical_scroll_13\", \"vertical_scroll_14\", \
+                     \"vertical_scroll_15\", \"vertical_scroll_16\", \"vertical_scroll_17\", \
+                     \"vertical_scroll_18\", \"vertical_scroll_19\", \"vertical_scroll_20\", \
+                     \"vertical_scroll_21\", \"vertical_scroll_22\", \"vertical_scroll_23\", \
+                     \"vertical_scroll_24\", \"vertical_scroll_25\", \"vertical_scroll_26\", \
+                     \"vertical_scroll_27\", \"vertical_scroll_28\", \"vertical_scroll_29\", \
+                     \"vertical_scroll_30\", \"vertical_scroll_31\", \"vertical_scroll_32\", \
+                     \"vertical_scroll_33\", \"vertical_scroll_34\", \"vertical_scroll_35\", \
+                     \"vertical_scroll_36\", \"vertical_scroll_37\", \"vertical_scroll_38\", \
+                     \"vertical_scroll_39\", \"sprite_mask_carried_in\", \"palette\"], \
+                     complete: true, firstRowLine: 0, frame: 6, fromFirstLine: true, \
+                     memoryExact: true, rowsPerLine: 1, values: Uint32Array(len 16128, \
+                     fnv1a64 0x6ff1a0129c1a30e5)}",
+                ),
+                ("not recorded", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_line_palettes_hold() {
+        let recorded = held_capture_shapes(&EVERY_RECORDER);
+        let unrecorded = held_capture_shapes(&[]);
+        assert_shapes(
+            &[
+                ("recorded", recorded.get_line_palettes()),
+                ("not recorded", unrecorded.get_line_palettes()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "{changes: Uint16Array(len 10, fnv1a64 0x978cad4acc7ab705), \
+                     coloursPerPalette: 64, paletteOfLine: Uint16Array(len 224, \
+                     fnv1a64 0x5f8fc5aa294a6f75), palettes: Uint16Array(len 128, \
+                     fnv1a64 0x0b27d5654f63eefb)}",
+                ),
+                ("not recorded", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_picture_drawn_from_the_line_states_holds() {
+        let mut recorded = held_capture_shapes(&EVERY_RECORDER);
+        let mut unrecorded = held_capture_shapes(&[]);
+        assert_shapes(
+            &[
+                ("recorded", recorded.picture_from_line_states()),
+                ("not recorded", unrecorded.picture_from_line_states()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "{data: Uint8Array(len 286720, fnv1a64 0x90450a1e4b4824fc), height: 224, \
+                     width: 320}",
+                ),
+                ("not recorded", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_pixel_sources_hold_for_every_plane_mask() {
+        let mut emu = held_capture_shapes(&EVERY_RECORDER);
+        let mut found = vec![("planes left out".to_string(), emu.get_pixel_sources(None))];
+        for planes in (0..16).chain([16, 31]) {
+            found.push((
+                format!("planes {planes}"),
+                emu.get_pixel_sources(Some(planes)),
+            ));
+        }
+        let mut unrecorded = held_capture_shapes(&[]);
+        found.push((
+            "nothing recorded".to_string(),
+            unrecorded.get_pixel_sources(None),
+        ));
+        let mut no_game = RetroEmulator::new("genesis").unwrap();
+        found.push(("no game".to_string(), no_game.get_pixel_sources(None)));
+        assert_shapes(
+            &found,
+            &[
+                (
+                    "planes left out",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 0",
+                    "{frame: 6, fromLineStates: true, height: 224, matchesPicture: true, \
+                     width: 320}",
+                ),
+                (
+                    "planes 1",
+                    "{frame: 6, fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 2",
+                    "{colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 3",
+                    "{colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 4",
+                    "{frame: 6, fromLineStates: true, height: 224, matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 5",
+                    "{frame: 6, fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 6",
+                    "{colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 7",
+                    "{colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 8",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 9",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 10",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 11",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, width: 320}",
+                ),
+                (
+                    "planes 12",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 13",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 14",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 15",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "planes 16",
+                    "{frame: 6, fromLineStates: true, height: 224, matchesPicture: true, \
+                     width: 320}",
+                ),
+                (
+                    "planes 31",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x3672315cebf45476), \
+                     colour: Uint16Array(len 71680, fnv1a64 0x0927060996b8ea60), frame: 6, \
+                     fromLineStates: true, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x4f47f23a1f1bd0e5), matchesPicture: true, \
+                     tile: Uint32Array(len 71680, fnv1a64 0x16545b43d85629c6), width: 320}",
+                ),
+                (
+                    "nothing recorded",
+                    "{cell: Uint16Array(len 71680, fnv1a64 0x1534eb7b2a7cb9e3), \
+                     colour: Uint16Array(len 71680, fnv1a64 0xbe0328133f1361c0), frame: 6, \
+                     fromLineStates: false, height: 224, layer: Uint16Array(len 71680, \
+                     fnv1a64 0x6093cce1db1c529b), matchesPicture: false, \
+                     tile: Uint32Array(len 71680, fnv1a64 0xbc22a43e29ecf66a), width: 320}",
+                ),
+                ("no game", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_line_sprites_hold() {
+        let mut recorded = held_capture_shapes(&EVERY_RECORDER);
+        let mut unrecorded = held_capture_shapes(&[]);
+        let mut no_game = RetroEmulator::new("genesis").unwrap();
+        assert_shapes(
+            &[
+                ("recorded", recorded.get_line_sprites()),
+                ("nothing recorded", unrecorded.get_line_sprites()),
+                ("no game", no_game.get_line_sprites()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "{drawnWidth: Uint8Array(len 488, fnv1a64 0x8a6c997556324945), \
+                     fates: Uint8Array(len 488, fnv1a64 0x170fe62d918f96c5), frame: 6, \
+                     fromLineStates: true, lines: Uint16Array(len 896, \
+                     fnv1a64 0x4bd753302fe7e706), slots: Uint8Array(len 488, \
+                     fnv1a64 0xe9ff911bdf30e495), width: Uint8Array(len 488, \
+                     fnv1a64 0x2129b8dd2dc27785), x: Int16Array(len 488, \
+                     fnv1a64 0x6f77b8bbd663dea5)}",
+                ),
+                (
+                    "nothing recorded",
+                    "{drawnWidth: Uint8Array(len 488, fnv1a64 0x8a6c997556324945), \
+                     fates: Uint8Array(len 488, fnv1a64 0x170fe62d918f96c5), frame: 6, \
+                     fromLineStates: false, lines: Uint16Array(len 896, \
+                     fnv1a64 0x4bd753302fe7e706), slots: Uint8Array(len 488, \
+                     fnv1a64 0xe9ff911bdf30e495), width: Uint8Array(len 488, \
+                     fnv1a64 0x2129b8dd2dc27785), x: Int16Array(len 488, \
+                     fnv1a64 0x6f77b8bbd663dea5)}",
+                ),
+                ("no game", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_chosen_sprites_drawn_alone_hold() {
+        let mut emu = held_capture_shapes(&EVERY_RECORDER);
+        let mut some = [0u8; 30];
+        for (slot, flag) in [(0, 1), (3, 7), (9, 1), (25, 255), (29, 1)] {
+            some[slot] = flag;
+        }
+        let mut unrecorded = held_capture_shapes(&[]);
+        let mut no_game = RetroEmulator::new("genesis").unwrap();
+        assert_shapes(
+            &[
+                ("none chosen", emu.render_sprites(&[])),
+                ("some chosen", emu.render_sprites(&some)),
+                ("every slot chosen", emu.render_sprites(&[1; 80])),
+                ("longer than the table", emu.render_sprites(&[1; 100])),
+                ("nothing recorded", unrecorded.render_sprites(&[1; 80])),
+                ("no game", no_game.render_sprites(&[1; 80])),
+            ],
+            &[
+                (
+                    "none chosen",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xe97846eb7709a325), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "some chosen",
+                    "{data: Uint8Array(len 286720, fnv1a64 0x7fd870991a18c139), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "every slot chosen",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xa2af1da2713f146f), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "longer than the table",
+                    "{data: Uint8Array(len 286720, fnv1a64 0xa2af1da2713f146f), \
+                     fromLineStates: true, height: 224, width: 320}",
+                ),
+                (
+                    "nothing recorded",
+                    "{data: Uint8Array(len 286720, fnv1a64 0x295ae25c4132c021), \
+                     fromLineStates: false, height: 224, width: 320}",
+                ),
+                ("no game", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_video_memory_sources_hold() {
+        let recorded = held_capture_shapes(&EVERY_RECORDER);
+        let unrecorded = held_capture_shapes(&[]);
+        assert_shapes(
+            &[
+                ("recorded", recorded.get_video_memory_sources()),
+                ("not recorded", unrecorded.get_video_memory_sources()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "{frames: Uint32Array(len 65536, fnv1a64 0x79b47c3c923896a5), \
+                     origins: Uint32Array(len 65536, fnv1a64 0xf16512049df41557)}",
+                ),
+                ("not recorded", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_resolved_sources_hold() {
+        let emu = held_capture_shapes(&EVERY_RECORDER);
+        let no_game = RetroEmulator::new("genesis").unwrap();
+        let addresses = [
+            0x0000_1000,
+            0x0000_1235,
+            0x0007_FFFF,
+            0x0008_0000,
+            0x0020_0001,
+            0x003F_FFFF,
+            0x0040_0000,
+            0x00A0_0000,
+            0x00A1_3000,
+            0x00C0_0000,
+            0x00E0_0000,
+            0x00FF_0000,
+            0x00FF_FFFF,
+            0x1200_1234,
+            0xFFFF_0000,
+        ];
+        assert_shapes(
+            &[
+                ("a game", emu.resolve_sources(&addresses).into()),
+                ("no address", emu.resolve_sources(&[]).into()),
+                ("no game", no_game.resolve_sources(&addresses).into()),
+            ],
+            &[
+                ("a game", "Int32Array(len 15, fnv1a64 0xb4c0be8f60bbbc95)"),
+                (
+                    "no address",
+                    "Int32Array(len 0, fnv1a64 0xcbf29ce484222325)",
+                ),
+                ("no game", "Int32Array(len 15, fnv1a64 0xada63fd6c9a763c9)"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_frame_writes_hold() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        emu.load_rom(&capture_shapes_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.set_capture_recording(options(&EVERY_RECORDER));
+        emu.run_frame();
+        let first_frame = emu.take_frame_writes();
+        for _ in 0..4 {
+            emu.run_frame();
+        }
+        let _ = emu.take_frame_writes();
+        emu.run_to_capture_boundary();
+        let to_the_boundary = emu.take_frame_writes();
+        let taken_again = emu.take_frame_writes();
+        emu.run_to_capture_boundary();
+        let boundary_to_boundary = emu.take_frame_writes();
+        let mut unrecorded = held_capture_shapes(&[]);
+        assert_shapes(
+            &[
+                ("the first frame", first_frame),
+                ("to the boundary", to_the_boundary),
+                ("taken again", taken_again),
+                ("from one boundary to the next", boundary_to_boundary),
+                ("not recorded", unrecorded.take_frame_writes()),
+            ],
+            &[
+                (
+                    "the first frame",
+                    "{dropped: 0, records: Uint32Array(len 48, fnv1a64 0x3e2be344a8da7c51), \
+                     wordsPerRecord: 8}",
+                ),
+                (
+                    "to the boundary",
+                    "{dropped: 0, records: Uint32Array(len 16, fnv1a64 0x3a4a1295ad40bb60), \
+                     wordsPerRecord: 8}",
+                ),
+                (
+                    "taken again",
+                    "{dropped: 0, records: Uint32Array(len 0, fnv1a64 0xcbf29ce484222325), \
+                     wordsPerRecord: 8}",
+                ),
+                (
+                    "from one boundary to the next",
+                    "{dropped: 0, records: Uint32Array(len 48, fnv1a64 0xb5d5d9292f29c7e0), \
+                     wordsPerRecord: 8}",
+                ),
+                ("not recorded", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn when_the_core_is_at_a_capture_boundary() {
+        let mut emu = RetroEmulator::new("genesis").unwrap();
+        let mut found = vec![("no game", emu.at_capture_boundary().into())];
+        emu.load_rom(&capture_shapes_rom()).unwrap();
+        emu.set_execution_mode("Running".to_string());
+        emu.run_frame();
+        found.push(("after a frame", emu.at_capture_boundary().into()));
+        emu.run_to_capture_boundary();
+        found.push(("held there", emu.at_capture_boundary().into()));
+        let _ = emu.render_layer(0);
+        let _ = emu.get_pixel_sources(None);
+        found.push(("after reading", emu.at_capture_boundary().into()));
+        emu.run_to_capture_boundary();
+        found.push(("at the next boundary", emu.at_capture_boundary().into()));
+        emu.run_frame();
+        found.push(("after the frame call", emu.at_capture_boundary().into()));
+        emu.run_to_capture_boundary();
+        let _ = emu.save_state();
+        found.push(("after a save", emu.at_capture_boundary().into()));
+        assert_shapes(
+            &found,
+            &[
+                ("no game", "false"),
+                ("after a frame", "false"),
+                ("held there", "true"),
+                ("after reading", "true"),
+                ("at the next boundary", "true"),
+                ("after the frame call", "false"),
+                ("after a save", "false"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_a_repaint_draws() {
+        // `repaintFrame` returns nothing to JavaScript.
+        let repaint: fn(&mut RetroEmulator) = RetroEmulator::repaint_frame;
+        let mut recorded = held_capture_shapes(&EVERY_RECORDER);
+        recorded.toggle_layer(0, false);
+        repaint(&mut recorded);
+        let mut unrecorded = held_capture_shapes(&[]);
+        unrecorded.toggle_layer(1, false);
+        repaint(&mut unrecorded);
+        assert_shapes(
+            &[
+                ("plane A hidden", recorded.get_framebuffer_data().into()),
+                (
+                    "plane B hidden, nothing recorded",
+                    unrecorded.get_framebuffer_data().into(),
+                ),
+            ],
+            &[
+                (
+                    "plane A hidden",
+                    "Uint8ClampedArray(len 286720, fnv1a64 0x478376a41bb9c42b)",
+                ),
+                (
+                    "plane B hidden, nothing recorded",
+                    "Uint8ClampedArray(len 286720, fnv1a64 0xf1074741c02b84f3)",
+                ),
+            ],
         );
     }
 }

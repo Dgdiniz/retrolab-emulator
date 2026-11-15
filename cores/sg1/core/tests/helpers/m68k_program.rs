@@ -76,6 +76,14 @@ impl M68kProgram {
         self
     }
 
+    /// The address label `name` names.
+    pub fn address(&self, name: &'static str) -> u32 {
+        *self
+            .labels
+            .get(name)
+            .unwrap_or_else(|| panic!("no label {name}")) as u32
+    }
+
     /// A branch with a 16-bit displacement to `target`: `opcode` is the
     /// condition's opcode with a zero displacement (`$6000` BRA, `$6600`
     /// BNE, `$6700` BEQ).

@@ -14,11 +14,15 @@
 mod helpers;
 
 use helpers::M68kProgram;
+use retro_core::capture::{
+    layer, planes, CaptureCore, CaptureRecording, SpriteFate, NO_COLUMN, NO_PALETTE,
+};
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::video::LineStateTable;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
-use sg1_core::vdp::{CaptureRecording, LineKind, Vdp, LAYER_PLANE_A, NO_COLUMN, NO_PALETTE};
+use sg1_core::vdp::sources::DRAWN_BY_SPRITE;
+use sg1_core::vdp::{LineKind, Vdp, LAYER_PLANE_A, LAYER_SPRITES};
 use sg1_core::GenesisEmulator;
 
 /// Frames run before a check, so the program has set the VDP up.
@@ -365,7 +369,8 @@ fn the_table_says_what_each_line_was_drawn_with() {
     assert_eq!(palettes.palettes[64 + 1], YELLOW);
 
     // The write itself, on line 120, from the beam's column on.
-    let changes = palettes.changes.as_chunks::<5>().0;
+    let changes = palettes.changes.as_ref().expect("this core records them");
+    let changes = changes.as_chunks::<5>().0;
     assert_eq!(changes.len(), 1, "{changes:?}");
     let [row, from, index, colour, whole_line] = changes[0];
     assert_eq!((row, index, colour, whole_line), (120, 1, YELLOW, 0));
@@ -558,6 +563,7 @@ fn a_debugger_edit_of_a_colour_or_the_vertical_scroll_shows_on_every_line() {
     let palettes = emu.line_palettes().expect("line states on");
     assert!(palettes
         .changes
+        .expect("this core records them")
         .as_chunks::<5>()
         .0
         .iter()
@@ -646,7 +652,7 @@ fn recording_changes_nothing_on_any_frame_loop() {
 fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not() {
     let rom = raster_program();
     let mut emu = recording(&rom);
-    let state = emu.finish_frame_and_save_state();
+    let state = emu.save_state_at_frame_end();
     let all_unrecorded = |emu: &GenesisEmulator| {
         let table = emu.line_states().expect("still armed");
         column(&table, "kind")
@@ -682,11 +688,123 @@ fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not(
     assert!(emu.line_palettes().is_none());
     assert!(emu.picture_from_line_states().is_none());
 
-    // The recorders this core does not have read false.
-    emu.set_capture_recording(CaptureRecording {
-        pixel_sources: true,
+    // The pixel sources and the line sprites are worked out from the line
+    // table: each reads back as asked and keeps the table on its own. Every
+    // recorder reads back as asked.
+    for wanted in [
+        CaptureRecording {
+            pixel_sources: true,
+            ..CaptureRecording::default()
+        },
+        CaptureRecording {
+            line_sprites: true,
+            ..CaptureRecording::default()
+        },
+    ] {
+        let wanted = CaptureRecording {
+            frame_writes: true,
+            video_memory_sources: true,
+            ..wanted
+        };
+        emu.set_capture_recording(wanted);
+        assert_eq!(emu.capture_recording(), wanted);
+        emu.run_frame_fast();
+        assert!(emu.line_states().is_some(), "{wanted:?} keeps the table");
+    }
+    // The writes are recorded as they are made: they keep no line table.
+    let writes_only = CaptureRecording {
         frame_writes: true,
+        video_memory_sources: true,
         ..CaptureRecording::default()
-    });
-    assert_eq!(emu.capture_recording(), CaptureRecording::default());
+    };
+    emu.set_capture_recording(writes_only);
+    assert_eq!(emu.capture_recording(), writes_only);
+    assert!(emu.line_states().is_none());
+    assert!(emu.video_memory_sources().is_some());
+    assert!(emu.take_frame_writes().is_some());
+}
+
+#[test]
+fn where_each_pixel_came_from_is_the_frame_s_and_working_it_out_moves_nothing() {
+    let mut emu = recording(&raster_program());
+    let mut twin = recording(&raster_program());
+    for _ in 0..3 {
+        emu.run_to_capture_boundary();
+        twin.run_to_capture_boundary();
+        let hash = emu.state_hash();
+        let picture = shown(&emu);
+
+        let sources = emu.pixel_sources(planes::MAIN).expect("a game is loaded");
+        assert!(sources.from_line_states && sources.matches_picture);
+        assert_eq!(sources.frame, emu.capture_frame_snapshot().frame);
+        let (layer, cell) = (sources.layer.unwrap(), sources.cell.unwrap());
+        // Sprite 0, two cells by two at (100, 50), in front of plane A.
+        for y in 50..66 {
+            for x in 100..116 {
+                assert_eq!(
+                    layer[y * 320 + x] & layer::WHAT_DREW,
+                    DRAWN_BY_SPRITE,
+                    "({x}, {y})"
+                );
+                assert_eq!(cell[y * 320 + x], 0);
+            }
+        }
+        let sprites = emu.line_sprites().expect("a game is loaded");
+        assert!(sprites.from_line_states);
+        assert_eq!(sprites.lines.len(), 224 * 4);
+        for line in 0..224 {
+            let row = &sprites.lines[line * 4..line * 4 + 4];
+            let on_line = (50..66).contains(&line);
+            assert_eq!(row[2], u16::from(on_line), "line {line}");
+            if on_line {
+                let at = usize::from(row[1]);
+                assert_eq!(sprites.slots[at], 0);
+                assert_eq!(sprites.fates[at], SpriteFate::DrawnWhole as u8);
+                assert_eq!((sprites.x[at], sprites.width[at]), (100, 16));
+                assert_eq!(sprites.drawn_width[at], 16);
+            }
+        }
+        let alone = emu.render_sprites(&[1]).expect("a game is loaded");
+        let layer_image = emu.render_layer(LAYER_SPRITES as u32).expect("the sprites");
+        assert_eq!(alone, layer_image);
+
+        assert_eq!(emu.state_hash(), hash, "nothing a savestate holds moved");
+        assert_eq!(shown(&emu), picture, "the picture shown did not move");
+        // And the frame goes on as one nothing was worked out in.
+        emu.run_frame_fast();
+        twin.run_frame_fast();
+        assert_eq!(emu.state_hash(), twin.state_hash());
+        assert_eq!(shown(&emu), shown(&twin));
+    }
+}
+
+#[test]
+fn a_pixel_a_cram_transfer_painted_names_the_colour_it_moved() {
+    let mut emu = recording(&direct_colour_program());
+    emu.run_to_capture_boundary();
+    let sources = emu.pixel_sources(planes::MAIN).expect("a game is loaded");
+    assert!(sources.from_line_states && sources.matches_picture);
+    let (layer, colour) = (sources.layer.unwrap(), sources.colour.unwrap());
+    let picture = shown(&emu);
+    for line in 0..224 {
+        for x in 0..320 {
+            let at = line * 320 + x;
+            if (51..=70).contains(&line) {
+                assert_eq!(layer[at], layer::UNLAYERED_COLOUR, "({x}, {line})");
+                let (red, green, blue) = Vdp::convert_genesis_color(colour[at]);
+                assert_eq!(picture[at * 4..at * 4 + 3], [red, green, blue]);
+            } else {
+                assert_eq!(layer[at], layer::NOTHING, "({x}, {line})");
+                assert_eq!(colour[at], 0, "the backdrop's index");
+            }
+        }
+    }
+}
+
+#[test]
+fn with_no_game_loaded_there_is_nothing_to_work_out() {
+    let mut emu = GenesisEmulator::new();
+    assert!(emu.pixel_sources(planes::MAIN).is_none());
+    assert!(emu.line_sprites().is_none());
+    assert!(emu.render_sprites(&[1; 80]).is_none());
 }

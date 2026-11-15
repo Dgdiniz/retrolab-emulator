@@ -655,25 +655,16 @@ impl VideoDebugger for Ppu {
             .collect()
     }
 
+    /// The sprites the held frame drew, back to front: only the sprites
+    /// that drew a pixel on a line that showed sprites, ordered by the
+    /// priority rotation (`(slot - first) & 0x7F`, largest first) of the
+    /// first line that showed them, so the first sprite paints on top.
+    /// Each line is read with its own settings and sprite table when the
+    /// line table holds the frame (see [`Ppu::line_sprites`], which also
+    /// gives each line's own order and what it dropped); otherwise the
+    /// visible lines are read with the registers and OAM as they stand.
     fn resolved_sprite_render_order(&self) -> Vec<SpriteOrderEntry> {
-        let oam = self.oam();
-        let first = usize::from(self.oam_first_sprite);
-        // Priority order (front-to-back) walks all 128 OAM entries starting
-        // at the rotated first sprite, exactly like `render_obj_row`'s range
-        // eval (`(oam_first_sprite + i) & 0x7F`). The renderer then paints
-        // that gathered set in reverse so the highest-priority sprite wins,
-        // so back-to-front paint order is the reverse of the priority walk.
-        (0..128usize)
-            .rev()
-            .map(|i| {
-                let idx = (first + i) & 0x7F;
-                let s = parse_sprite(oam, idx, self.obj_base_size, self.obj_interlace);
-                SpriteOrderEntry {
-                    index: idx as u32,
-                    priority: u32::from(s.priority),
-                }
-            })
-            .collect()
+        self.sprite_render_order()
     }
 
     fn get_layer_data(&self, layer_id: u32) -> Option<LayerData> {
@@ -874,9 +865,9 @@ impl VideoDebugger for Ppu {
     }
 
     /// The line table, when the host asked for it
-    /// ([`crate::ppu::CaptureRecording`]): `line` (the scanline, 1 for the
-    /// first drawn) then every setting of [`crate::ppu::LineState`], in
-    /// its own names, one row per line drawn. A setting kept per
+    /// ([`retro_core::capture::CaptureRecording`]): `line` (the scanline, 1
+    /// for the first drawn) then every setting of [`crate::ppu::LineState`],
+    /// in its own names, one row per line drawn. A setting kept per
     /// background or per layer gives a column per element
     /// (`bg_hoffset[0]`), a window selection a column per flag
     /// (`window_enable[2].w1_enable`). `None` when no table is kept or no
@@ -1260,7 +1251,8 @@ impl Ppu {
     /// as a write through the port does, so the next line drawn, or a
     /// repaint, reads the new contents. A write is no write of the frame's:
     /// a frame drawn again from its line table shows it on every line, and
-    /// the table then reports its memory as not exact.
+    /// the table then reports its memory as not exact. While the VRAM
+    /// sources are recorded, each byte written is put down to the debugger.
     pub fn write_vram_debug(&mut self, word_address: u32, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -1277,6 +1269,7 @@ impl Ppu {
                 high = value;
             }
             *word = u16::from_le_bytes([low, high]);
+            self.note_vram_debug_write(byte_address);
         }
         self.vram_generation = self.vram_generation.wrapping_add(1);
         self.after_video_memory_edit();
@@ -1792,23 +1785,68 @@ mod tests {
         assert_eq!(sprites[1].x, 100, "in-range X is unchanged");
     }
 
-    #[test]
-    fn resolved_render_order_reverses_oam_first_sprite_walk() {
+    /// A PPU showing sprites on the main screen, every sprite parked below
+    /// the visible lines but slots 0-9, which sit on line 10 side by side,
+    /// slot `n` with priority `n % 4`.
+    fn ten_sprites_shown() -> Ppu {
         let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.obj_main_enable = true;
+        for slot in 0..128 {
+            ppu.oam[slot * 4 + 1] = 0xF0;
+        }
+        for slot in 0..10 {
+            ppu.oam[slot * 4] = (slot * 10) as u8;
+            ppu.oam[slot * 4 + 1] = 10;
+            ppu.oam[slot * 4 + 3] = ((slot % 4) as u8) << 4;
+        }
+        ppu
+    }
+
+    #[test]
+    fn resolved_render_order_lists_the_drawn_sprites_by_the_rotation() {
+        let mut ppu = ten_sprites_shown();
         ppu.oam_first_sprite = 5;
 
+        // The walk meets 5..9 then 0..4; back to front is the reverse: the
+        // sprite before the first sprite at the back, the first in front.
         let order = ppu.resolved_sprite_render_order();
-        assert_eq!(order.len(), 128);
-
-        // Front-to-back priority walks 5,6,...,127,0,...,4 from the rotated
-        // first sprite; back-to-front paint order is the reverse.
-        let forward: Vec<u32> = (0..128usize).map(|i| ((5 + i) & 0x7F) as u32).collect();
-        let mut expected = forward;
-        expected.reverse();
         let got: Vec<u32> = order.iter().map(|e| e.index).collect();
-        assert_eq!(got, expected);
+        assert_eq!(got, vec![4, 3, 2, 1, 0, 9, 8, 7, 6, 5]);
         assert_eq!(order.last().unwrap().index, 5, "first-sprite paints on top");
-        assert_eq!(order[0].index, 4, "sprite before first-sprite is rearmost");
+        assert!(order.iter().all(|e| e.priority == e.index % 4));
+
+        // Without the rotation, slot 0 is in front.
+        ppu.oam_first_sprite = 0;
+        let got: Vec<u32> = ppu
+            .resolved_sprite_render_order()
+            .iter()
+            .map(|e| e.index)
+            .collect();
+        assert_eq!(got, (0..10u32).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resolved_render_order_leaves_out_what_drew_nothing() {
+        let mut ppu = ten_sprites_shown();
+        // Slot 3 at x = 256: met and fetched, but no pixel of it shows.
+        ppu.oam[3 * 4] = 0;
+        ppu.oam[0x200] |= 0x01 << (3 * 2);
+        let got: Vec<u32> = ppu
+            .resolved_sprite_render_order()
+            .iter()
+            .map(|e| e.index)
+            .collect();
+        assert!(!got.contains(&3));
+        assert_eq!(got.len(), 9);
+
+        // A frame that shows no sprite draws none.
+        ppu.obj_main_enable = false;
+        assert!(ppu.resolved_sprite_render_order().is_empty());
+        ppu.obj_main_enable = true;
+        ppu.display_disable = true;
+        assert!(ppu.resolved_sprite_render_order().is_empty());
     }
 
     // -- export_sprite_image -----------------------------------------

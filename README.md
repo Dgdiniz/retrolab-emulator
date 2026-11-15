@@ -15,7 +15,11 @@ and video views. It compiles to WebAssembly, and it is the emulator the
   and the Virtua Racing SVP).
 - `cores/snes1`: the Super Nintendo (65C816, SPC700, PPU, S-DSP, and the
   SA-1, Super FX, Cx4, DSP-1, S-DD1 and SPC7110 cartridge chips).
-- `cpus/`, `retro-core/`: the CPUs and the traits every core implements.
+- `cpus/`: the CPUs.
+- `retro-core/`: what every core shares (the traits a core implements, the
+  types it hands a host, the debugger's, audio's and capture's shared
+  logic); `retro-wasm/`: what the cores' WebAssembly bindings share. A core
+  holds only what its console's hardware makes different.
 - `web/`: a debugger that runs in the browser; `debugger-core/` holds the
   TypeScript it shares with RetroLab's.
 

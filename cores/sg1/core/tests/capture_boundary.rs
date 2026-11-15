@@ -9,6 +9,7 @@
 //! next. Every check here runs it, each frame call against the same frame
 //! run whole.
 
+use retro_core::capture::CaptureCore;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -199,7 +200,7 @@ fn the_boundary_holds_the_memory_the_picture_was_drawn_from() {
         assert_eq!(snapshot.framebuffer.len(), 320 * 224 * 4);
         assert_eq!(snapshot.vram.len(), 0x10000);
         assert_eq!(snapshot.palette.len(), 64);
-        assert_eq!(snapshot.vsram.len(), 64);
+        assert_eq!(snapshot.console.vsram.len(), 64);
         assert_eq!(snapshot.registers.len(), 24);
         assert_eq!(snapshot.registers[12].value, 0x81);
         let (shown, held) = shown_and_held_colour(&emu);
@@ -375,7 +376,7 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
         EmulatorCore::save_state(&emu).is_empty(),
         "a held frame has no savestate: it needs finishing first"
     );
-    let state = emu.finish_frame_and_save_state();
+    let state = emu.save_state_at_frame_end();
     assert!(!state.is_empty());
     assert!(!emu.at_capture_boundary(), "the frame was finished");
     assert_eq!(emu.frame_count(), whole.frame_count());
@@ -391,7 +392,7 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
 
     // Taken where no frame is held, nothing runs first.
     let count = emu.frame_count();
-    assert!(!emu.finish_frame_and_save_state().is_empty());
+    assert!(!emu.save_state_at_frame_end().is_empty());
     assert_eq!(emu.frame_count(), count);
 }
 
@@ -399,7 +400,7 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
 fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
     let mut emu = emulator();
     emu.run_frame_fast();
-    let state = emu.finish_frame_and_save_state();
+    let state = emu.save_state_at_frame_end();
 
     emu.run_to_capture_boundary();
     EmulatorCore::reset(&mut emu);

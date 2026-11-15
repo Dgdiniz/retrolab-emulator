@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
+use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::{EmulatorCore, InputState};
-use snes1_core::{CaptureRecording, SnesEmulator};
+use snes1_core::SnesEmulator;
 
 #[derive(Args, Debug)]
 pub struct ScreenshotArgs {
@@ -250,7 +251,8 @@ fn save_layer_images(emu: &mut SnesEmulator, output_path: &Path) -> Result<()> {
     for (layer, suffix) in ["bg1", "bg2", "bg3", "bg4", "obj"].into_iter().enumerate() {
         let image = emu
             .render_layer(layer as u32)
-            .map_err(|e| anyhow::anyhow!("failed to render layer {suffix}: {e}"))?;
+            .ok_or_else(|| anyhow::anyhow!("failed to render layer {suffix}: no such layer"))?
+            .image;
         let (width, height) = (image.width, image.height);
         let png = image::RgbaImage::from_raw(width, height, image.rgba).ok_or_else(|| {
             anyhow::anyhow!("failed to build a {width}x{height} image for layer {suffix}")

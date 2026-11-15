@@ -14,6 +14,7 @@ use crate::timing::VideoRegion;
 use crate::vdp::dma::{DmaTarget, MemoryDma};
 use crate::vdp::Vdp;
 use crate::ym2612::Ym2612;
+use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
 use retro_core::cpu::{Addressable, CyclesTrackable};
 
 /// 68K cycles the BUSACK ($A11100) read keeps reporting "busy" after BUSREQ is
@@ -280,6 +281,41 @@ impl AddressBus {
         PeekView(self)
     }
 
+    /// For each of `addresses`, a 68000 address (bits 24-31 ignored): where
+    /// a read of it comes from now. In the cartridge window
+    /// (`0x000000-0x7FFFFF`), the offset into the ROM file the read
+    /// reaches, through the cartridge's mapping as it stands
+    /// ([`GenesisCartridge::byte_sources`]: a bank mapper's banks as they
+    /// are set, the SRAM switch), else
+    /// [`SOURCE_CARTRIDGE_RAM`](retro_core::cartridge::SOURCE_CARTRIDGE_RAM)
+    /// or [`SOURCE_COPROCESSOR`](retro_core::cartridge::SOURCE_COPROCESSOR);
+    /// [`SOURCE_WORK_RAM`] for work RAM (`0xE00000-0xFFFFFF`, where a
+    /// transfer from 68000 memory reads it); [`SOURCE_UNKNOWN`] for every
+    /// other address, an empty slot and a read past the end of the ROM.
+    /// Reads the mapping and changes nothing.
+    pub fn resolve_sources(&self, addresses: &[u32]) -> Vec<i32> {
+        let window: Vec<u32> = addresses
+            .iter()
+            .map(|&address| address & 0x00FF_FFFF)
+            .filter(|&address| address <= 0x7F_FFFF)
+            .collect();
+        let from_cartridge = match &self.cartridge {
+            Some(cartridge) => cartridge.byte_sources(&window),
+            None => vec![SourcePlace::Unknown; window.len()],
+        };
+        let mut from_cartridge = from_cartridge.into_iter();
+        addresses
+            .iter()
+            .map(|&address| match address & 0x00FF_FFFF {
+                0x00_0000..=0x7F_FFFF => from_cartridge
+                    .next()
+                    .map_or(SOURCE_UNKNOWN, SourcePlace::code),
+                0xE0_0000..=0xFF_FFFF => SOURCE_WORK_RAM,
+                _ => SOURCE_UNKNOWN,
+            })
+            .collect()
+    }
+
     /// Set the cartridge.
     pub fn set_cartridge(&mut self, cartridge: Box<dyn GenesisCartridge>) {
         self.cartridge = Some(cartridge);
@@ -539,6 +575,9 @@ impl AddressBus {
                 if (addr & 0x11) == 0x11 {
                     self.psg.write(value);
                 } else {
+                    // Where the value came from, for a capture recording
+                    // who wrote video memory: the last word the 68000 read.
+                    self.vdp.note_port_origin(self.open_bus_pc.wrapping_sub(2));
                     self.vdp.write(addr, value);
 
                     // Check if a Memory-to-VRAM DMA was triggered
@@ -918,6 +957,9 @@ impl Addressable for AddressBus {
                 if (addr & 0x10) != 0 {
                     self.psg.write((value & 0xFF) as u8);
                 } else {
+                    // Where the value came from, for a capture recording
+                    // who wrote video memory: the last word the 68000 read.
+                    self.vdp.note_port_origin(self.open_bus_pc.wrapping_sub(2));
                     self.vdp.write_word_port(addr, value);
 
                     // Check if a Memory-to-VRAM DMA was triggered

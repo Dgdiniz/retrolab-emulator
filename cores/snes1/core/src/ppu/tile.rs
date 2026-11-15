@@ -114,6 +114,31 @@ pub fn fetch_bg_tilemap_entry(
     hires: bool,
     tile16: bool,
 ) -> TilemapEntry {
+    TilemapEntry::decode(
+        vram[bg_tilemap_word_index(
+            screen_addr_byte,
+            screen_size,
+            screen_x,
+            screen_y,
+            hires,
+            tile16,
+        )],
+    )
+}
+
+/// The VRAM word holding the tilemap entry that covers the pixel
+/// `(screen_x, screen_y)` of a background: the address
+/// [`fetch_bg_tilemap_entry`] reads, with the same arguments.
+#[inline]
+#[must_use]
+pub fn bg_tilemap_word_index(
+    screen_addr_byte: u32,
+    screen_size: u8,
+    screen_x: u16,
+    screen_y: u16,
+    hires: bool,
+    tile16: bool,
+) -> usize {
     let (mask_x, mask_y) = tilemap_masks(screen_size, hires, tile16);
 
     // Hires *or* 16x16 tiles force a 16-px horizontal tile stride; the
@@ -138,8 +163,7 @@ pub fn fetch_bg_tilemap_entry(
         offset_tiles += if screen_size == 3 { 0x800 } else { 0x400 };
     }
 
-    let word_index = ((screen_addr_byte >> 1) + offset_tiles) as usize & 0x7FFF;
-    TilemapEntry::decode(vram[word_index])
+    ((screen_addr_byte >> 1) + offset_tiles) as usize & 0x7FFF
 }
 
 /// Build the whole tilemap-entry row for tile-row `ty` (non-hires).
@@ -399,15 +423,66 @@ pub fn compute_offset_per_tile(
     base_voffset: u16,
     scanline_y: u16,
 ) -> (u16, u16) {
-    let plain = (
-        tile_left_x.wrapping_add(base_hoffset),
-        scanline_y.wrapping_add(base_voffset),
+    let scroll = offset_per_tile(
+        vram,
+        bg3_screen_addr_byte,
+        bg3_screen_size,
+        bg3_hoffset,
+        bg3_voffset,
+        bgmode,
+        bg_index,
+        tile_left_x,
+        base_hoffset,
+        base_voffset,
+        scanline_y,
     );
+    (scroll.hoffset, scroll.voffset)
+}
+
+/// The scroll one tile column of a background is fetched with under
+/// offset-per-tile, and which of its two axes BG3's tilemap replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileColumnScroll {
+    /// The absolute horizontal tilemap coordinate (see
+    /// [`compute_offset_per_tile`]).
+    pub hoffset: u16,
+    /// The absolute vertical tilemap coordinate.
+    pub voffset: u16,
+    /// An entry of BG3 replaced the horizontal scroll.
+    pub horizontal_replaced: bool,
+    /// An entry of BG3 replaced the vertical scroll.
+    pub vertical_replaced: bool,
+}
+
+/// [`compute_offset_per_tile`], saying too which axes were replaced: the
+/// one rule both the renderer and the offset-per-tile table read.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn offset_per_tile(
+    vram: &[u16; 0x8000],
+    bg3_screen_addr_byte: u32,
+    bg3_screen_size: u8,
+    bg3_hoffset: u16,
+    bg3_voffset: u16,
+    bgmode: u8,
+    bg_index: u8,
+    tile_left_x: u16,
+    base_hoffset: u16,
+    base_voffset: u16,
+    scanline_y: u16,
+) -> TileColumnScroll {
+    let mut scroll = TileColumnScroll {
+        hoffset: tile_left_x.wrapping_add(base_hoffset),
+        voffset: scanline_y.wrapping_add(base_voffset),
+        horizontal_replaced: false,
+        vertical_replaced: false,
+    };
     // The tile's position within the scrolled line; the first tile
     // column has no column to its left to read from.
     let column_x = tile_left_x.wrapping_add(base_hoffset & 7);
     if column_x < 8 {
-        return plain;
+        return scroll;
     }
 
     // Mode 6 is hires, and BG3 is read on the 16-pixel stride every
@@ -427,26 +502,29 @@ pub fn compute_offset_per_tile(
     let horizontal = |entry: OffsetEntry| column_x.wrapping_add(entry.offset & !7);
     let vertical = |entry: OffsetEntry| scanline_y.wrapping_add(entry.offset);
 
-    let (mut hoffset, mut voffset) = plain;
     let first = entry_at(0);
     if bgmode == 4 {
         if first.applies_to(bg_index) {
             if first.vertical {
-                voffset = vertical(first);
+                scroll.voffset = vertical(first);
+                scroll.vertical_replaced = true;
             } else {
-                hoffset = horizontal(first);
+                scroll.hoffset = horizontal(first);
+                scroll.horizontal_replaced = true;
             }
         }
     } else {
         if first.applies_to(bg_index) {
-            hoffset = horizontal(first);
+            scroll.hoffset = horizontal(first);
+            scroll.horizontal_replaced = true;
         }
         let second = entry_at(8);
         if second.applies_to(bg_index) {
-            voffset = vertical(second);
+            scroll.voffset = vertical(second);
+            scroll.vertical_replaced = true;
         }
     }
-    (hoffset, voffset)
+    scroll
 }
 
 /// Same addressing as [`fetch_bg_tilemap_entry`] but returns the
@@ -550,6 +628,10 @@ pub fn mode7_clip(n: i32) -> i32 {
 /// of `vram[tile*64 + (py & 7) * 8 + (px & 7)]`.
 #[must_use]
 pub fn mode7_sample(vram: &[u16; 0x8000], px: i32, py: i32, repeat: u8) -> Option<u8> {
+    // The frame loops' sampler; `mode7_sample_at` gives the same byte with
+    // where it came from, kept apart so this one stays as small as the
+    // per-pixel loop needs it (`mode7_sample_at_is_mode7_sample` holds the
+    // two together).
     let outside = ((px | py) & !1023) != 0;
     let tile: u32 = match repeat {
         // Palette colour 0 outside the plane -> fully transparent.
@@ -558,7 +640,7 @@ pub fn mode7_sample(vram: &[u16; 0x8000], px: i32, py: i32, repeat: u8) -> Optio
         3 if outside => 0,
         // Inside (any mode) or wrap modes 0/1. The `& 1023` is a
         // no-op when already inside, so one branch serves both.
-        _ => mode7_tile_at(vram, px & 1023, py & 1023),
+        _ => u32::from(vram[mode7_cell_at(px & 1023, py & 1023) as usize] & 0x00FF),
     };
     // The character pixel always uses the low 3 bits of the raw
     // coordinate; `& 7` is invariant under the `& 1023` wrap, so the
@@ -569,13 +651,68 @@ pub fn mode7_sample(vram: &[u16; 0x8000], px: i32, py: i32, repeat: u8) -> Optio
     Some((pixel_word >> 8) as u8)
 }
 
-/// Read the Mode 7 tilemap byte (tile number) covering world
-/// coordinate `(px, py)`, both pre-masked into `0..=1023`.
+/// One Mode 7 sample and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mode7Sample {
+    /// The character byte read, as [`mode7_sample`] returns it.
+    pub byte: u8,
+    /// The character the byte was read from.
+    pub character: u8,
+    /// The plane cell whose map entry named the character, `row * 128 +
+    /// column`, which is also the VRAM word whose low byte holds that
+    /// entry; 0 when no entry was read (the screen-over forcing character
+    /// 0 outside the plane).
+    pub cell: u16,
+    /// The coordinates fall outside the 1024x1024 plane.
+    pub outside: bool,
+    /// The column read within the character, `0..=7`.
+    pub column: u8,
+    /// The row read within the character, `0..=7`.
+    pub row: u8,
+}
+
+/// [`mode7_sample`], with the character, the plane cell and the pixel
+/// read, for a traced redraw: the same sampling, which a test holds to
+/// [`mode7_sample`] over every screen-over mode.
+#[must_use]
+pub fn mode7_sample_at(vram: &[u16; 0x8000], px: i32, py: i32, repeat: u8) -> Option<Mode7Sample> {
+    let outside = ((px | py) & !1023) != 0;
+    let (tile, cell): (u32, u32) = match repeat {
+        // Palette colour 0 outside the plane -> fully transparent.
+        2 if outside => return None,
+        // Character 0 repetition outside the plane.
+        3 if outside => (0, 0),
+        // Inside (any mode) or wrap modes 0/1. The `& 1023` is a
+        // no-op when already inside, so one branch serves both.
+        _ => {
+            let cell = mode7_cell_at(px & 1023, py & 1023);
+            (u32::from(vram[cell as usize] & 0x00FF), cell)
+        }
+    };
+    // The character pixel always uses the low 3 bits of the raw
+    // coordinate; `& 7` is invariant under the `& 1023` wrap, so the
+    // forced-tile-0 branch reads the same pixel of tile 0.
+    let cx = (px & 7) as u32;
+    let cy = (py & 7) as u32;
+    let pixel_word = vram[(tile * 64 + cy * 8 + cx) as usize];
+    Some(Mode7Sample {
+        byte: (pixel_word >> 8) as u8,
+        character: tile as u8,
+        cell: cell as u16,
+        outside,
+        column: cx as u8,
+        row: cy as u8,
+    })
+}
+
+/// The Mode 7 plane cell covering world coordinate `(px, py)`, both
+/// pre-masked into `0..=1023`: `row * 128 + column`, the VRAM word whose
+/// low byte is the cell's character number.
 #[inline]
-fn mode7_tile_at(vram: &[u16; 0x8000], px: i32, py: i32) -> u32 {
+fn mode7_cell_at(px: i32, py: i32) -> u32 {
     let tx = ((px >> 3) & 127) as u32;
     let ty = ((py >> 3) & 127) as u32;
-    u32::from(vram[(ty * 128 + tx) as usize] & 0x00FF)
+    ty * 128 + tx
 }
 
 #[cfg(test)]
@@ -984,6 +1121,47 @@ mod tests {
     /// the two implementations cannot silently diverge.
     /// Cell (tx=1, ty=2) -> tile 7; tile 7 pixel (cx=3, cy=4) -> 0xAB; the
     /// world coord is therefore (px=11, py=20).
+    #[test]
+    fn mode7_sample_at_is_mode7_sample() {
+        let mut vram = make_vram();
+        let mut state = 0x7E57_5EEDu32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for word in vram.iter_mut() {
+            *word = next() as u16;
+        }
+        for _ in 0..20_000 {
+            let px = (next() % 4096) as i32 - 2048;
+            let py = (next() % 4096) as i32 - 2048;
+            for repeat in 0..4 {
+                let sample = mode7_sample_at(&vram, px, py, repeat);
+                assert_eq!(sample.map(|s| s.byte), mode7_sample(&vram, px, py, repeat));
+                if let Some(sample) = sample {
+                    assert_eq!(sample.outside, ((px | py) & !1023) != 0);
+                    assert_eq!(
+                        (sample.column, sample.row),
+                        ((px & 7) as u8, (py & 7) as u8)
+                    );
+                    let word = vram[usize::from(sample.character) * 64
+                        + usize::from(sample.row) * 8
+                        + usize::from(sample.column)];
+                    assert_eq!(sample.byte, (word >> 8) as u8);
+                    if !(sample.outside && repeat == 3) {
+                        let cell = (((py & 1023) >> 3) * 128 + ((px & 1023) >> 3)) as u16;
+                        assert_eq!(sample.cell, cell);
+                        assert_eq!(sample.character, vram[usize::from(cell)] as u8);
+                    } else {
+                        assert_eq!((sample.cell, sample.character), (0, 0));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn mode7_sample_parity_golden() {
         let mut vram = make_vram();

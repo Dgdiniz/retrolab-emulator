@@ -45,7 +45,9 @@ pub use spc7110::{fixed_unix_time, set_fixed_unix_time};
 #[cfg(feature = "chip-superfx")]
 mod superfx;
 
-pub use builder::{detected_manifest, rom_sha256, BuildError, CartridgeBuilder};
+pub use builder::{
+    copier_header_length, detected_manifest, rom_sha256, BuildError, CartridgeBuilder,
+};
 pub use chip_ids::{
     CX4_CHIP_ID, CX4_MMIO_BASE, CX4_RAM_BASE, CX4_ROM_BASE, SA1_BWRAM_BASE, SA1_BWRAM_LINEAR_BASE,
     SA1_CHIP_ID, SA1_IRAM_BASE, SA1_MMIO_BASE, SA1_ROM_BASE, SUPERFX_CHIP_ID, SUPERFX_MMIO_BASE,

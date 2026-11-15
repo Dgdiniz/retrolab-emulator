@@ -48,6 +48,7 @@ for part in "${parts[@]}"; do
             # The WebAssembly crates' tests only run in a WebAssembly build.
             run "wasm tests (sg1)" wasm-pack test --node cores/sg1/wasm
             run "wasm tests (snes1)" wasm-pack test --node cores/snes1/wasm
+            run "wasm tests (retro-wasm)" wasm-pack test --node retro-wasm
             run "licenses" cargo deny check licenses
             ;;
         debugger-core)

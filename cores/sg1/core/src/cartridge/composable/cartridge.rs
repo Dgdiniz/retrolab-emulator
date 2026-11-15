@@ -24,9 +24,11 @@
 
 use std::sync::Arc;
 
-use retro_core::cartridge::{CartridgeInfo, ChipSet, ExpansionChipState};
+use retro_core::cartridge::{CartridgeInfo, ChipSet, ExpansionChipState, SourcePlace};
 
-use super::map_plan::rom_mirror_mask;
+use super::byte_source;
+use super::chips::bank_mapper::{bank_table_of, BankTable};
+use super::map_plan::{rom_mirror_mask, MapTarget};
 use super::plain::SRAM_CONTROL_ADDR;
 use super::savestate::GenesisCoprocessorState;
 use super::{GenesisCartridge, MapPlan};
@@ -285,6 +287,55 @@ impl GenesisCartridge for ComposableCartridge {
         }
     }
 
+    /// Through the plan, as [`read_bus`](GenesisCartridge::read_bus) reads:
+    /// a bank mapper's slot reaches the ROM through the banks set now, any
+    /// other chip's slot is the coprocessor, and an SRAM slot reads as
+    /// [`read_sram`](GenesisCartridge::read_sram) does (the ROM shows
+    /// through while the SRAM is switched off).
+    fn byte_sources(&self, addresses: &[u32]) -> Vec<SourcePlace> {
+        // Each bank mapper the plan reaches, its table read once.
+        let mut mappers: Vec<(u8, BankTable)> = Vec::new();
+        for slot in &self.plan.slots {
+            if let MapTarget::ChipMmio { chip_id, .. } = slot.target {
+                if mappers.iter().all(|(id, _)| *id != chip_id) {
+                    if let Some(table) = self.chips.get(chip_id).and_then(bank_table_of) {
+                        mappers.push((chip_id, table));
+                    }
+                }
+            }
+        }
+        let rom_len = self.rom.len();
+        addresses
+            .iter()
+            .map(|&address| {
+                byte_source::through_plan(
+                    &self.plan,
+                    address,
+                    |offset| byte_source::rom_byte(offset, rom_len),
+                    |offset| {
+                        byte_source::sram_byte(
+                            !self.sram.is_empty(),
+                            self.sram_enabled,
+                            self.sram_start,
+                            offset,
+                            self.rom_mask,
+                            rom_len,
+                        )
+                    },
+                    |chip_id, offset| match mappers.iter().find(|(id, _)| *id == chip_id) {
+                        Some((_, table)) => {
+                            let physical = u32::try_from(table.physical_offset(offset));
+                            physical.map_or(SourcePlace::Unknown, |physical| {
+                                byte_source::rom_byte(physical, rom_len)
+                            })
+                        }
+                        None => SourcePlace::Coprocessor,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn reset(&mut self) {
         self.sram_enabled = self.sram_permanent;
         self.sram_dirty = false;
@@ -466,6 +517,45 @@ mod tests {
         assert_eq!(c.read_addr(0x300005), 0xC5);
         assert_eq!(c.coprocessor_label(), Some("FAKE"));
         assert!(c.coprocessor_accesses() >= 2);
+    }
+
+    #[test]
+    fn a_byte_s_source_is_the_rom_a_chip_or_a_bank_as_it_stands() {
+        let mut chips = ChipSet::default();
+        chips.push(Box::new(FakeChip::new()));
+        let c = ComposableCartridge::new(rom(), plan_with_chip_window(), chips, test_info());
+        assert_eq!(
+            c.byte_sources(&[0x000100, 0x300004, 0x200100, 0x500000]),
+            [
+                SourcePlace::Rom(0x100),
+                SourcePlace::Coprocessor,
+                SourcePlace::Rom(0x100),
+                SourcePlace::Unknown,
+            ],
+            "the 2 MiB ROM mirrored by its slot's mask; no slot past the window"
+        );
+        assert_eq!(c.coprocessor_accesses(), 0, "nothing was read");
+
+        // A SEGA mapper over a 5 MiB ROM: slot 6 reaches bank 9 once set.
+        use crate::cartridge::composable::chips::BankMapperChip;
+        use crate::cartridge::composable::presets::bank_mapper_plan;
+        use crate::cartridge::composable::savestate::BankMapperKind;
+        let rom: Arc<[u8]> = Arc::from(vec![0u8; 0x500000].into_boxed_slice());
+        let mut chips = ChipSet::default();
+        let id = chips.push(Box::new(BankMapperChip::sega(rom.clone())));
+        chips.add_observer(0xA130F0..=0xA130FF, id);
+        let plan = bank_mapper_plan(BankMapperKind::Sega, id, None);
+        let mut banked = ComposableCartridge::new(rom, plan, chips, test_info());
+        assert_eq!(
+            banked.byte_sources(&[0x300010, 0x000020]),
+            [SourcePlace::Rom(0x300010), SourcePlace::Rom(0x20)]
+        );
+        banked.observe_bus_write(0xA130F6, 9);
+        assert_eq!(
+            banked.byte_sources(&[0x300010, 0x37FFFF]),
+            [SourcePlace::Rom(0x480010), SourcePlace::Rom(0x4FFFFF)]
+        );
+        assert_eq!(banked.coprocessor_accesses(), 0, "nothing was read");
     }
 
     #[test]

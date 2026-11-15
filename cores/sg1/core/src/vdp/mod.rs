@@ -7,15 +7,21 @@ pub mod dma;
 pub mod planes;
 pub mod recording;
 mod redraw;
+pub mod sources;
 pub mod sprites;
 pub mod tiles;
 pub mod timing;
 pub mod window;
+pub mod writes;
 
+pub use recording::LineKind;
 use recording::PaletteRedraw;
-pub use recording::{CaptureRecording, LineKind, LinePalettes, NO_COLUMN, NO_PALETTE};
-pub use redraw::LayerImage;
+use retro_core::capture::{NoTrace, PixelTrace, SpriteFate};
+use sources::LineTrace;
+pub use sources::Shade;
 use window::WindowArea;
+use writes::{MemoryTransfer, PaletteStore};
+pub use writes::{RaisedEvents, VideoEvent, VideoEventWatch, WriteTarget};
 
 /// Pixels in a row of the framebuffer: the 40-cell mode's width, which
 /// the 32-cell mode's 256 fit inside.
@@ -387,6 +393,12 @@ pub struct Vdp {
     /// pays one check of it at each place that records. Never part of the
     /// savestate.
     recording: Option<Box<recording::Recording>>,
+
+    /// The bus's word for where the value of the store being made through a
+    /// port came from, the address of the last word the 68000 read, set
+    /// before each port write ([`Vdp::note_port_origin`]) and read only
+    /// while the writes are recorded. Not part of the savestate.
+    port_origin: u32,
 }
 
 /// What a DMA moves, which sets how much of it one scanline carries
@@ -618,6 +630,7 @@ impl Vdp {
             debug_layer_disable: [false; LAYER_COUNT],
             frame_being_drawn: 0,
             recording: None,
+            port_origin: 0,
         };
 
         // Initialize with default register values
@@ -1230,7 +1243,7 @@ impl Vdp {
                     let raw_addr = init_addr as usize;
                     let wa = raw_addr & 0xFFFE;
                     if wa + 1 < self.vram.len() {
-                        self.note_vram_write(wa);
+                        self.note_port_vram_store(raw_addr, value, true);
                         if (raw_addr & 1) == 0 {
                             self.vram[wa] = (value >> 8) as u8;
                             self.vram[wa + 1] = (value & 0xFF) as u8;
@@ -1247,7 +1260,12 @@ impl Vdp {
                     if index < 64 {
                         self.cram[index] = value & 0x0EEE;
                         self.cram_rgb[index] = Self::convert_genesis_color(value & 0x0EEE);
-                        self.note_palette_change(index, value & 0x0EEE, PaletteRedraw::Nothing);
+                        self.note_palette_change(
+                            index,
+                            value & 0x0EEE,
+                            PaletteRedraw::Nothing,
+                            PaletteStore::FillStart,
+                        );
                     }
                 }
                 0x05 => {
@@ -1275,6 +1293,7 @@ impl Vdp {
                 remaining: length,
                 cell_accum: 0,
             });
+            self.note_fill_start(init_addr);
 
             // Front-load the cells the chip would have written from this trigger
             // cycle to the end of the current scanline (Genesis Plus GX runs its
@@ -1312,7 +1331,7 @@ impl Vdp {
                 let raw_addr = self.address as usize;
                 let addr = raw_addr & 0xFFFE; // Word-align
                 if addr + 1 < self.vram.len() {
-                    self.note_vram_write(addr);
+                    self.note_port_vram_store(raw_addr, value, false);
                     if (raw_addr & 1) == 0 {
                         self.vram[addr] = (value >> 8) as u8;
                         self.vram[addr + 1] = (value & 0xFF) as u8;
@@ -1357,7 +1376,7 @@ impl Vdp {
                             };
                         }
                     }
-                    self.note_palette_change(index, masked, redraw);
+                    self.note_palette_change(index, masked, redraw, PaletteStore::Port);
                 }
                 self.address = self.address.wrapping_add(self.registers[15] as u16);
             }
@@ -1560,7 +1579,12 @@ impl Vdp {
     /// - Per-scanline pixel count limit (320 in H40, 256 in H32).
     /// - The masking flag carries over to the next scanline when the pixel
     ///   limit is reached.
-    fn render_sprite_line(&mut self, line: u16) {
+    ///
+    /// With a trace (`T::ON`) it also notes each sprite the evaluation met
+    /// and, where the line's sprite limit or its dots stop the evaluation,
+    /// the sprites on the line after, read without changing anything; and
+    /// the sprite each pixel of the line buffer came from.
+    fn render_sprite_line<T: PixelTrace<Notes = LineTrace>>(&mut self, line: u16, trace: &mut T) {
         let width = self.display_width() as usize;
         let is_h40 = (self.registers[12] & 0x01) != 0;
         let max_sprite_pixels: i32 = if is_h40 { 320 } else { 256 };
@@ -1611,6 +1635,12 @@ impl Vdp {
         // is drawn clipped to the remaining dots. -1 = no sprite clipped.
         let mut clip_sprite_idx: i32 = -1;
         let mut clip_x_end: i16 = 0;
+        // For a trace: the first sprite of the list not taken when the
+        // evaluation stopped, and why it stopped.
+        let mut stopped_at: Option<(usize, SpriteFate)> = None;
+        if T::ON {
+            trace.notes().begin_sprites(self.sprite_mask_overflow);
+        }
 
         for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate() {
             let (_, y1, _, y2) = sprite.bounds();
@@ -1618,6 +1648,10 @@ impl Vdp {
                 count += 1;
                 if count > max_sprites_per_line {
                     self.sprite_overflow = true;
+                    if T::ON {
+                        trace.notes().over_sprite_limit();
+                        stopped_at = Some((idx, SpriteFate::OverLineLimit));
+                    }
                     break;
                 }
 
@@ -1636,6 +1670,10 @@ impl Vdp {
                 if !masked {
                     self.sprites_on_line_buf.push(idx as u16);
                 }
+                if T::ON {
+                    let slot = self.sprite_cache.slot_at(idx);
+                    trace.notes().met_sprite(slot, sprite, masked);
+                }
 
                 if pixel_count >= max_sprite_pixels {
                     // Dot limit crossed mid-sprite: that sprite is drawn clipped
@@ -1649,6 +1687,10 @@ impl Vdp {
                         clip_x_end = sprite.x + allowed_tiles as i16 * 8;
                     }
                     self.sprite_mask_overflow = pixel_count >= width as i32;
+                    if T::ON {
+                        trace.notes().dots_ran_out((!masked).then_some(clip_x_end));
+                        stopped_at = Some((idx + 1, SpriteFate::LeftOut));
+                    }
                     // The limit was hit, so the flag is not cleared below.
                     break;
                 }
@@ -1660,12 +1702,31 @@ impl Vdp {
             self.sprite_mask_overflow = false;
         }
 
+        // For a trace, the sprites on the line after the evaluation
+        // stopped: read, never taken.
+        if T::ON {
+            if let Some((first, fate)) = stopped_at {
+                for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate().skip(first) {
+                    let (_, y1, _, y2) = sprite.bounds();
+                    if scanline >= y1 && scanline < y2 {
+                        let slot = self.sprite_cache.slot_at(idx);
+                        trace.notes().left_out(slot, sprite, fate);
+                    }
+                }
+            }
+        }
+
         // Render sprites in REVERSE order (lowest priority first) so that
         // higher-priority sprites (earlier in list) overwrite lower ones.
         let num_sprites = self.sprites_on_line_buf.len();
         for si in (0..num_sprites).rev() {
             let sprite_idx = self.sprites_on_line_buf[si] as usize;
             let sprite = self.sprite_cache.sprites()[sprite_idx];
+            let slot = if T::ON {
+                self.sprite_cache.slot_at(sprite_idx)
+            } else {
+                0
+            };
             let (sx1, sy1, sx2, _sy2) = sprite.bounds();
 
             let local_y = (scanline - sy1) as u16;
@@ -1718,6 +1779,17 @@ impl Vdp {
                 self.sprite_line_color[screen_x] = color_index;
                 self.sprite_line_palette[screen_x] = sprite.palette;
                 self.sprite_line_priority[screen_x] = sprite.priority;
+                if T::ON {
+                    trace.notes().sprite_pixel(
+                        screen_x,
+                        slot,
+                        pattern_index,
+                        pixel_y,
+                        pixel_x,
+                        sprite.flip_h,
+                        sprite.flip_v,
+                    );
+                }
             }
         }
     }
@@ -1882,14 +1954,36 @@ impl Vdp {
     /// `remap_scanline` turns indices into RGB via `cram_rgb`. Keeping them
     /// separate lets a mid-line CRAM write re-tint the line (remap only) without
     /// recompositing; an ordinary frame just runs both back to back.
+    #[inline(always)]
     fn render_scanline(&mut self, line: u16) {
+        self.render_scanline_with(line, &mut NoTrace::new());
+    }
+
+    /// [`Self::render_scanline`] with a trace, which notes where each
+    /// pixel of the line came from (`T::ON`); the frame loops pass
+    /// [`NoTrace`].
+    fn render_scanline_with<T: PixelTrace<Notes = LineTrace>>(&mut self, line: u16, trace: &mut T) {
         let display_enabled = (self.registers[1] & 0x40) != 0;
         if !display_enabled {
             self.render_blanked_line(line);
+            if T::ON {
+                let width = self.display_width() as usize;
+                trace.notes().blanked(width, self.backdrop_index());
+            }
             return;
         }
-        self.composite_scanline(line);
+        self.composite_scanline_with(line, trace);
         self.remap_scanline(line);
+        if T::ON {
+            let width = self.display_width() as usize;
+            let shadow_highlight = (self.registers[12] & 0x08) != 0;
+            trace.notes().remapped(
+                (&self.line_index, &self.line_sh_op, &self.line_high_pri),
+                0,
+                width,
+                shadow_highlight,
+            );
+        }
     }
 
     /// Backdrop CRAM index (palette*16 + colour) from reg7.
@@ -1989,7 +2083,20 @@ impl Vdp {
     /// Resolve plane B / plane A / window and sprites into this line's
     /// palette-index buffers. Produces no RGB (that is `remap_scanline`'s job),
     /// so the line can be re-tinted after a mid-line CRAM change.
+    #[inline(always)]
     fn composite_scanline(&mut self, line: u16) {
+        self.composite_scanline_with(line, &mut NoTrace::new());
+    }
+
+    /// [`Self::composite_scanline`] with a trace, which notes where the
+    /// pixel each column resolves to came from (`T::ON`): its layer, the
+    /// character and the map entry or sprite it was read from. The frame
+    /// loops pass [`NoTrace`].
+    fn composite_scanline_with<T: PixelTrace<Notes = LineTrace>>(
+        &mut self,
+        line: u16,
+        trace: &mut T,
+    ) {
         let width = self.display_width() as usize;
         let shadow_highlight = (self.registers[12] & 0x08) != 0;
         let bd_idx = self.backdrop_index().min(63) as u8;
@@ -2001,7 +2108,7 @@ impl Vdp {
         let dis_sprites = self.debug_layer_disable[LAYER_SPRITES];
 
         // Render sprites for this scanline into the line buffer (ONCE)
-        self.render_sprite_line(line);
+        self.render_sprite_line(line, trace);
 
         // Pre-compute plane parameters to avoid repeated register reads
         let plane_a_nametable = ((self.registers[2] & 0x38) as u16) << 10;
@@ -2071,6 +2178,10 @@ impl Vdp {
         // Composite each pixel
         for x in 0..width {
             let xu16 = x as u16;
+            // For a trace: where the plane B and the plane A or window
+            // candidates came from.
+            let mut origin_b = sources::PenOrigin::BACKDROP;
+            let mut origin_a = sources::PenOrigin::BACKDROP;
 
             // ---- Plane B ----
             let v_scroll_b = if v_scroll_mode == 0 {
@@ -2111,6 +2222,15 @@ impl Vdp {
                     &self.vram, pattern_b, px_b, py_b, flip_h_b, flip_v_b,
                 );
                 if ci_b != 0 {
+                    if T::ON {
+                        origin_b = sources::PenOrigin::character(
+                            sources::DRAWN_BY_PLANE_B,
+                            word_b,
+                            addr_b,
+                            px_b,
+                            py_b,
+                        );
+                    }
                     let cram_i = palette_b * 16 + ci_b as usize;
                     (Some(cram_i.min(63) as u8), priority_b)
                 } else {
@@ -2141,6 +2261,15 @@ impl Vdp {
 
                     let wci = Self::read_tile_pixel_flipped(&self.vram, wpat, wpx, wpy, wfh, wfv);
                     if wci != 0 {
+                        if T::ON {
+                            origin_a = sources::PenOrigin::character(
+                                sources::DRAWN_BY_WINDOW,
+                                wword,
+                                waddr,
+                                wpx,
+                                wpy,
+                            );
+                        }
                         let cram_i = wpal * 16 + wci as usize;
                         (Some(cram_i.min(63) as u8), wpri)
                     } else {
@@ -2189,6 +2318,15 @@ impl Vdp {
                         &self.vram, pattern_a, px_a, py_a, flip_h_a, flip_v_a,
                     );
                     if ci_a != 0 {
+                        if T::ON {
+                            origin_a = sources::PenOrigin::character(
+                                sources::DRAWN_BY_PLANE_A,
+                                word_a,
+                                addr_a,
+                                px_a,
+                                py_a,
+                            );
+                        }
                         let cram_i = palette_a * 16 + ci_a as usize;
                         (Some(cram_i.min(63) as u8), priority_a)
                     } else {
@@ -2200,17 +2338,19 @@ impl Vdp {
             };
 
             // ---- Merge planes (priority only; colour resolved in remap) ----
-            let (merged_idx, merged_pri) = match (plane_b_idx, plane_a_idx) {
-                (None, None) => (None, false),
-                (Some(b), None) => (Some(b), plane_b_pri),
-                (None, Some(a)) => (Some(a), plane_a_pri),
+            // `merged_is_a`: the merged pixel is plane A's (or the window's),
+            // not plane B's; read by a trace alone.
+            let (merged_idx, merged_pri, merged_is_a) = match (plane_b_idx, plane_a_idx) {
+                (None, None) => (None, false, false),
+                (Some(b), None) => (Some(b), plane_b_pri, false),
+                (None, Some(a)) => (Some(a), plane_a_pri, true),
                 (Some(b), Some(a)) => {
                     if plane_a_pri {
-                        (Some(a), true)
+                        (Some(a), true, true)
                     } else if plane_b_pri {
-                        (Some(b), true)
+                        (Some(b), true, false)
                     } else {
-                        (Some(a), false)
+                        (Some(a), false, true)
                     }
                 }
             };
@@ -2220,7 +2360,9 @@ impl Vdp {
             let has_sprite = s_ci != 0 && !dis_sprites;
 
             // ---- Composite to a final palette index ----
-            let (final_index, is_high_priority, sh_operator) = if has_sprite {
+            // `sprite_shown`: the final pixel is the sprite's; read by a
+            // trace alone.
+            let (final_index, is_high_priority, sh_operator, sprite_shown) = if has_sprite {
                 let s_pal = self.sprite_line_palette[x] as usize;
                 let s_pri = self.sprite_line_priority[x];
                 let s_idx = (s_pal * 16 + s_ci as usize).min(63) as u8;
@@ -2233,30 +2375,43 @@ impl Vdp {
                 if is_sh_operator {
                     // Operator sprite: transparent, keep the underlying pixel index.
                     match merged_idx {
-                        None => (bd_idx, false, sh_op),
-                        Some(bi) => (bi, merged_pri, sh_op),
+                        None => (bd_idx, false, sh_op, false),
+                        Some(bi) => (bi, merged_pri, sh_op, false),
                     }
                 } else {
-                    let (idx, pri) = match merged_idx {
-                        None => (s_idx, false),
+                    let (idx, pri, shown) = match merged_idx {
+                        None => (s_idx, false, true),
                         Some(bi) => {
                             if s_pri {
-                                (s_idx, true)
+                                (s_idx, true, true)
                             } else if merged_pri {
-                                (bi, true)
+                                (bi, true, false)
                             } else {
-                                (s_idx, false)
+                                (s_idx, false, true)
                             }
                         }
                     };
-                    (idx, pri, 0)
+                    (idx, pri, 0, shown)
                 }
             } else {
                 match merged_idx {
-                    None => (bd_idx, false, 0u8),
-                    Some(bi) => (bi, merged_pri, 0u8),
+                    None => (bd_idx, false, 0u8, false),
+                    Some(bi) => (bi, merged_pri, 0u8, false),
                 }
             };
+
+            if T::ON {
+                let origin = if sprite_shown {
+                    trace.notes().sprite_origin(x)
+                } else if merged_idx.is_none() {
+                    sources::PenOrigin::BACKDROP
+                } else if merged_is_a {
+                    origin_a
+                } else {
+                    origin_b
+                };
+                trace.notes().pen(x, origin);
+            }
 
             if let Some((dbg_x, dbg_y)) = self.debug_pixel {
                 if xu16 == dbg_x && line == dbg_y {
@@ -2351,16 +2506,11 @@ impl Vdp {
             let base_color = self.cram_rgb[final_index as usize];
 
             // ---- Shadow/Highlight final color adjustment ----
-            let final_color = if shadow_highlight {
-                if sh_operator == 14 {
-                    Self::highlight_color(base_color)
-                } else if sh_operator == 15 || is_high_priority {
-                    base_color
-                } else {
-                    Self::shadow_color(base_color)
-                }
-            } else {
-                base_color
+            let final_color = match sources::shade(shadow_highlight, sh_operator, is_high_priority)
+            {
+                sources::Shade::AsIs => base_color,
+                sources::Shade::Shadowed => Self::shadow_color(base_color),
+                sources::Shade::Highlighted => Self::highlight_color(base_color),
             };
 
             // ---- Layer-mode rendering (debug visualization) ----
@@ -3018,7 +3168,7 @@ impl Vdp {
             }
         } else {
             if code == 0x01 {
-                self.note_vram_transfer(dest_start & 0xFFFE, auto_increment, words);
+                self.note_memory_transfer_start(dest_start, auto_increment, words);
             }
             let mut dest = dest_start;
             for i in 0..words {
@@ -3054,7 +3204,12 @@ impl Vdp {
                             let masked = word & 0x0EEE;
                             self.cram[index] = masked;
                             self.cram_rgb[index] = Self::convert_genesis_color(masked);
-                            self.note_palette_change(index, masked, PaletteRedraw::Nothing);
+                            self.note_palette_change(
+                                index,
+                                masked,
+                                PaletteRedraw::Nothing,
+                                PaletteStore::Transfer,
+                            );
                         }
                     }
                     0x05 => {
@@ -3112,6 +3267,14 @@ impl Vdp {
         // DMA: the CPU is halted instead, so it can never observe one.
         let transfer = self.dma_bus_transfer();
         self.pending_cpu_dma_mclks += self.dma_busy_master_clocks(transfer, length);
+
+        self.note_memory_transfer(MemoryTransfer {
+            source: source_start,
+            destination: dest_start,
+            step: auto_increment,
+            words,
+            code,
+        });
     }
 
     /// Advance a deferred mid-active CRAM DMA up to the slot that line `line`
@@ -3241,7 +3404,12 @@ impl Vdp {
                 // Render table only; `cram` read-back state stays at its
                 // DMA-final value (committed in `execute_pending_dma`).
                 self.cram_rgb[index] = Self::convert_genesis_color(word & 0x0EEE);
-                self.note_palette_change(index, word & 0x0EEE, PaletteRedraw::Nothing);
+                self.note_palette_change(
+                    index,
+                    word & 0x0EEE,
+                    PaletteRedraw::Nothing,
+                    PaletteStore::Transfer,
+                );
             }
             prog.cursor += 1;
         }
@@ -3430,7 +3598,7 @@ impl Vdp {
             0x01 => {
                 // VRAM fill: write high byte
                 let vram_addr = addr as usize;
-                self.note_vram_write(vram_addr & 0xFFFE);
+                self.note_fill_vram_cell(vram_addr, fill_byte);
                 if (vram_addr & 1) != 0 {
                     let word_addr = vram_addr ^ 1;
                     if word_addr < self.vram.len() {
@@ -3451,7 +3619,12 @@ impl Vdp {
                 if index < 64 {
                     self.cram[index] = cram_word;
                     self.cram_rgb[index] = Self::convert_genesis_color(cram_word);
-                    self.note_palette_change(index, cram_word, PaletteRedraw::Nothing);
+                    self.note_palette_change(
+                        index,
+                        cram_word,
+                        PaletteRedraw::Nothing,
+                        PaletteStore::FillCell,
+                    );
                 }
             }
             0x05 => {
@@ -3459,6 +3632,7 @@ impl Vdp {
                 let index = ((addr & 0x7E) >> 1) as usize;
                 if index < 64 {
                     self.vsram[index] = vsram_word;
+                    self.note_fill_vsram_cell(index);
                 }
             }
             _ => {
@@ -3516,6 +3690,7 @@ impl Vdp {
         let remaining = state.remaining - n;
         if remaining == 0 {
             self.fill_state = None;
+            self.note_fill_end();
         } else if let Some(s) = self.fill_state.as_mut() {
             s.remaining = remaining;
         }
@@ -3527,9 +3702,7 @@ impl Vdp {
         let mut src = source;
         let mut dst = dest;
 
-        // Each destination byte lies in the word at its address with bit 0
-        // cleared; the journal takes those words before any is written.
-        self.note_vram_transfer(dest & 0xFFFE, auto_increment, length as usize);
+        self.note_copy_start(dest, auto_increment, length as usize);
 
         // Copy byte-by-byte IN PLACE (read one byte, immediately write it, then
         // advance), NOT through a temp buffer. Overlapping src/dst regions must
@@ -3558,6 +3731,7 @@ impl Vdp {
             src = src.wrapping_add(1);
             dst = dst.wrapping_add(auto_increment);
         }
+        self.note_copy(source, dest, auto_increment, length as usize);
 
         self.address = dst;
 
