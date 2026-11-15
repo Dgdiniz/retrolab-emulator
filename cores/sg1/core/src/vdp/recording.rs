@@ -25,7 +25,7 @@
 //! before, so going back through it puts VRAM back as any line read it.
 
 use retro_core::capture::{
-    distinct_palettes, CaptureRecording, LinePalettes, NO_COLUMN, NO_PALETTE,
+    distinct_palettes, CaptureRecording, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE,
 };
 use retro_core::video::LineStateTable;
 
@@ -101,6 +101,10 @@ pub(super) struct LineTable {
     pub(super) journal: Vec<MemoryUndo>,
     /// The journal ran out of room.
     pub(super) journal_full: bool,
+    /// The debugger wrote video memory since the frame the journal follows
+    /// began: a line drawn again shows the edit, which the line did not
+    /// read, until the next picture begins.
+    pub(super) debugger_edited: bool,
     /// The sprite lists the renderer parsed, oldest first: those of the
     /// frame the journal follows and of the frame before it.
     pub(super) sprite_lists: Vec<RecordedSpriteList>,
@@ -215,6 +219,7 @@ impl LineTable {
             frame,
             journal: Vec::with_capacity(4096),
             journal_full: false,
+            debugger_edited: false,
             sprite_lists: Vec::new(),
         }
     }
@@ -230,6 +235,7 @@ impl LineTable {
         self.frame = frame;
         self.journal.clear();
         self.journal_full = false;
+        self.debugger_edited = false;
         self.sprite_lists.clear();
     }
 
@@ -239,6 +245,7 @@ impl LineTable {
         self.frame = frame;
         self.journal.clear();
         self.journal_full = false;
+        self.debugger_edited = false;
         self.sprite_lists
             .retain(|list| list.frame.saturating_add(1) >= frame);
     }
@@ -278,9 +285,27 @@ impl LineTable {
             .rposition(|list| list.frame == frame && list.line <= line)
     }
 
-    /// The row can be given back exactly the video memory its line read.
+    /// The row can be given back exactly the video memory its line read:
+    /// it was drawn in the frame the journal follows, the journal had room,
+    /// and the debugger has written no video memory since.
     pub(super) fn row_is_exact(&self, row: &LineRecord) -> bool {
-        row.recorded() && row.frame == self.frame && !self.journal_full
+        row.recorded() && row.frame == self.frame && self.memory_followed()
+    }
+
+    /// Video memory can be put back as the lines of the frame the journal
+    /// follows read it: the journal had room, and the debugger has written
+    /// no video memory since the frame began.
+    fn memory_followed(&self) -> bool {
+        !self.journal_full && !self.debugger_edited
+    }
+
+    /// Every one of the first `rows` rows was drawn in the frame the
+    /// journal follows: the table holds that frame from its first line to
+    /// its finished picture.
+    pub(super) fn holds_frame(&self, rows: usize) -> bool {
+        self.rows[..rows]
+            .iter()
+            .all(|row| row.recorded() && row.frame == self.frame)
     }
 
     /// The palettes the first `rows` rows began with, each once in the order
@@ -304,17 +329,18 @@ pub(super) fn colour_word((red, green, blue): (u8, u8, u8)) -> u16 {
     (u16::from(blue >> 5) << 9) | (u16::from(green >> 5) << 5) | (u16::from(red >> 5) << 1)
 }
 
-/// The names of the line table's columns, `line` first.
+/// The names of the line table's columns, in the order
+/// [`Vdp::line_state_table`] lists them: a setting held in an array gives a
+/// column per element, `name[index]` ([`TableColumns`]).
 fn line_state_columns() -> Vec<String> {
     let mut columns: Vec<String> = ["line", "frame", "kind", "exact"]
         .into_iter()
         .map(String::from)
         .collect();
-    columns.extend((0..24).map(|i| format!("register_{i}")));
-    columns.push("plane_a_horizontal_scroll".to_string());
-    columns.push("plane_b_horizontal_scroll".to_string());
-    columns.extend((0..VERTICAL_SCROLL_WORDS).map(|i| format!("vertical_scroll_{i}")));
-    columns.push("sprite_mask_carried_in".to_string());
+    <[u8; 24]>::push_names("register", &mut columns);
+    <[u16; 2]>::push_names("horizontal_scroll", &mut columns);
+    <[u16; VERTICAL_SCROLL_WORDS]>::push_names("vertical_scroll", &mut columns);
+    bool::push_names("sprite_mask_carried_in", &mut columns);
     columns.push("palette".to_string());
     columns
 }
@@ -531,6 +557,30 @@ impl Vdp {
         }
     }
 
+    /// The debugger wrote video memory: the line table's frame no longer
+    /// has the memory its lines read, though a line drawn again shows the
+    /// edit, until the next picture begins.
+    pub(super) fn note_debugger_video_edit(&mut self) {
+        if let Some(table) = self.line_table_mut() {
+            table.debugger_edited = true;
+        }
+    }
+
+    /// Whether the line table holds the frame its journal follows from its
+    /// first line to its finished picture: every visible line drawn in that
+    /// frame. `false` while line states are not armed.
+    pub(super) fn line_table_holds_frame(&self) -> bool {
+        self.line_table().is_some_and(|table| {
+            table.holds_frame(Self::picture_rows(table, self.timing.visible_scanlines()))
+        })
+    }
+
+    /// The rows of `table` the picture has: one for each of the `visible`
+    /// lines.
+    fn picture_rows(table: &LineTable, visible: u16) -> usize {
+        usize::from(visible).min(table.rows.len())
+    }
+
     /// A debugger wrote colour `index`: every recorded line, and every
     /// palette write recorded of it, takes the new colour, so the picture
     /// drawn again shows it wherever the colour is used.
@@ -584,13 +634,41 @@ impl Vdp {
         }
     }
 
-    /// The line table as a table of values, one row for each line of the
-    /// picture: the columns are listed on the `VideoDebugger::get_line_states`
-    /// of [`Vdp`]. A line nothing was recorded of holds 0 in every column
-    /// but `line` and `palette` ([`NO_PALETTE`]).
-    pub(super) fn line_state_table(&self) -> Option<LineStateTable> {
+    /// The settings each line of the picture was drawn with, while line
+    /// states are recorded ([`Self::set_capture_recording`]), as a table of
+    /// values (`CaptureCore::line_states`): one row for each visible line,
+    /// from line 0, the table's `frame` the one its journal follows. The
+    /// columns, a setting held in an array giving a column per element
+    /// (`name[index]`):
+    ///
+    /// - `line`; `frame`, the frame the line was drawn in (its low 32 bits);
+    /// - `kind`, how it was drawn ([`LineKind`]: 0 not recorded, 1 drawn,
+    ///   2 blank, 3 painted by a CRAM transfer);
+    /// - `exact`, 1 when the video memory the line read can be given back
+    ///   exactly (it was drawn in the frame the journal follows, the journal
+    ///   had room, and the debugger has written no video memory since that
+    ///   frame began);
+    /// - `register[0]` to `register[23]`, the VDP registers;
+    /// - `horizontal_scroll[0]` and `horizontal_scroll[1]`, the horizontal
+    ///   scroll the line read for plane A and for plane B, as the debugger's
+    ///   layer list numbers them;
+    /// - `vertical_scroll[0]` to `vertical_scroll[39]`, the vertical scroll
+    ///   memory the renderer reads;
+    /// - `sprite_mask_carried_in`, 1 when the line above ran out of sprite
+    ///   dots and armed the sprite mask for this one;
+    /// - `palette`, the palette the line began with, an index into
+    ///   [`Self::line_palettes`], or [`NO_PALETTE`] (65535).
+    ///
+    /// A line nothing was recorded of holds 0 in every column but `line`
+    /// and `palette`.
+    ///
+    /// `memory_exact` is false while a row belongs to an earlier frame (the
+    /// lines below a stop part of the way down), once the journal ran out
+    /// of room, and once the debugger wrote video memory since the frame
+    /// began, until the next picture's first line.
+    pub fn line_state_table(&self) -> Option<LineStateTable> {
         let table = self.line_table()?;
-        let rows = usize::from(self.timing.visible_scanlines()).min(table.rows.len());
+        let rows = Self::picture_rows(table, self.timing.visible_scanlines());
         let columns = line_state_columns();
         let palette_of_line = table.palettes_of_rows(rows).palette_of_line;
         let mut values = Vec::with_capacity(rows * columns.len());
@@ -604,25 +682,20 @@ impl Vdp {
             values.push(row.frame as u32);
             values.push(row.kind as u32);
             values.push(u32::from(table.row_is_exact(row)));
-            values.extend(row.registers.iter().map(|&value| u32::from(value)));
-            values.extend(row.horizontal_scroll.iter().map(|&value| u32::from(value)));
-            values.extend(row.vertical_scroll.iter().map(|&value| u32::from(value)));
-            values.push(u32::from(row.sprite_mask_carried_in));
+            row.registers.push_values(&mut values);
+            row.horizontal_scroll.push_values(&mut values);
+            row.vertical_scroll.push_values(&mut values);
+            row.sprite_mask_carried_in.push_values(&mut values);
             values.push(u32::from(palette_of_line[line]));
         }
-        let rows_of_frame = || {
-            table.rows[..rows]
-                .iter()
-                .filter(|row| row.recorded() && row.frame == table.frame)
-        };
         let earlier = table.rows[..rows]
             .iter()
             .any(|row| row.recorded() && row.frame != table.frame);
         Some(LineStateTable {
             frame: table.frame,
             from_first_line: table.rows[0].recorded() && table.rows[0].frame == table.frame,
-            complete: rows_of_frame().count() == rows,
-            memory_exact: !table.journal_full && !earlier,
+            complete: table.holds_frame(rows),
+            memory_exact: table.memory_followed() && !earlier,
             rows_per_line: 1,
             first_row_line: 0,
             columns,
@@ -643,7 +716,7 @@ impl Vdp {
     /// 0.
     pub fn line_palettes(&self) -> Option<LinePalettes> {
         let table = self.line_table()?;
-        let rows = usize::from(self.timing.visible_scanlines()).min(table.rows.len());
+        let rows = Self::picture_rows(table, self.timing.visible_scanlines());
         let mut palettes = table.palettes_of_rows(rows);
         let mut changes = Vec::new();
         for (line, row) in table.rows[..rows].iter().enumerate() {

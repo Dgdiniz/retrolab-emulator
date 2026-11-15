@@ -17,10 +17,11 @@ use crate::video::{PixelImage, VideoRegister};
 /// `at_boundary` says which.
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameSnapshot<C> {
-    /// The number of the frame the picture is: the frames finished, plus one
-    /// while the frame is held at its capture boundary (it is counted once
-    /// it ends). A snapshot taken at the boundary and one taken after the
-    /// same frame ran whole carry the same number.
+    /// The number of the frame whose picture `framebuffer` is: the frames
+    /// finished, plus one while the frame is held at its capture boundary or
+    /// stopped past it before its end (it is counted once it ends). A
+    /// snapshot taken at the boundary and one taken after the same frame ran
+    /// whole carry the same number.
     pub frame: u64,
     /// The core was held at a capture boundary.
     pub at_boundary: bool,

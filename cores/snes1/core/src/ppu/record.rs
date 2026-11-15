@@ -940,7 +940,7 @@ impl Ppu {
         Some(LineStateTable {
             frame: table.frame,
             from_first_line: table.from_first_line,
-            complete: table.finished,
+            complete: table.holds_whole_frame(),
             memory_exact: table.memory_exact(),
             rows_per_line,
             first_row_line,

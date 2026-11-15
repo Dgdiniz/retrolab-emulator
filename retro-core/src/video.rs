@@ -50,13 +50,16 @@ pub struct SpriteData {
 /// exactly as the emulator drew them, so "what the debugger exports" can
 /// never drift from "what the renderer drew".
 ///
-/// `priority` is the console's per-sprite priority attribute (Genesis
-/// priority bit, SNES 2-bit OBJ priority), carried for UI/debug display;
-/// it is *not* the sole ordering key, `index`'s position in the vector
-/// already encodes the fully-resolved order.
+/// `priority` is the console's per-sprite priority attribute (the Mega
+/// Drive's priority bit, the SNES's 2-bit sprite priority) as the line that
+/// drew the sprite first read it, carried for display; it is *not* the
+/// ordering key, `index`'s position in the vector already encodes the
+/// fully-resolved order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpriteOrderEntry {
+    /// The sprite's slot in the console's sprite table.
     pub index: u32,
+    /// Its priority attribute.
     pub priority: u32,
 }
 
@@ -196,19 +199,23 @@ pub struct TileDecodeRequest {
 
 /// The settings each line of a frame was drawn with, as a core recorded them
 /// while the lines were drawn: one column per setting, in the core's own
-/// names, one row per line. A core records it only while a host asks for it,
-/// and never keeps it in a savestate.
+/// names, one row per line. A core records it only while a host asks for it
+/// ([`crate::capture::CaptureCore::line_states`]), and never keeps it in a
+/// savestate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineStateTable {
     /// The number of the frame the lines belong to: the frames finished, plus
-    /// one while the frame is in progress or held at its capture boundary, as
-    /// a frame snapshot numbers its picture.
+    /// one while that frame is in progress, wherever it is held; the number
+    /// a frame snapshot gives the frame's finished picture.
     pub frame: u64,
     /// The table begins with the frame's first drawn line.
     pub from_first_line: bool,
     /// The frame's picture is finished: every line drawn is in the table.
     pub complete: bool,
-    /// Video memory can be put back as each line read it.
+    /// Video memory can be put back as each line read it. A debugger write
+    /// into video memory since the table's frame began makes it false until
+    /// the next frame's first line: a frame drawn again shows the edit,
+    /// which no line read.
     pub memory_exact: bool,
     /// Rows of the picture each line gives: 1, or 2 when lines are woven or
     /// doubled.
@@ -281,15 +288,26 @@ pub trait VideoDebugger {
     /// Get all sprite data.
     fn get_sprite_data(&self) -> Vec<SpriteData>;
 
-    /// The hardware sprite draw order exactly as the *renderer itself*
-    /// resolves it (Genesis SAT link chain, SNES OAM order from the
-    /// rotated first-sprite), returned back-to-front (see
-    /// [`SpriteOrderEntry`]). Consumers blit selected members in this
-    /// order so a composite object reproduces on-screen overlaps without
-    /// re-deriving priority rules and drifting from the emulator.
+    /// The sprites the held frame drew, back to front, as the renderer
+    /// orders them among themselves (see [`SpriteOrderEntry`]): only the
+    /// sprites the frame drew, that is a sprite of which some line drew a
+    /// visible column while the line showed sprites (a column of transparent
+    /// pixels counts), each listed once, with its priority attribute as
+    /// the line that drew it first read it. A frame that drew no sprite
+    /// gives an empty list. The order is the one the console's hardware
+    /// takes its sprites in (the Mega Drive's link chain, the SNES's sprite
+    /// table from its rotated first sprite), the sprite taken first in
+    /// front. Consumers blit selected members in this order so a composite
+    /// object reproduces on-screen overlaps without re-deriving priority
+    /// rules and drifting from the emulator.
+    ///
+    /// Each line is read with the settings and the sprite table it was
+    /// drawn with where the core's line table holds it, else with the
+    /// state as it stands. Nothing runs, and nothing a savestate or the
+    /// state hash reads moves.
     ///
     /// Default: empty, cores without a sprite renderer expose no order.
-    fn resolved_sprite_render_order(&self) -> Vec<SpriteOrderEntry> {
+    fn resolved_sprite_render_order(&mut self) -> Vec<SpriteOrderEntry> {
         Vec::new()
     }
 
@@ -338,14 +356,6 @@ pub trait VideoDebugger {
     fn decode_tiles(&self, request: &TileDecodeRequest) -> Result<IndexedImage, ExportError> {
         let _ = request;
         Err(ExportError::Unsupported)
-    }
-
-    /// The settings each line of the frame last drawn was drawn with, when
-    /// the core keeps a line table and a host asked it to record one.
-    ///
-    /// Default: `None`, a core that keeps no line table.
-    fn get_line_states(&self) -> Option<LineStateTable> {
-        None
     }
 }
 

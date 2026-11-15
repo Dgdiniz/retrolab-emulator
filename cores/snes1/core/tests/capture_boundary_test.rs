@@ -10,7 +10,7 @@
 //! frame must not. The main loop reads the APU's first port without end,
 //! so the APU is caught up all through the frame.
 
-use retro_core::capture::{CaptureCore, FrameSnapshot};
+use retro_core::capture::{planes, CaptureCore, FrameSnapshot};
 use retro_core::cpu::Addressable;
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
 use snes1_core::apu::Apu;
@@ -666,6 +666,199 @@ fn a_boundary_run_stopped_by_a_breakpoint_reports_no_boundary() {
     emu.run_to_capture_boundary();
     assert!(emu.at_capture_boundary());
     assert_eq!(emu.capture_frame_snapshot().frame, 2);
+}
+
+/// The breakpoint that stops a frame as its vertical blank starts.
+fn vblank_breakpoint(emu: &mut SnesEmulator) -> u32 {
+    emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::VBLANK,
+            param: 0,
+        },
+        cpu_id: None,
+        condition: None,
+    })
+}
+
+/// The numbers the snapshot, the pixel sources and the line sprites give
+/// the picture the host holds.
+fn picture_numbers(emu: &mut SnesEmulator) -> [u64; 3] {
+    [
+        emu.capture_frame_snapshot().frame,
+        emu.pixel_sources(planes::MAIN)
+            .expect("a game is loaded")
+            .frame,
+        emu.line_sprites().expect("a game is loaded").frame,
+    ]
+}
+
+/// Run the debugger again with breakpoint `id` off.
+fn resume_without(emu: &mut SnesEmulator, id: u32) {
+    emu.debugger().enable_breakpoint(id, false);
+    emu.set_execution_mode(ExecutionMode::Running);
+}
+
+#[test]
+fn the_held_picture_is_numbered_by_the_frame_whose_picture_the_host_holds() {
+    let mut emu = loaded();
+    emu.run_frame();
+    emu.run_frame();
+    assert_eq!(picture_numbers(&mut emu), [2; 3], "two frames run whole");
+
+    // Stopped part of the way through the third frame's picture: the
+    // framebuffer shows its first lines over the second frame's picture,
+    // and the number is the frames finished.
+    let line_100 = scanline_breakpoint(&mut emu, 100);
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+    assert!(!emu.at_capture_boundary());
+    assert_eq!(emu.frame_count(), 2);
+    assert_eq!(picture_numbers(&mut emu), [2; 3], "in the picture");
+
+    // Held at that frame's boundary, its picture finished: one more.
+    resume_without(&mut emu, line_100);
+    emu.run_to_capture_boundary();
+    assert!(emu.at_capture_boundary());
+    assert_eq!(emu.frame_count(), 2);
+    assert_eq!(picture_numbers(&mut emu), [3; 3], "at the boundary");
+
+    // The same frame run to its end keeps its number.
+    emu.run_frame();
+    assert_eq!(emu.frame_count(), 3);
+    assert_eq!(picture_numbers(&mut emu), [3; 3], "run to its end");
+
+    // Stopped by an event breakpoint as the fourth frame's vertical blank
+    // starts, past its boundary: the framebuffer shows the frame's
+    // finished picture (its backdrop the colour the third frame's vertical
+    // blank wrote), so the number is one more than the frames finished, as
+    // at the boundary.
+    let vblank = vblank_breakpoint(&mut emu);
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+    assert!(!emu.at_capture_boundary());
+    assert!(emu.frame_in_progress());
+    assert_eq!(emu.frame_count(), 3);
+    assert_eq!(program_frame_count(&mut emu), 3, "the NMI is still to come");
+    let shown = emu.capture_frame_snapshot();
+    assert!(!shown.at_boundary);
+    assert_eq!(first_pixel(&shown), rgba(3));
+    assert_eq!(
+        picture_numbers(&mut emu),
+        [4; 3],
+        "as the vertical blank starts"
+    );
+
+    // Run to its end from there, the frame keeps its number and its picture.
+    resume_without(&mut emu, vblank);
+    emu.run_frame();
+    assert_eq!(emu.frame_count(), 4);
+    assert_eq!(emu.capture_frame_snapshot().framebuffer, shown.framebuffer);
+    assert_eq!(picture_numbers(&mut emu), [4; 3], "run to its end");
+
+    // Further into the fifth frame's vertical blank, on line 230, the NMI
+    // handler has written the next backdrop; the framebuffer still shows
+    // the fifth frame's picture, and the number is still one more.
+    let line_230 = scanline_breakpoint(&mut emu, 230);
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+    assert!(emu.frame_in_progress());
+    assert_eq!(emu.frame_count(), 4);
+    assert_eq!(program_frame_count(&mut emu), 5, "the NMI handler ran");
+    let shown = emu.capture_frame_snapshot();
+    assert_eq!(shown.palette[0], 5);
+    assert_eq!(first_pixel(&shown), rgba(4));
+    assert_eq!(picture_numbers(&mut emu), [5; 3], "on line 230");
+    resume_without(&mut emu, line_230);
+    emu.run_frame();
+    assert_eq!(emu.frame_count(), 5);
+    assert_eq!(picture_numbers(&mut emu), [5; 3], "run to its end");
+}
+
+// -------------------------------------------------------------
+// A save at the boundary
+// -------------------------------------------------------------
+
+/// The hits of breakpoint `id`.
+fn hits(emu: &mut SnesEmulator, id: u32) -> u32 {
+    emu.debugger()
+        .list_breakpoints()
+        .into_iter()
+        .find(|info| info.id == id)
+        .expect("the breakpoint")
+        .hit_count
+}
+
+/// The processor's `PBR:PC`.
+fn pc(emu: &SnesEmulator) -> u32 {
+    let cpu = emu.cpu();
+    (u32::from(cpu.pbr) << 16) | u32::from(cpu.pc)
+}
+
+#[test]
+fn a_save_at_the_boundary_finishes_the_frame_past_a_breakpoint_in_its_rest() {
+    for mode in [ExecutionMode::Running, ExecutionMode::Paused] {
+        let mut held = loaded();
+        let mut whole = loaded();
+        held.run_frame();
+        held.run_to_capture_boundary();
+        // The NMI handler runs in the vertical blank, after the boundary.
+        let handler = held.debugger().add_breakpoint(Breakpoint {
+            address: 0x00_F000,
+            bp_type: BreakpointType::execute(),
+            cpu_id: None,
+            condition: None,
+        });
+        held.set_execution_mode(mode);
+        let saved = held.save_state_at_frame_end();
+        assert!(!held.at_capture_boundary(), "{mode:?}");
+        assert!(!held.frame_in_progress(), "{mode:?}: the frame ended");
+        assert_eq!(held.debugger().get_execution_mode(), mode, "not stopped");
+        assert_eq!(hits(&mut held, handler), 0, "{mode:?}: nothing counted");
+        whole.run_frame();
+        whole.run_frame();
+        assert_eq!(saved, whole.save_state(), "{mode:?}");
+
+        // The breakpoint stays: the next frame stops in the handler.
+        held.set_execution_mode(ExecutionMode::Running);
+        held.run_frame();
+        assert_eq!(held.debugger().get_execution_mode(), ExecutionMode::Paused);
+        assert_eq!(pc(&held), 0x00_F000, "{mode:?}");
+        assert_eq!(hits(&mut held, handler), 1, "{mode:?}");
+    }
+}
+
+#[test]
+fn the_rest_of_the_frame_a_save_runs_leaves_no_event_for_the_next_frame() {
+    let mut emu = loaded();
+    emu.run_frame();
+    emu.run_to_capture_boundary();
+    // The NMI handler writes colour 0 in every vertical blank.
+    let colour_0 = emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::PALETTE_WRITE,
+            param: 0,
+        },
+        cpu_id: None,
+        condition: None,
+    });
+    emu.save_state_at_frame_end();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
+    assert_eq!(hits(&mut emu, colour_0), 0);
+
+    // The next frame stops where its own handler writes the colour, not on
+    // its first instruction for a write the save's finish made.
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+    assert_eq!(hits(&mut emu, colour_0), 1);
+    let at = pc(&emu);
+    assert!((0x00_F000..0x00_F010).contains(&at), "stopped at {at:06x}");
+    assert_eq!(
+        emu.frame_count(),
+        2,
+        "in the vertical blank of the third frame"
+    );
 }
 
 // -------------------------------------------------------------

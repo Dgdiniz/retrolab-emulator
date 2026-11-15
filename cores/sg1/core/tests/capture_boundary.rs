@@ -9,7 +9,7 @@
 //! next. Every check here runs it, each frame call against the same frame
 //! run whole.
 
-use retro_core::capture::CaptureCore;
+use retro_core::capture::{planes, CaptureCore};
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -479,6 +479,78 @@ fn an_event_breakpoint_stop_goes_on_where_it_stopped() {
                 take_audio(&mut whole),
                 "{frame_loop:?} {event:?}: the frame's samples"
             );
+        }
+    }
+}
+
+/// Rows `range` of a picture 320 pixels wide, RGBA.
+fn rows(picture: &[u8], range: std::ops::Range<usize>) -> &[u8] {
+    &picture[range.start * 320 * 4..range.end * 320 * 4]
+}
+
+#[test]
+fn at_an_event_stop_the_snapshot_numbers_the_picture_the_host_holds() {
+    // The program gives tile 1, at the top left, its other colour every
+    // frame: rows 0 to 7 of two frames' pictures differ.
+    for frame_loop in [ExecutionTier::LightDebug, ExecutionTier::FullDebug] {
+        for event in [
+            GenesisEvent::Scanline(3),
+            GenesisEvent::Scanline(100),
+            GenesisEvent::VBlank,
+            GenesisEvent::Scanline(230),
+        ] {
+            let name = format!("{frame_loop:?} {event:?}");
+            let mut whole = emulator();
+            let mut stopped = emulator();
+            for _ in 0..WARM_UP {
+                run_whole(&mut whole, frame_loop);
+                run_whole(&mut stopped, frame_loop);
+            }
+            let before = whole.capture_frame_snapshot();
+            run_whole(&mut whole, frame_loop);
+            let after = whole.capture_frame_snapshot();
+            assert_ne!(
+                rows(&before.framebuffer, 0..8),
+                rows(&after.framebuffer, 0..8)
+            );
+
+            break_on(&mut stopped, event);
+            run_whole(&mut stopped, frame_loop);
+            let line = usize::from(stopped.vdp().timing().scanline);
+            let boundary = usize::from(stopped.vdp().first_vblank_line());
+            let held = stopped.capture_frame_snapshot();
+            assert_eq!(held.framebuffer, stopped.get_framebuffer().data, "{name}");
+            if line < boundary {
+                // The host holds the lines drawn so far over the frame
+                // before's: the frame before is the last one finished.
+                let drawn = 0..line + 1;
+                assert_eq!(
+                    rows(&held.framebuffer, drawn.clone()),
+                    rows(&after.framebuffer, drawn),
+                    "{name}"
+                );
+                assert_eq!(
+                    rows(&held.framebuffer, line + 1..224),
+                    rows(&before.framebuffer, line + 1..224),
+                    "{name}"
+                );
+                assert_eq!(held.frame, before.frame, "{name}: the frames finished");
+            } else {
+                // Past the boundary the host holds the held frame's finished
+                // picture, numbered as it is once the frame ran whole.
+                assert_eq!(held.framebuffer, after.framebuffer, "{name}");
+                assert_eq!(held.frame, after.frame, "{name}: the frame shown");
+            }
+            assert_eq!(
+                held.frame,
+                stopped.frame_count() + u64::from(line >= boundary),
+                "{name}"
+            );
+            // The pixel sources and the line sprites number it alike.
+            let sources = stopped.pixel_sources(planes::LAYER).expect("a game");
+            assert_eq!(sources.frame, held.frame, "{name}");
+            let sprites = stopped.line_sprites().expect("a game");
+            assert_eq!(sprites.frame, held.frame, "{name}");
         }
     }
 }

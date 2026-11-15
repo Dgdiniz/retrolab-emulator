@@ -1037,15 +1037,26 @@ impl SnesEmulator {
     }
 
     /// The number a snapshot of the picture the host holds carries
-    /// ([`FrameSnapshot::frame`]): the frames finished, plus one while the
-    /// frame is held at its capture boundary. A frame stopped elsewhere,
-    /// at a breakpoint, is numbered by the frames finished.
+    /// ([`FrameSnapshot::frame`]): the number of the frame whose picture
+    /// the framebuffer shows. The frames finished, plus one while the frame
+    /// in progress has its picture finished: held at its capture boundary,
+    /// or stopped past it in its vertical blank. A frame stopped part of
+    /// the way through its picture, whose framebuffer shows the lines drawn
+    /// so far over the frame before, is numbered by the frames finished.
     fn picture_frame(&self) -> u64 {
-        if self.held_at_capture_boundary {
-            self.frame_count + 1
-        } else {
-            self.frame_count
-        }
+        self.frame_count + u64::from(self.picture_finished_in_frame())
+    }
+
+    /// Whether the frame in progress has its picture finished
+    /// ([`SnesEmulator::finish_picture`] ran for it): it is held at its
+    /// capture boundary, or its `VBlankStart` was handled, which leaves no
+    /// `VBlankStart` queued until the frame's end arms the next frame's.
+    /// Read off the saved scheduler, as
+    /// [`SnesEmulator::frame_in_progress`] is.
+    fn picture_finished_in_frame(&self) -> bool {
+        self.held_at_capture_boundary
+            || (self.frame_in_progress()
+                && self.scheduler.earliest(&EventKind::VBlankStart).is_none())
     }
 
     /// The picture the host holds, as
@@ -1917,20 +1928,25 @@ impl SnesEmulator {
         self.frame_in_progress() || self.debugger.get_execution_mode() != ExecutionMode::Running
     }
 
-    /// Run the rest of the frame held at the capture boundary, as a frame
-    /// call in the `Running` mode would, whatever the debugger's execution
-    /// mode: a breakpoint or a trace selects the instrumented loop, and a
-    /// breakpoint can stop it before the frame's end. Does nothing when the
-    /// core is not held at a boundary.
-    pub fn finish_held_frame(&mut self) {
+    /// Finish the frame held at the capture boundary on the loop a player
+    /// runs, whatever the debugger is doing: the fast loop, with nothing of
+    /// the debugger armed, as a frame call with no breakpoint and no trace
+    /// runs it. No breakpoint, watchpoint or event can stop it before the
+    /// frame's end, and nothing of it is traced or counted. The debugger's
+    /// hooks are armed again after, as its breakpoints and traces ask, and
+    /// its cached CPU states show where the frame ended. Returns whether
+    /// there was a frame to finish.
+    pub fn finish_held_frame(&mut self) -> bool {
         if !self.held_at_capture_boundary {
-            return;
+            return false;
         }
+        self.disarm_debugger_hooks();
+        self.run_frame_fast();
         self.sync_spc_trace_enable();
         self.sync_gsu_trace_enable();
         self.sync_debug_arm();
-        let tier = self.debugger.running_tier();
-        self.run_frame_on_tier(tier);
+        self.update_debugger_state();
+        true
     }
 
     /// Run the frame in progress, or the next one, on the fast or the
@@ -2308,6 +2324,14 @@ impl SnesEmulator {
     /// and disarmed (clearing their buffers) otherwise.
     fn sync_debug_arm(&mut self) {
         let armed = self.debugger.has_watchpoints_or_events();
+        self.arm_debug_recorders(armed);
+    }
+
+    /// Arm or disarm what the watchpoints and the event breakpoints read:
+    /// the emulator flag that gates the event checks, the bus's record of
+    /// the CPU's accesses, the APU's record of S-DSP register writes and
+    /// the PPU's palette and tile watch. Disarming drops what they hold.
+    fn arm_debug_recorders(&mut self, armed: bool) {
         self.debug_armed = armed;
         self.bus.set_debug_armed(armed);
         self.bus.apu_mut().set_dsp_event_recording(armed);
@@ -2317,6 +2341,22 @@ impl SnesEmulator {
             None
         };
         self.bus.ppu_mut().set_event_watch(watch);
+    }
+
+    /// Set the debugger's hooks as a frame call with no breakpoint and no
+    /// trace has them: what the APU and the cartridge's CPU traced so far
+    /// moved to the debugger and their trace capture off, and nothing armed
+    /// for a watchpoint or an event, so a frame run now leaves nothing
+    /// behind for a later check to find. The next debug entry point arms
+    /// them again from the debugger's state.
+    fn disarm_debugger_hooks(&mut self) {
+        self.drain_spc_trace();
+        self.drain_gsu_trace();
+        self.bus.apu_mut().set_spc_trace_enabled(false);
+        if let Some(cart) = self.bus.cartridge_mut() {
+            cart.set_secondary_trace_enabled(false);
+        }
+        self.arm_debug_recorders(false);
     }
 
     /// The palette colours and the tiles the enabled `PaletteWrite` and
@@ -3186,19 +3226,20 @@ impl CaptureCore for SnesEmulator {
     }
 
     /// The frame held at a capture boundary, if any, is finished first
-    /// ([`Self::finish_held_frame`]): on the loop the breakpoints and traces
-    /// select as if the debugger were running, whatever its mode, so a
-    /// breakpoint in the rest of the frame stops the finish and the save is
-    /// taken where it stopped. Anywhere else it is
-    /// [`EmulatorCore::save_state`].
+    /// ([`SnesEmulator::finish_held_frame`]): on the fast loop, whatever the
+    /// debugger is doing, so no breakpoint stops it and the save holds the
+    /// frame's end, the state a player's run of that frame reaches.
+    /// Anywhere else it is [`EmulatorCore::save_state`].
     fn save_state_at_frame_end(&mut self) -> Vec<u8> {
         self.finish_held_frame();
         EmulatorCore::save_state(self)
     }
 
     /// The console's part is OAM and the PPU's settings
-    /// ([`SnesSnapshotConsole`]). A frame stopped by a breakpoint anywhere
-    /// but at its capture boundary is numbered by the frames finished.
+    /// ([`SnesSnapshotConsole`]). A frame stopped by a breakpoint part of
+    /// the way through its picture is numbered by the frames finished; one
+    /// stopped in its vertical blank, whose picture is finished, one more,
+    /// as at its capture boundary.
     fn capture_frame_snapshot(&self) -> FrameSnapshot<SnesSnapshotConsole> {
         let (width, height) = self.picture_size();
         let ppu = self.bus.ppu();
@@ -3257,10 +3298,15 @@ impl CaptureCore for SnesEmulator {
         self.bus.ppu_mut().picture_from_line_states()
     }
 
-    /// A debugger edit of video memory since the table's line 1 clears
-    /// [`LineStateTable::memory_exact`].
+    /// The columns are `line` (the scanline, 1 for the first drawn) then
+    /// every setting of [`crate::ppu::LineState`], in its own names: a
+    /// setting kept per background or per layer gives a column per element
+    /// (`bg_hoffset[0]`), a window selection a column per flag
+    /// (`window_enable[2].w1_enable`). A debugger edit of video memory since
+    /// the table's line 1 clears [`LineStateTable::memory_exact`]. `None`
+    /// when no table is kept or no line was drawn since it was started.
     fn line_states(&self) -> Option<LineStateTable> {
-        self.bus.ppu().get_line_states()
+        self.bus.ppu().line_state_table()
     }
 
     /// One palette of the 256 CGRAM colours for each distinct CGRAM a line

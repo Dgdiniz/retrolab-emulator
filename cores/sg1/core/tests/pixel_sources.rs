@@ -1,6 +1,7 @@
 //! Where each pixel came from, the sprites each line held and what became
-//! of each, and the chosen sprites drawn alone: worked out on demand by
-//! drawing the frame again from its line table with a trace.
+//! of each, the sprites the frame drew in the order they were drawn, and
+//! the chosen sprites drawn alone: worked out on demand by drawing the
+//! frame again from its line table with a trace.
 //!
 //! Each scene is put in video memory, then a frame is drawn line by line
 //! with the line states recorded, as the frame loops draw one; the planes
@@ -12,6 +13,7 @@ mod draw;
 
 use draw::*;
 use retro_core::capture::{layer, line_flags, planes, CaptureRecording, SpriteFate, NO_CELL};
+use retro_core::video::{SpriteOrderEntry, VideoDebugger};
 use sg1_core::vdp::sources::{
     DRAWN_BY_PLANE_A, DRAWN_BY_PLANE_B, DRAWN_BY_SPRITE, DRAWN_BY_WINDOW, FLIPPED_ACROSS,
     FLIPPED_DOWN, HIGH_PRIORITY, OPERATOR_HIGHLIGHT, OPERATOR_SHADOW, OPERATOR_SHIFT, SHADE_SHIFT,
@@ -388,6 +390,126 @@ fn a_sprite_at_x_0_of_the_table_hides_itself_and_the_sprites_after_it() {
     assert_eq!(at(&layer, 82, 100) & layer::WHAT_DREW, layer::BACKDROP);
 }
 
+/// The slots of the frame's sprites in the order they were drawn, back to
+/// front.
+fn order_slots(vdp: &mut Vdp) -> Vec<u32> {
+    vdp.resolved_sprite_render_order()
+        .iter()
+        .map(|entry| entry.index)
+        .collect()
+}
+
+/// Write `value` into VRAM at `address` through the data port, as a game
+/// does.
+fn port_write(vdp: &mut Vdp, address: u16, value: u16) {
+    vdp.write_word_port(4, 0x4000 | (address & 0x3FFF));
+    vdp.write_word_port(4, address >> 14);
+    vdp.write_word_port(0, value);
+}
+
+#[test]
+fn the_render_order_names_the_sprites_the_lines_drew_back_to_front() {
+    // Sprites 0, 2 and 5 draw. Sprite 1 lies off the screen; sprite 3, at
+    // the table's x 0 after sprite 2, is the mask and hides itself and
+    // sprite 4.
+    let mut masked = vdp();
+    put_tile(&mut masked, 1, &solid_tile(1));
+    put_sprite(&mut masked, 0, (10, 20), (1, 1), 1, 0x8001);
+    put_sprite(&mut masked, 1, (330, 20), (1, 1), 2, 1);
+    put_sprite(&mut masked, 2, (30, 40), (1, 1), 3, 1);
+    put_sprite(&mut masked, 3, (-128, 40), (1, 1), 4, 1);
+    put_sprite(&mut masked, 4, (60, 40), (1, 1), 5, 1);
+    put_sprite(&mut masked, 5, (80, 60), (1, 1), 0, 1);
+    draw_frame(&mut masked);
+    assert_eq!(
+        masked.resolved_sprite_render_order(),
+        [
+            SpriteOrderEntry {
+                index: 5,
+                priority: 0
+            },
+            SpriteOrderEntry {
+                index: 2,
+                priority: 0
+            },
+            SpriteOrderEntry {
+                index: 0,
+                priority: 1
+            },
+        ]
+    );
+
+    // The 21st sprite of a line in 40 cells is over its limit.
+    let mut limited = vdp();
+    chain_on_line_100(&mut limited, 21, 1, 12);
+    draw_frame(&mut limited);
+    assert_eq!(order_slots(&mut limited), (0..20).rev().collect::<Vec<_>>());
+
+    // The 14th of sixteen three cells wide is drawn in part where the dots
+    // run out, and the last two are left out.
+    let mut clipped = vdp();
+    chain_on_line_100(&mut clipped, 16, 3, 16);
+    draw_frame(&mut clipped);
+    assert_eq!(order_slots(&mut clipped), (0..14).rev().collect::<Vec<_>>());
+
+    // A frame drawn with the display off draws no sprite.
+    let mut dark = vdp();
+    chain_on_line_100(&mut dark, 3, 1, 12);
+    dark.set_test_register(1, 0x04);
+    draw_frame(&mut dark);
+    assert!(dark.resolved_sprite_render_order().is_empty());
+}
+
+#[test]
+fn a_sprite_is_listed_with_the_priority_the_line_that_drew_it_first_read() {
+    // Frame 1: sprite 0 on lines 20 to 27 and sprite 1 on lines 150 to
+    // 157, both of low priority.
+    let mut vdp = vdp();
+    put_tile(&mut vdp, 1, &solid_tile(1));
+    put_sprite(&mut vdp, 0, (10, 20), (1, 1), 1, 1);
+    put_sprite(&mut vdp, 1, (40, 150), (1, 1), 0, 1);
+    draw_frame(&mut vdp);
+    assert_eq!(
+        vdp.resolved_sprite_render_order(),
+        [
+            SpriteOrderEntry {
+                index: 1,
+                priority: 0
+            },
+            SpriteOrderEntry {
+                index: 0,
+                priority: 0
+            },
+        ]
+    );
+
+    // Between the frames the game gives both high priority through the
+    // data port; the vertical blank makes the renderer parse the table
+    // again. Frame 2 stops after line 100, so the lines below it are frame
+    // 1's, drawn with frame 1's list.
+    for slot in [0u16, 1] {
+        port_write(&mut vdp, SPRITES + slot * 8 + 4, 0x8001);
+    }
+    vdp.scanline(224);
+    vdp.set_frame_being_drawn(2);
+    for line in 0..=100 {
+        vdp.scanline(line);
+    }
+    assert_eq!(
+        vdp.resolved_sprite_render_order(),
+        [
+            SpriteOrderEntry {
+                index: 1,
+                priority: 0
+            },
+            SpriteOrderEntry {
+                index: 0,
+                priority: 1
+            },
+        ]
+    );
+}
+
 #[test]
 fn a_sprite_off_the_screen_is_listed_off_screen() {
     let mut vdp = vdp();
@@ -473,6 +595,7 @@ fn working_them_out_moves_neither_the_picture_nor_the_state() {
         let sources = vdp.pixel_sources(planes::MAIN);
         assert!(sources.matches_picture);
         vdp.line_sprites();
+        vdp.resolved_sprite_render_order();
         vdp.render_sprites(&[1; 80]);
         assert_eq!(vdp.framebuffer(), &picture[..]);
         assert_eq!(
@@ -511,6 +634,10 @@ fn without_a_table_the_state_now_and_a_line_with_no_record_reads_nothing() {
     for line in 100..224 {
         vdp.scanline(line);
     }
+    assert!(
+        vdp.picture_from_line_states().is_none(),
+        "the table does not hold the frame from its first line"
+    );
     let sources = vdp.pixel_sources(planes::MAIN);
     assert!(!sources.from_line_states);
     assert!(

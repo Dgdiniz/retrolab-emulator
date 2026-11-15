@@ -22,9 +22,8 @@
 use std::ops::Range;
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, LineStateTable, PaletteData, PixelImage, SpriteData,
-    SpriteOrderEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
-    VideoRegister,
+    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
+    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
 };
 
 use super::sprites::{link_chain, Sprite};
@@ -136,7 +135,8 @@ impl Vdp {
     /// frame's own writes are undone, so a line drawn before the frame last
     /// wrote one of these bytes shows the frame's earlier value there, and
     /// every other line shows the debugger's. The sprite lists the table
-    /// recorded are parsed again on the same terms.
+    /// recorded are parsed again on the same terms. No line read the edit,
+    /// so the table's `memory_exact` is false until the next picture begins.
     pub fn write_vram_debug(&mut self, byte_address: u32, bytes: &[u8]) {
         let sprite_table = self.sprite_table_bytes();
         let start = byte_address as usize % VRAM_BYTES;
@@ -148,6 +148,9 @@ impl Vdp {
         }
         if self.recording.is_some() {
             self.note_debugger_vram_store(start, bytes.len());
+            if !bytes.is_empty() {
+                self.note_debugger_video_edit();
+            }
         }
         if sprite_table_written {
             self.invalidate_sprite_cache();
@@ -173,7 +176,8 @@ impl Vdp {
     /// colour too, and so does every palette write it recorded of that
     /// colour, so a repaint shows the edit wherever the colour is used: a
     /// colour the frame changed part of the way down the screen takes the
-    /// edit above and below the change alike.
+    /// edit above and below the change alike. No line read the edit, so the
+    /// table's `memory_exact` is false until the next picture begins.
     pub fn write_cram_debug(&mut self, colour_index: u32, colours: &[u16]) {
         let start = colour_index as usize % CRAM_COLOURS;
         for (offset, &colour) in colours.iter().take(CRAM_COLOURS).enumerate() {
@@ -182,6 +186,9 @@ impl Vdp {
             self.cram[index] = stored;
             self.cram_rgb[index] = Self::convert_genesis_color(stored);
             self.patch_recorded_colour(index, stored);
+        }
+        if !colours.is_empty() {
+            self.note_debugger_video_edit();
         }
     }
 
@@ -197,13 +204,18 @@ impl Vdp {
     /// them; an empty one writes nothing.
     ///
     /// While the line table is armed, every line it holds takes the new
-    /// words too, so a repaint shows the edit on every line.
+    /// words too, so a repaint shows the edit on every line. No line read
+    /// the edit, so the table's `memory_exact` is false until the next
+    /// picture begins.
     pub fn write_vsram_debug(&mut self, index: u32, values: &[u16]) {
         let start = index as usize % VSRAM_WORDS;
         for (offset, &value) in values.iter().take(VSRAM_WORDS).enumerate() {
             let word = (start + offset) % VSRAM_WORDS;
             self.vsram[word] = value & VSRAM_SCROLL_BITS;
             self.patch_recorded_vertical_scroll(word, value & VSRAM_SCROLL_BITS);
+        }
+        if !values.is_empty() {
+            self.note_debugger_video_edit();
         }
     }
 }
@@ -272,24 +284,12 @@ impl VideoDebugger for Vdp {
             .collect()
     }
 
-    fn resolved_sprite_render_order(&self) -> Vec<SpriteOrderEntry> {
-        // The link chain as the renderer walks it: the chain head is the
-        // highest-priority sprite (drawn on top of the ones it links to).
-        let mut chain: Vec<SpriteOrderEntry> = self
-            .sprite_table_chain()
-            .into_iter()
-            .map(|(slot, sprite)| SpriteOrderEntry {
-                index: u32::from(slot),
-                priority: u32::from(sprite.priority),
-            })
-            .collect();
-
-        // The renderer paints the per-line list in reverse (lowest priority
-        // first) so the chain head wins overlaps (`vdp/mod.rs`: "Render
-        // sprites in REVERSE order"). Back-to-front paint order is therefore
-        // the reverse of link-chain order.
-        chain.reverse();
-        chain
+    /// The sprites the held frame drew, back to front: each line's sprite
+    /// evaluation run again from the line table where it holds the line, as
+    /// [`Vdp::line_sprites`] runs it. In the link chain the renderer walks,
+    /// a sprite taken earlier is drawn in front of the ones after it.
+    fn resolved_sprite_render_order(&mut self) -> Vec<SpriteOrderEntry> {
+        self.sprite_render_order()
     }
 
     fn get_layer_data(&self, layer_id: u32) -> Option<LayerData> {
@@ -344,33 +344,6 @@ impl VideoDebugger for Vdp {
 
     fn toggle_layer(&mut self, layer_id: u32, visible: bool) {
         self.set_layer_debug_disabled(layer_id as usize, !visible);
-    }
-
-    /// The settings each line of the picture was drawn with, while line
-    /// states are recorded (`Vdp::set_capture_recording`): one row for each
-    /// visible line, the table's `frame` the one its journal follows. The
-    /// columns:
-    ///
-    /// - `line`; `frame`, the frame the line was drawn in (its low 32 bits);
-    /// - `kind`, how it was drawn (`LineKind`: 0 not recorded, 1 drawn,
-    ///   2 blank, 3 painted by a CRAM transfer);
-    /// - `exact`, 1 when the video memory the line read can be given back
-    ///   exactly (it was drawn in the frame the journal follows, and the
-    ///   journal had room);
-    /// - `register_0` to `register_23`, the VDP registers;
-    /// - `plane_a_horizontal_scroll`, `plane_b_horizontal_scroll`, the
-    ///   horizontal scroll the line read for each plane;
-    /// - `vertical_scroll_0` to `vertical_scroll_39`, the vertical scroll
-    ///   memory the renderer reads;
-    /// - `sprite_mask_carried_in`, 1 when the line above ran out of sprite
-    ///   dots and armed the sprite mask for this one;
-    /// - `palette`, the palette the line began with, an index into
-    ///   `Vdp::line_palettes`, or `NO_PALETTE` (65535).
-    ///
-    /// A line nothing was recorded of holds 0 in every column but `line`
-    /// and `palette`.
-    fn get_line_states(&self) -> Option<LineStateTable> {
-        self.line_state_table()
     }
 
     fn get_vram(&self) -> &[u8] {
@@ -661,32 +634,45 @@ mod tests {
     }
 
     #[test]
-    fn resolved_render_order_reverses_the_link_chain() {
+    fn resolved_render_order_lists_the_drawn_sprites_against_the_link_chain() {
         let mut vdp = Vdp::new();
+        vdp.registers[1] = 0x44; // display on (bit 6) + mode 5 (bit 2)
         vdp.registers[5] = 0; // SAT base 0
         vdp.registers[12] = 0; // H32 (64-slot window)
 
-        // Link chain 0 -> 3 -> 1 -> end. word1 (bytes 2-3) holds the link
-        // in bits 0-6; the other words can stay zero (from_sat still parses).
-        let set_link = |vdp: &mut Vdp, slot: usize, link: u8| {
-            vdp.vram[slot * 8 + 2] = 0x00;
-            vdp.vram[slot * 8 + 3] = link;
+        // One cell each on lines 0 to 7 (Y 0x80), at the table's X `x`,
+        // linking to `link`; the pattern word carries the priority bit.
+        let place = |vdp: &mut Vdp, slot: usize, x: u16, link: u8, pattern: u16| {
+            let at = slot * 8;
+            vdp.vram[at..at + 2].copy_from_slice(&0x0080u16.to_be_bytes());
+            vdp.vram[at + 2] = 0x00; // one cell by one
+            vdp.vram[at + 3] = link;
+            vdp.vram[at + 4..at + 6].copy_from_slice(&pattern.to_be_bytes());
+            vdp.vram[at + 6..at + 8].copy_from_slice(&x.to_be_bytes());
         };
-        set_link(&mut vdp, 0, 3);
-        set_link(&mut vdp, 3, 1);
-        set_link(&mut vdp, 1, 0);
-        // Give the chain head the priority bit (word2 bit 15) so we can
-        // confirm it is carried through.
-        vdp.vram[4] = 0x80;
+        // Link chain 0 -> 3 -> 1 -> 4 -> end. Slot 4 lies left of the
+        // screen (screen X -112), so no column of it is drawn, and slot 2
+        // is not in the chain at all.
+        place(&mut vdp, 0, 0x80, 3, 0x8000);
+        place(&mut vdp, 3, 0x90, 1, 0x0000);
+        place(&mut vdp, 1, 0xA0, 4, 0x0000);
+        place(&mut vdp, 4, 0x10, 0, 0x0000);
+        place(&mut vdp, 2, 0xB0, 0, 0x0000);
 
         let order = vdp.resolved_sprite_render_order();
         let indices: Vec<u32> = order.iter().map(|e| e.index).collect();
-        // Chain front-to-back priority is [0, 3, 1]; paint order is the
-        // reverse (the renderer paints the on-line list back-to-front).
+        // Chain front-to-back is [0, 3, 1] among the sprites drawn; paint
+        // order is the reverse (the renderer paints the on-line list
+        // back-to-front).
         assert_eq!(indices, [1u32, 3, 0]);
         let top = order.last().expect("non-empty order");
         assert_eq!(top.index, 0, "chain head paints last (on top)");
         assert_eq!(top.priority, 1, "priority bit carried");
+        assert!(order[..2].iter().all(|e| e.priority == 0));
+
+        // With the display off no line draws a sprite.
+        vdp.registers[1] = 0x04;
+        assert!(vdp.resolved_sprite_render_order().is_empty());
     }
 
     #[test]

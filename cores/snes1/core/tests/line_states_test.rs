@@ -10,7 +10,7 @@
 
 use retro_core::capture::{layer, planes, CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
-use retro_core::video::LineStateTable;
+use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode, Framebuffer};
 use snes1_core::debugger::snes_events;
 use snes1_core::{SnesBus, SnesEmulator};
@@ -814,15 +814,20 @@ fn a_table_armed_mid_frame_is_not_used() {
     emu.debugger().enable_breakpoint(line_100, false);
     emu.set_execution_mode(ExecutionMode::Running);
     emu.run_to_capture_boundary();
+    assert!(emu.at_capture_boundary(), "the frame's picture is finished");
     let table = emu.line_states().unwrap();
     assert!(!table.from_first_line);
-    assert!(table.complete);
+    assert!(!table.complete, "its first hundred lines are not in it");
     assert_eq!(column(&table, "line")[0], 101);
     assert!(!emu.draws_from_line_states());
     assert!(emu.picture_from_line_states().is_none());
 
     emu.run_to_capture_boundary();
-    assert!(emu.line_states().unwrap().from_first_line);
+    let table = emu.line_states().unwrap();
+    assert!(
+        table.from_first_line && table.complete,
+        "the next frame is whole"
+    );
     assert!(emu.draws_from_line_states());
 }
 
@@ -869,6 +874,119 @@ fn load_rom_keeps_the_recording_switch() {
     emu.set_capture_recording(CaptureRecording::default());
     assert!(emu.line_states().is_none());
     assert!(!emu.draws_from_line_states());
+}
+
+#[test]
+fn a_debugger_edit_of_video_memory_shows_though_no_line_read_it() {
+    type Edit = fn(&mut SnesEmulator);
+    let edits: [(&str, Edit); 3] = [
+        // Planes 0 and 1 of row 4 of tile 1, the tile BG1 shows everywhere.
+        ("VRAM", |emu| emu.write_vram_debug(0x0014, &[0x00, 0x00])),
+        // The colour sprite 0 is drawn with.
+        ("the palette", |emu| emu.write_cgram_debug(130, &[0x7C00])),
+        // Sprite 0's X.
+        ("the sprite table", |emu| emu.write_oam_debug(0, &[160])),
+    ];
+    for (memory, edit) in edits {
+        let mut emu = mid_frame_memory(line_states_on());
+        emu.run_frame();
+        emu.run_to_capture_boundary();
+        assert!(emu.line_states().unwrap().memory_exact, "{memory}");
+        let shown = picture(&emu);
+
+        edit(&mut emu);
+        let table = emu.line_states().unwrap();
+        assert!(table.from_first_line && table.complete, "{memory}");
+        assert!(!table.memory_exact, "{memory}: no line read the edit");
+        assert!(emu.draws_from_line_states(), "{memory}");
+        emu.repaint_held_frame();
+        assert_ne!(picture(&emu), shown, "{memory}: a redraw shows the edit");
+
+        // The next frame's lines read it: exact again from its first line.
+        emu.run_to_capture_boundary();
+        let table = emu.line_states().unwrap();
+        assert!(table.from_first_line && table.memory_exact, "{memory}");
+    }
+}
+
+/// Whether the layer render, the pixel sources and the line sprites of the
+/// held frame say they read it from the line table.
+fn readers_from_line_states(emu: &mut SnesEmulator) -> [bool; 3] {
+    [
+        emu.render_layer(0).expect("BG1").from_line_states,
+        emu.pixel_sources(planes::MAIN)
+            .expect("a game is loaded")
+            .from_line_states,
+        emu.line_sprites()
+            .expect("a game is loaded")
+            .from_line_states,
+    ]
+}
+
+#[test]
+fn the_picture_is_drawn_from_the_line_states_only_from_a_whole_frame() {
+    let mut emu = mid_frame_memory(line_states_on());
+    emu.run_frame();
+    emu.run_to_capture_boundary();
+    assert!(emu.picture_from_line_states().is_some(), "a whole frame");
+    assert_eq!(readers_from_line_states(&mut emu), [true; 3]);
+
+    // Stopped at line 120: the table holds the frame's first lines only.
+    emu.run_frame();
+    let line_120 = emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::SCANLINE,
+            param: 120,
+        },
+        cpu_id: None,
+        condition: None,
+    });
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+    let table = emu.line_states().unwrap();
+    assert!(table.from_first_line && !table.complete);
+    assert!(emu.picture_from_line_states().is_none(), "not finished");
+    assert_eq!(readers_from_line_states(&mut emu), [false; 3]);
+
+    // Armed there, the table holds the frame from line 121 to its picture.
+    emu.set_capture_recording(CaptureRecording::default());
+    emu.set_capture_recording(line_states_on());
+    emu.debugger().enable_breakpoint(line_120, false);
+    emu.set_execution_mode(ExecutionMode::Running);
+    emu.run_to_capture_boundary();
+    let table = emu.line_states().unwrap();
+    assert!(!table.from_first_line && !table.complete);
+    assert!(emu.picture_from_line_states().is_none(), "lines missing");
+    assert_eq!(readers_from_line_states(&mut emu), [false; 3]);
+}
+
+#[test]
+fn the_lines_keep_their_numbers_and_the_first_row_says_where_the_picture_starts() {
+    let mut emu = hdma_scene_at_boundary();
+    let table = emu.line_states().unwrap();
+    assert_eq!(column(&table, "line")[0], 1, "the first line drawn is 1");
+    assert_eq!(table.first_row_line, 1);
+
+    // With overscan the frame draws 239 lines, and the picture shows the
+    // 224 from line 8 on.
+    emu.write_memory_debug(0x2133, &[0x04]);
+    emu.run_to_capture_boundary();
+    let table = emu.line_states().unwrap();
+    assert!(table.from_first_line && table.complete);
+    assert_eq!(column(&table, "line"), (1..=239).collect::<Vec<u32>>());
+    assert_eq!(table.first_row_line, 8);
+    let shown = picture(&emu);
+    let (width, height, image) = &shown;
+    assert_eq!(*height, 224);
+    // Inside window 1 BG1 is masked: the row shows its line's backdrop.
+    let (left, _) = hdma_window(8);
+    assert_eq!(
+        pixel(image, *width, u32::from(left) + 1, 0),
+        rgba(hdma_backdrop(8)),
+        "the picture's first row is line 8"
+    );
+    assert_eq!(redrawn(&mut emu), shown);
 }
 
 // -------------------------------------------------------------
@@ -1026,6 +1144,87 @@ fn a_frame_drawn_again_from_its_line_states_is_the_frame() {
         bus.ppu_mut().render_scanline(line, &mut again);
     }
     assert_ne!(crop(&again, 256, 224), shown);
+}
+
+#[test]
+fn the_render_order_names_the_sprites_that_drew_with_the_priority_their_first_line_read() {
+    let mut bus = SnesBus::new();
+    bus.ppu_mut().set_capture_recording(line_states_on());
+    // The vertical blank: the memory ports are open.
+    bus.set_raster_snapshot(0, 225);
+    // Sprite tile 0 (colour 5) at word $4000; tile 1 is left empty, every
+    // pixel transparent.
+    for (word, pair) in solid_tile(5).chunks(2).enumerate() {
+        write_vram_word(
+            &mut bus,
+            0x4000 + word as u16,
+            u16::from_le_bytes([pair[0], pair[1]]),
+        );
+    }
+    // Sprite 0 on lines 21-28 with priority 1; sprite 1, of the empty tile,
+    // on the same lines with priority 2; sprite 2 on lines 101-108, where
+    // no line shows sprites; sprite 3 on lines 61-68 with priority 2; the
+    // others below the picture.
+    bus.write(ppu_addr(0x2102), 0x00);
+    bus.write(ppu_addr(0x2103), 0x00);
+    for sprite in 0..128u8 {
+        let (x, y, tile, attributes) = match sprite {
+            0 => (10, 20, 0, 0x10),
+            1 => (30, 20, 1, 0x20),
+            2 => (50, 100, 0, 0x30),
+            3 => (70, 60, 0, 0x20),
+            _ => (0, 0xF0, 0, 0),
+        };
+        for byte in [x, y, tile, attributes] {
+            bus.write(ppu_addr(0x2104), byte);
+        }
+    }
+    for _ in 0..32 {
+        bus.write(ppu_addr(0x2104), 0);
+    }
+    bus.write(ppu_addr(0x2101), 0x02);
+    bus.write(ppu_addr(0x212C), 0x10); // sprites on the main screen
+    bus.write(ppu_addr(0x2100), 0x0F);
+
+    let mut fb = Framebuffer::new(512, 480);
+    for line in 1..=224u16 {
+        bus.set_raster_snapshot(300, line - 1);
+        if line == 25 {
+            // Sprite 0's priority rewritten in forced blank between two of
+            // its lines: 3 from line 25 on.
+            bus.write(ppu_addr(0x2100), 0x80);
+            bus.write(ppu_addr(0x2102), 0x01);
+            bus.write(ppu_addr(0x2103), 0x00);
+            bus.write(ppu_addr(0x2104), 0x00);
+            bus.write(ppu_addr(0x2104), 0x30);
+            bus.write(ppu_addr(0x2100), 0x0F);
+        }
+        if line == 90 {
+            bus.write(ppu_addr(0x212C), 0x00); // sprites on neither screen
+        }
+        if line == 121 {
+            bus.write(ppu_addr(0x212C), 0x10);
+        }
+        bus.ppu_mut().render_scanline(line, &mut fb);
+    }
+    bus.ppu_mut().note_picture_finished();
+
+    let entry = |index: u32, priority: u32| SpriteOrderEntry { index, priority };
+    // Back to front, slot 0 in front: what drew, the empty sprite included
+    // (it drew its columns), each with the priority its first line read.
+    assert_eq!(
+        bus.ppu_mut().resolved_sprite_render_order(),
+        vec![entry(3, 2), entry(1, 2), entry(0, 1)]
+    );
+
+    // From the registers as they stand every line shows sprites and
+    // sprite 0 has priority 3.
+    bus.ppu_mut()
+        .set_capture_recording(CaptureRecording::default());
+    assert_eq!(
+        bus.ppu_mut().resolved_sprite_render_order(),
+        vec![entry(3, 2), entry(2, 3), entry(1, 2), entry(0, 3)]
+    );
 }
 
 // -------------------------------------------------------------

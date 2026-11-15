@@ -18,7 +18,7 @@ use retro_core::capture::{
     layer, planes, CaptureCore, CaptureRecording, SpriteFate, NO_COLUMN, NO_PALETTE,
 };
 use retro_core::types::{Breakpoint, BreakpointType};
-use retro_core::video::LineStateTable;
+use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
 use sg1_core::vdp::sources::DRAWN_BY_SPRITE;
@@ -320,9 +320,9 @@ fn the_table_says_what_each_line_was_drawn_with() {
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
-    names.extend((0..24).map(|i| format!("register_{i}")));
-    names.extend(["plane_a_horizontal_scroll", "plane_b_horizontal_scroll"].map(String::from));
-    names.extend((0..40).map(|i| format!("vertical_scroll_{i}")));
+    names.extend((0..24).map(|i| format!("register[{i}]")));
+    names.extend(["horizontal_scroll[0]", "horizontal_scroll[1]"].map(String::from));
+    names.extend((0..40).map(|i| format!("vertical_scroll[{i}]")));
     names.extend(["sprite_mask_carried_in", "palette"].map(String::from));
     assert_eq!(table.columns, names);
     assert_eq!(table.values.len(), 224 * names.len());
@@ -340,13 +340,13 @@ fn the_table_says_what_each_line_was_drawn_with() {
     assert!(column(&table, "exact").iter().all(|&e| e == 1));
 
     // Each change shows from the line after the one whose interrupt made it.
-    let scroll_x = column(&table, "plane_a_horizontal_scroll");
+    let scroll_x = column(&table, "horizontal_scroll[0]");
     assert_eq!((scroll_x[100], scroll_x[101]), (0, 8));
-    let scroll_y = column(&table, "vertical_scroll_0");
+    let scroll_y = column(&table, "vertical_scroll[0]");
     assert_eq!((scroll_y[140], scroll_y[141]), (0, 16));
-    let backdrop = column(&table, "register_7");
+    let backdrop = column(&table, "register[7]");
     assert_eq!((backdrop[160], backdrop[161]), (0, 4));
-    assert!(column(&table, "plane_b_horizontal_scroll")
+    assert!(column(&table, "horizontal_scroll[1]")
         .iter()
         .all(|&s| s == 0));
 
@@ -477,19 +477,27 @@ fn after_a_stop_part_of_the_way_down_the_lines_below_are_the_frame_before() {
         assert_eq!(u64::from(frames[line]), drawn_in, "line {line}");
         assert_eq!(exact[line], u32::from(line <= 100), "line {line}");
     }
+    // The picture the host holds is no frame's finished picture: the
+    // snapshot numbers it by the frames finished.
+    assert_eq!(emu.capture_frame_snapshot().frame, frame);
 
-    // The lines of this frame come back exactly; those of the frame before
-    // come back with their own scroll, palette and registers, over video
-    // memory as this frame found it, which has the cell of line 180 put
-    // back: they differ there alone.
-    let picture = emu.picture_from_line_states().expect("line states on");
+    // The table does not hold the frame from its first line to its
+    // finished picture: there is no picture drawn from it.
+    assert!(emu.picture_from_line_states().is_none());
+
+    // A repaint draws every line from its record: those of this frame come
+    // back exactly; those of the frame before come back with their own
+    // scroll, palette and registers, over video memory as this frame found
+    // it, which has the cell of line 180 put back: they differ there alone.
     let live = shown(&emu);
-    let apart = rows_apart(&picture.rgba, &live);
+    assert!(emu.repaint_held_frame(), "every line from its record");
+    let repainted = shown(&emu);
+    let apart = rows_apart(&repainted, &live);
     assert_eq!(apart, (184..192).collect::<Vec<_>>());
     for y in 184..192 {
         for x in 0..320 {
             let at = (y * 320 + x) * 4;
-            let same = picture.rgba[at..at + 4] == live[at..at + 4];
+            let same = repainted[at..at + 4] == live[at..at + 4];
             assert_eq!(same, !(88..96).contains(&x), "({x}, {y})");
         }
     }
@@ -521,14 +529,19 @@ fn armed_part_of_the_way_through_a_frame_the_table_holds_the_lines_after() {
         .iter()
         .all(|&p| p == NO_PALETTE));
 
-    // The lines it holds come back exactly; the others from the state now.
-    let picture = emu.picture_from_line_states().expect("line states on");
-    let apart = rows_apart(&picture.rgba, &shown(&emu));
+    // The table does not hold the frame from its first line: there is no
+    // picture drawn from it.
+    assert!(emu.picture_from_line_states().is_none());
+
+    // A repaint draws the lines it holds exactly, the others from the
+    // state now.
+    let live = shown(&emu);
+    assert!(!emu.repaint_held_frame(), "not every line has a record");
+    let apart = rows_apart(&shown(&emu), &live);
     assert!(
         !apart.is_empty() && apart.iter().all(|&row| row <= 100),
         "{apart:?}"
     );
-    assert!(!emu.repaint_held_frame(), "not every line has a record");
 }
 
 #[test]
@@ -559,7 +572,7 @@ fn a_debugger_edit_of_a_colour_or_the_vertical_scroll_shows_on_every_line() {
     // The vertical scroll the lower lines read was 16; every line takes 0.
     emu.vdp_mut().write_vsram_debug(0, &[0]);
     let table = emu.line_states().expect("line states on");
-    assert!(column(&table, "vertical_scroll_0").iter().all(|&v| v == 0));
+    assert!(column(&table, "vertical_scroll[0]").iter().all(|&v| v == 0));
     let palettes = emu.line_palettes().expect("line states on");
     assert!(palettes
         .changes
@@ -568,6 +581,51 @@ fn a_debugger_edit_of_a_colour_or_the_vertical_scroll_shows_on_every_line() {
         .0
         .iter()
         .all(|change| change[3] == 0x0EEE));
+}
+
+#[test]
+fn a_debugger_write_into_video_memory_leaves_the_memory_inexact_until_the_next_picture() {
+    type Edit = fn(&mut Vdp);
+    let edits: [(&str, Edit); 3] = [
+        // Tile 1's first four pixels, colour 4.
+        ("VRAM", |vdp| vdp.write_vram_debug(0x0020, &[0x44; 2])),
+        ("CRAM", |vdp| vdp.write_cram_debug(1, &[0x0EEE])),
+        ("VSRAM", |vdp| vdp.write_vsram_debug(0, &[3])),
+    ];
+    for (what, edit) in edits {
+        let mut emu = recording(&raster_program());
+        emu.run_to_capture_boundary();
+        // An empty write writes nothing.
+        emu.vdp_mut().write_vram_debug(0x0020, &[]);
+        emu.vdp_mut().write_cram_debug(1, &[]);
+        emu.vdp_mut().write_vsram_debug(0, &[]);
+        let table = emu.line_states().expect("line states on");
+        assert!(table.complete && table.memory_exact, "{what}: no edit yet");
+        let before = shown(&emu);
+
+        edit(emu.vdp_mut());
+        let table = emu.line_states().expect("line states on");
+        assert!(table.complete, "{what}: the table still holds the frame");
+        assert!(!table.memory_exact, "{what}: no line read the edit");
+        assert!(column(&table, "exact").iter().all(|&e| e == 0), "{what}");
+
+        // The edit shows in the frame drawn again, the repaint and the
+        // picture drawn from the table alike.
+        assert!(emu.repaint_held_frame(), "{what}");
+        let repainted = shown(&emu);
+        assert_ne!(repainted, before, "{what}: the edit shows");
+        let picture = emu.picture_from_line_states().expect("the whole frame");
+        assert_eq!(picture.rgba, repainted, "{what}");
+
+        // From the next picture's first line, the memory is the frame's.
+        emu.run_to_capture_boundary();
+        let table = emu.line_states().expect("line states on");
+        assert!(
+            table.complete && table.memory_exact,
+            "{what}: the next frame"
+        );
+        assert!(column(&table, "exact").iter().all(|&e| e == 1), "{what}");
+    }
 }
 
 #[test]
@@ -767,6 +825,14 @@ fn where_each_pixel_came_from_is_the_frame_s_and_working_it_out_moves_nothing() 
         let alone = emu.render_sprites(&[1]).expect("a game is loaded");
         let layer_image = emu.render_layer(LAYER_SPRITES as u32).expect("the sprites");
         assert_eq!(alone, layer_image);
+        // The one sprite the frame drew, of low priority.
+        assert_eq!(
+            emu.vdp_mut().resolved_sprite_render_order(),
+            [SpriteOrderEntry {
+                index: 0,
+                priority: 0
+            }]
+        );
 
         assert_eq!(emu.state_hash(), hash, "nothing a savestate holds moved");
         assert_eq!(shown(&emu), picture, "the picture shown did not move");

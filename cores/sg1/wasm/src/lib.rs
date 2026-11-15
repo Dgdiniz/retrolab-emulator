@@ -1371,13 +1371,17 @@ impl RetroEmulator {
         serde_wasm_bindgen::to_value(&sprites).unwrap()
     }
 
-    /// The renderer's resolved sprite paint order as `SpriteOrderEntry[]`
-    /// in back-to-front order (last entry draws on top), so a composite
-    /// exporter blits members exactly as the VDP drew them.
+    /// The sprites the held frame drew, as `SpriteOrderEntry[]` in
+    /// back-to-front order (last entry draws on top), so a composite
+    /// exporter blits members exactly as the VDP drew them: only the sprites
+    /// of which some line drew a visible column, each once, with the
+    /// priority bit of the line that drew it first; an empty array when the
+    /// frame drew no sprite. Each line is read from the line table where it
+    /// holds the line, else from the state as it stands.
     #[wasm_bindgen(js_name = resolvedSpriteRenderOrder)]
-    pub fn resolved_sprite_render_order(&self) -> JsValue {
+    pub fn resolved_sprite_render_order(&mut self) -> JsValue {
         use retro_core::video::VideoDebugger;
-        let order = self.genesis.vdp().resolved_sprite_render_order();
+        let order = self.genesis.vdp_mut().resolved_sprite_render_order();
         serde_wasm_bindgen::to_value(&order).unwrap()
     }
 
@@ -3204,56 +3208,56 @@ mod tests {
             &[
                 (
                     "recorded",
-                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register_0\", \
-                     \"register_1\", \"register_2\", \"register_3\", \"register_4\", \
-                     \"register_5\", \"register_6\", \"register_7\", \"register_8\", \
-                     \"register_9\", \"register_10\", \"register_11\", \"register_12\", \
-                     \"register_13\", \"register_14\", \"register_15\", \"register_16\", \
-                     \"register_17\", \"register_18\", \"register_19\", \"register_20\", \
-                     \"register_21\", \"register_22\", \"register_23\", \
-                     \"plane_a_horizontal_scroll\", \"plane_b_horizontal_scroll\", \
-                     \"vertical_scroll_0\", \"vertical_scroll_1\", \"vertical_scroll_2\", \
-                     \"vertical_scroll_3\", \"vertical_scroll_4\", \"vertical_scroll_5\", \
-                     \"vertical_scroll_6\", \"vertical_scroll_7\", \"vertical_scroll_8\", \
-                     \"vertical_scroll_9\", \"vertical_scroll_10\", \"vertical_scroll_11\", \
-                     \"vertical_scroll_12\", \"vertical_scroll_13\", \"vertical_scroll_14\", \
-                     \"vertical_scroll_15\", \"vertical_scroll_16\", \"vertical_scroll_17\", \
-                     \"vertical_scroll_18\", \"vertical_scroll_19\", \"vertical_scroll_20\", \
-                     \"vertical_scroll_21\", \"vertical_scroll_22\", \"vertical_scroll_23\", \
-                     \"vertical_scroll_24\", \"vertical_scroll_25\", \"vertical_scroll_26\", \
-                     \"vertical_scroll_27\", \"vertical_scroll_28\", \"vertical_scroll_29\", \
-                     \"vertical_scroll_30\", \"vertical_scroll_31\", \"vertical_scroll_32\", \
-                     \"vertical_scroll_33\", \"vertical_scroll_34\", \"vertical_scroll_35\", \
-                     \"vertical_scroll_36\", \"vertical_scroll_37\", \"vertical_scroll_38\", \
-                     \"vertical_scroll_39\", \"sprite_mask_carried_in\", \"palette\"], \
+                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register[0]\", \
+                     \"register[1]\", \"register[2]\", \"register[3]\", \"register[4]\", \
+                     \"register[5]\", \"register[6]\", \"register[7]\", \"register[8]\", \
+                     \"register[9]\", \"register[10]\", \"register[11]\", \"register[12]\", \
+                     \"register[13]\", \"register[14]\", \"register[15]\", \"register[16]\", \
+                     \"register[17]\", \"register[18]\", \"register[19]\", \"register[20]\", \
+                     \"register[21]\", \"register[22]\", \"register[23]\", \
+                     \"horizontal_scroll[0]\", \"horizontal_scroll[1]\", \"vertical_scroll[0]\", \
+                     \"vertical_scroll[1]\", \"vertical_scroll[2]\", \"vertical_scroll[3]\", \
+                     \"vertical_scroll[4]\", \"vertical_scroll[5]\", \"vertical_scroll[6]\", \
+                     \"vertical_scroll[7]\", \"vertical_scroll[8]\", \"vertical_scroll[9]\", \
+                     \"vertical_scroll[10]\", \"vertical_scroll[11]\", \"vertical_scroll[12]\", \
+                     \"vertical_scroll[13]\", \"vertical_scroll[14]\", \"vertical_scroll[15]\", \
+                     \"vertical_scroll[16]\", \"vertical_scroll[17]\", \"vertical_scroll[18]\", \
+                     \"vertical_scroll[19]\", \"vertical_scroll[20]\", \"vertical_scroll[21]\", \
+                     \"vertical_scroll[22]\", \"vertical_scroll[23]\", \"vertical_scroll[24]\", \
+                     \"vertical_scroll[25]\", \"vertical_scroll[26]\", \"vertical_scroll[27]\", \
+                     \"vertical_scroll[28]\", \"vertical_scroll[29]\", \"vertical_scroll[30]\", \
+                     \"vertical_scroll[31]\", \"vertical_scroll[32]\", \"vertical_scroll[33]\", \
+                     \"vertical_scroll[34]\", \"vertical_scroll[35]\", \"vertical_scroll[36]\", \
+                     \"vertical_scroll[37]\", \"vertical_scroll[38]\", \"vertical_scroll[39]\", \
+                     \"sprite_mask_carried_in\", \"palette\"], \
                      complete: true, firstRowLine: 0, frame: 6, fromFirstLine: true, \
                      memoryExact: true, rowsPerLine: 1, values: Uint32Array(len 16128, \
                      fnv1a64 0x6ff1a0129c1a30e5)}",
                 ),
                 (
                     "kept for the line sprites",
-                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register_0\", \
-                     \"register_1\", \"register_2\", \"register_3\", \"register_4\", \
-                     \"register_5\", \"register_6\", \"register_7\", \"register_8\", \
-                     \"register_9\", \"register_10\", \"register_11\", \"register_12\", \
-                     \"register_13\", \"register_14\", \"register_15\", \"register_16\", \
-                     \"register_17\", \"register_18\", \"register_19\", \"register_20\", \
-                     \"register_21\", \"register_22\", \"register_23\", \
-                     \"plane_a_horizontal_scroll\", \"plane_b_horizontal_scroll\", \
-                     \"vertical_scroll_0\", \"vertical_scroll_1\", \"vertical_scroll_2\", \
-                     \"vertical_scroll_3\", \"vertical_scroll_4\", \"vertical_scroll_5\", \
-                     \"vertical_scroll_6\", \"vertical_scroll_7\", \"vertical_scroll_8\", \
-                     \"vertical_scroll_9\", \"vertical_scroll_10\", \"vertical_scroll_11\", \
-                     \"vertical_scroll_12\", \"vertical_scroll_13\", \"vertical_scroll_14\", \
-                     \"vertical_scroll_15\", \"vertical_scroll_16\", \"vertical_scroll_17\", \
-                     \"vertical_scroll_18\", \"vertical_scroll_19\", \"vertical_scroll_20\", \
-                     \"vertical_scroll_21\", \"vertical_scroll_22\", \"vertical_scroll_23\", \
-                     \"vertical_scroll_24\", \"vertical_scroll_25\", \"vertical_scroll_26\", \
-                     \"vertical_scroll_27\", \"vertical_scroll_28\", \"vertical_scroll_29\", \
-                     \"vertical_scroll_30\", \"vertical_scroll_31\", \"vertical_scroll_32\", \
-                     \"vertical_scroll_33\", \"vertical_scroll_34\", \"vertical_scroll_35\", \
-                     \"vertical_scroll_36\", \"vertical_scroll_37\", \"vertical_scroll_38\", \
-                     \"vertical_scroll_39\", \"sprite_mask_carried_in\", \"palette\"], \
+                    "{columns: [\"line\", \"frame\", \"kind\", \"exact\", \"register[0]\", \
+                     \"register[1]\", \"register[2]\", \"register[3]\", \"register[4]\", \
+                     \"register[5]\", \"register[6]\", \"register[7]\", \"register[8]\", \
+                     \"register[9]\", \"register[10]\", \"register[11]\", \"register[12]\", \
+                     \"register[13]\", \"register[14]\", \"register[15]\", \"register[16]\", \
+                     \"register[17]\", \"register[18]\", \"register[19]\", \"register[20]\", \
+                     \"register[21]\", \"register[22]\", \"register[23]\", \
+                     \"horizontal_scroll[0]\", \"horizontal_scroll[1]\", \"vertical_scroll[0]\", \
+                     \"vertical_scroll[1]\", \"vertical_scroll[2]\", \"vertical_scroll[3]\", \
+                     \"vertical_scroll[4]\", \"vertical_scroll[5]\", \"vertical_scroll[6]\", \
+                     \"vertical_scroll[7]\", \"vertical_scroll[8]\", \"vertical_scroll[9]\", \
+                     \"vertical_scroll[10]\", \"vertical_scroll[11]\", \"vertical_scroll[12]\", \
+                     \"vertical_scroll[13]\", \"vertical_scroll[14]\", \"vertical_scroll[15]\", \
+                     \"vertical_scroll[16]\", \"vertical_scroll[17]\", \"vertical_scroll[18]\", \
+                     \"vertical_scroll[19]\", \"vertical_scroll[20]\", \"vertical_scroll[21]\", \
+                     \"vertical_scroll[22]\", \"vertical_scroll[23]\", \"vertical_scroll[24]\", \
+                     \"vertical_scroll[25]\", \"vertical_scroll[26]\", \"vertical_scroll[27]\", \
+                     \"vertical_scroll[28]\", \"vertical_scroll[29]\", \"vertical_scroll[30]\", \
+                     \"vertical_scroll[31]\", \"vertical_scroll[32]\", \"vertical_scroll[33]\", \
+                     \"vertical_scroll[34]\", \"vertical_scroll[35]\", \"vertical_scroll[36]\", \
+                     \"vertical_scroll[37]\", \"vertical_scroll[38]\", \"vertical_scroll[39]\", \
+                     \"sprite_mask_carried_in\", \"palette\"], \
                      complete: true, firstRowLine: 0, frame: 6, fromFirstLine: true, \
                      memoryExact: true, rowsPerLine: 1, values: Uint32Array(len 16128, \
                      fnv1a64 0x6ff1a0129c1a30e5)}",
@@ -3489,6 +3493,60 @@ mod tests {
                      fnv1a64 0x6f77b8bbd663dea5)}",
                 ),
                 ("no game", "null"),
+            ],
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn what_the_sprite_render_order_holds() {
+        let mut recorded = held_capture_shapes(&EVERY_RECORDER);
+        let mut unrecorded = held_capture_shapes(&[]);
+        let mut no_game = RetroEmulator::new("genesis").unwrap();
+        assert_shapes(
+            &[
+                ("recorded", recorded.resolved_sprite_render_order()),
+                (
+                    "nothing recorded",
+                    unrecorded.resolved_sprite_render_order(),
+                ),
+                ("no game", no_game.resolved_sprite_render_order()),
+            ],
+            &[
+                (
+                    "recorded",
+                    "[{index: 47, priority: 1}, {index: 42, priority: 0}, \
+                     {index: 39, priority: 1}, {index: 38, priority: 0}, {index: 37, priority: 1}, \
+                     {index: 36, priority: 0}, {index: 35, priority: 1}, {index: 34, priority: 0}, \
+                     {index: 33, priority: 1}, {index: 32, priority: 0}, {index: 31, priority: 1}, \
+                     {index: 30, priority: 0}, {index: 27, priority: 1}, {index: 26, priority: 0}, \
+                     {index: 25, priority: 1}, {index: 24, priority: 0}, {index: 23, priority: 1}, \
+                     {index: 22, priority: 0}, {index: 21, priority: 1}, {index: 20, priority: 0}, \
+                     {index: 19, priority: 1}, {index: 18, priority: 0}, {index: 17, priority: 1}, \
+                     {index: 16, priority: 0}, {index: 15, priority: 1}, {index: 14, priority: 0}, \
+                     {index: 13, priority: 1}, {index: 12, priority: 0}, {index: 11, priority: 1}, \
+                     {index: 10, priority: 0}, {index: 9, priority: 1}, {index: 8, priority: 0}, \
+                     {index: 7, priority: 1}, {index: 6, priority: 0}, {index: 5, priority: 1}, \
+                     {index: 4, priority: 0}, {index: 3, priority: 1}, {index: 2, priority: 0}, \
+                     {index: 1, priority: 1}, {index: 0, priority: 0}]",
+                ),
+                (
+                    "nothing recorded",
+                    "[{index: 47, priority: 1}, {index: 42, priority: 0}, \
+                     {index: 39, priority: 1}, {index: 38, priority: 0}, {index: 37, priority: 1}, \
+                     {index: 36, priority: 0}, {index: 35, priority: 1}, {index: 34, priority: 0}, \
+                     {index: 33, priority: 1}, {index: 32, priority: 0}, {index: 31, priority: 1}, \
+                     {index: 30, priority: 0}, {index: 27, priority: 1}, {index: 26, priority: 0}, \
+                     {index: 25, priority: 1}, {index: 24, priority: 0}, {index: 23, priority: 1}, \
+                     {index: 22, priority: 0}, {index: 21, priority: 1}, {index: 20, priority: 0}, \
+                     {index: 19, priority: 1}, {index: 18, priority: 0}, {index: 17, priority: 1}, \
+                     {index: 16, priority: 0}, {index: 15, priority: 1}, {index: 14, priority: 0}, \
+                     {index: 13, priority: 1}, {index: 12, priority: 0}, {index: 11, priority: 1}, \
+                     {index: 10, priority: 0}, {index: 9, priority: 1}, {index: 8, priority: 0}, \
+                     {index: 7, priority: 1}, {index: 6, priority: 0}, {index: 5, priority: 1}, \
+                     {index: 4, priority: 0}, {index: 3, priority: 1}, {index: 2, priority: 0}, \
+                     {index: 1, priority: 1}, {index: 0, priority: 0}]",
+                ),
+                ("no game", "[]"),
             ],
         );
     }

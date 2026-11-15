@@ -158,14 +158,18 @@ impl Vdp {
 
     /// The picture drawn again from the line table into a buffer of its
     /// own, cut as the host's framebuffer is (the mode's width by
-    /// [`Self::drawn_height`] lines), RGBA; `None` while line states are not
-    /// armed. Where the table holds every line of the frame and its
-    /// journal had room, this is the picture the frame drew, byte for byte:
-    /// what a host can compare the framebuffer with. Lines the table does
-    /// not hold are drawn from the state as it is now. The framebuffer and
-    /// everything a savestate holds stay as they were.
+    /// [`Self::drawn_height`] lines), RGBA: only while the table holds the
+    /// frame its journal follows from its first line to its finished
+    /// picture, `None` otherwise (line states not armed, armed part of the
+    /// way through the frame, or the frame stopped part of the way down).
+    /// Where the journal had room and the debugger has written no video
+    /// memory since the frame began, this is the picture the frame drew,
+    /// byte for byte: what a host can compare the framebuffer with. The
+    /// framebuffer and everything a savestate holds stay as they were.
     pub fn picture_from_line_states(&mut self) -> Option<PixelImage> {
-        self.line_table()?;
+        if !self.line_table_holds_frame() {
+            return None;
+        }
         let width = self.display_width() as usize;
         let height = self.drawn_height() as usize;
         let kept = DrawState::keep(self);

@@ -1449,14 +1449,16 @@ impl RetroEmulator {
         serde_wasm_bindgen::to_value(&sprites).unwrap()
     }
 
-    /// The renderer's resolved sprite paint order as `SpriteOrderEntry[]`
-    /// in back-to-front order (last entry draws on top), mirroring
+    /// The sprites the held frame drew, as `SpriteOrderEntry[]` in
+    /// back-to-front order (last entry draws on top), mirroring
     /// `render_obj_row`'s rotated OAM walk so a composite exporter blits
-    /// members exactly as the PPU drew them.
+    /// members exactly as the PPU drew them: only the sprites of which some
+    /// line that showed sprites drew a visible column, each once, with the
+    /// priority the line that drew it first read; an empty array when the
+    /// frame drew no sprite.
     #[wasm_bindgen(js_name = resolvedSpriteRenderOrder)]
-    pub fn resolved_sprite_render_order(&self) -> JsValue {
-        use retro_core::video::VideoDebugger;
-        let order = self.snes.ppu().resolved_sprite_render_order();
+    pub fn resolved_sprite_render_order(&mut self) -> JsValue {
+        let order = self.snes.video_debugger().resolved_sprite_render_order();
         serde_wasm_bindgen::to_value(&order).unwrap()
     }
 

@@ -1,9 +1,10 @@
 //! Where each pixel of the held frame came from, the sprites each line held
-//! and what became of each, and the chosen sprites drawn alone: worked out
-//! on demand, by drawing the frame again the way
-//! [`Vdp::picture_from_line_states`] draws it (each line from the line table
-//! where the table holds it, from the state as it is now otherwise) with a
-//! trace that notes what the renderer read for each pixel.
+//! and what became of each, the sprites the frame drew in the order they
+//! were drawn, and the chosen sprites drawn alone: worked out on demand, by
+//! drawing the frame again the way a repaint draws it
+//! ([`Vdp::rerender_current_frame`]: each line from the line table where
+//! the table holds it, from the state as it is now otherwise) with a trace
+//! that notes what the renderer read for each pixel.
 //!
 //! The renderer the frame loops run is the same code: `render_scanline`,
 //! `composite_scanline` and `render_sprite_line` are generic over a
@@ -69,7 +70,7 @@ use retro_core::capture::{
     drawn_by, layer, line_flags, planes, tile_value, LineSprites, PixelSources, PixelTrace,
     RenderedLayer, SpriteFate, LINE_SPRITES_STRIDE, NO_CELL,
 };
-use retro_core::video::{crop_rgba, equals_cropped_rgba, PixelImage};
+use retro_core::video::{crop_rgba, equals_cropped_rgba, PixelImage, SpriteOrderEntry};
 
 /// The `layer` plane's bits 0-2 for a pixel plane A drew.
 pub const DRAWN_BY_PLANE_A: u16 = drawn_by(LAYER_PLANE_A as u16);
@@ -159,8 +160,14 @@ fn flip_bits(across: bool, down: bool) -> u16 {
 #[derive(Debug, Clone, Copy)]
 struct MetSprite {
     slot: u8,
+    /// Where the line's sprite list holds it: the renderer takes the list's
+    /// sprites in this order, and draws one taken earlier in front of one
+    /// taken later.
+    position: u8,
     x: i16,
     width: u8,
+    /// Its priority bit, as the line's sprite list holds it.
+    priority: bool,
     masked: bool,
     /// The fate of a sprite met after the evaluation stopped; `None` for one
     /// it took, whose fate is worked out from where it lies and whether the
@@ -299,13 +306,15 @@ impl LineTrace {
         self.clipped = None;
     }
 
-    /// The evaluation took `sprite`, of slot `slot`, hidden by the sprite
-    /// mask or not.
-    pub(super) fn met_sprite(&mut self, slot: u8, sprite: &Sprite, masked: bool) {
+    /// The evaluation took `sprite`, of slot `slot`, at `position` of the
+    /// line's sprite list, hidden by the sprite mask or not.
+    pub(super) fn met_sprite(&mut self, slot: u8, position: u8, sprite: &Sprite, masked: bool) {
         self.sprites.push(MetSprite {
             slot,
+            position,
             x: sprite.x,
             width: sprite.width_tiles * 8,
+            priority: sprite.priority,
             masked,
             left_out: None,
         });
@@ -326,13 +335,16 @@ impl LineTrace {
         self.flags |= line_flags::OVER_LIMIT;
     }
 
-    /// The evaluation stopped before `sprite`, of slot `slot`, which falls
-    /// on the line: it is listed with `fate`.
-    pub(super) fn left_out(&mut self, slot: u8, sprite: &Sprite, fate: SpriteFate) {
+    /// The evaluation stopped before `sprite`, of slot `slot` at `position`
+    /// of the line's sprite list, which falls on the line: it is listed with
+    /// `fate`.
+    pub(super) fn left_out(&mut self, slot: u8, position: u8, sprite: &Sprite, fate: SpriteFate) {
         self.sprites.push(MetSprite {
             slot,
+            position,
             x: sprite.x,
             width: sprite.width_tiles * 8,
+            priority: sprite.priority,
             masked: false,
             left_out: Some(fate),
         });
@@ -470,14 +482,15 @@ impl Vdp {
     /// 320) by [`Self::drawn_height`] lines, cut as the framebuffer is.
     /// `frame` is the frame being drawn ([`Self::set_frame_being_drawn`]).
     ///
-    /// The frame is drawn again as [`Self::picture_from_line_states`]
-    /// draws it, each line from the line table where it holds the line and
-    /// from the state as it is now otherwise, with a trace that notes what
-    /// the renderer read for each pixel: the planes describe the picture
-    /// that redraw draws, and `matches_picture` says it is the framebuffer's
-    /// byte for byte. The debugger's layer toggles apply, as they do to
-    /// that picture. Nothing runs: the framebuffer, and everything a
-    /// savestate or the state hash reads, stay as they were.
+    /// The frame is drawn again as a repaint draws it
+    /// ([`Self::rerender_current_frame`]), each line from the line table
+    /// where it holds the line and from the state as it is now otherwise,
+    /// with a trace that notes what the renderer read for each pixel: the
+    /// planes describe the picture that redraw draws, and `matches_picture`
+    /// says it is the framebuffer's byte for byte. The debugger's layer
+    /// toggles apply, as they do to that picture. Nothing runs: the
+    /// framebuffer, and everything a savestate or the state hash reads,
+    /// stay as they were.
     pub fn pixel_sources(&mut self, planes: u32) -> PixelSources {
         let width = self.display_width() as usize;
         let height = self.drawn_height() as usize;
@@ -548,29 +561,7 @@ impl Vdp {
     /// state hash reads, stay as they were.
     pub fn line_sprites(&mut self) -> LineSprites {
         let height = self.drawn_height() as usize;
-        let kept = DrawState::keep(self);
-        let mut trace = LineTrace::new();
-        let mut lines = vec![LineEvaluation::default(); height];
-        let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
-            let evaluation = &mut lines[usize::from(line)];
-            if vdp.row_is_drawn(row) {
-                vdp.render_sprite_line(line, &mut *trace);
-                let width = vdp.display_width() as i32;
-                evaluation.flags = trace.flags;
-                evaluation.entries = trace.entries(width).collect();
-            } else {
-                // The display was off: the renderer evaluated no sprite.
-                let carried = vdp.sprite_mask_overflow;
-                evaluation.flags = if carried {
-                    line_flags::MASK_CARRIED_IN
-                } else {
-                    0
-                };
-                evaluation.entries.clear();
-            }
-        });
-        kept.restore(self);
-
+        let (lines, from_line_states) = self.evaluate_sprite_lines();
         let entries = lines.iter().map(|line| line.entries.len()).sum();
         let mut sprites = LineSprites {
             frame: self.frame_being_drawn,
@@ -598,6 +589,76 @@ impl Vdp {
             }
         }
         sprites
+    }
+
+    /// The sprites the held frame drew, back to front
+    /// ([`retro_core::video::VideoDebugger::resolved_sprite_render_order`]):
+    /// each sprite of which a line of [`Self::line_sprites`] drew a visible
+    /// column (drawn whole, or in part with columns on screen), once, with
+    /// the priority bit the line that drew it first read. A line drawn with
+    /// the display off draws no sprite. The renderer draws a sprite taken
+    /// earlier from a line's sprite list in front of one taken later, so
+    /// the list's last sprite comes first: the order is by where the
+    /// sprite list of the line that drew a sprite first holds it, last to
+    /// first. Two sprites at the same place of the lists of different
+    /// lines (the frame parsed a new list part of the way down) never share
+    /// a line, and keep the order of their slots. A frame that drew no
+    /// sprite gives an empty list. Nothing runs, as for
+    /// [`Self::line_sprites`].
+    pub(super) fn sprite_render_order(&mut self) -> Vec<SpriteOrderEntry> {
+        let (lines, _) = self.evaluate_sprite_lines();
+        let mut first_drawn: [Option<(u8, bool)>; SPRITE_TABLE_SLOTS] = [None; SPRITE_TABLE_SLOTS];
+        for entry in lines.iter().flat_map(|line| &line.entries) {
+            if entry.drawn > 0 {
+                first_drawn[usize::from(entry.sprite.slot)]
+                    .get_or_insert((entry.sprite.position, entry.sprite.priority));
+            }
+        }
+        let mut order: Vec<(usize, u8, bool)> = first_drawn
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, drawn)| {
+                drawn.map(|(position, priority)| (slot, position, priority))
+            })
+            .collect();
+        order.sort_by_key(|&(_, position, _)| std::cmp::Reverse(position));
+        order
+            .into_iter()
+            .map(|(slot, _, priority)| SpriteOrderEntry {
+                index: slot as u32,
+                priority: u32::from(priority),
+            })
+            .collect()
+    }
+
+    /// Every line of the picture's sprite evaluation run again, as
+    /// [`Self::line_sprites`] describes, and whether each line was run from
+    /// the line table. What drawing changes is kept and put back.
+    fn evaluate_sprite_lines(&mut self) -> (Vec<LineEvaluation>, bool) {
+        let height = self.drawn_height() as usize;
+        let kept = DrawState::keep(self);
+        let mut trace = LineTrace::new();
+        let mut lines = vec![LineEvaluation::default(); height];
+        let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
+            let evaluation = &mut lines[usize::from(line)];
+            if vdp.row_is_drawn(row) {
+                vdp.render_sprite_line(line, &mut *trace);
+                let width = vdp.display_width() as i32;
+                evaluation.flags = trace.flags;
+                evaluation.entries = trace.entries(width).collect();
+            } else {
+                // The display was off: the renderer evaluated no sprite.
+                let carried = vdp.sprite_mask_overflow;
+                evaluation.flags = if carried {
+                    line_flags::MASK_CARRIED_IN
+                } else {
+                    0
+                };
+                evaluation.entries.clear();
+            }
+        });
+        kept.restore(self);
+        (lines, from_line_states)
     }
 
     /// The sprites of the chosen slots drawn alone, as the held frame drew
@@ -718,12 +779,12 @@ mod tests {
         };
         let mut trace = LineTrace::new();
         trace.begin_sprites(false);
-        trace.met_sprite(1, &sprite(-8, 2), false); // half on screen
-        trace.met_sprite(2, &sprite(400, 1), false); // off the right edge
-        trace.met_sprite(3, &sprite(10, 1), true); // masked
-        trace.met_sprite(4, &sprite(300, 4), false); // the dots run out in it
+        trace.met_sprite(1, 0, &sprite(-8, 2), false); // half on screen
+        trace.met_sprite(2, 1, &sprite(400, 1), false); // off the right edge
+        trace.met_sprite(3, 2, &sprite(10, 1), true); // masked
+        trace.met_sprite(4, 3, &sprite(300, 4), false); // the dots run out in it
         trace.dots_ran_out(Some(316));
-        trace.left_out(5, &sprite(0, 1), SpriteFate::LeftOut);
+        trace.left_out(5, 4, &sprite(0, 1), SpriteFate::LeftOut);
         let entries: Vec<(u8, SpriteFate, u8)> = trace
             .entries(320)
             .map(|entry| (entry.sprite.slot, entry.fate, entry.drawn))

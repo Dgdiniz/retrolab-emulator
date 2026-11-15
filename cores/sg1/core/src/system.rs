@@ -842,11 +842,17 @@ impl GenesisEmulator {
             .unwrap_or(0)
     }
 
-    /// The number of the frame the picture is: the frames finished, plus
-    /// one while a frame is held part of the way through (it is counted
-    /// once it ends).
+    /// The number of the frame whose picture the host's framebuffer shows:
+    /// the frames finished, plus one while a frame is held at its capture
+    /// boundary or at an event breakpoint past it (on the boundary's line or
+    /// a later one), where the framebuffer holds the held frame's finished
+    /// picture (it is counted once it ends). A frame held before its
+    /// boundary is numbered by the frames finished: the framebuffer shows
+    /// its lines drawn so far over the frame before's.
     fn picture_frame(&self) -> u64 {
-        self.frame_count + u64::from(self.held_frame.is_some())
+        let boundary = u32::from(self.bus.vdp().first_vblank_line());
+        let finished = self.held_frame.is_some_and(|held| held.line >= boundary);
+        self.frame_count + u64::from(finished)
     }
 
     /// [`CaptureCore::run_to_capture_boundary`] on the frame loop
@@ -5064,23 +5070,27 @@ impl EmulatorCore for GenesisEmulator {
 /// `vdp::writes`); the pixel sources, the line sprites and the chosen
 /// sprites are worked out on demand from the line table (`vdp::sources`).
 ///
-/// The rules this core keeps where the contract leaves them to the core:
+/// How this core keeps the contract:
 ///
-/// - A frame is numbered by the frames finished, plus one while a frame is
-///   held part of the way through, wherever it is held (at the capture
-///   boundary or at an event breakpoint); the pixel sources and the line
-///   sprites carry that number.
-/// - A save finishes a held frame on the loop a player runs, whatever the
-///   debugger is doing, so no breakpoint stops it;
+/// - A frame is held at its capture boundary by the capture call, or at an
+///   event breakpoint, at the line it fires on; the snapshot, the pixel
+///   sources and the line sprites number the frames finished, plus one
+///   while the frame is held on the boundary's line or past it, where the
+///   framebuffer shows its finished picture.
+/// - A save finishes any held frame on the loop a player runs, whatever
+///   the debugger is doing, so no breakpoint stops it;
 ///   [`EmulatorCore::save_state`] returns no bytes while a frame is held.
-/// - The repaint draws each line the line table holds from it and every
-///   other line from the state as it stands, and says whether every line
-///   had its record; the picture from the line states answers whenever the
-///   table is kept, drawing the lines it does not hold the same way.
+/// - The repaint, a layer, the pixel sources and the line sprites draw each
+///   line the line table holds from its record (the lines below a stop part
+///   of the way down from the frame before's) and every other line from the
+///   state as it stands, and say whether every line had its record; the
+///   picture from the line states answers only while the table holds the
+///   frame from its first line to its finished picture.
 /// - A debugger edit of video memory is not journaled: a line drawn again
 ///   reads it wherever the frame did not write over it later, and an edit
 ///   of a colour, a vertical scroll word or the sprite table is patched into
-///   every recorded line, so the table's `memory_exact` stays as it was.
+///   every recorded line, so the edit shows; the table's `memory_exact` is
+///   false until the next picture's first line.
 /// - The pixel sources, the line sprites and the chosen sprites are `None`
 ///   while no cartridge is loaded.
 impl CaptureCore for GenesisEmulator {
@@ -5169,8 +5179,10 @@ impl CaptureCore for GenesisEmulator {
         self.bus.vdp_mut().picture_from_line_states()
     }
 
+    /// The table [`crate::vdp::Vdp::line_state_table`] gives: one row for
+    /// each visible line, from line 0, the picture's first row.
     fn line_states(&self) -> Option<LineStateTable> {
-        VideoDebugger::get_line_states(self.bus.vdp())
+        self.bus.vdp().line_state_table()
     }
 
     fn line_palettes(&self) -> Option<LinePalettes> {

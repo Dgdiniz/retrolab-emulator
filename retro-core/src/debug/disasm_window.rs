@@ -12,7 +12,7 @@
 //! branch) from surfacing above the new PC.
 //!
 //! SG1 (68K + Z80) and SNES1 (65816 + SPC700) share this one algorithm.
-//! The function returns [`retro_core::types::DisasmRow`] directly, so
+//! The function returns [`crate::types::DisasmRow`] directly, so
 //! cores don't have to marshal between an intermediate representation.
 
 use crate::types::{DisasmRow, DisasmRowKind};

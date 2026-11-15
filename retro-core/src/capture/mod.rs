@@ -30,6 +30,9 @@ mod pixels;
 mod sprites;
 mod writes;
 
+#[cfg(feature = "capture-conformance")]
+pub mod conformance;
+
 pub use frame::{FrameSnapshot, RenderedLayer};
 pub use lines::{distinct_palettes, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE};
 pub use pixels::{drawn_by, layer, planes, tile_value, NoTrace, PixelSources, PixelTrace, NO_CELL};
@@ -91,8 +94,9 @@ pub fn arm_recorder<T>(slot: &mut Option<T>, wanted: bool, make: impl FnOnce() -
 ///
 /// None of it advances emulation unless it says so, and none of it moves
 /// anything a savestate or the state hash reads: a frame drawn again puts
-/// back what drawing it changed. Where the cores differ today the method
-/// says so; that rule is each core's own until one rule is chosen.
+/// back what drawing it changed. Each method's doc is the contract every
+/// core keeps; what a core puts in the shapes (its layer codes, its
+/// columns, its units) its own docs give.
 pub trait CaptureCore: EmulatorCore {
     /// The console's part of a frame snapshot.
     type SnapshotConsole;
@@ -122,17 +126,13 @@ pub trait CaptureCore: EmulatorCore {
     /// Whether the core is held at a capture boundary.
     fn at_capture_boundary(&self) -> bool;
 
-    /// A savestate taken where a frame ends: a frame held part of the way
-    /// through is finished first, so a host's save never holds half a frame.
-    /// A host saves through this: [`EmulatorCore::save_state`] takes `&self`
-    /// and cannot finish a frame.
-    ///
-    /// How the rest of the frame runs is each core's own today. The Mega
-    /// Drive core finishes any held frame on the loop a player runs, so no
-    /// breakpoint stops it, and its `save_state` returns no bytes while a
-    /// frame is held. The SNES core finishes a frame held at the capture
-    /// boundary on the loop the debugger's state picks, so a breakpoint in
-    /// the rest of the frame stops it and the save is taken where it stopped.
+    /// A savestate taken where a frame ends: a frame held at its capture
+    /// boundary is finished first, on the frame loop no breakpoint can stop
+    /// (the loop a player runs), and then saved, so a save taken at the
+    /// boundary never holds part of a frame and a breakpoint set in the rest
+    /// of the frame changes nothing: the saved machine is the one a twin
+    /// that ran the same frames whole holds. A host saves through this:
+    /// [`EmulatorCore::save_state`] takes `&self` and cannot finish a frame.
     fn save_state_at_frame_end(&mut self) -> Vec<u8>;
 
     /// Copies of the picture the host shows and of the video memory, the
@@ -141,25 +141,22 @@ pub trait CaptureCore: EmulatorCore {
     /// the memory may already hold what the game wrote for the next frame,
     /// which [`FrameSnapshot::at_boundary`] tells the host.
     ///
-    /// [`FrameSnapshot::frame`] numbers the picture: the frames finished,
-    /// plus one while the frame is held at its capture boundary, so a
+    /// [`FrameSnapshot::frame`] numbers the frame whose picture the host's
+    /// framebuffer shows: the frames finished, plus one while the frame is
+    /// held at its capture boundary or stopped past it before its end, where
+    /// the framebuffer shows the held frame's finished picture. So a
     /// snapshot taken there and one taken after the same frame ran whole
-    /// carry the same number. A frame held elsewhere (stopped by an event
-    /// breakpoint) is numbered by each core's own rule today: the Mega
-    /// Drive core adds one for any held frame, the SNES core only at the
-    /// capture boundary.
+    /// carry the same number. A frame stopped before its boundary (an event
+    /// breakpoint part of the way down) is numbered by the frames finished:
+    /// the framebuffer shows the lines drawn so far over the frame before.
     fn capture_frame_snapshot(&self) -> FrameSnapshot<Self::SnapshotConsole>;
 
     /// Draw the held frame again into the framebuffer the host shows, with
     /// the debugger's layer mask, from the line table where it holds the
     /// frame, without advancing emulation: after a host toggles a layer or
     /// edits video memory while paused, the change shows at once. Returns
-    /// whether every line was drawn from the line table.
-    ///
-    /// What that answer covers is each core's own today: the Mega Drive core
-    /// draws each line the table holds from it and any other from the state
-    /// as it stands, line by line; the SNES core draws from the table only
-    /// when it holds the whole frame.
+    /// whether every line was drawn from the line table, as
+    /// [`RenderedLayer::from_line_states`] says of a layer.
     fn repaint_held_frame(&mut self) -> bool;
 
     /// One layer of the held frame drawn alone, alpha-keyed: `layer` is an id
@@ -171,23 +168,28 @@ pub trait CaptureCore: EmulatorCore {
     fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer>;
 
     /// The picture drawn again from the line table into a buffer of its own,
-    /// cut as the picture the host shows is.
-    ///
-    /// When it answers is each core's own today: the Mega Drive core answers
-    /// whenever the line table is kept, drawing the lines it does not hold
-    /// from the state as it stands; the SNES core answers only when the
-    /// table holds a whole frame, from its first line to its finished
-    /// picture.
+    /// cut as the picture the host shows is: only while the table holds the
+    /// frame from its first line to its finished picture
+    /// ([`LineStateTable::from_first_line`] and [`LineStateTable::complete`]),
+    /// `None` otherwise. Where its memory is exact
+    /// ([`LineStateTable::memory_exact`]) it is the frame's own picture,
+    /// byte for byte. [`Self::render_layer`], [`Self::pixel_sources`] and
+    /// [`Self::line_sprites`] answer for a table that holds less, and say
+    /// whether every line was drawn from it.
     fn picture_from_line_states(&mut self) -> Option<PixelImage>;
 
     /// The settings each line of the frame was drawn with, while the line
     /// table is kept ([`LineStateTable`]): one column per setting, in the
-    /// core's own names, one row per line.
+    /// core's own names, one row per line. A setting kept per layer or per
+    /// index gives a column per element, named `name[index]`
+    /// ([`TableColumns`]). Lines keep the console's own numbering:
+    /// [`LineStateTable::first_row_line`] is the line drawn into the
+    /// picture's first row. This is the one way to read the table.
     ///
-    /// After a debugger edit of video memory,
-    /// [`LineStateTable::memory_exact`] follows each core's own rule today:
-    /// the Mega Drive core keeps it, the edit patched into every recorded
-    /// line; the SNES core clears it.
+    /// A debugger write into video memory (its tiles and maps, the palette,
+    /// the scroll or sprite memory) since the table's frame began makes
+    /// [`LineStateTable::memory_exact`] false until the next frame's first
+    /// line; a frame drawn again still shows the edit.
     fn line_states(&self) -> Option<LineStateTable>;
 
     /// The palettes the lines of the line table were drawn with
@@ -198,11 +200,13 @@ pub trait CaptureCore: EmulatorCore {
     /// asks for (bits of [`planes`]; other bits are ignored); `None` while no
     /// game is loaded. The frame is drawn again with a trace, from the line
     /// table where it holds the frame; [`PixelSources::matches_picture`]
-    /// says whether that picture is the one the host holds.
+    /// says whether that picture is the one the host holds, and
+    /// [`PixelSources::frame`] numbers it as a snapshot does.
     fn pixel_sources(&mut self, planes: u32) -> Option<PixelSources>;
 
     /// The sprites each line of the held frame met and what became of each
-    /// ([`LineSprites`]); `None` while no game is loaded.
+    /// ([`LineSprites`], numbered as a snapshot is); `None` while no game is
+    /// loaded.
     fn line_sprites(&mut self) -> Option<LineSprites>;
 
     /// The chosen sprites of the held frame drawn alone, as the frame drew

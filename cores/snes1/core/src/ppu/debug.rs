@@ -20,9 +20,8 @@
 //! and keep the renderer's caches of VRAM in step.
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, LineStateTable, PaletteData, PixelImage, SpriteData,
-    SpriteOrderEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
-    VideoRegister,
+    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
+    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
 };
 
 use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
@@ -663,7 +662,7 @@ impl VideoDebugger for Ppu {
     /// line table holds the frame (see [`Ppu::line_sprites`], which also
     /// gives each line's own order and what it dropped); otherwise the
     /// visible lines are read with the registers and OAM as they stand.
-    fn resolved_sprite_render_order(&self) -> Vec<SpriteOrderEntry> {
+    fn resolved_sprite_render_order(&mut self) -> Vec<SpriteOrderEntry> {
         self.sprite_render_order()
     }
 
@@ -862,18 +861,6 @@ impl VideoDebugger for Ppu {
             height,
             rgba,
         })
-    }
-
-    /// The line table, when the host asked for it
-    /// ([`retro_core::capture::CaptureRecording`]): `line` (the scanline, 1
-    /// for the first drawn) then every setting of [`crate::ppu::LineState`],
-    /// in its own names, one row per line drawn. A setting kept per
-    /// background or per layer gives a column per element
-    /// (`bg_hoffset[0]`), a window selection a column per flag
-    /// (`window_enable[2].w1_enable`). `None` when no table is kept or no
-    /// line was drawn since it was started.
-    fn get_line_states(&self) -> Option<LineStateTable> {
-        self.line_state_table()
     }
 
     /// Decode a run of tiles to a vertically stacked *indexed* sheet

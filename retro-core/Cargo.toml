@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "Common traits and types for retro console emulators"
 
+[features]
+# The capture conformance suite (`capture::conformance`), which each core's
+# tests run against its own emulator.
+capture-conformance = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

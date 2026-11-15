@@ -1672,7 +1672,7 @@ impl Vdp {
                 }
                 if T::ON {
                     let slot = self.sprite_cache.slot_at(idx);
-                    trace.notes().met_sprite(slot, sprite, masked);
+                    trace.notes().met_sprite(slot, idx as u8, sprite, masked);
                 }
 
                 if pixel_count >= max_sprite_pixels {
@@ -1710,7 +1710,7 @@ impl Vdp {
                     let (_, y1, _, y2) = sprite.bounds();
                     if scanline >= y1 && scanline < y2 {
                         let slot = self.sprite_cache.slot_at(idx);
-                        trace.notes().left_out(slot, sprite, fate);
+                        trace.notes().left_out(slot, idx as u8, sprite, fate);
                     }
                 }
             }
@@ -4190,7 +4190,7 @@ impl Vdp {
     /// one past the table (80 sprites in H40, 64 in H32). Sprite 0 is always
     /// in the chain.
     pub fn get_sprite_count_debug(&self) -> usize {
-        retro_core::video::VideoDebugger::resolved_sprite_render_order(self).len()
+        sprites::link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).count()
     }
 
     /// Get VRAM for debugging (read-only access).
