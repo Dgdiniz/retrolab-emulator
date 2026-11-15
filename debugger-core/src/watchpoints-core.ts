@@ -80,9 +80,53 @@ export interface EventParamOption {
   label: string
 }
 
+/**
+ * What an event is, in words every console shares (the serde snake_case
+ * `kind` of each `getAvailableEvents()` entry). A host finds an event by
+ * its kind; a breakpoint stores the console's own `code`, which never
+ * changes.
+ */
+export type EventKind =
+  | 'vertical_blank'
+  | 'vertical_blank_interrupt'
+  | 'raster_interrupt'
+  | 'line'
+  | 'transfer_start'
+  | 'transfer_done'
+  | 'line_transfer_set_up'
+  | 'palette_write'
+  | 'tile_write'
+  | 'sprite_table_write'
+  | 'video_register_write'
+  | 'audio_port_write'
+  | 'audio_register_write'
+
+/** Every {@link EventKind}, in the order the cores declare them. */
+export const EVENT_KINDS: readonly EventKind[] = [
+  'vertical_blank',
+  'vertical_blank_interrupt',
+  'raster_interrupt',
+  'line',
+  'transfer_start',
+  'transfer_done',
+  'line_transfer_set_up',
+  'palette_write',
+  'tile_write',
+  'sprite_table_write',
+  'video_register_write',
+  'audio_port_write',
+  'audio_register_write',
+]
+
 /** One event class a core can break on (from `getAvailableEvents`). */
 export interface EventClass {
   code: number
+  /**
+   * What the event is, or `null` when the core names no kind for it: a
+   * build whose catalogue predates kinds, or a kind this version does not
+   * know.
+   */
+  kind: EventKind | null
   label: string
   description: string | null
   /** Label for what `param` selects, or `null` for a param-less event. */
@@ -285,6 +329,24 @@ export function isDefaultMatchSpec(spec: MatchSpec): boolean {
 }
 
 /**
+ * Why an event breakpoint given a value test or a condition never fires.
+ * An event comes with no value read or written and no CPU state to
+ * evaluate a condition against, so the core takes either as never
+ * matching. Hit-skip, the action and one-shot apply to an event as to any
+ * breakpoint; a range end is ignored.
+ */
+export const EVENT_CONDITIONS_NOTE =
+  'An event breakpoint checks no value or condition: with either set, it never fires.'
+
+/**
+ * {@link EVENT_CONDITIONS_NOTE} when `spec` gives an event breakpoint a
+ * value test or a condition, else `null`. A blank condition is none.
+ */
+export function eventConditionsNote(spec: MatchSpec): string | null {
+  return spec.value !== null || toExpr(spec.expr) !== null ? EVENT_CONDITIONS_NOTE : null
+}
+
+/**
  * Compact one-line summary of the active conditions, joined by a middle
  * dot (U+00B7), e.g. `..0xFF000F`, `=0x42 & 0xF0`, `skip 3`, `log`, `once`.
  * Returns `""` for a bare spec so callers can render nothing.
@@ -398,10 +460,16 @@ function parseParamOptions(raw: unknown): EventParamOption[] {
   return out
 }
 
+/** A raw `kind` as an {@link EventKind}, or `null` for one this version does not know. */
+function toEventKind(v: unknown): EventKind | null {
+  return typeof v === 'string' && (EVENT_KINDS as readonly string[]).includes(v) ? (v as EventKind) : null
+}
+
 /**
  * Normalize a raw `getAvailableEvents()` payload into typed
  * {@link EventClass} rows. Items without a numeric `code` are dropped;
- * missing labels/descriptions/param metadata get sensible defaults.
+ * missing labels/descriptions/param metadata get sensible defaults, and a
+ * missing or unknown `kind` reads `null`.
  */
 export function parseEventCatalog(raw: unknown): EventClass[] {
   if (!Array.isArray(raw)) return []
@@ -418,6 +486,7 @@ export function parseEventCatalog(raw: unknown): EventClass[] {
           : null
     out.push({
       code,
+      kind: toEventKind(item.kind),
       label: typeof item.label === 'string' ? item.label : `Event ${code}`,
       description: typeof item.description === 'string' ? item.description : null,
       paramLabel,
@@ -425,6 +494,15 @@ export function parseEventCatalog(raw: unknown): EventClass[] {
     })
   }
   return out
+}
+
+/**
+ * The code of the catalogue's event of `kind`, the number an event
+ * breakpoint on it stores, or `null` when the console raises no such event.
+ */
+export function eventCodeForKind(catalog: readonly EventClass[], kind: EventKind): number | null {
+  const event = catalog.find((e) => e.kind === kind)
+  return event ? event.code : null
 }
 
 /** `true` when `param` is the any-param wildcard. */

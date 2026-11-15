@@ -1,99 +1,312 @@
 //! SNES debugger.
 //!
-//! [`SnesDebugger`] is the `EmulatorCore`-facing implementation of
-//! [`retro_core::debugger::DebuggerCore`]. It multiplexes breakpoints,
-//! code coverage, and instruction tracing across the two CPUs (65C816
-//! main + SPC700 audio) and caches a register snapshot of each for the
-//! debugger UI. A cartridge with a CPU of its own (the SA-1's second
-//! 65816, the Super FX's GSU, the Cx4) adds a third slot: its register
-//! snapshot and, for the GSU and the Cx4, a trace ring.
+//! [`SnesDebugger`] is retro-core's [`DebuggerState`] with the SNES's three
+//! CPU slots: the 65C816 ([`MAIN_CPU`]), the SPC700 ([`SOUND_CPU`]) and the
+//! cartridge's own CPU ([`CARTRIDGE_CPU`]: the SA-1's second 65816, the
+//! Super FX's GSU or the Cx4) when the cartridge has one; and
+//! [`SnesDebugConsole`], the console's own part: its event catalogue and
+//! its memory regions. The breakpoints, the coverage, the trace rings, the
+//! 65C816's instruction history and call stack and the cached CPU states
+//! all live in the shared state; the emulator records into it and checks
+//! it from its frame loops (`system.rs`).
 //!
-//! The headline feature wired here is the **65C816 instruction trace**:
-//! per instruction the emulator captures a compact [`TraceEntryBinary65816`]
+//! What stays here is what the SNES makes different: the event codes users
+//! store ([`snes_events`], [`SnesEvent`]), each CPU's trace entry and the
+//! register snapshots of each CPU (`cpu_state_*`).
+//!
+//! The headline feature is the **65C816 instruction trace**: per
+//! instruction the emulator captures a compact [`TraceEntryBinary65816`]
 //! (registers + raster position + instruction bytes + resolved effective
-//! address) into a [`TracingState`] buffer. The host drains the buffer and
+//! address) into the 65C816's trace ring. The host drains the ring and
 //! renders each entry to text with
 //! [`crate::trace_format::format_trace_line_65816`], reproducing the
-//! bsnes-plus trace format byte-for-byte so the two can be diffed.
+//! bsnes-plus trace format byte for byte so the two can be diffed.
 //!
-//! The SPC700 side has the same shape: coverage, a register snapshot, and
-//! a tracing buffer of [`TraceEntryBinarySpc700`] records rendered by
-//! [`crate::trace_format::format_trace_line_spc700`]. Because the SPC700
-//! runs via lazy catch-up (not instruction-stepped in the 65C816 hot
-//! loop), its entries are captured inside `Apu::catch_up_to` and bridged
-//! into [`SnesDebugger`] by the emulator each frame.
-//!
-//! The 65C816 additionally maintains a **call stack** (JSR/JSL/BRK/COP push,
-//! RTS/RTL/RTI pop) and a ring buffer of **instruction history**, both
-//! surfaced through the [`DebuggerCore`] trait.
+//! The SPC700 has the same shape: a ring of [`TraceEntryBinarySpc700`]
+//! records rendered by [`crate::trace_format::format_trace_line_spc700`].
+//! Because the SPC700 runs via lazy catch-up (not instruction-stepped in
+//! the 65C816 loop), its entries are captured inside the APU's catch-up and
+//! moved into the debugger by the emulator; the Super FX's and the Cx4's
+//! entries come out of their chips the same way.
 
-use std::collections::VecDeque;
-
-use retro_core::audio::AudioDebugger;
 use retro_core::debug::{
-    select_tier, BreakpointList, CoverageBitmap, ExecutionTier, TierSelectorInputs, TracingState,
+    BreakpointChecks, ConsoleDebug, CpuDebugSpec, DebugEvent, DebuggerState, EventParam, EventSpec,
+    TraceEntry,
 };
-use retro_core::debugger::DebuggerCore;
 use retro_core::types::{
-    AccessFlags, Breakpoint, BreakpointId, BreakpointInfo, CpuArchitecture, CpuInfo, CpuState,
-    EventClass, EventParamOption, ExecutionMode, Instruction, InstructionTrace, MatchSpec,
-    MemoryRegion, MemoryRegionInfo, RegisterValue, StackFrame, SystemInfo,
+    CpuArchitecture, CpuState, EventKind, MemoryRegion, MemoryRegionInfo, RegisterValue, SystemInfo,
 };
-use retro_core::video::VideoDebugger;
 use spc700::Spc700;
 #[cfg(feature = "chip-superfx")]
 use superfx_gsu::Gsu;
 
 #[cfg(feature = "chip-cx4")]
 use crate::cartridge::cx4::hg51b::Hg51b;
+use crate::ppu::PpuDebugEvent;
 use wdc65816::Wdc65816;
 
-/// Serialized size of one [`TraceEntryBinary65816`] (44 bytes).
-///
-/// Layout (all little-endian): `master_cycle(8) pbr_pc(4) a(2) x(2) y(2)
-/// s(2) d(2) vcounter(2) hdot(2) framecounter(4) eff_addr(4) dbr(1) p(1)
-/// e(1) eff_present(1) bytes_len(1) cycles(1) bytes(4)`.
-pub const TRACE_ENTRY_SIZE_65816: usize = 44;
+/// The 65C816, the 5A22's CPU.
+pub const MAIN_CPU: usize = 0;
 
-/// Serialized size of one [`TraceEntryBinarySpc700`] (24 bytes).
-///
-/// Layout (all little-endian): `master_cycle(8) pc(2) a(1) x(1) y(1)
-/// sp(1) psw(1) bytes_len(1) bytes(3)` followed by 5 reserved bytes.
-pub const TRACE_ENTRY_SIZE_SPC700: usize = 24;
+/// The SPC700, the sound CPU.
+pub const SOUND_CPU: usize = 1;
 
-/// Serialized size of one [`TraceEntryBinaryGsu`] (52 bytes).
-///
-/// Layout (all little-endian): `master_cycle(8) pbr_pc(4) sfr(2) rombr(1)
-/// rambr(1) bytes_len(1) bytes(3) r[16](32)`.
-pub const TRACE_ENTRY_SIZE_GSU: usize = 52;
+/// The cartridge's own CPU, when it has one: the SA-1's second 65816, the
+/// Super FX's GSU or the Cx4.
+pub const CARTRIDGE_CPU: usize = 2;
 
-/// Serialized size of one [`TraceEntryBinaryCx4`] (93 bytes).
-///
-/// Layout (all little-endian): `cycles(8) pc(4) opcode(2) p(2) flags(1)
-/// a(4) acch(4) accl(4) gpr[16](64)`.
-pub const TRACE_ENTRY_SIZE_CX4: usize = 93;
+/// The 65C816's slot: coverage over its 24-bit space, a trace, an
+/// instruction history and a call stack, and every breakpoint check.
+const MAIN_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
+    coverage_size: 0x0100_0000,
+    address_mask: 0x00FF_FFFF,
+    trace_entry_size: <TraceEntryBinary65816 as TraceEntry>::SIZE,
+    history: true,
+    checks: BreakpointChecks::ALL,
+};
 
-/// 24-bit address-space size for the 65C816 coverage bitmap (16 MiB).
-const COVERAGE_SIZE_65816: u32 = 0x0100_0000;
-/// 16-bit address-space size for the SPC700 coverage bitmap (64 KiB).
-const COVERAGE_SIZE_SPC700: u32 = 0x0001_0000;
+/// The SPC700's slot: coverage over its 16-bit space and a trace. Its
+/// breakpoints are not checked: it runs inside the APU's catch-up, between
+/// two of the 65C816's instructions, where no loop of the emulator stops.
+const SOUND_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
+    coverage_size: 0x0001_0000,
+    address_mask: 0xFFFF,
+    trace_entry_size: <TraceEntryBinarySpc700 as TraceEntry>::SIZE,
+    history: false,
+    checks: BreakpointChecks::NONE,
+};
 
-/// Cap on retained 65C816 instruction-history records (ring buffer).
-const MAX_INSTRUCTION_HISTORY_65816: usize = 1024;
-/// Cap on tracked 65C816 call-stack depth (prevents runaway growth when a
-/// program's pushes and pops are unbalanced, e.g. manual stack juggling).
-const MAX_CALL_STACK_DEPTH_65816: usize = 256;
+/// The slot of the cartridge's own CPU, by the architecture it reports: the
+/// Super FX's GSU and the Cx4 keep a trace, the SA-1's second 65816 does
+/// not, and a cartridge with no CPU of its own (`None`) leaves the slot
+/// empty. None keeps coverage or a history, and none has its breakpoints
+/// checked: each runs inside its chip's catch-up.
+pub fn cartridge_cpu_spec(architecture: Option<CpuArchitecture>) -> CpuDebugSpec {
+    let trace_entry_size = match architecture {
+        Some(CpuArchitecture::SuperFx) => <TraceEntryBinaryGsu as TraceEntry>::SIZE,
+        Some(CpuArchitecture::Hg51b) => <TraceEntryBinaryCx4 as TraceEntry>::SIZE,
+        _ => return CpuDebugSpec::NO_CPU,
+    };
+    CpuDebugSpec {
+        trace_entry_size,
+        ..CpuDebugSpec::NO_CPU
+    }
+}
+
+/// The SNES's debugger: the shared state over the console's three CPU
+/// slots and its own part.
+pub type SnesDebugger = DebuggerState<3, SnesDebugConsole>;
+
+/// The debugger of an SNES described by `system_info`: no cartridge CPU yet
+/// (slot 2 empty until a cartridge brings one), running, and the CPU states
+/// it reports those of a 65C816 and an SPC700 just made.
+pub fn snes_debugger(system_info: SystemInfo) -> SnesDebugger {
+    let mut debugger = DebuggerState::new(
+        [MAIN_CPU_SPEC, SOUND_CPU_SPEC, CpuDebugSpec::NO_CPU],
+        system_info,
+        SnesDebugConsole::default(),
+    );
+    debugger.set_cpu_states(vec![
+        cpu_state_65816(&Wdc65816::new()),
+        cpu_state_spc700(&Spc700::new()),
+    ]);
+    debugger
+}
+
+/// The SNES's own part of its debugger: the event catalogue, and the sizes
+/// of the loaded ROM and of its save RAM, which the memory regions report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnesDebugConsole {
+    rom_size: u32,
+    sram_size: u32,
+}
+
+impl SnesDebugConsole {
+    /// Record the loaded ROM's size and its save RAM's, in bytes.
+    pub fn set_memory_sizes(&mut self, rom_size: u32, sram_size: u32) {
+        self.rom_size = rom_size;
+        self.sram_size = sram_size;
+    }
+}
+
+impl ConsoleDebug for SnesDebugConsole {
+    /// The SNES's events, in the order a host lists them. Five carry no
+    /// param (VBlank, NMI, IRQ, DMA start, HDMA start); the APU ports and the
+    /// ports a DMA fills are offered as choices, the rest as numbers.
+    const EVENTS: &'static [EventSpec] = &[
+        EventSpec {
+            code: snes_events::VBLANK,
+            kind: EventKind::VerticalBlank,
+            label: "VBlank",
+            description: "Entering vertical blank",
+            param: EventParam::None,
+        },
+        EventSpec {
+            code: snes_events::NMI,
+            kind: EventKind::VerticalBlankInterrupt,
+            label: "NMI",
+            description: "V-blank NMI delivered to the 65C816",
+            param: EventParam::None,
+        },
+        EventSpec {
+            code: snes_events::IRQ,
+            kind: EventKind::RasterInterrupt,
+            label: "IRQ",
+            description: "H/V-timer IRQ raised",
+            param: EventParam::None,
+        },
+        EventSpec {
+            code: snes_events::DMA_START,
+            kind: EventKind::TransferStart,
+            label: "DMA start",
+            description: "General-purpose DMA block started ($420B)",
+            param: EventParam::None,
+        },
+        EventSpec {
+            code: snes_events::HDMA_START,
+            kind: EventKind::LineTransferSetUp,
+            label: "HDMA start",
+            description: "Top-of-frame HDMA initialisation",
+            param: EventParam::None,
+        },
+        EventSpec {
+            code: snes_events::SCANLINE,
+            kind: EventKind::Line,
+            label: "Scanline",
+            description: "A rendered scanline matched the V counter",
+            param: EventParam::Number {
+                label: "Scanline (V)",
+            },
+        },
+        EventSpec {
+            code: snes_events::PPU_REG_WRITE,
+            kind: EventKind::VideoRegisterWrite,
+            label: "PPU register write",
+            description: "Write to a PPU register ($2100-$213F)",
+            param: EventParam::Number {
+                label: "Register ($00-$3F)",
+            },
+        },
+        EventSpec {
+            code: snes_events::APU_PORT_WRITE,
+            kind: EventKind::AudioPortWrite,
+            label: "APU port write",
+            description: "65C816 write to an APU mailbox port ($2140-$2143)",
+            param: EventParam::Choice {
+                label: "Port",
+                options: &[(0, "Port 0"), (1, "Port 1"), (2, "Port 2"), (3, "Port 3")],
+            },
+        },
+        EventSpec {
+            code: snes_events::DSP_REG_WRITE,
+            kind: EventKind::AudioRegisterWrite,
+            label: "S-DSP register write",
+            description: "SPC700 write to an S-DSP register",
+            param: EventParam::Number {
+                label: "DSP register ($00-$7F)",
+            },
+        },
+        EventSpec {
+            code: snes_events::DMA_DONE,
+            kind: EventKind::TransferDone,
+            label: "DMA done",
+            description: "A general DMA channel finished its block, by the B-bus port it wrote",
+            param: EventParam::Choice {
+                label: "B-bus port",
+                options: &[
+                    (0x18, "VRAM ($2118)"),
+                    (0x22, "Palette ($2122)"),
+                    (0x04, "Sprite table ($2104)"),
+                    (0x80, "Work RAM ($2180)"),
+                ],
+            },
+        },
+        EventSpec {
+            code: snes_events::PALETTE_WRITE,
+            kind: EventKind::PaletteWrite,
+            label: "Palette write",
+            description: "A colour written into CGRAM by the processor, a DMA or an HDMA",
+            param: EventParam::Number {
+                label: "Colour (0-255)",
+            },
+        },
+        EventSpec {
+            code: snes_events::TILE_CHANGE,
+            kind: EventKind::TileWrite,
+            label: "Tile changed",
+            description: "A write into VRAM changed a tile's bytes (the same bytes written again do not count)",
+            param: EventParam::Number {
+                label: "Tile (4bpp, 0-2047)",
+            },
+        },
+    ];
+
+    fn memory_regions(&self) -> Vec<MemoryRegionInfo> {
+        vec![
+            MemoryRegionInfo {
+                region: MemoryRegion::MainRam,
+                name: "WRAM".to_string(),
+                start_address: 0x7E_0000,
+                size: 0x0002_0000,
+                writable: true,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::VideoRam,
+                name: "VRAM".to_string(),
+                start_address: 0,
+                size: 0x0001_0000,
+                writable: true,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::SpriteTable,
+                name: "OAM".to_string(),
+                start_address: 0,
+                size: 0x0220,
+                writable: true,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::PaletteRam,
+                name: "CGRAM".to_string(),
+                start_address: 0,
+                size: 0x0200,
+                writable: true,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::AudioRam,
+                name: "ARAM".to_string(),
+                start_address: 0,
+                size: 0x0001_0000,
+                writable: true,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::Rom,
+                name: "ROM".to_string(),
+                start_address: 0,
+                size: self.rom_size,
+                writable: false,
+            },
+            MemoryRegionInfo {
+                region: MemoryRegion::SaveRam,
+                name: "SRAM".to_string(),
+                start_address: 0,
+                size: self.sram_size,
+                writable: true,
+            },
+        ]
+    }
+}
 
 /// SNES event-breakpoint codes, carried in the `code` field of
 /// [`retro_core::types::BreakpointType::Event`].
 ///
-/// retro-core stays agnostic about these numbers, they are the SNES
-/// core's private taxonomy, paired with the matching
-/// [`SnesEvent`] constructor. The `param` field disambiguates within a
-/// class (a scanline, a register index, a port); paramless classes
+/// These numbers are the SNES core's own; users store them in their
+/// breakpoint files, so none is ever renumbered. Each is paired with the
+/// matching [`SnesEvent`] variant and, in the catalogue, with the
+/// [`EventKind`] every console shares. The `param` field disambiguates
+/// within a class (a scanline, a register index, a port); paramless classes
 /// (VBlank/NMI/IRQ/DMA/HDMA) report `param == 0`, so a breakpoint stored
-/// with `param == 0` or [`retro_core::types::BREAKPOINT_PARAM_ANY`]
-/// matches them.
+/// with `param == 0` or [`retro_core::types::BREAKPOINT_PARAM_ANY`] matches
+/// them.
 pub mod snes_events {
     /// Entering V-blank (the `VBlankStart` scheduler event).
     pub const VBLANK: u32 = 1;
@@ -134,12 +347,12 @@ pub mod snes_events {
 
 /// A SNES debug event that can be matched by an `Event` breakpoint.
 ///
-/// Each variant maps to a `(code, param)` pair via [`Self::to_code_param`],
-/// the same pair the host stores in
+/// Each variant names one of the [`snes_events`] codes; its
+/// [`DebugEvent::code_param`] is the `(code, param)` pair the host stores in
 /// [`retro_core::types::BreakpointType::Event`]. The hook sites in
-/// `system.rs` / `bus.rs` / `apu` construct the appropriate variant and
-/// call [`SnesDebugger::check_event`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `system.rs` / `bus.rs` / `apu` build the variant and check it against
+/// the breakpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SnesEvent {
     /// Entering V-blank.
     VBlank,
@@ -167,24 +380,33 @@ pub enum SnesEvent {
     TileChange(u16),
 }
 
-impl SnesEvent {
-    /// Resolve to the `(code, param)` pair used by
-    /// [`retro_core::types::BreakpointType::Event`]. Paramless events
-    /// report `param == 0`.
-    pub fn to_code_param(self) -> (u32, u32) {
+impl DebugEvent for SnesEvent {
+    /// The event's code and param; paramless events report `param == 0`.
+    fn code_param(self) -> (u32, u32) {
         match self {
             SnesEvent::VBlank => (snes_events::VBLANK, 0),
             SnesEvent::Nmi => (snes_events::NMI, 0),
             SnesEvent::Irq => (snes_events::IRQ, 0),
             SnesEvent::DmaStart => (snes_events::DMA_START, 0),
             SnesEvent::HdmaStart => (snes_events::HDMA_START, 0),
-            SnesEvent::Scanline(v) => (snes_events::SCANLINE, v as u32),
-            SnesEvent::PpuRegisterWrite(reg) => (snes_events::PPU_REG_WRITE, reg as u32),
-            SnesEvent::ApuPortWrite(port) => (snes_events::APU_PORT_WRITE, port as u32),
-            SnesEvent::DspRegisterWrite(reg) => (snes_events::DSP_REG_WRITE, reg as u32),
+            SnesEvent::Scanline(v) => (snes_events::SCANLINE, u32::from(v)),
+            SnesEvent::PpuRegisterWrite(reg) => (snes_events::PPU_REG_WRITE, u32::from(reg)),
+            SnesEvent::ApuPortWrite(port) => (snes_events::APU_PORT_WRITE, u32::from(port)),
+            SnesEvent::DspRegisterWrite(reg) => (snes_events::DSP_REG_WRITE, u32::from(reg)),
             SnesEvent::DmaDone(port) => (snes_events::DMA_DONE, u32::from(port)),
             SnesEvent::PaletteWrite(colour) => (snes_events::PALETTE_WRITE, u32::from(colour)),
             SnesEvent::TileChange(tile) => (snes_events::TILE_CHANGE, u32::from(tile)),
+        }
+    }
+}
+
+/// The PPU's events are the palette-write and tile-change events of
+/// [`SnesEvent`], with the same codes and params.
+impl DebugEvent for PpuDebugEvent {
+    fn code_param(self) -> (u32, u32) {
+        match self {
+            PpuDebugEvent::PaletteWrite(colour) => SnesEvent::PaletteWrite(colour).code_param(),
+            PpuDebugEvent::TileChange(tile) => SnesEvent::TileChange(tile).code_param(),
         }
     }
 }
@@ -195,7 +417,7 @@ impl SnesEvent {
 /// this carries everything [`crate::trace_format::format_trace_line_65816`]
 /// needs to reconstruct the exact bsnes-plus trace line without touching
 /// the bus, including the already-resolved effective address (the only
-/// field that depends on live memory for indirect addressing modes).
+/// field that depends on memory for indirect addressing modes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TraceEntryBinary65816 {
@@ -235,11 +457,15 @@ pub struct TraceEntryBinary65816 {
     pub bytes: [u8; 4],
 }
 
-impl TraceEntryBinary65816 {
-    /// Serialize to a fixed [`TRACE_ENTRY_SIZE_65816`]-byte little-endian
-    /// record for streaming through [`TracingState`].
-    pub fn to_bytes(&self) -> [u8; TRACE_ENTRY_SIZE_65816] {
-        let mut b = [0u8; TRACE_ENTRY_SIZE_65816];
+impl TraceEntry for TraceEntryBinary65816 {
+    /// 44 bytes, all little-endian: `master_cycle(8) pbr_pc(4) a(2) x(2)
+    /// y(2) s(2) d(2) vcounter(2) hdot(2) framecounter(4) eff_addr(4) dbr(1)
+    /// p(1) e(1) eff_present(1) bytes_len(1) cycles(1) bytes(4)`.
+    const SIZE: usize = 44;
+    type Bytes = [u8; 44];
+
+    fn to_bytes(&self) -> [u8; 44] {
+        let mut b = [0u8; 44];
         b[0..8].copy_from_slice(&self.master_cycle.to_le_bytes());
         b[8..12].copy_from_slice(&self.pbr_pc.to_le_bytes());
         b[12..14].copy_from_slice(&self.a.to_le_bytes());
@@ -261,10 +487,8 @@ impl TraceEntryBinary65816 {
         b
     }
 
-    /// Parse one record produced by [`Self::to_bytes`]. Returns `None`
-    /// when `bytes` is shorter than [`TRACE_ENTRY_SIZE_65816`].
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TRACE_ENTRY_SIZE_65816 {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
             return None;
         }
         let mut raw = [0u8; 4];
@@ -321,11 +545,14 @@ pub struct TraceEntryBinarySpc700 {
     pub bytes: [u8; 3],
 }
 
-impl TraceEntryBinarySpc700 {
-    /// Serialize to a fixed [`TRACE_ENTRY_SIZE_SPC700`]-byte little-endian
-    /// record for streaming through [`TracingState`].
-    pub fn to_bytes(&self) -> [u8; TRACE_ENTRY_SIZE_SPC700] {
-        let mut b = [0u8; TRACE_ENTRY_SIZE_SPC700];
+impl TraceEntry for TraceEntryBinarySpc700 {
+    /// 24 bytes, all little-endian: `master_cycle(8) pc(2) a(1) x(1) y(1)
+    /// sp(1) psw(1) bytes_len(1) bytes(3)` followed by 5 reserved bytes.
+    const SIZE: usize = 24;
+    type Bytes = [u8; 24];
+
+    fn to_bytes(&self) -> [u8; 24] {
+        let mut b = [0u8; 24];
         b[0..8].copy_from_slice(&self.master_cycle.to_le_bytes());
         b[8..10].copy_from_slice(&self.pc.to_le_bytes());
         b[10] = self.a;
@@ -339,10 +566,8 @@ impl TraceEntryBinarySpc700 {
         b
     }
 
-    /// Parse one record produced by [`Self::to_bytes`]. Returns `None`
-    /// when `bytes` is shorter than [`TRACE_ENTRY_SIZE_SPC700`].
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TRACE_ENTRY_SIZE_SPC700 {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
             return None;
         }
         let mut raw = [0u8; 3];
@@ -392,11 +617,14 @@ pub struct TraceEntryBinaryGsu {
     pub r: [u16; 16],
 }
 
-impl TraceEntryBinaryGsu {
-    /// Serialize to a fixed [`TRACE_ENTRY_SIZE_GSU`]-byte little-endian
-    /// record for streaming through [`TracingState`].
-    pub fn to_bytes(&self) -> [u8; TRACE_ENTRY_SIZE_GSU] {
-        let mut b = [0u8; TRACE_ENTRY_SIZE_GSU];
+impl TraceEntry for TraceEntryBinaryGsu {
+    /// 52 bytes, all little-endian: `master_cycle(8) pbr_pc(4) sfr(2)
+    /// rombr(1) rambr(1) bytes_len(1) bytes(3) r[16](32)`.
+    const SIZE: usize = 52;
+    type Bytes = [u8; 52];
+
+    fn to_bytes(&self) -> [u8; 52] {
+        let mut b = [0u8; 52];
         b[0..8].copy_from_slice(&self.master_cycle.to_le_bytes());
         b[8..12].copy_from_slice(&self.pbr_pc.to_le_bytes());
         b[12..14].copy_from_slice(&self.sfr.to_le_bytes());
@@ -411,10 +639,8 @@ impl TraceEntryBinaryGsu {
         b
     }
 
-    /// Parse one record produced by [`Self::to_bytes`]. Returns `None`
-    /// when `bytes` is shorter than [`TRACE_ENTRY_SIZE_GSU`].
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TRACE_ENTRY_SIZE_GSU {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
             return None;
         }
         let mut raw = [0u8; 3];
@@ -442,9 +668,8 @@ impl TraceEntryBinaryGsu {
 /// Captured **before** the instruction executes, inside the chip's `catch_up`
 /// burst loop. Everything [`crate::trace_format::format_trace_line_cx4`] needs
 /// lives here, so the formatter stays bus-free: the 16-bit `opcode` is decoded
-/// by the pure [`crate::cartridge::cx4::instructions::disassemble`], and the
-/// accumulators + 16 general-purpose registers are snapshotted so the register
-/// column is exact at the boundary.
+/// by the chip's pure disassembler, and the accumulators + 16 general-purpose
+/// registers are snapshotted so the register column is exact at the boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TraceEntryBinaryCx4 {
@@ -469,11 +694,14 @@ pub struct TraceEntryBinaryCx4 {
     pub gpr: [u32; 16],
 }
 
-impl TraceEntryBinaryCx4 {
-    /// Serialize to a fixed [`TRACE_ENTRY_SIZE_CX4`]-byte little-endian record
-    /// for streaming through [`TracingState`].
-    pub fn to_bytes(&self) -> [u8; TRACE_ENTRY_SIZE_CX4] {
-        let mut b = [0u8; TRACE_ENTRY_SIZE_CX4];
+impl TraceEntry for TraceEntryBinaryCx4 {
+    /// 93 bytes, all little-endian: `cycles(8) pc(4) opcode(2) p(2) flags(1)
+    /// a(4) acch(4) accl(4) gpr[16](64)`.
+    const SIZE: usize = 93;
+    type Bytes = [u8; 93];
+
+    fn to_bytes(&self) -> [u8; 93] {
+        let mut b = [0u8; 93];
         b[0..8].copy_from_slice(&self.cycles.to_le_bytes());
         b[8..12].copy_from_slice(&self.pc.to_le_bytes());
         b[12..14].copy_from_slice(&self.opcode.to_le_bytes());
@@ -489,10 +717,8 @@ impl TraceEntryBinaryCx4 {
         b
     }
 
-    /// Parse one record produced by [`Self::to_bytes`]. Returns `None` when
-    /// `bytes` is shorter than [`TRACE_ENTRY_SIZE_CX4`].
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TRACE_ENTRY_SIZE_CX4 {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
             return None;
         }
         let mut gpr = [0u32; 16];
@@ -514,276 +740,11 @@ impl TraceEntryBinaryCx4 {
     }
 }
 
-/// SNES debugger: breakpoints, coverage, tracing, and cached CPU states
-/// for both the 65C816 (cpu 0) and the SPC700 (cpu 1), plus the state of
-/// a cartridge's own CPU and the GSU / Cx4 trace ring as cpu 2.
-pub struct SnesDebugger {
-    breakpoints: BreakpointList,
-    execution_mode: ExecutionMode,
-
-    coverage_65816: CoverageBitmap,
-    coverage_spc700: CoverageBitmap,
-
-    tracing_65816: TracingState,
-    tracing_spc700: TracingState,
-    /// GSU (Super FX) trace ring (cpu 2). Fed by the chip's `catch_up` burst
-    /// loop when enabled; idle on a non-Super-FX cart.
-    tracing_gsu: TracingState,
-    /// Cx4 (HG51B169) trace ring (cpu 2). Fed by the chip's `catch_up` burst
-    /// loop when enabled; idle on a non-Cx4 cart. A cart hosts at most one
-    /// secondary CPU, so only one of `tracing_gsu`/`tracing_cx4` is ever live,
-    /// the slot-2 trait methods pick the ring by the installed architecture.
-    tracing_cx4: TracingState,
-
-    /// 65C816 call stack (JSR/JSL/BRK/COP push, RTS/RTL/RTI pop). Built
-    /// in both the light and full debug tiers (opcode classification is
-    /// allocation-free).
-    call_stack_65816: Vec<StackFrame>,
-    /// 65C816 instruction history ring (newest at the back). Populated
-    /// only in the full-debug single-step path, where the disassembly
-    /// string is already being built.
-    instruction_history_65816: VecDeque<InstructionTrace>,
-
-    /// Register snapshots refreshed by the emulator's full-debug tier /
-    /// single-step path. Index 0 = 65C816, index 1 = SPC700, index 2 = the
-    /// cartridge's own CPU when it has one (SA-1, Super FX, Cx4).
-    cpu_states: Vec<CpuState>,
-
-    system_info: SystemInfo,
-
-    rom_size: u32,
-    sram_size: u32,
-}
-
-impl SnesDebugger {
-    /// Build a debugger for a system described by `system_info` (used by
-    /// [`DebuggerCore::get_cpu_info`]). CPU states start at reset defaults.
-    pub fn new(system_info: SystemInfo) -> Self {
-        Self {
-            breakpoints: BreakpointList::new(),
-            execution_mode: ExecutionMode::Running,
-            coverage_65816: CoverageBitmap::new(COVERAGE_SIZE_65816),
-            coverage_spc700: CoverageBitmap::new(COVERAGE_SIZE_SPC700),
-            tracing_65816: TracingState::new(8, TRACE_ENTRY_SIZE_65816),
-            tracing_spc700: TracingState::new(8, TRACE_ENTRY_SIZE_SPC700),
-            tracing_gsu: TracingState::new(8, TRACE_ENTRY_SIZE_GSU),
-            tracing_cx4: TracingState::new(8, TRACE_ENTRY_SIZE_CX4),
-            call_stack_65816: Vec::with_capacity(MAX_CALL_STACK_DEPTH_65816),
-            instruction_history_65816: VecDeque::with_capacity(MAX_INSTRUCTION_HISTORY_65816),
-            cpu_states: vec![
-                cpu_state_65816(&Wdc65816::new()),
-                cpu_state_spc700(&Spc700::new()),
-            ],
-            system_info,
-            rom_size: 0,
-            sram_size: 0,
-        }
-    }
-
-    /// Mark a 65C816 instruction start as executed (coverage bitmap).
-    #[inline]
-    pub fn record_coverage_65816(&mut self, pc24: u32) {
-        self.coverage_65816.set(pc24);
-    }
-
-    /// Mark an SPC700 instruction start as executed.
-    #[inline]
-    pub fn record_coverage_spc700(&mut self, pc: u32) {
-        self.coverage_spc700.set(pc);
-    }
-
-    /// `true` iff the 65C816 has executed from `addr`.
-    pub fn is_covered_65816(&self, addr: u32) -> bool {
-        self.coverage_65816.get(addr)
-    }
-
-    /// Number of distinct 65C816 instruction starts seen so far.
-    pub fn coverage_count_65816(&self) -> u32 {
-        self.coverage_65816.count()
-    }
-
-    /// Number of distinct SPC700 instruction starts seen so far.
-    pub fn coverage_count_spc700(&self) -> u32 {
-        self.coverage_spc700.count()
-    }
-
-    /// Append a 65C816 trace entry to the buffer. Returns `true` when the
-    /// buffer reached its flush threshold.
-    #[inline]
-    pub fn record_trace_65816(&mut self, entry: &TraceEntryBinary65816) -> bool {
-        self.tracing_65816.push_entry(&entry.to_bytes())
-    }
-
-    /// Append an SPC700 trace entry to the buffer. Returns `true` when the
-    /// buffer reached its flush threshold.
-    #[inline]
-    pub fn record_trace_spc700(&mut self, entry: &TraceEntryBinarySpc700) -> bool {
-        self.tracing_spc700.push_entry(&entry.to_bytes())
-    }
-
-    /// Append a batch of pre-serialized GSU trace records (drained from the
-    /// Super FX chip's own capture buffer, each already a
-    /// [`TRACE_ENTRY_SIZE_GSU`]-byte [`TraceEntryBinaryGsu`]). Returns `true`
-    /// when the ring reached its flush threshold. A short trailing fragment
-    /// (not a whole entry) is ignored.
-    pub fn record_trace_gsu_bytes(&mut self, raw: &[u8]) -> bool {
-        let mut flush = false;
-        for chunk in raw.as_chunks::<TRACE_ENTRY_SIZE_GSU>().0 {
-            flush |= self.tracing_gsu.push_entry(chunk);
-        }
-        flush
-    }
-
-    /// Append a batch of pre-serialized Cx4 trace records (drained from the Cx4
-    /// chip's own capture buffer, each already a [`TRACE_ENTRY_SIZE_CX4`]-byte
-    /// [`TraceEntryBinaryCx4`]). Returns `true` when the ring reached its flush
-    /// threshold. A short trailing fragment (not a whole entry) is ignored.
-    pub fn record_trace_cx4_bytes(&mut self, raw: &[u8]) -> bool {
-        let mut flush = false;
-        for chunk in raw.as_chunks::<TRACE_ENTRY_SIZE_CX4>().0 {
-            flush |= self.tracing_cx4.push_entry(chunk);
-        }
-        flush
-    }
-
-    /// Push a 65C816 call-stack frame (on JSR/JSL/BRK/COP). Bounded by
-    /// [`MAX_CALL_STACK_DEPTH_65816`] so pathological push/pop imbalance
-    /// can't grow the vector without limit.
-    #[inline]
-    pub fn push_call_65816(&mut self, frame: StackFrame) {
-        if self.call_stack_65816.len() < MAX_CALL_STACK_DEPTH_65816 {
-            self.call_stack_65816.push(frame);
-        }
-    }
-
-    /// Pop the most recent 65C816 call-stack frame (on RTS/RTL/RTI).
-    #[inline]
-    pub fn pop_call_65816(&mut self) -> Option<StackFrame> {
-        self.call_stack_65816.pop()
-    }
-
-    /// Append a 65C816 instruction-history record, evicting the oldest
-    /// when the ring is full.
-    #[inline]
-    pub fn record_instruction_65816(&mut self, trace: InstructionTrace) {
-        if self.instruction_history_65816.len() >= MAX_INSTRUCTION_HISTORY_65816 {
-            self.instruction_history_65816.pop_front();
-        }
-        self.instruction_history_65816.push_back(trace);
-    }
-
-    /// Check (and count) an execute breakpoint on the 65C816 at `pc24`.
-    #[inline]
-    pub fn check_execute_65816(&mut self, pc24: u32) -> bool {
-        self.breakpoints.check_execute(0, pc24)
-    }
-
-    /// Check (and count) a read/write watchpoint on the 65C816 bus at
-    /// `addr`. `write` selects the access direction. Wired in from the
-    /// emulator's per-instruction bus-event drain.
-    #[inline]
-    pub fn check_memory_access_65816(&mut self, addr: u32, write: bool) -> bool {
-        self.breakpoints.check_memory_access(0, addr, write)
-    }
-
-    /// Value-aware variant of [`Self::check_memory_access_65816`]:
-    /// supplies the byte the CPU read/wrote so value-matched watchpoints
-    /// (`(observed & mask) <op> target`) can fire. The emulator's bus
-    /// drain carries the value alongside every `Read`/`Write` event.
-    #[inline]
-    pub fn check_memory_access_valued_65816(&mut self, addr: u32, write: bool, value: u8) -> bool {
-        self.breakpoints
-            .check_memory_access_valued(0, addr, write, value as u32)
-    }
-
-    /// Check (and count) an [`SnesEvent`] against the registered
-    /// [`retro_core::types::BreakpointType::Event`] breakpoints.
-    #[inline]
-    pub fn check_event(&mut self, event: SnesEvent) -> bool {
-        let (code, param) = event.to_code_param();
-        self.breakpoints.check_event(code, param)
-    }
-
-    /// `true` when any enabled breakpoint is a watchpoint or event hook
-    /// (i.e. not a plain execute breakpoint). The emulator uses this to
-    /// arm bus-level access recording and the inline event checks only
-    /// when they can actually fire, keeping the fast path branch-free.
-    #[inline]
-    pub fn has_watchpoints_or_events(&self) -> bool {
-        self.breakpoints.has_watchpoints_or_events()
-    }
-
-    /// `true` iff the SPC700 has executed from `addr` (coverage bitmap).
-    pub fn is_covered_spc700(&self, addr: u32) -> bool {
-        self.coverage_spc700.get(addr)
-    }
-
-    /// Mutable borrow of the breakpoint list, so the cartridge debugger
-    /// can append ROM/SRAM breakpoints into the same list the CPU step
-    /// path checks (rather than maintaining a parallel list).
-    pub fn breakpoints_mut(&mut self) -> &mut BreakpointList {
-        &mut self.breakpoints
-    }
-
-    /// Replace the cached register snapshots (index 0 = 65C816, 1 = SPC700,
-    /// 2 = the cartridge's own CPU when it has one).
-    pub fn set_cpu_states(&mut self, states: Vec<CpuState>) {
-        self.cpu_states = states;
-    }
-
-    /// Replace the cached [`SystemInfo`] (whose `cpus` list backs
-    /// [`DebuggerCore::get_cpu_info`]). Called on every `load_rom` so the CPU
-    /// roster tracks the installed cartridge, a plain SNES cart is two CPUs,
-    /// an SA-1 cart adds the chip's second 65816 as a third slot.
-    pub fn set_system_info(&mut self, system_info: SystemInfo) {
-        self.system_info = system_info;
-    }
-
-    /// Record the loaded ROM / SRAM sizes so [`DebuggerCore::get_memory_regions`]
-    /// reports them.
-    pub fn set_memory_sizes(&mut self, rom_size: u32, sram_size: u32) {
-        self.rom_size = rom_size;
-        self.sram_size = sram_size;
-    }
-
-    /// Pick the execution tier for the next frame given the current
-    /// breakpoint / tracing / execution-mode state.
-    pub fn execution_tier(&self) -> ExecutionTier {
-        select_tier(TierSelectorInputs {
-            execution_mode: self.execution_mode,
-            has_breakpoints: !self.breakpoints.is_empty(),
-            tracing_enabled_per_cpu: &[
-                self.tracing_65816.is_enabled(),
-                self.tracing_spc700.is_enabled(),
-                // A cart hosts one secondary CPU, so only one of these is live.
-                self.tracing_gsu.is_enabled() || self.tracing_cx4.is_enabled(),
-            ],
-        })
-    }
-
-    /// Whether the installed slot-2 secondary CPU is the Cx4 HG51B169 (vs the
-    /// Super FX GSU or the SA-1's 65816). Routes the slot-2 trace trait methods
-    /// to the matching ring; a cart never hosts more than one secondary CPU.
-    fn secondary_cpu_is_cx4(&self) -> bool {
-        matches!(
-            self.system_info.cpus.get(2).map(|c| c.architecture),
-            Some(CpuArchitecture::Hg51b)
-        )
-    }
-
-    /// `true` iff GSU (cpu 2) tracing is currently enabled, the chip reads
-    /// this each frame to decide whether to capture entries in its `catch_up`
-    /// burst.
-    pub fn is_gsu_tracing_enabled(&self) -> bool {
-        self.tracing_gsu.is_enabled()
-    }
-}
-
 /// Build the 65C816 register snapshot (`CpuState`, cpu 0). `pc` carries
 /// the full 24-bit `PBR:PC`; `flags` is the raw `P` byte.
 pub fn cpu_state_65816(cpu: &Wdc65816) -> CpuState {
     CpuState {
-        cpu_id: 0,
+        cpu_id: MAIN_CPU,
         pc: ((cpu.pbr as u32) << 16) | cpu.pc as u32,
         flags: cpu.p as u32,
         registers: vec![
@@ -831,7 +792,7 @@ pub fn cpu_state_65816(cpu: &Wdc65816) -> CpuState {
 /// 16-bit pair `Y:A` exposed as a pseudo-register for convenience.
 pub fn cpu_state_spc700(smp: &Spc700) -> CpuState {
     CpuState {
-        cpu_id: 1,
+        cpu_id: SOUND_CPU,
         pc: smp.pc as u32,
         flags: smp.psw as u32,
         registers: vec![
@@ -943,319 +904,79 @@ pub fn cpu_state_hg51b(core: &Hg51b) -> CpuState {
     }
 }
 
-impl DebuggerCore for SnesDebugger {
-    fn get_cpu_states(&self) -> Vec<CpuState> {
-        self.cpu_states.clone()
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use retro_core::debug::check_catalogue;
 
-    fn get_cpu_info(&self, cpu_id: usize) -> Option<&CpuInfo> {
-        self.system_info.cpus.get(cpu_id)
-    }
-
-    fn add_breakpoint(&mut self, bp: Breakpoint) -> BreakpointId {
-        self.breakpoints.add(bp)
-    }
-
-    fn remove_breakpoint(&mut self, id: BreakpointId) {
-        self.breakpoints.remove(id);
-    }
-
-    fn enable_breakpoint(&mut self, id: BreakpointId, enabled: bool) {
-        self.breakpoints.enable(id, enabled);
-    }
-
-    fn set_breakpoint_access(&mut self, id: BreakpointId, access: AccessFlags) {
-        self.breakpoints.set_access(id, access);
-    }
-
-    fn set_breakpoint_match_spec(&mut self, id: BreakpointId, spec: MatchSpec) {
-        self.breakpoints.set_match_spec(id, spec);
-    }
-
-    fn list_breakpoints(&self) -> Vec<BreakpointInfo> {
-        self.breakpoints.list()
-    }
-
-    /// The SNES event taxonomy (see [`snes_events`]). Paramless classes
-    /// (VBlank/NMI/IRQ/DMA/HDMA) advertise no param; the rest carry a
-    /// free-form numeric param (scanline, register index, colour, tile)
-    /// except APU ports, which enumerate their four mailboxes, and DMA done,
-    /// which enumerates the ports of the four memories a DMA fills.
-    fn available_events(&self) -> Vec<EventClass> {
-        let paramless = |code: u32, label: &str, description: &str| EventClass {
-            code,
-            label: label.to_string(),
-            description: Some(description.to_string()),
-            param_label: None,
-            param_options: Vec::new(),
-        };
-        let numeric = |code: u32, label: &str, description: &str, param_label: &str| EventClass {
-            code,
-            label: label.to_string(),
-            description: Some(description.to_string()),
-            param_label: Some(param_label.to_string()),
-            param_options: Vec::new(),
-        };
-        vec![
-            paramless(snes_events::VBLANK, "VBlank", "Entering vertical blank"),
-            paramless(
-                snes_events::NMI,
-                "NMI",
-                "V-blank NMI delivered to the 65C816",
-            ),
-            paramless(snes_events::IRQ, "IRQ", "H/V-timer IRQ raised"),
-            paramless(
-                snes_events::DMA_START,
-                "DMA start",
-                "General-purpose DMA block started ($420B)",
-            ),
-            paramless(
-                snes_events::HDMA_START,
-                "HDMA start",
-                "Top-of-frame HDMA initialisation",
-            ),
-            numeric(
-                snes_events::SCANLINE,
-                "Scanline",
-                "A rendered scanline matched the V counter",
-                "Scanline (V)",
-            ),
-            numeric(
-                snes_events::PPU_REG_WRITE,
-                "PPU register write",
-                "Write to a PPU register ($2100-$213F)",
-                "Register ($00-$3F)",
-            ),
-            EventClass {
-                code: snes_events::APU_PORT_WRITE,
-                label: "APU port write".to_string(),
-                description: Some("65C816 write to an APU mailbox port ($2140-$2143)".to_string()),
-                param_label: Some("Port".to_string()),
-                param_options: (0..4)
-                    .map(|p| EventParamOption {
-                        value: p,
-                        label: format!("Port {p}"),
-                    })
-                    .collect(),
-            },
-            numeric(
-                snes_events::DSP_REG_WRITE,
-                "S-DSP register write",
-                "SPC700 write to an S-DSP register",
-                "DSP register ($00-$7F)",
-            ),
-            EventClass {
-                code: snes_events::DMA_DONE,
-                label: "DMA done".to_string(),
-                description: Some(
-                    "A general DMA channel finished its block, by the B-bus port it wrote"
-                        .to_string(),
-                ),
-                param_label: Some("B-bus port".to_string()),
-                param_options: [
-                    (0x18, "VRAM ($2118)"),
-                    (0x22, "Palette ($2122)"),
-                    (0x04, "Sprite table ($2104)"),
-                    (0x80, "Work RAM ($2180)"),
-                ]
-                .into_iter()
-                .map(|(value, label)| EventParamOption {
-                    value,
-                    label: label.to_string(),
-                })
-                .collect(),
-            },
-            numeric(
-                snes_events::PALETTE_WRITE,
-                "Palette write",
-                "A colour written into CGRAM by the processor, a DMA or an HDMA",
-                "Colour (0-255)",
-            ),
-            numeric(
-                snes_events::TILE_CHANGE,
-                "Tile changed",
-                "A write into VRAM changed a tile's bytes (the same bytes written again do not count)",
-                "Tile (4bpp, 0-2047)",
-            ),
-        ]
-    }
-
-    fn get_execution_mode(&self) -> ExecutionMode {
-        self.execution_mode
-    }
-
-    fn set_execution_mode(&mut self, mode: ExecutionMode) {
-        self.execution_mode = mode;
-    }
-
-    // Memory access is served by the emulator (it owns the bus); these
-    // return empty / no-op so the trait stays satisfied. The host uses
-    // `EmulatorCore::read_memory_debug` for live reads.
-    fn read_memory(&self, _region: MemoryRegion, _addr: u32, _size: u32) -> Vec<u8> {
-        Vec::new()
-    }
-
-    fn write_memory(&mut self, _region: MemoryRegion, _addr: u32, _data: &[u8]) {}
-
-    fn get_memory_regions(&self) -> Vec<MemoryRegionInfo> {
-        vec![
-            MemoryRegionInfo {
-                region: MemoryRegion::MainRam,
-                name: "WRAM".to_string(),
-                start_address: 0x7E_0000,
-                size: 0x0002_0000,
-                writable: true,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::VideoRam,
-                name: "VRAM".to_string(),
-                start_address: 0,
-                size: 0x0001_0000,
-                writable: true,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::Custom(0),
-                name: "OAM".to_string(),
-                start_address: 0,
-                size: 0x0220,
-                writable: true,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::Custom(1),
-                name: "CGRAM".to_string(),
-                start_address: 0,
-                size: 0x0200,
-                writable: true,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::AudioRam,
-                name: "ARAM".to_string(),
-                start_address: 0,
-                size: 0x0001_0000,
-                writable: true,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::Rom,
-                name: "ROM".to_string(),
-                start_address: 0,
-                size: self.rom_size,
-                writable: false,
-            },
-            MemoryRegionInfo {
-                region: MemoryRegion::SaveRam,
-                name: "SRAM".to_string(),
-                start_address: 0,
-                size: self.sram_size,
-                writable: true,
-            },
-        ]
-    }
-
-    // Forward disassembly needs the bus; the emulator serves it via
-    // `EmulatorCore::disassemble_cpu`, and the coverage-aware window via
-    // `SnesEmulator::disassemble_window`.
-    fn disassemble(&self, _cpu_id: usize, _addr: u32, _count: u32) -> Vec<Instruction> {
-        Vec::new()
-    }
-
-    // Call stack / instruction history are tracked for the 65C816 (cpu
-    // 0) only; the other CPUs return empty.
-    fn get_call_stack(&self, cpu_id: usize) -> Vec<StackFrame> {
-        if cpu_id == 0 {
-            self.call_stack_65816.clone()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn get_instruction_history(&self, cpu_id: usize, count: u32) -> Vec<InstructionTrace> {
-        if cpu_id != 0 {
-            return Vec::new();
-        }
-        let count = count as usize;
-        let len = self.instruction_history_65816.len();
-        let skip = len.saturating_sub(count);
-        self.instruction_history_65816
+    #[test]
+    fn the_catalogue_names_each_code_with_its_kind() {
+        assert_eq!(check_catalogue(SnesDebugConsole::EVENTS), Ok(()));
+        let kinds: Vec<(u32, EventKind)> = SnesDebugConsole::EVENTS
             .iter()
-            .skip(skip)
-            .cloned()
-            .collect()
+            .map(|spec| (spec.code, spec.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (snes_events::VBLANK, EventKind::VerticalBlank),
+                (snes_events::NMI, EventKind::VerticalBlankInterrupt),
+                (snes_events::IRQ, EventKind::RasterInterrupt),
+                (snes_events::DMA_START, EventKind::TransferStart),
+                (snes_events::HDMA_START, EventKind::LineTransferSetUp),
+                (snes_events::SCANLINE, EventKind::Line),
+                (snes_events::PPU_REG_WRITE, EventKind::VideoRegisterWrite),
+                (snes_events::APU_PORT_WRITE, EventKind::AudioPortWrite),
+                (snes_events::DSP_REG_WRITE, EventKind::AudioRegisterWrite),
+                (snes_events::DMA_DONE, EventKind::TransferDone),
+                (snes_events::PALETTE_WRITE, EventKind::PaletteWrite),
+                (snes_events::TILE_CHANGE, EventKind::TileWrite),
+            ]
+        );
     }
 
-    // The video and audio debuggers live on the structs that own the
-    // data (`Ppu`, `Apu`), not on this one; the host reaches them
-    // through `SnesEmulator::video_debugger()` and `audio_debugger()`.
-    fn video_debugger(&mut self) -> Option<&mut dyn VideoDebugger> {
-        None
+    #[test]
+    fn each_event_reports_its_code_and_param() {
+        assert_eq!(SnesEvent::VBlank.code_param(), (1, 0));
+        assert_eq!(SnesEvent::Scanline(100).code_param(), (6, 100));
+        assert_eq!(SnesEvent::DmaDone(0x18).code_param(), (10, 0x18));
+        assert_eq!(PpuDebugEvent::PaletteWrite(3).code_param(), (11, 3));
+        assert_eq!(PpuDebugEvent::TileChange(2047).code_param(), (12, 2047));
     }
 
-    fn audio_debugger(&mut self) -> Option<&mut dyn AudioDebugger> {
-        None
+    #[test]
+    fn the_cartridge_cpu_slot_follows_its_architecture() {
+        let gsu = cartridge_cpu_spec(Some(CpuArchitecture::SuperFx));
+        assert_eq!(
+            gsu.trace_entry_size,
+            <TraceEntryBinaryGsu as TraceEntry>::SIZE
+        );
+        assert_eq!(gsu.checks, BreakpointChecks::NONE);
+        let cx4 = cartridge_cpu_spec(Some(CpuArchitecture::Hg51b));
+        assert_eq!(
+            cx4.trace_entry_size,
+            <TraceEntryBinaryCx4 as TraceEntry>::SIZE
+        );
+        assert_eq!(
+            cartridge_cpu_spec(Some(CpuArchitecture::Mos65816)),
+            CpuDebugSpec::NO_CPU,
+            "the SA-1's 65816 keeps no trace"
+        );
+        assert_eq!(cartridge_cpu_spec(None), CpuDebugSpec::NO_CPU);
     }
 
-    fn set_tracing_enabled(&mut self, cpu_id: usize, enabled: bool) {
-        match cpu_id {
-            0 => self.tracing_65816.set_enabled(enabled),
-            1 => self.tracing_spc700.set_enabled(enabled),
-            2 if self.secondary_cpu_is_cx4() => self.tracing_cx4.set_enabled(enabled),
-            2 => self.tracing_gsu.set_enabled(enabled),
-            _ => {}
-        }
-    }
-
-    fn is_tracing_enabled(&self, cpu_id: usize) -> bool {
-        match cpu_id {
-            0 => self.tracing_65816.is_enabled(),
-            1 => self.tracing_spc700.is_enabled(),
-            2 if self.secondary_cpu_is_cx4() => self.tracing_cx4.is_enabled(),
-            2 => self.tracing_gsu.is_enabled(),
-            _ => false,
-        }
-    }
-
-    fn needs_trace_flush(&self) -> bool {
-        self.tracing_65816.needs_flush()
-            || self.tracing_spc700.needs_flush()
-            || self.tracing_gsu.needs_flush()
-            || self.tracing_cx4.needs_flush()
-    }
-
-    fn get_trace_flush_data(&mut self, cpu_id: usize) -> Option<Vec<u8>> {
-        let cx4 = self.secondary_cpu_is_cx4();
-        let ts = match cpu_id {
-            0 => &mut self.tracing_65816,
-            1 => &mut self.tracing_spc700,
-            2 if cx4 => &mut self.tracing_cx4,
-            2 => &mut self.tracing_gsu,
-            _ => return None,
-        };
-        if !ts.has_data() {
-            return None;
-        }
-        Some(ts.get_flush_data().to_vec())
-    }
-
-    fn clear_trace_flushed(&mut self, cpu_id: usize) {
-        match cpu_id {
-            0 => self.tracing_65816.clear_flushed(),
-            1 => self.tracing_spc700.clear_flushed(),
-            2 if self.secondary_cpu_is_cx4() => self.tracing_cx4.clear_flushed(),
-            2 => self.tracing_gsu.clear_flushed(),
-            _ => {}
-        }
-    }
-
-    fn traceable_cpu_count(&self) -> usize {
-        // Cpu 2 has a trace ring only on a Super FX or Cx4 cart. The SA-1's
-        // secondary 65816 is steppable but *not* traced, so any other
-        // three-CPU roster (or a bare cartridge) stays at 2.
-        if matches!(
-            self.system_info.cpus.get(2).map(|c| c.architecture),
-            Some(CpuArchitecture::SuperFx | CpuArchitecture::Hg51b)
-        ) {
-            3
-        } else {
-            2
-        }
+    #[test]
+    fn the_memory_regions_name_the_sprite_table_and_the_palette() {
+        let mut console = SnesDebugConsole::default();
+        console.set_memory_sizes(0x2_0000, 0x2000);
+        let regions: Vec<(String, MemoryRegion, u32)> = console
+            .memory_regions()
+            .into_iter()
+            .map(|region| (region.name, region.region, region.size))
+            .collect();
+        assert!(regions.contains(&("OAM".to_string(), MemoryRegion::SpriteTable, 0x220)));
+        assert!(regions.contains(&("CGRAM".to_string(), MemoryRegion::PaletteRam, 0x200)));
+        assert!(regions.contains(&("ROM".to_string(), MemoryRegion::Rom, 0x2_0000)));
+        assert!(regions.contains(&("SRAM".to_string(), MemoryRegion::SaveRam, 0x2000)));
     }
 }

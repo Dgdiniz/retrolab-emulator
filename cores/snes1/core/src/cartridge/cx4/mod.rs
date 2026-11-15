@@ -68,6 +68,7 @@ use retro_core::audio::IntegerRateConverter;
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
+use retro_core::debug::TraceEntry;
 use retro_core::emulator::StepResult;
 use retro_core::types::{CpuState, Instruction};
 
@@ -114,8 +115,8 @@ pub struct Cx4Chip {
     /// Whether the debugger has armed HG51B169 instruction tracing (cpu 2).
     trace_enabled: bool,
     /// Trace records captured during `catch_up` since the last drain, each a
-    /// [`TRACE_ENTRY_SIZE_CX4`](crate::debugger::TRACE_ENTRY_SIZE_CX4)-byte
-    /// [`TraceEntryBinaryCx4`](crate::debugger::TraceEntryBinaryCx4).
+    /// [`TraceEntryBinaryCx4`](crate::debugger::TraceEntryBinaryCx4) in its
+    /// bytes ([`TraceEntry::SIZE`] of them).
     trace_buf: Vec<u8>,
     /// Debugger metadata (type, name, features).
     info: ExpansionChipInfo,
@@ -231,10 +232,7 @@ impl Cx4Chip {
     /// as a serialized [`TraceEntryBinaryCx4`]. Takes the core + ROM as disjoint
     /// borrows so it can be called inside `catch_up`'s step loop while the
     /// mutable [`Cx4Bus`] borrows `ram`/`ram_dirty`.
-    fn capture_trace_entry(
-        core: &Hg51b,
-        rom: &[u8],
-    ) -> [u8; crate::debugger::TRACE_ENTRY_SIZE_CX4] {
+    fn capture_trace_entry(core: &Hg51b, rom: &[u8]) -> <TraceEntryBinaryCx4 as TraceEntry>::Bytes {
         let pc = core.pc;
         let opcode = program_word(core, rom, pc);
         let f = &core.flags;
@@ -303,6 +301,21 @@ impl Coprocessor for Cx4Chip {
         };
         self.last_mdr = value;
         value
+    }
+
+    /// The S-CPU's view of the chip read without a side effect: the cart ROM
+    /// (contended while the chip holds the bus), the cart RAM and the data
+    /// RAM of the `$6000-$7FFF` window as a read gives them. `None` for the
+    /// registers at `$7F40-$7FFF`.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        if offset >= CX4_ROM_BASE {
+            Some(self.rom_read(offset - CX4_ROM_BASE))
+        } else if offset >= CX4_RAM_BASE {
+            Some(self.cart_ram_read(offset - CX4_RAM_BASE))
+        } else {
+            let addr = 0x6000 | (offset.wrapping_sub(CX4_MMIO_BASE) & 0x1FFF) as u16;
+            self.core.peek_window(addr, self.last_mdr)
+        }
     }
 
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64) {
@@ -616,9 +629,8 @@ impl Coprocessor for Cx4Chip {
     }
 
     /// Drain the HG51B169 trace bytes captured since the last call (each a
-    /// [`TRACE_ENTRY_SIZE_CX4`](crate::debugger::TRACE_ENTRY_SIZE_CX4)-byte
-    /// [`TraceEntryBinaryCx4`]); the console re-parses them into its cpu-2 trace
-    /// ring.
+    /// [`TraceEntryBinaryCx4`] in its bytes); the console adds them to the
+    /// trace of its cartridge CPU.
     fn take_secondary_trace(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.trace_buf)
     }
@@ -960,8 +972,9 @@ mod tests {
 
     #[test]
     fn trace_capture_records_and_formats_entries() {
-        use crate::debugger::{TraceEntryBinaryCx4, TRACE_ENTRY_SIZE_CX4};
+        use crate::debugger::TraceEntryBinaryCx4;
         use crate::trace_format::format_trace_line_cx4;
+        const SIZE: usize = <TraceEntryBinaryCx4 as TraceEntry>::SIZE;
 
         let program: &[u16] = &[
             0x6412, // ld a,#0x12
@@ -977,13 +990,13 @@ mod tests {
 
         let raw = c.take_secondary_trace();
         assert!(!raw.is_empty(), "tracing captured HG51B169 instructions");
-        assert_eq!(raw.len() % TRACE_ENTRY_SIZE_CX4, 0, "whole records only");
+        assert_eq!(raw.len() % SIZE, 0, "whole records only");
 
         // Every record parses + formats, and the first opcode is the real `ld`
         // (proving the capture is the running program, not an idle NOP), while
         // the last is the `halt`.
         let mut lines = Vec::new();
-        for chunk in raw.as_chunks::<TRACE_ENTRY_SIZE_CX4>().0 {
+        for chunk in raw.as_chunks::<SIZE>().0 {
             let e = TraceEntryBinaryCx4::from_bytes(chunk).expect("record parses");
             lines.push(format_trace_line_cx4(&e));
         }

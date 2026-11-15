@@ -2,11 +2,12 @@
 //! disassembly entry point that replaces `disassemble_around_pc`.
 //!
 //! Each test handcrafts a 68K image directly into ROM and primes the
-//! coverage bitmap via `record_coverage_68k` so the algorithm's
+//! coverage bitmap via `record_coverage` so the algorithm's
 //! behaviour can be observed without having to drive real execution
 //! through the system step paths.
 
 use retro_core::{DisasmRowKind, EmulatorCore};
+use sg1_core::debugger::{MAIN_CPU, SOUND_CPU};
 use sg1_core::GenesisEmulator;
 
 /// Build a Genesis-shaped 1 MiB ROM with a minimal header so
@@ -77,7 +78,7 @@ fn fully_covered_bitmap_yields_all_code_rows() {
     }
     let mut emu = load_min_emu_with_rom(rom);
     for addr in (0x200..0x210u32).step_by(2) {
-        emu.debugger().record_coverage_68k(addr);
+        emu.debugger().record_coverage(MAIN_CPU, addr);
     }
 
     let rows = emu.disassemble_window(0, 0x208, 3, 2);
@@ -119,7 +120,7 @@ fn gap_inside_covered_region_emits_byte_by_byte_unknown_rows() {
     write_word(&mut rom, 0x218, 0x4E71);
     let mut emu = load_min_emu_with_rom(rom);
     for addr in [0x200u32, 0x202, 0x204, 0x216, 0x218] {
-        emu.debugger().record_coverage_68k(addr);
+        emu.debugger().record_coverage(MAIN_CPU, addr);
     }
 
     // 3 NOPs + 16 byte-by-byte Unknown gap rows (0x206..0x215) + 2 NOPs
@@ -168,7 +169,7 @@ fn branch_jump_scenario_does_not_show_stale_predecessors() {
     }
     let mut emu = load_min_emu_with_rom(rom);
     for addr in [0x200u32, 0x202, 0x204] {
-        emu.debugger().record_coverage_68k(addr);
+        emu.debugger().record_coverage(MAIN_CPU, addr);
     }
     // The branch target itself isn't covered yet (the CPU hasn't
     // resumed stepping): this mirrors the "we just hit a breakpoint at
@@ -201,7 +202,7 @@ fn branch_jump_scenario_fills_in_after_more_steps_cover_the_new_path() {
     }
     let mut emu = load_min_emu_with_rom(rom);
     for addr in [0x200u32, 0x202, 0x204, 0x5000, 0x5002, 0x5004, 0x5006] {
-        emu.debugger().record_coverage_68k(addr);
+        emu.debugger().record_coverage(MAIN_CPU, addr);
     }
 
     let rows = emu.disassemble_window(0, 0x5008, 3, 2);
@@ -234,7 +235,7 @@ fn after_count_of_zero_returns_only_backward_rows() {
     let mut rom = build_min_rom();
     write_word(&mut rom, 0x200, 0x4E71);
     let mut emu = load_min_emu_with_rom(rom);
-    emu.debugger().record_coverage_68k(0x200);
+    emu.debugger().record_coverage(MAIN_CPU, 0x200);
 
     let rows = emu.disassemble_window(0, 0x202, 2, 0);
     assert_eq!(rows.len(), 2);
@@ -286,7 +287,7 @@ fn branch_jump_then_partial_step_back_into_old_region() {
     let mut emu = load_min_emu_with_rom(rom);
     // Cover the two instructions actually executed before the branch.
     for addr in [0x200u32, 0x206] {
-        emu.debugger().record_coverage_68k(addr);
+        emu.debugger().record_coverage(MAIN_CPU, addr);
     }
 
     let rows = emu.disassemble_window(0, 0x208, 6, 1);
@@ -336,7 +337,7 @@ fn forward_walk_emits_byte_by_byte_unknown_in_gap() {
     let mut rom = build_min_rom();
     write_word(&mut rom, 0x200, 0x4E71); // NOP, covered (the PC row)
     let mut emu = load_min_emu_with_rom(rom);
-    emu.debugger().record_coverage_68k(0x200);
+    emu.debugger().record_coverage(MAIN_CPU, 0x200);
 
     let rows = emu.disassemble_window(0, 0x200, 0, 6);
     assert_eq!(rows.len(), 6);
@@ -368,7 +369,7 @@ fn z80_disassemble_window_uses_z80_coverage_bitmap() {
 
     // Record a Z80 coverage entry at 0x100 so the backward walk has
     // something to find.
-    emu.debugger().record_coverage_z80(0x100);
+    emu.debugger().record_coverage(SOUND_CPU, 0x100);
 
     let rows = emu.disassemble_window(1, 0x200, 2, 2);
     assert_eq!(rows.len(), 4);

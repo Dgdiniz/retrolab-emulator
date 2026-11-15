@@ -17,6 +17,7 @@ use helpers::M68kProgram;
 use retro_core::capture::{
     layer, planes, CaptureCore, CaptureRecording, SpriteFate, NO_COLUMN, NO_PALETTE,
 };
+use retro_core::debug::DebugEvent;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
@@ -449,7 +450,7 @@ fn drawing_again_moves_nothing_a_savestate_holds() {
 
 /// Arm an event breakpoint and return its id.
 fn break_on(emu: &mut GenesisEmulator, event: GenesisEvent) -> u32 {
-    let (code, param) = event.to_code_param();
+    let (code, param) = event.code_param();
     emu.debugger().add_breakpoint(Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event { code, param },

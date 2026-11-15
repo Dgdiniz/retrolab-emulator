@@ -530,6 +530,22 @@ impl Coprocessor for Spc7110Chip {
         self.read_mcu(offset)
     }
 
+    /// The S-CPU's view of the chip read without a side effect: battery
+    /// SRAM and the MCU's data-ROM window through the `dx/ex/fx` banks.
+    /// `None` for the registers and the decompression port, whose reads
+    /// step the chip.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        if offset >= SPC7110_REG_BASE {
+            None
+        } else if offset >= SPC7110_SRAM_BASE {
+            Some(self.read_sram((offset - SPC7110_SRAM_BASE) as usize))
+        } else if offset >= SPC7110_DCU_BASE {
+            None
+        } else {
+            Some(self.read_mcu(offset))
+        }
+    }
+
     fn write(&mut self, offset: u32, value: u8, _master_cycle: u64) {
         self.accesses += 1;
         if offset >= SPC7110_REG_BASE {

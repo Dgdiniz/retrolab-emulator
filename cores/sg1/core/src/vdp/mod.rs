@@ -21,7 +21,7 @@ use sources::LineTrace;
 pub use sources::Shade;
 use window::WindowArea;
 use writes::{MemoryTransfer, PaletteStore};
-pub use writes::{RaisedEvents, VideoEvent, VideoEventWatch, WriteTarget};
+pub use writes::{VideoEvent, VideoEventWatch, WriteTarget};
 
 /// Pixels in a row of the framebuffer: the 40-cell mode's width, which
 /// the 32-cell mode's 256 fit inside.

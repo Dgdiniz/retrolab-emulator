@@ -8,7 +8,7 @@ describe('traceCpuSpec - sg1', () => {
     expect(s.setEnabled).toBe('setTracingEnabled')
     expect(s.getFlushData).toBe('getTraceFlushData')
     expect(s.convertChunkToText).toBe('convertTraceChunkToText')
-    expect(s.entrySize).toBe(84)
+    expect(s.getEntrySize).toBe('getTraceEntrySize')
     expect(s.uiLabel).toBe('68K')
     expect(s.fileLabel).toBe('68k')
   })
@@ -20,7 +20,7 @@ describe('traceCpuSpec - sg1', () => {
     expect(s.getFlushData).toBe('getZ80TraceFlushData')
     expect(s.clearFlushed).toBe('clearZ80TraceFlushed')
     expect(s.convertChunkToText).toBe('convertZ80TraceChunkToText')
-    expect(s.entrySize).toBe(38)
+    expect(s.getEntrySize).toBe('getZ80TraceEntrySize')
     expect(s.uiLabel).toBe('Z80')
     expect(s.fileLabel).toBe('z80')
   })
@@ -34,7 +34,7 @@ describe('traceCpuSpec - snes1', () => {
     expect(s.getFlushData).toBe('getTraceFlushData')
     expect(s.clearFlushed).toBe('clearTraceFlushed')
     expect(s.convertChunkToText).toBe('convertTraceChunkToText')
-    expect(s.entrySize).toBe(44)
+    expect(s.getEntrySize).toBe('getTraceEntrySize')
     expect(s.uiLabel).toBe('65816')
     expect(s.fileLabel).toBe('65816')
   })
@@ -46,7 +46,7 @@ describe('traceCpuSpec - snes1', () => {
     expect(s.getFlushData).toBe('getSpc700TraceFlushData')
     expect(s.clearFlushed).toBe('clearSpc700TraceFlushed')
     expect(s.convertChunkToText).toBe('convertSpc700TraceChunkToText')
-    expect(s.entrySize).toBe(24)
+    expect(s.getEntrySize).toBe('getSpc700TraceEntrySize')
     expect(s.uiLabel).toBe('SPC700')
     expect(s.fileLabel).toBe('spc700')
   })
@@ -60,9 +60,8 @@ describe('traceCpuSpec - one table for both debugger UIs', () => {
     expect(traceCpuSpec('snes1', 1)).toBe(traceCpuSpecForKind('spc700'))
   })
 
-  it('gives the SNES CPUs entry sizes of their own, not the Genesis ones', () => {
-    expect(traceCpuSpec('snes1', 0).entrySize).not.toBe(traceCpuSpec('sg1', 0).entrySize)
-    expect(traceCpuSpec('snes1', 1).entrySize).not.toBe(traceCpuSpec('sg1', 1).entrySize)
+  it("asks each secondary CPU's own binding for its entry size", () => {
+    expect(traceCpuSpec('snes1', 1).getEntrySize).not.toBe(traceCpuSpec('sg1', 1).getEntrySize)
   })
 })
 

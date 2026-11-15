@@ -10,6 +10,7 @@
 //! run whole.
 
 use retro_core::capture::{planes, CaptureCore};
+use retro_core::debug::DebugEvent;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -424,7 +425,7 @@ fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
 
 /// Arm an event breakpoint and return its id.
 fn break_on(emu: &mut GenesisEmulator, event: GenesisEvent) -> u32 {
-    let (code, param) = event.to_code_param();
+    let (code, param) = event.code_param();
     emu.debugger().add_breakpoint(Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event { code, param },

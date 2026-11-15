@@ -322,6 +322,33 @@ impl Coprocessor for SvpCoprocessor {
         0xFF
     }
 
+    /// DRAM and its two cell-arranged views as they hold now, the DSP not
+    /// caught up and nothing counted; `None` for the mailbox, whose read of
+    /// `PM0` clears its "SSP wrote" bit.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        let off = offset as usize;
+        if off < SVP_DRAM_LEN {
+            return Some(self.dram.get(off).copied().unwrap_or(0xFF));
+        }
+        if offset
+            .checked_sub(SVP_MAILBOX_BASE)
+            .is_some_and(|reg| reg <= 0x0B)
+        {
+            return None;
+        }
+        if let Some(a) = offset.checked_sub(SVP_CELL1_BASE) {
+            if a <= 0xFFFF {
+                return Some(self.read_cell(a, false));
+            }
+        }
+        if let Some(a) = offset.checked_sub(SVP_CELL2_BASE) {
+            if a <= 0xFFFF {
+                return Some(self.read_cell(a, true));
+            }
+        }
+        Some(0xFF)
+    }
+
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64) {
         self.run_ssp(master_cycle);
         self.accesses += 1;

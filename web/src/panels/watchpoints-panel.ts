@@ -12,10 +12,24 @@
  * so the per-row controls call `window.*` globals (toggle/remove/access)
  * and the inline conditions editor keeps its draft in this closure so a
  * mid-edit re-render (e.g. after a step) doesn't lose typed values.
+ *
+ * A memory watchpoint is added on the focused CPU, and only when that CPU
+ * checks reads and writes (`getBreakpointChecks`); otherwise the form is
+ * disabled and the panel says why. An event breakpoint watches the
+ * console, not a CPU, and is always offered. A memory row the CPU it
+ * names does not check is tagged, with the reason in its tooltip.
+ *
+ * An event breakpoint checks no value and no condition, so its editor
+ * offers only hit-skip, the action and one-shot; one a saved breakpoint
+ * carries is shown locked, and its row tagged, with the reason.
  */
 
 import {
   accessToShorthand,
+  breakpointChecksNote,
+  breakpointChecksOf,
+  breakpointUncheckedNote,
+  checkedAccess,
   parseAccessFlags,
   toggleFlag,
   type AccessFlags,
@@ -24,10 +38,12 @@ import {
 import {
   BREAKPOINT_ACTION_OPTIONS,
   DEFAULT_MATCH_SPEC,
+  EVENT_CONDITIONS_NOTE,
   VALUE_COMPARE_OPTIONS,
   VALUE_SIZE_OPTIONS,
   buildWatchpointRows,
   clampValueSize,
+  eventConditionsNote,
   isDefaultMatchSpec,
   matchSpecToWire,
   parseEventAddForm,
@@ -44,6 +60,7 @@ import {
 } from '@debugger-core/watchpoints-core'
 import type { DebugBridge, PanelHandle } from '../debug-bridge'
 import { saveBreakpoints } from './breakpoint-persistence'
+import { cpuChecksReader, type CpuChecks } from './cpu-checks'
 
 /** Escape a string for safe interpolation into an HTML attribute. */
 function attr(s: string): string {
@@ -109,7 +126,7 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
     })
   }
 
-  function renderEditor(row: WatchpointRow): string {
+  function renderEditor(row: WatchpointRow, cpu: CpuChecks): string {
     const compareOpts = VALUE_COMPARE_OPTIONS.map(
       (o) => `<option value="${o.value}"${o.value === draft.valueCompare ? ' selected' : ''}>${o.label}</option>`,
     ).join('')
@@ -122,19 +139,40 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
     const errs = editErrors.length
       ? `<div class="wp-edit-errors">${attr(editErrors.join('. '))}</div>`
       : ''
+    // An event breakpoint checks no value and no condition: its editor
+    // offers neither, and shows one a saved breakpoint carries locked.
+    const isEvent = row.kind === 'event'
+    const lock = isEvent ? ` disabled title="${attr(EVENT_CONDITIONS_NOTE)}"` : ''
+    const range = isEvent
+      ? ''
+      : `<label class="wp-edit-field"><span>Range end</span><input class="wp-edit-input" value="${attr(draft.rangeEnd)}" placeholder="(single)" oninput="wpEditField('rangeEnd', this.value)"/></label>`
+    const valueTest =
+      isEvent && row.matchSpec.value === null
+        ? ''
+        : `<label class="wp-edit-field"><span>Compare</span><select${lock} oninput="wpEditField('valueCompare', this.value)">${compareOpts}</select></label>
+          <label class="wp-edit-field"><span>Value</span><input class="wp-edit-input" value="${attr(draft.value)}" placeholder="(any)"${lock} oninput="wpEditField('value', this.value)"/></label>
+          <label class="wp-edit-field"><span>Size</span><select${lock} oninput="wpEditField('valueSize', this.value)">${sizeOpts}</select></label>
+          <label class="wp-edit-field"><span>Mask</span><input class="wp-edit-input" value="${attr(draft.valueMask)}" placeholder="(all bits)"${lock} oninput="wpEditField('valueMask', this.value)"/></label>`
+    const conditionLocked = isEvent || !cpu.checks.conditions
+    const condition =
+      isEvent && row.matchSpec.expr === null
+        ? ''
+        : `<label class="wp-edit-field wp-edit-field--full"><span>Condition</span><input class="wp-edit-input wp-edit-expr" value="${attr(draft.expr)}" placeholder="(none) e.g. d0 == 5 && [0xFF0000].w > 0x100" title="${conditionTitle(row, cpu)}"${conditionLocked ? ' disabled' : ''} oninput="wpEditField('expr', this.value)"/></label>`
+    const eventNote = isEvent ? eventConditionsNote(row.matchSpec) : null
+    const note = eventNote
+      ? `<div class="wp-edit-note" style="color: #d7ba7d; font-size: 11px; padding: 2px 0;">${attr(eventNote)}</div>`
+      : ''
     return `
       <div class="watchpoint-editor" data-wp-edit="${row.wasmId}">
         <div class="wp-edit-grid">
-          <label class="wp-edit-field"><span>Range end</span><input class="wp-edit-input" value="${attr(draft.rangeEnd)}" placeholder="(single)" oninput="wpEditField('rangeEnd', this.value)"/></label>
-          <label class="wp-edit-field"><span>Compare</span><select oninput="wpEditField('valueCompare', this.value)">${compareOpts}</select></label>
-          <label class="wp-edit-field"><span>Value</span><input class="wp-edit-input" value="${attr(draft.value)}" placeholder="(any)" oninput="wpEditField('value', this.value)"/></label>
-          <label class="wp-edit-field"><span>Size</span><select oninput="wpEditField('valueSize', this.value)">${sizeOpts}</select></label>
-          <label class="wp-edit-field"><span>Mask</span><input class="wp-edit-input" value="${attr(draft.valueMask)}" placeholder="(all bits)" oninput="wpEditField('valueMask', this.value)"/></label>
+          ${range}
+          ${valueTest}
           <label class="wp-edit-field"><span>Skip hits</span><input class="wp-edit-input" type="number" min="0" value="${draft.hitSkip}" oninput="wpEditField('hitSkip', this.value)"/></label>
           <label class="wp-edit-field"><span>Action</span><select oninput="wpEditField('action', this.value)">${actionOpts}</select></label>
           <label class="wp-edit-field wp-edit-check"><input type="checkbox"${draft.oneShot ? ' checked' : ''} onchange="wpEditField('oneShot', this.checked)"/><span>One-shot</span></label>
         </div>
-        <label class="wp-edit-field wp-edit-field--full"><span>Condition</span><input class="wp-edit-input wp-edit-expr" value="${attr(draft.expr)}" placeholder="(none) e.g. d0 == 5 && [0xFF0000].w > 0x100" title="Optional expression over registers / memory. Fires only when non-zero. Operators: && || ! == != < <= > >= + - * / % &amp; | ^ ~ << >>. Memory: [addr] [addr].w [addr].l" oninput="wpEditField('expr', this.value)"/></label>
+        ${condition}
+        ${note}
         ${errs}
         <div class="wp-edit-actions">
           <button class="btn-apply" onclick="wpEditApply(${row.wasmId})">Apply</button>
@@ -144,24 +182,44 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
     `
   }
 
-  function renderRow(row: WatchpointRow): string {
+  /**
+   * The condition field's tooltip: how to write one, or why it cannot be
+   * edited: an event breakpoint checks none, nor does the row's CPU.
+   */
+  function conditionTitle(row: WatchpointRow, cpu: CpuChecks): string {
+    if (row.kind === 'event') return attr(EVENT_CONDITIONS_NOTE)
+    if (!cpu.checks.conditions) return attr(breakpointChecksNote(cpu.checks, cpu.name) ?? '')
+    return 'Optional expression over registers / memory. Fires only when non-zero. Operators: && || ! == != < <= > >= + - * / % &amp; | ^ ~ << >>. Memory: [addr] [addr].w [addr].l'
+  }
+
+  function renderRow(row: WatchpointRow, cpu: CpuChecks): string {
     const enabledClass = row.enabled ? '' : ' disabled'
     const icon = row.enabled ? '●' : '○'
     const color = row.enabled ? '#e51400' : '#555'
     const title = row.enabled ? 'Click to disable' : 'Click to enable'
     const kindClass = row.kind === 'event' ? 'wp-kind--event' : 'wp-kind--memory'
     const kindLabel = row.kind === 'event' ? 'EVT' : 'MEM'
+    const settable = checkedAccess(cpu.checks)
+    // A direction the row's CPU does not check can be cleared, never set.
+    const lock = (on: boolean, which: 'read' | 'write') => (on || settable[which] ? '' : ' disabled')
     const access =
       row.kind === 'memory'
         ? `<span class="watchpoint-access">` +
-          `<label class="bp-flag" title="Break on read"><input type="checkbox" ${row.access.read ? 'checked' : ''} onchange="toggleWatchpointAccess(${row.wasmId}, 'read')"/>R</label>` +
-          `<label class="bp-flag" title="Break on write"><input type="checkbox" ${row.access.write ? 'checked' : ''} onchange="toggleWatchpointAccess(${row.wasmId}, 'write')"/>W</label>` +
+          `<label class="bp-flag" title="Break on read"><input type="checkbox" ${row.access.read ? 'checked' : ''}${lock(row.access.read, 'read')} onchange="toggleWatchpointAccess(${row.wasmId}, 'read')"/>R</label>` +
+          `<label class="bp-flag" title="Break on write"><input type="checkbox" ${row.access.write ? 'checked' : ''}${lock(row.access.write, 'write')} onchange="toggleWatchpointAccess(${row.wasmId}, 'write')"/>W</label>` +
           `</span>`
         : ''
     const summary = row.summary
       ? `<span class="wp-summary" title="${attr(row.summary)}">${attr(row.summary)}</span>`
       : ''
-    const editor = editingId === row.wasmId ? renderEditor(row) : ''
+    const uncheckedText =
+      row.kind === 'memory'
+        ? breakpointUncheckedNote(row.access, row.matchSpec.expr !== null, cpu.checks, cpu.name)
+        : eventConditionsNote(row.matchSpec)
+    const unchecked = uncheckedText
+      ? `<span class="wp-unchecked" title="${attr(uncheckedText)}" style="color: #d7ba7d; font-size: 11px;">not checked</span>`
+      : ''
+    const editor = editingId === row.wasmId ? renderEditor(row, cpu) : ''
     return `
       <div class="watchpoint-item${enabledClass}" data-wp-id="${row.wasmId}">
         <div class="watchpoint-info">
@@ -170,6 +228,7 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
           <span class="watchpoint-label">${attr(row.label)}</span>
           ${access}
           ${summary}
+          ${unchecked}
           <span style="color: #6a9955; font-size: 11px;">Hits: ${row.hitCount}</span>
         </div>
         <div class="watchpoint-actions">
@@ -181,11 +240,28 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
     `
   }
 
+  /**
+   * Offer the memory form only when the focused CPU checks reads and
+   * writes. Returns why it is not offered, or `null` when it is.
+   */
+  function offerAddForm(focused: CpuChecks): string | null {
+    const nothing = !focused.checks.memory
+    for (const control of [addrInput, readInput, writeInput, valueInput, sizeSelect, addBtn]) {
+      if (control) (control as HTMLInputElement).disabled = nothing
+    }
+    return nothing ? breakpointChecksNote(focused.checks, focused.name) : null
+  }
+
   function update(): void {
     const emulator = bridge.getEmulator()
     if (!emulator) return
     try {
       refreshCatalog()
+      const cpuChecks = cpuChecksReader(emulator)
+      const offerNote = offerAddForm(cpuChecks(bridge.getFocusedCpu()))
+      const noteHtml = offerNote
+        ? `<div class="wp-checks-note" style="color: #d7ba7d; font-size: 11px; padding: 2px 0 4px;">${attr(offerNote)}</div>`
+        : ''
 
       // Toggle the event add-form visibility on cores with a catalog.
       if (eventAdd) eventAdd.style.display = catalog.length ? '' : 'none'
@@ -201,10 +277,10 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
 
       const rows = buildWatchpointRows(appliedRows(emulator), [], catalog)
       if (rows.length === 0) {
-        list!.innerHTML = '<div style="color: #858585;">No watchpoints</div>'
+        list!.innerHTML = noteHtml + '<div style="color: #858585;">No watchpoints</div>'
         return
       }
-      list!.innerHTML = rows.map(renderRow).join('')
+      list!.innerHTML = noteHtml + rows.map((row) => renderRow(row, cpuChecks(row.cpuId))).join('')
     } catch (err) {
       console.error('Failed to update watchpoints:', err)
     }
@@ -224,8 +300,10 @@ export function initWatchpointsPanel(bridge: DebugBridge): PanelHandle {
     }
     const emulator = bridge.getEmulator()
     if (!emulator) return
+    const cpu = bridge.getFocusedCpu()
+    if (!breakpointChecksOf(emulator, cpu).memory) return
     try {
-      const id = emulator.addBreakpoint(r.address, accessToShorthand(r.access), bridge.getFocusedCpu())
+      const id = emulator.addBreakpoint(r.address, accessToShorthand(r.access), cpu)
       if (!isDefaultMatchSpec(r.spec)) emulator.setBreakpointMatchSpec(id, matchSpecToWire(r.spec))
       addrInput!.value = ''
       valueInput!.value = ''

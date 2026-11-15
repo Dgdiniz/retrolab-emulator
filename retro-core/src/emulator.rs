@@ -29,9 +29,10 @@ pub trait EmulatorCore {
     /// Reset the emulator to initial state.
     fn reset(&mut self);
 
-    /// Step one instruction on the focused CPU.
-    /// Delegates to `step_cpu(focused_cpu())`.
-    fn step(&mut self) -> StepResult;
+    /// Step one instruction on the focused CPU: `step_cpu(focused_cpu())`.
+    fn step(&mut self) -> StepResult {
+        self.step_cpu(self.focused_cpu())
+    }
 
     /// Step one instruction on a specific CPU.
     /// cpu_id 0 = main CPU, 1+ = secondary CPUs.
@@ -101,6 +102,30 @@ pub trait EmulatorCore {
 
     /// Get mutable reference to the debugger.
     fn debugger(&mut self) -> &mut dyn DebuggerCore;
+
+    /// The debugger, to read.
+    fn debugger_ref(&self) -> &dyn DebuggerCore;
+
+    /// Write the CPU states the debugger reports
+    /// ([`DebuggerCore::get_cpu_states`]) from the CPUs as they are now.
+    fn refresh_debugger_state(&mut self);
+
+    /// Set the debugger's execution mode. A pause also writes the CPU
+    /// states the debugger reports, wherever the game stopped: a loop that
+    /// runs with nothing armed never writes them.
+    fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.debugger().set_execution_mode(mode);
+        if mode == ExecutionMode::Paused {
+            self.refresh_debugger_state();
+        }
+    }
+
+    /// A chunk of CPU `cpu_id`'s trace as text, one line per whole entry
+    /// ([`crate::debug::trace::trace_to_text`]); `None` for a CPU whose
+    /// trace the core does not write as text.
+    fn trace_to_text(&mut self, _cpu_id: usize, _data: &[u8]) -> Option<String> {
+        None
+    }
 
     // ===== Additional debugging methods that need bus access =====
 

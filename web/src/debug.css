@@ -368,6 +368,14 @@ input[title],
     background: transparent;
 }
 
+/*
+ * `no-exec` rows belong to a CPU that checks no execute breakpoints: a
+ * click adds none there, and the row's title says why.
+ */
+.disasm-line.no-exec {
+    cursor: not-allowed;
+}
+
 .disasm-line.current {
     background: #094771;
 }

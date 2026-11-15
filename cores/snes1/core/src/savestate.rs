@@ -1276,9 +1276,9 @@ pub struct SnesSaveState {
     pub frame_base_cycle: u64,
     pub frame_count: u64,
     pub timing: TimingState,
-    /// Debugger-focused CPU id (0 = 5A22, 1 = SPC700, 2 = the cartridge's
-    /// CPU on an SA-1, Super FX or Cx4 cart). Stored narrow because the
-    /// valid values are 0 to 2.
+    /// Kept so the layout stays readable, and carries nothing: always
+    /// written 0 and never read. Which CPU the debugger shows is a host's
+    /// choice, not the machine's state.
     pub focused_cpu: u8,
     pub audio_enabled: bool,
 }

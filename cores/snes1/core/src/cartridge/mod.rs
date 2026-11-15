@@ -137,6 +137,15 @@ pub trait SnesCartridge: Send {
         0
     }
 
+    /// The byte a read of the chip `chip_id` at `offset` would give, read
+    /// for a debugger without a side effect (the chip's
+    /// [`retro_core::cartridge::Coprocessor::peek`]). `None` when there is
+    /// no such chip or it cannot answer without changing itself; the bus
+    /// then gives the open-bus value. The default answers `None`.
+    fn peek_chip(&self, _chip_id: u8, _offset: u32) -> Option<u8> {
+        None
+    }
+
     /// Write to the coprocessor chip identified by `chip_id`.
     ///
     /// `master_cycle` carries the same meaning as in

@@ -91,16 +91,21 @@ fn test_breakpoint_serialization() {
 
 #[test]
 fn test_memory_regions() {
-    let regions = vec![
-        MemoryRegion::MainRam,
-        MemoryRegion::VideoRam,
-        MemoryRegion::Rom,
-        MemoryRegion::Custom(0),
+    let regions = [
+        (MemoryRegion::MainRam, "\"MainRam\""),
+        (MemoryRegion::VideoRam, "\"VideoRam\""),
+        (MemoryRegion::AudioRam, "\"AudioRam\""),
+        (MemoryRegion::Rom, "\"Rom\""),
+        (MemoryRegion::SaveRam, "\"SaveRam\""),
+        (MemoryRegion::PaletteRam, "\"PaletteRam\""),
+        (MemoryRegion::SpriteTable, "\"SpriteTable\""),
     ];
 
-    for region in regions {
+    for (region, name) in regions {
         let json = serde_json::to_string(&region).unwrap();
-        let _deserialized: MemoryRegion = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, name);
+        let deserialized: MemoryRegion = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, region);
     }
 }
 

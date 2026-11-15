@@ -51,6 +51,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 use retro_core::cpu::Addressable;
+use retro_core::debug::TraceEntry;
 use retro_core::emulator::StepResult;
 use retro_core::types::{CpuState, Instruction};
 use superfx_gsu::Gsu;
@@ -238,6 +239,20 @@ impl Coprocessor for SuperFxChip {
         };
         self.last_mdr = value;
         value
+    }
+
+    /// The S-CPU's view of the chip read without a side effect: Game Pak ROM
+    /// and RAM as a read gives them, the open-bus answers while the GSU
+    /// holds a bus included. `None` for the register window, whose reads
+    /// can clear a flag.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        if offset >= SUPERFX_ROM_BASE {
+            Some(self.scpu_rom_read(offset - SUPERFX_ROM_BASE))
+        } else if offset >= SUPERFX_RAM_BASE {
+            Some(self.scpu_ram_read(offset - SUPERFX_RAM_BASE))
+        } else {
+            None
+        }
     }
 
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64) {
@@ -508,9 +523,8 @@ impl Coprocessor for SuperFxChip {
     }
 
     /// Drain the GSU trace bytes captured since the last call (each a
-    /// [`TRACE_ENTRY_SIZE_GSU`](crate::debugger::TRACE_ENTRY_SIZE_GSU)-byte
-    /// [`TraceEntryBinaryGsu`]); the console re-parses them into its cpu-2
-    /// trace ring.
+    /// [`TraceEntryBinaryGsu`] in its bytes, [`TraceEntry::SIZE`] of them);
+    /// the console adds them to the trace of its cartridge CPU.
     fn take_secondary_trace(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.gsu_trace_buf)
     }
@@ -1266,8 +1280,8 @@ mod tests {
 
     #[test]
     fn gsu_trace_capture_records_and_formats_entries() {
-        use crate::debugger::TRACE_ENTRY_SIZE_GSU;
         use crate::trace_format::format_trace_line_gsu;
+        const SIZE: usize = <TraceEntryBinaryGsu as TraceEntry>::SIZE;
 
         // iwt r0,#$1234 ; iwt r1,#$5678 ; stop, a short linear kernel.
         let kernel = [0xF0, 0x34, 0x12, 0xF1, 0x78, 0x56, 0x00];
@@ -1278,12 +1292,12 @@ mod tests {
 
         let raw = c.take_secondary_trace();
         assert!(!raw.is_empty(), "tracing captured GSU instructions");
-        assert_eq!(raw.len() % TRACE_ENTRY_SIZE_GSU, 0, "whole records only");
+        assert_eq!(raw.len() % SIZE, 0, "whole records only");
         // Every record parses + formats into a well-formed line, and the real
         // kernel opcode (`iwt`) is decoded, proving the capture is the running
         // program, not just the reset-primed NOP.
         let mut saw_iwt = false;
-        for chunk in raw.as_chunks::<TRACE_ENTRY_SIZE_GSU>().0 {
+        for chunk in raw.as_chunks::<SIZE>().0 {
             let entry = TraceEntryBinaryGsu::from_bytes(chunk).unwrap();
             let line = format_trace_line_gsu(&entry);
             assert!(line.contains("R0:"), "line has the R0 column: {line}");

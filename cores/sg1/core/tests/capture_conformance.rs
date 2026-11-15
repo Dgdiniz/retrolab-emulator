@@ -15,6 +15,7 @@ mod helpers;
 
 use helpers::M68kProgram;
 use retro_core::capture::conformance::{CoreUnderTest, VideoMemoryEdit};
+use retro_core::debug::DebugEvent;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::video::VideoDebugger;
 use retro_core::{EmulatorCore, ExecutionMode};
@@ -204,7 +205,7 @@ fn build() -> GenesisEmulator {
 
 /// An event breakpoint on the start of line `line`.
 fn on_line(line: u16) -> Breakpoint {
-    let (code, param) = GenesisEvent::Scanline(line).to_code_param();
+    let (code, param) = GenesisEvent::Scanline(line).code_param();
     Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event { code, param },

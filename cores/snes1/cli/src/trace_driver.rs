@@ -12,15 +12,27 @@ use std::ops::ControlFlow;
 
 use anyhow::Result;
 use indicatif::ProgressBar;
+use retro_core::debug::TraceEntry;
 use retro_core::EmulatorCore;
 use snes1_core::{
     format_trace_line_65816, format_trace_line_spc700, SnesEmulator, TraceEntryBinary65816,
-    TraceEntryBinarySpc700, TRACE_ENTRY_SIZE_65816, TRACE_ENTRY_SIZE_SPC700,
+    TraceEntryBinarySpc700,
 };
 #[cfg(feature = "chip-cx4")]
-use snes1_core::{format_trace_line_cx4, TraceEntryBinaryCx4, TRACE_ENTRY_SIZE_CX4};
+use snes1_core::{format_trace_line_cx4, TraceEntryBinaryCx4};
 #[cfg(feature = "chip-superfx")]
-use snes1_core::{format_trace_line_gsu, TraceEntryBinaryGsu, TRACE_ENTRY_SIZE_GSU};
+use snes1_core::{format_trace_line_gsu, TraceEntryBinaryGsu};
+
+/// Bytes of one 65C816 trace entry.
+const SIZE_65816: usize = <TraceEntryBinary65816 as TraceEntry>::SIZE;
+/// Bytes of one SPC700 trace entry.
+const SIZE_SPC700: usize = <TraceEntryBinarySpc700 as TraceEntry>::SIZE;
+/// Bytes of one GSU trace entry.
+#[cfg(feature = "chip-superfx")]
+const SIZE_GSU: usize = <TraceEntryBinaryGsu as TraceEntry>::SIZE;
+/// Bytes of one Cx4 trace entry.
+#[cfg(feature = "chip-cx4")]
+const SIZE_CX4: usize = <TraceEntryBinaryCx4 as TraceEntry>::SIZE;
 
 use crate::trace_ref::TraceCpu;
 
@@ -95,7 +107,7 @@ where
             while stepped < n && !stop {
                 emu.step_cpu(0);
                 stepped += 1;
-                if emu.debugger().needs_trace_flush() {
+                if emu.debugger().any_trace_needs_flush() {
                     stop = drain_and_feed(emu, cpu, &mut on_line, &mut stats)?;
                 }
                 if let Some(pb) = progress {
@@ -168,7 +180,7 @@ where
 {
     match cpu {
         TraceCpu::Snes => {
-            for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_65816>().0 {
+            for chunk in data.as_chunks::<SIZE_65816>().0 {
                 if let Some(entry) = TraceEntryBinary65816::from_bytes(chunk) {
                     let line = format_trace_line_65816(&entry);
                     stats.instructions += 1;
@@ -179,7 +191,7 @@ where
             }
         }
         TraceCpu::Spc700 => {
-            for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_SPC700>().0 {
+            for chunk in data.as_chunks::<SIZE_SPC700>().0 {
                 if let Some(entry) = TraceEntryBinarySpc700::from_bytes(chunk) {
                     let line = format_trace_line_spc700(&entry);
                     stats.instructions += 1;
@@ -201,7 +213,7 @@ fn feed_gsu<F>(data: &[u8], on_line: &mut F, stats: &mut RunStats) -> Result<boo
 where
     F: FnMut(&str) -> Result<ControlFlow<()>>,
 {
-    for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_GSU>().0 {
+    for chunk in data.as_chunks::<SIZE_GSU>().0 {
         if let Some(entry) = TraceEntryBinaryGsu::from_bytes(chunk) {
             let line = format_trace_line_gsu(&entry);
             stats.instructions += 1;
@@ -230,7 +242,7 @@ fn feed_cx4<F>(data: &[u8], on_line: &mut F, stats: &mut RunStats) -> Result<boo
 where
     F: FnMut(&str) -> Result<ControlFlow<()>>,
 {
-    for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_CX4>().0 {
+    for chunk in data.as_chunks::<SIZE_CX4>().0 {
         if let Some(entry) = TraceEntryBinaryCx4::from_bytes(chunk) {
             let line = format_trace_line_cx4(&entry);
             stats.instructions += 1;

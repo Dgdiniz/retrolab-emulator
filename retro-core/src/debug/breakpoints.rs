@@ -2,24 +2,29 @@
 //!
 //! Each core (Genesis, SNES, ...) owns one [`BreakpointList`] inside its
 //! debugger. The list stores execute / read / write / read+write
-//! breakpoints and exposes the hot-loop check methods the CPU step path
-//! calls per instruction:
+//! breakpoints and event breakpoints, and exposes the checks the CPU step
+//! path makes per instruction:
 //!
-//! - [`BreakpointList::check_execute`]: at every fetch boundary.
-//! - [`BreakpointList::check_memory_access`]: at every bus read/write
-//!   (wire in via [`BusWatchpointHook`] from the bus impl).
+//! - [`BreakpointList::check_execute`]: before an instruction, at its
+//!   address.
+//! - [`BreakpointList::check_accesses`]: after an instruction, over the
+//!   bytes it read and wrote ([`crate::debug::access`]).
+//! - [`BreakpointList::check_event`]: when the hardware raises an event a
+//!   breakpoint can stop on ([`crate::debug::events`]).
 //!
-//! Both checks **filter on `cpu_id`** so a breakpoint set on the host
-//! CPU (e.g. 68K, address space 0-0xFFFFFF) never spuriously fires for
+//! The address checks **filter on `cpu_id`** so a breakpoint set on the
+//! host CPU (e.g. 68K, address space 0-0xFFFFFF) never spuriously fires for
 //! the sub-CPU (e.g. Z80, address space 0-0xFFFF) at an overlapping
 //! address. Breakpoints with `cpu_id == None` apply to all CPUs and are
 //! intended for system-wide hooks.
 //!
-//! Watchpoint wiring on the bus is opt-in via the [`BusWatchpointHook`]
-//! trait. SG1 and the SNES core both use execute breakpoints, read/write
-//! watchpoints and the data-carrying [`BreakpointType::Event`] hooks via
-//! [`BreakpointList::check_event`].
+//! A condition (`MatchSpec::expr`) and a watch wider than a byte read the
+//! machine through an [`ExprContext`] the core builds over the CPU's
+//! registers and a side-effect-free peek of its memory
+//! ([`crate::debug::expr::CpuExprContext`]).
 
+use crate::debug::access::Access;
+use crate::debug::events::ParamSet;
 use crate::debug::expr::{eval_str, ExprContext};
 use crate::types::{
     AccessFlags, Breakpoint, BreakpointAction, BreakpointId, BreakpointInfo, BreakpointType,
@@ -129,29 +134,19 @@ impl BreakpointList {
         self.breakpoints.len()
     }
 
-    /// Hot-path: returns `true` (halt) when an enabled execute
-    /// breakpoint matches `(cpu_id, pc)` and its [`MatchSpec`] conditions
-    /// fire. A breakpoint with `cpu_id: None` matches every CPU; an
-    /// `address_end` range matches any pc in `[address, address_end]`.
-    /// Execute breakpoints carry no observed value, so a value predicate
-    /// on one never fires.
+    /// Returns `true` (halt) when an enabled execute breakpoint matches
+    /// `(cpu_id, pc)` and its [`MatchSpec`] conditions fire. A breakpoint
+    /// with `cpu_id: None` matches every CPU; an `address_end` range
+    /// matches any pc in `[address, address_end]`. Execute breakpoints
+    /// carry no observed value, so a value predicate on one never fires.
     ///
-    /// This is the value-/expression-agnostic entry. A breakpoint carrying
-    /// an `expr` condition cannot fire here (no evaluation context) and
-    /// stays silent; route conditional breakpoints through
-    /// [`Self::check_execute_ctx`].
-    pub fn check_execute(&mut self, cpu_id: usize, pc: u32) -> bool {
-        self.check_execute_ctx(cpu_id, pc, None)
-    }
-
-    /// Hot-path: like [`Self::check_execute`] but supplies an optional
-    /// [`ExprContext`] so a conditional execute breakpoint (`MatchSpec.expr`)
-    /// can be evaluated against live registers / memory. With `ctx: None`
-    /// this behaves exactly like [`Self::check_execute`] (expression
-    /// breakpoints fail closed). The context is only consulted after the
-    /// pc/cpu match holds, so the common (no-expression) case pays nothing
-    /// beyond a never-taken branch.
-    pub fn check_execute_ctx(
+    /// `ctx` evaluates a breakpoint's condition (`MatchSpec::expr`) against
+    /// the CPU's registers and memory before the instruction runs. With
+    /// `None` (a CPU the core builds no context for) a breakpoint carrying
+    /// a condition fails closed and stays silent. The context is only
+    /// consulted after the pc/cpu match holds, so the common
+    /// (no-condition) case pays nothing beyond a never-taken branch.
+    pub fn check_execute(
         &mut self,
         cpu_id: usize,
         pc: u32,
@@ -182,109 +177,22 @@ impl BreakpointList {
         should_break
     }
 
-    /// Hot-path: value-agnostic memory watchpoint check. Matches when an
-    /// enabled read/write/read+write breakpoint covers `(cpu_id, addr,
-    /// write)`. A breakpoint with a value predicate set cannot fire here
-    /// (no observed byte is available), use
-    /// [`Self::check_memory_access_valued`] for those.
+    /// Returns `true` (halt) when a read or write watchpoint on `cpu_id`
+    /// fires for the bytes one instruction accessed. Each enabled
+    /// watchpoint fires **at most once** per call, on the first access it
+    /// covers in a direction it watches, so a multi-byte or ranged watch
+    /// counts one hit per instruction however many of its bytes were
+    /// touched.
     ///
-    /// Wire this in from the bus via [`BusWatchpointHook`] (or call it
-    /// directly).
-    pub fn check_memory_access(&mut self, cpu_id: usize, addr: u32, write: bool) -> bool {
-        self.check_memory_access_inner(cpu_id, addr, write, None)
-    }
-
-    /// Hot-path: value-aware memory watchpoint check. Like
-    /// [`Self::check_memory_access`] but supplies the observed byte so
-    /// single-byte value-matched watchpoints (`(observed & mask) <op>
-    /// target`) can fire. Multi-byte watchpoints (`value_size > 1`) can't
-    /// assemble their full value here, drive those through
-    /// [`Self::check_memory_access_batch`], which reads the consecutive
-    /// bytes from memory. Cores that can cheaply recover the accessed byte
-    /// call this for single-byte watches.
-    pub fn check_memory_access_valued(
+    /// A one-byte value watch compares the byte that access moved. A wider
+    /// one (`value_size` 2-4) compares the whole value at its address,
+    /// `ctx.read_mem(address, width)`, which the context reads in the CPU's
+    /// byte order after the instruction. A condition (`MatchSpec::expr`) is
+    /// evaluated through the same context.
+    pub fn check_accesses(
         &mut self,
         cpu_id: usize,
-        addr: u32,
-        write: bool,
-        value: u32,
-    ) -> bool {
-        self.check_memory_access_inner(cpu_id, addr, write, Some(value))
-    }
-
-    /// Batch watchpoint check for every byte access recorded during one
-    /// instruction. Each enabled read/write watchpoint fires **at most
-    /// once** here (on the first covered access matching its direction),
-    /// so a multi-byte or ranged watch counts a single hit per instruction
-    /// even when several of its covered bytes were touched. A multi-byte
-    /// watch (`value_size > 1`) assembles its observed value from
-    /// `value_size` consecutive bytes starting at the watch's base address
-    /// via `read_byte` (a side-effect-free peek) in `big_endian` order;
-    /// single-byte watches use the recorded access byte. Returns whether
-    /// any watchpoint halts.
-    ///
-    /// `accesses` is a slice of `(addr, is_write, byte)` tuples, the
-    /// per-byte expansion of the instruction's bus traffic.
-    pub fn check_memory_access_batch<F: FnMut(u32) -> u8>(
-        &mut self,
-        cpu_id: usize,
-        accesses: &[(u32, bool, u8)],
-        big_endian: bool,
-        mut read_byte: F,
-    ) -> bool {
-        let mut should_break = false;
-        for bp in &mut self.breakpoints {
-            if !bp.enabled {
-                continue;
-            }
-            let Some(flags) = bp.breakpoint.bp_type.access() else {
-                continue;
-            };
-            if !matches_cpu(bp.breakpoint.cpu_id, cpu_id) {
-                continue;
-            }
-            // The first covered access whose direction this watch cares
-            // about; `None` means this watch saw no relevant traffic.
-            let touched = accesses.iter().copied().find(|&(addr, write, _)| {
-                addr_matches(bp, addr) && if write { flags.write } else { flags.read }
-            });
-            let Some((_, _, byte)) = touched else {
-                continue;
-            };
-            let observed = if bp.match_spec.needs_value() {
-                let width = bp.match_spec.value_width();
-                if width > 1 {
-                    Some(assemble_value(
-                        bp.breakpoint.address,
-                        width,
-                        big_endian,
-                        &mut read_byte,
-                    ))
-                } else {
-                    Some(byte as u32)
-                }
-            } else {
-                None
-            };
-            // No evaluation context on this path: an expression-bearing
-            // watch fails closed (use `check_memory_access_batch_ctx`).
-            should_break |= record_and_should_break(bp, observed, None);
-        }
-        should_break
-    }
-
-    /// Like [`Self::check_memory_access_batch`] but evaluates everything,
-    /// the multi-byte value assembly *and* any `MatchSpec.expr` condition,
-    /// through a single [`ExprContext`]. Folding both into the context
-    /// sidesteps the borrow conflict a host would hit otherwise (the value
-    /// peek and the expression evaluator both need the live memory bus).
-    /// The context's [`ExprContext::read_mem`] supplies the observed value
-    /// for sized watches (honouring the core's endianness), so this takes
-    /// no separate `big_endian` flag or peek closure.
-    pub fn check_memory_access_batch_ctx(
-        &mut self,
-        cpu_id: usize,
-        accesses: &[(u32, bool, u8)],
+        accesses: &[Access],
         ctx: &mut dyn ExprContext,
     ) -> bool {
         let mut should_break = false;
@@ -295,23 +203,28 @@ impl BreakpointList {
             let Some(flags) = bp.breakpoint.bp_type.access() else {
                 continue;
             };
-            if !matches_cpu(bp.breakpoint.cpu_id, cpu_id) {
+            if !flags.watches_memory() || !matches_cpu(bp.breakpoint.cpu_id, cpu_id) {
                 continue;
             }
-            let touched = accesses.iter().copied().find(|&(addr, write, _)| {
-                addr_matches(bp, addr) && if write { flags.write } else { flags.read }
+            // The first covered access whose direction this watch cares
+            // about; `None` means this watch saw no relevant traffic.
+            let touched = accesses.iter().find(|access| {
+                addr_matches(bp, access.address)
+                    && if access.write {
+                        flags.write
+                    } else {
+                        flags.read
+                    }
             });
-            let Some((_, _, byte)) = touched else {
+            let Some(touched) = touched else {
                 continue;
             };
             let observed = if bp.match_spec.needs_value() {
                 let width = bp.match_spec.value_width();
                 if width > 1 {
-                    // `read_mem` returns the value already assembled in the
-                    // core's byte order, masked to `width` bytes.
                     Some(ctx.read_mem(bp.breakpoint.address, width) as u32)
                 } else {
-                    Some(byte as u32)
+                    Some(u32::from(touched.value))
                 }
             } else {
                 None
@@ -321,47 +234,13 @@ impl BreakpointList {
         should_break
     }
 
-    fn check_memory_access_inner(
-        &mut self,
-        cpu_id: usize,
-        addr: u32,
-        write: bool,
-        value: Option<u32>,
-    ) -> bool {
-        let mut should_break = false;
-        for bp in &mut self.breakpoints {
-            if !bp.enabled {
-                continue;
-            }
-            let Some(flags) = bp.breakpoint.bp_type.access() else {
-                continue;
-            };
-            if !matches_cpu(bp.breakpoint.cpu_id, cpu_id) {
-                continue;
-            }
-            if !addr_matches(bp, addr) {
-                continue;
-            }
-            let matched = if write { flags.write } else { flags.read };
-            if !matched {
-                continue;
-            }
-            // The single-byte access path carries no evaluation context;
-            // an expression-bearing watch fails closed here (it fires via
-            // the batch path, which threads an `ExprContext`).
-            should_break |= record_and_should_break(bp, value, None);
-        }
-        should_break
-    }
-
-    /// Hot-path (only when armed): returns `true` (halt) when an enabled
-    /// [`BreakpointType::Event`] breakpoint matches `code` and either
-    /// matches `param` exactly or was stored with [`BREAKPOINT_PARAM_ANY`],
-    /// and its [`MatchSpec`] conditions (hit-skip / action / one-shot)
-    /// fire.
+    /// Returns `true` (halt) when an enabled [`BreakpointType::Event`]
+    /// breakpoint matches `code` and either matches `param` exactly or was
+    /// stored with [`BREAKPOINT_PARAM_ANY`], and its [`MatchSpec`]
+    /// conditions (hit-skip / action / one-shot) fire.
     ///
     /// Events are system-wide, so this does **not** filter on `cpu_id`.
-    /// The `code`/`param` taxonomy is owned by the calling core; this
+    /// The `code`/`param` catalogue is owned by the calling core; this
     /// container only does the equality match + condition bookkeeping.
     pub fn check_event(&mut self, code: u32, param: u32) -> bool {
         let mut should_break = false;
@@ -400,6 +279,31 @@ impl BreakpointList {
                 }
         })
     }
+
+    /// The `(code, param)` of every enabled event breakpoint, in list
+    /// order.
+    pub fn enabled_events(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.breakpoints
+            .iter()
+            .filter_map(|bp| match bp.breakpoint.bp_type {
+                BreakpointType::Event { code, param } if bp.enabled => Some((code, param)),
+                _ => None,
+            })
+    }
+
+    /// The params the enabled event breakpoints on `code` watch
+    /// ([`ParamSet::insert`]: [`BREAKPOINT_PARAM_ANY`] watches them all, a
+    /// param past the set's capacity none), or `None` when they watch
+    /// nothing. A chip raises an event only for a param in the set.
+    pub fn watched_params<const W: usize>(&self, code: u32) -> Option<ParamSet<W>> {
+        let mut watched = ParamSet::<W>::new();
+        for (event, param) in self.enabled_events() {
+            if event == code {
+                watched.insert(param);
+            }
+        }
+        (!watched.is_empty()).then_some(watched)
+    }
 }
 
 /// `cpu_id: None` is a wildcard breakpoint (any CPU); otherwise we
@@ -437,40 +341,14 @@ fn addr_matches(info: &BreakpointInfo, addr: u32) -> bool {
     addr >= base && addr <= end
 }
 
-/// Assemble a `width`-byte (1-4) observed value from memory starting at
-/// `base`, reading each byte through `read_byte`. `big_endian` selects
-/// the byte order: the first byte is the most-significant byte for
-/// big-endian cores (68000) and the least-significant for little-endian
-/// cores (65816). Out-of-range widths are clamped by the caller via
-/// [`MatchSpec::value_width`].
-#[inline]
-fn assemble_value<F: FnMut(u32) -> u8>(
-    base: u32,
-    width: u8,
-    big_endian: bool,
-    read_byte: &mut F,
-) -> u32 {
-    let mut acc = 0u32;
-    for i in 0..width as u32 {
-        let byte = read_byte(base.wrapping_add(i)) as u32;
-        if big_endian {
-            acc = (acc << 8) | byte;
-        } else {
-            acc |= byte << (8 * i);
-        }
-    }
-    acc
-}
-
 /// Apply a base-matched breakpoint's [`MatchSpec`] conditions and update
 /// its runtime counters. Returns whether execution should **halt**.
 ///
 /// The caller has already confirmed the address/access (or event) match.
-/// `observed` is the byte seen at the access for value-matched
+/// `observed` is the value seen at the access for value-matched
 /// watchpoints, or `None` for execute / event checks (which carry no
 /// value). A spec with a value predicate never fires without an observed
-/// value, so a value-conditioned watchpoint stays inert on the
-/// value-agnostic path.
+/// value, so a value-conditioned execute breakpoint stays inert.
 ///
 /// `ctx` is the optional expression-evaluation context. A breakpoint that
 /// carries an `expr` only fires when the expression evaluates non-zero;
@@ -482,7 +360,7 @@ fn record_and_should_break<'c>(
     observed: Option<u32>,
     ctx: Option<&mut (dyn ExprContext + 'c)>,
 ) -> bool {
-    // Value predicate: only memory accesses provide an observed byte.
+    // Value predicate: only memory accesses provide an observed value.
     if info.match_spec.needs_value() {
         match observed {
             Some(v) if info.match_spec.value_matches(v) => {}
@@ -514,31 +392,11 @@ fn record_and_should_break<'c>(
     matches!(info.match_spec.action, BreakpointAction::Break)
 }
 
-/// Hook a bus can implement to forward read/write events to a
-/// [`BreakpointList`] (or any other watcher).
-///
-/// Intentionally minimal: just the two events we need. Cores that
-/// support N CPUs use `cpu_id` to disambiguate; uni-CPU cores pass `0`.
-///
-/// **Wiring status**: defined here as the public contract for bus
-/// implementations that want a push-style watch hook. Neither core wires
-/// it: SG1 and the SNES core record their bus accesses in their own debug
-/// buffers and run the [`BreakpointList`] checks from there.
-pub trait BusWatchpointHook {
-    /// Fired before/after a bus read at `addr`. Implementations decide
-    /// the exact semantics; the convention is "after the read resolved
-    /// but before the caller observes the returned byte".
-    fn on_read(&mut self, cpu_id: usize, addr: u32);
-
-    /// Fired before/after a bus write at `addr`. Implementations decide
-    /// the exact semantics; the convention is "after the value has been
-    /// committed to the target device".
-    fn on_write(&mut self, cpu_id: usize, addr: u32);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::debug::expr::{ByteOrder, CpuExprContext};
+    use std::collections::BTreeMap;
 
     fn exec_bp(addr: u32, cpu: Option<usize>) -> Breakpoint {
         Breakpoint {
@@ -557,6 +415,96 @@ mod tests {
             condition: None,
         }
     }
+
+    fn event_bp(code: u32, param: u32) -> Breakpoint {
+        Breakpoint {
+            address: 0,
+            bp_type: BreakpointType::Event { code, param },
+            cpu_id: None,
+            condition: None,
+        }
+    }
+
+    fn hit_count(list: &BreakpointList, id: BreakpointId) -> u32 {
+        list.list()
+            .into_iter()
+            .find(|b| b.id == id)
+            .unwrap()
+            .hit_count
+    }
+
+    fn read(address: u32, value: u8) -> Access {
+        Access {
+            address,
+            write: false,
+            value,
+        }
+    }
+
+    fn write(address: u32, value: u8) -> Access {
+        Access {
+            address,
+            write: true,
+            value,
+        }
+    }
+
+    /// A machine for the checks: a register map and a sparse memory (absent
+    /// bytes read 0), in a byte order.
+    struct Machine {
+        registers: BTreeMap<&'static str, i64>,
+        memory: BTreeMap<u32, u8>,
+        order: ByteOrder,
+    }
+
+    impl Machine {
+        fn new(order: ByteOrder) -> Self {
+            Self {
+                registers: BTreeMap::new(),
+                memory: BTreeMap::new(),
+                order,
+            }
+        }
+
+        fn with_registers(mut self, pairs: &[(&'static str, i64)]) -> Self {
+            self.registers.extend(pairs.iter().copied());
+            self
+        }
+
+        fn with_bytes(mut self, base: u32, bytes: &[u8]) -> Self {
+            for (offset, &byte) in bytes.iter().enumerate() {
+                self.memory.insert(base + offset as u32, byte);
+            }
+            self
+        }
+
+        /// Run `check` with a context over this machine.
+        fn check<T>(&self, check: impl FnOnce(&mut dyn ExprContext) -> T) -> T {
+            let mut ctx = CpuExprContext::new(
+                |name| self.registers.get(name).copied(),
+                |address| *self.memory.get(&address).unwrap_or(&0),
+                self.order,
+            );
+            check(&mut ctx)
+        }
+    }
+
+    /// No registers, no memory, big-endian.
+    fn empty() -> Machine {
+        Machine::new(ByteOrder::BigEndian)
+    }
+
+    /// Check one instruction's accesses against `list` over `machine`.
+    fn accesses(
+        list: &mut BreakpointList,
+        cpu: usize,
+        found: &[Access],
+        machine: &Machine,
+    ) -> bool {
+        machine.check(|ctx| list.check_accesses(cpu, found, ctx))
+    }
+
+    // -- The list -------------------------------------------------------
 
     #[test]
     fn add_assigns_monotonic_ids() {
@@ -596,25 +544,26 @@ mod tests {
         assert!(list.list()[0].enabled);
     }
 
+    // -- Execute breakpoints -------------------------------------------
+
     #[test]
     fn check_execute_filters_by_cpu_id() {
         let mut list = BreakpointList::new();
-        list.add(exec_bp(0x1000, Some(0))); // 68K-only
-        list.add(exec_bp(0x1000, Some(1))); // Z80-only
-                                            // 68K fires only on cpu 0
-        assert!(list.check_execute(0, 0x1000));
-        assert!(list.check_execute(1, 0x1000));
-        // Wrong address
-        assert!(!list.check_execute(0, 0x2000));
+        list.add(exec_bp(0x1000, Some(0))); // the main CPU's
+        list.add(exec_bp(0x1000, Some(1))); // the sound CPU's
+        assert!(list.check_execute(0, 0x1000, None));
+        assert!(list.check_execute(1, 0x1000, None));
+        assert!(!list.check_execute(0, 0x2000, None), "wrong address");
+        assert!(!list.check_execute(2, 0x1000, None), "a CPU with none");
     }
 
     #[test]
     fn check_execute_wildcard_cpu_fires_for_all() {
         let mut list = BreakpointList::new();
         list.add(exec_bp(0x1000, None));
-        assert!(list.check_execute(0, 0x1000));
-        assert!(list.check_execute(1, 0x1000));
-        assert!(list.check_execute(42, 0x1000));
+        assert!(list.check_execute(0, 0x1000, None));
+        assert!(list.check_execute(1, 0x1000, None));
+        assert!(list.check_execute(42, 0x1000, None));
     }
 
     #[test]
@@ -622,35 +571,37 @@ mod tests {
         let mut list = BreakpointList::new();
         let id = list.add(exec_bp(0x1000, Some(0)));
         list.enable(id, false);
-        assert!(!list.check_execute(0, 0x1000));
+        assert!(!list.check_execute(0, 0x1000, None));
     }
 
     #[test]
     fn check_execute_increments_hit_count() {
         let mut list = BreakpointList::new();
         let id = list.add(exec_bp(0x1000, Some(0)));
-        list.check_execute(0, 0x1000);
-        list.check_execute(0, 0x1000);
-        list.check_execute(0, 0x2000); // miss
-        let item = list.list().into_iter().find(|b| b.id == id).unwrap();
-        assert_eq!(item.hit_count, 2);
+        list.check_execute(0, 0x1000, None);
+        list.check_execute(0, 0x1000, None);
+        list.check_execute(0, 0x2000, None); // miss
+        assert_eq!(hit_count(&list, id), 2);
     }
 
+    // -- Watchpoints ----------------------------------------------------
+
     #[test]
-    fn check_memory_access_respects_type() {
+    fn check_accesses_respects_the_direction_watched() {
         let mut list = BreakpointList::new();
         list.add(mem_bp(0x1000, BreakpointType::write(), Some(0)));
         list.add(mem_bp(0x2000, BreakpointType::read(), Some(0)));
         list.add(mem_bp(0x3000, BreakpointType::read_write(), Some(0)));
+        let machine = empty();
 
-        assert!(list.check_memory_access(0, 0x1000, true));
-        assert!(!list.check_memory_access(0, 0x1000, false));
+        assert!(accesses(&mut list, 0, &[write(0x1000, 0)], &machine));
+        assert!(!accesses(&mut list, 0, &[read(0x1000, 0)], &machine));
 
-        assert!(list.check_memory_access(0, 0x2000, false));
-        assert!(!list.check_memory_access(0, 0x2000, true));
+        assert!(accesses(&mut list, 0, &[read(0x2000, 0)], &machine));
+        assert!(!accesses(&mut list, 0, &[write(0x2000, 0)], &machine));
 
-        assert!(list.check_memory_access(0, 0x3000, false));
-        assert!(list.check_memory_access(0, 0x3000, true));
+        assert!(accesses(&mut list, 0, &[read(0x3000, 0)], &machine));
+        assert!(accesses(&mut list, 0, &[write(0x3000, 0)], &machine));
     }
 
     #[test]
@@ -663,9 +614,10 @@ mod tests {
             BreakpointType::Access(AccessFlags::new(true, false, true)),
             Some(0),
         ));
-        assert!(list.check_execute(0, 0x1000));
-        assert!(list.check_memory_access(0, 0x1000, true));
-        assert!(!list.check_memory_access(0, 0x1000, false));
+        let machine = empty();
+        assert!(list.check_execute(0, 0x1000, None));
+        assert!(accesses(&mut list, 0, &[write(0x1000, 0)], &machine));
+        assert!(!accesses(&mut list, 0, &[read(0x1000, 0)], &machine));
     }
 
     #[test]
@@ -673,11 +625,11 @@ mod tests {
         let mut list = BreakpointList::new();
         let id = list.add(exec_bp(0x1000, Some(0)));
         // Accrue a hit so we can prove it survives the type change.
-        assert!(list.check_execute(0, 0x1000));
+        assert!(list.check_execute(0, 0x1000, None));
         // Flip it to a write watchpoint.
         list.set_access(id, AccessFlags::WRITE);
-        assert!(!list.check_execute(0, 0x1000));
-        assert!(list.check_memory_access(0, 0x1000, true));
+        assert!(!list.check_execute(0, 0x1000, None));
+        assert!(accesses(&mut list, 0, &[write(0x1000, 0)], &empty()));
         let item = list.list().into_iter().find(|b| b.id == id).unwrap();
         assert_eq!(item.breakpoint.bp_type, BreakpointType::write());
         // Two matches total: one execute (before), one write (after).
@@ -697,21 +649,74 @@ mod tests {
     }
 
     #[test]
-    fn check_memory_access_ignores_execute_breakpoints() {
+    fn check_accesses_ignores_execute_breakpoints() {
         let mut list = BreakpointList::new();
         list.add(exec_bp(0x1000, Some(0)));
-        assert!(!list.check_memory_access(0, 0x1000, true));
-        assert!(!list.check_memory_access(0, 0x1000, false));
+        let machine = empty();
+        assert!(!accesses(&mut list, 0, &[write(0x1000, 0)], &machine));
+        assert!(!accesses(&mut list, 0, &[read(0x1000, 0)], &machine));
     }
 
-    fn event_bp(code: u32, param: u32) -> Breakpoint {
-        Breakpoint {
-            address: 0,
-            bp_type: BreakpointType::Event { code, param },
-            cpu_id: None,
-            condition: None,
-        }
+    #[test]
+    fn check_accesses_ignores_the_wrong_direction_and_cpu() {
+        let mut list = BreakpointList::new();
+        list.add(mem_bp(0x1000, BreakpointType::write(), Some(0)));
+        let machine = empty();
+        // A read access never trips a write-only watch.
+        assert!(!accesses(&mut list, 0, &[read(0x1000, 0)], &machine));
+        // The right access on the wrong CPU is filtered out.
+        assert!(!accesses(&mut list, 1, &[write(0x1000, 0)], &machine));
+        // No access at all fires nothing.
+        assert!(!accesses(&mut list, 0, &[], &machine));
     }
+
+    #[test]
+    fn a_watch_counts_one_hit_per_instruction() {
+        // A ranged watch whose bytes are all written in one instruction,
+        // and a byte watch read and written in it: one hit each.
+        let mut list = BreakpointList::new();
+        let ranged = list.add_with_spec(
+            mem_bp(0x1000, BreakpointType::write(), Some(0)),
+            MatchSpec {
+                address_end: Some(0x1003),
+                ..Default::default()
+            },
+        );
+        let byte = list.add(mem_bp(0x2000, BreakpointType::read_write(), Some(0)));
+        let instruction = [
+            write(0x1000, 1),
+            write(0x1001, 2),
+            write(0x1002, 3),
+            write(0x1003, 4),
+            read(0x2000, 5),
+            write(0x2000, 6),
+        ];
+        assert!(accesses(&mut list, 0, &instruction, &empty()));
+        assert_eq!(hit_count(&list, ranged), 1);
+        assert_eq!(hit_count(&list, byte), 1);
+        assert!(accesses(&mut list, 0, &instruction, &empty()));
+        assert_eq!(
+            hit_count(&list, ranged),
+            2,
+            "the next instruction counts again"
+        );
+    }
+
+    #[test]
+    fn a_watch_with_no_value_fires_without_reading_memory() {
+        let mut list = BreakpointList::new();
+        let id = list.add(mem_bp(0x1000, BreakpointType::write(), Some(0)));
+        // No value predicate: memory is never read.
+        let mut ctx = CpuExprContext::new(
+            |_| None,
+            |_| panic!("a watch with no value must not read memory"),
+            ByteOrder::BigEndian,
+        );
+        assert!(list.check_accesses(0, &[write(0x1000, 0xAB)], &mut ctx));
+        assert_eq!(hit_count(&list, id), 1);
+    }
+
+    // -- Events ---------------------------------------------------------
 
     #[test]
     fn check_event_matches_code_and_param() {
@@ -740,8 +745,7 @@ mod tests {
         list.check_event(2, 1);
         list.check_event(2, 1);
         list.check_event(2, 9); // miss
-        let item = list.list().into_iter().find(|b| b.id == id).unwrap();
-        assert_eq!(item.hit_count, 2);
+        assert_eq!(hit_count(&list, id), 2);
         list.enable(id, false);
         assert!(!list.check_event(2, 1));
     }
@@ -771,15 +775,52 @@ mod tests {
         assert!(list.has_watchpoints_or_events());
     }
 
-    // -- Advanced match conditions (MatchSpec) ---------------------------
-
-    fn hit_count(list: &BreakpointList, id: BreakpointId) -> u32 {
-        list.list()
-            .into_iter()
-            .find(|b| b.id == id)
-            .unwrap()
-            .hit_count
+    #[test]
+    fn the_enabled_events_are_listed_in_order() {
+        let mut list = BreakpointList::new();
+        list.add(event_bp(6, 1));
+        list.add(exec_bp(0x1000, Some(0)));
+        let off = list.add(event_bp(8, 5));
+        list.add(event_bp(6, BREAKPOINT_PARAM_ANY));
+        list.enable(off, false);
+        assert_eq!(
+            list.enabled_events().collect::<Vec<_>>(),
+            [(6, 1), (6, BREAKPOINT_PARAM_ANY)]
+        );
     }
+
+    #[test]
+    fn the_watched_params_are_those_of_the_enabled_breakpoints_on_a_code() {
+        let mut list = BreakpointList::new();
+        assert_eq!(list.watched_params::<1>(6), None);
+        list.add(event_bp(6, 1));
+        list.add(event_bp(6, 63));
+        list.add(event_bp(6, 64)); // past a one-word set
+        list.add(event_bp(7, 2)); // another code
+        let off = list.add(event_bp(6, 9));
+        list.enable(off, false);
+        let colours = list.watched_params::<1>(6).expect("two colours watched");
+        assert!(colours.contains(1) && colours.contains(63));
+        assert!(!colours.contains(2) && !colours.contains(9));
+        let wider = list.watched_params::<2>(6).unwrap();
+        assert!(wider.contains(64), "a wider set holds it");
+        assert_eq!(list.watched_params::<1>(8), None);
+
+        let mut only_past = BreakpointList::new();
+        only_past.add(event_bp(6, 200));
+        assert_eq!(
+            only_past.watched_params::<1>(6),
+            None,
+            "a set holding nothing is None"
+        );
+
+        let mut any = BreakpointList::new();
+        any.add(event_bp(8, BREAKPOINT_PARAM_ANY));
+        let tiles = any.watched_params::<32>(8).unwrap();
+        assert!(tiles.contains(0) && tiles.contains(2047));
+    }
+
+    // -- Advanced match conditions (MatchSpec) ---------------------------
 
     #[test]
     fn address_range_matches_inclusive_span_for_execute() {
@@ -791,11 +832,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(list.check_execute(0, 0x1000)); // low edge
-        assert!(list.check_execute(0, 0x1004)); // inside
-        assert!(list.check_execute(0, 0x1008)); // high edge
-        assert!(!list.check_execute(0, 0x1009)); // just past
-        assert!(!list.check_execute(0, 0x0FFF)); // just before
+        assert!(list.check_execute(0, 0x1000, None)); // low edge
+        assert!(list.check_execute(0, 0x1004, None)); // inside
+        assert!(list.check_execute(0, 0x1008, None)); // high edge
+        assert!(!list.check_execute(0, 0x1009, None)); // just past
+        assert!(!list.check_execute(0, 0x0FFF, None)); // just before
         assert_eq!(hit_count(&list, id), 3);
     }
 
@@ -809,11 +850,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(list.check_memory_access(0, 0xFF0000, true));
-        assert!(list.check_memory_access(0, 0xFF000F, true));
-        assert!(!list.check_memory_access(0, 0xFF0010, true));
+        let machine = empty();
+        assert!(accesses(&mut list, 0, &[write(0xFF0000, 0)], &machine));
+        assert!(accesses(&mut list, 0, &[write(0xFF000F, 0)], &machine));
+        assert!(!accesses(&mut list, 0, &[write(0xFF0010, 0)], &machine));
         // Read on a write-only range still doesn't fire.
-        assert!(!list.check_memory_access(0, 0xFF0008, false));
+        assert!(!accesses(&mut list, 0, &[read(0xFF0008, 0)], &machine));
     }
 
     #[test]
@@ -826,9 +868,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(list.check_execute(0, 0x2000));
-        assert!(!list.check_execute(0, 0x1800));
-        assert!(!list.check_execute(0, 0x1000));
+        assert!(list.check_execute(0, 0x2000, None));
+        assert!(!list.check_execute(0, 0x1800, None));
+        assert!(!list.check_execute(0, 0x1000, None));
     }
 
     #[test]
@@ -841,12 +883,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Value-agnostic path can never fire a value-conditioned watch.
-        assert!(!list.check_memory_access(0, 0xFF0000, true));
+        let machine = empty();
         // Wrong value: no fire.
-        assert!(!list.check_memory_access_valued(0, 0xFF0000, true, 0x41));
+        assert!(!accesses(&mut list, 0, &[write(0xFF0000, 0x41)], &machine));
+        // The right value read, on a write watch: no fire.
+        assert!(!accesses(&mut list, 0, &[read(0xFF0000, 0x42)], &machine));
         // Right value: fire.
-        assert!(list.check_memory_access_valued(0, 0xFF0000, true, 0x42));
+        assert!(accesses(&mut list, 0, &[write(0xFF0000, 0x42)], &machine));
         assert_eq!(hit_count(&list, id), 1);
     }
 
@@ -861,9 +904,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!list.check_memory_access_valued(0, 0x10, false, 0x7F));
-        assert!(list.check_memory_access_valued(0, 0x10, false, 0x80));
-        assert!(list.check_memory_access_valued(0, 0x10, false, 0xFF));
+        let machine = empty();
+        assert!(!accesses(&mut list, 0, &[read(0x10, 0x7F)], &machine));
+        assert!(accesses(&mut list, 0, &[read(0x10, 0x80)], &machine));
+        assert!(accesses(&mut list, 0, &[read(0x10, 0xFF)], &machine));
         assert_eq!(hit_count(&list, id), 2);
     }
 
@@ -878,9 +922,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        let machine = empty();
         // 0x8F & 0xF0 == 0x80 -> match; 0x70 & 0xF0 == 0x70 -> miss.
-        assert!(list.check_memory_access_valued(0, 0x10, true, 0x8F));
-        assert!(!list.check_memory_access_valued(0, 0x10, true, 0x70));
+        assert!(accesses(&mut list, 0, &[write(0x10, 0x8F)], &machine));
+        assert!(!accesses(&mut list, 0, &[write(0x10, 0x70)], &machine));
     }
 
     #[test]
@@ -893,10 +938,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!list.check_execute(0, 0x1000)); // skip 1
-        assert!(!list.check_execute(0, 0x1000)); // skip 2
-        assert!(list.check_execute(0, 0x1000)); // fires
-        assert!(list.check_execute(0, 0x1000)); // keeps firing
+        assert!(!list.check_execute(0, 0x1000, None)); // skip 1
+        assert!(!list.check_execute(0, 0x1000, None)); // skip 2
+        assert!(list.check_execute(0, 0x1000, None)); // fires
+        assert!(list.check_execute(0, 0x1000, None)); // keeps firing
         assert_eq!(hit_count(&list, id), 2);
     }
 
@@ -911,12 +956,13 @@ mod tests {
                 ..Default::default()
             },
         );
+        let machine = empty();
         // Non-matching values must not consume the skip budget.
-        assert!(!list.check_memory_access_valued(0, 0x10, true, 0x00));
-        assert!(!list.check_memory_access_valued(0, 0x10, true, 0x00));
+        assert!(!accesses(&mut list, 0, &[write(0x10, 0x00)], &machine));
+        assert!(!accesses(&mut list, 0, &[write(0x10, 0x00)], &machine));
         // First value match -> consumed by skip; second -> fires.
-        assert!(!list.check_memory_access_valued(0, 0x10, true, 0x99));
-        assert!(list.check_memory_access_valued(0, 0x10, true, 0x99));
+        assert!(!accesses(&mut list, 0, &[write(0x10, 0x99)], &machine));
+        assert!(accesses(&mut list, 0, &[write(0x10, 0x99)], &machine));
     }
 
     #[test]
@@ -929,9 +975,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(list.check_execute(0, 0x1000));
+        assert!(list.check_execute(0, 0x1000, None));
         // Auto-disabled: no further fires, and the list reflects it.
-        assert!(!list.check_execute(0, 0x1000));
+        assert!(!list.check_execute(0, 0x1000, None));
         assert!(
             !list
                 .list()
@@ -954,8 +1000,8 @@ mod tests {
             },
         );
         // Never halts...
-        assert!(!list.check_execute(0, 0x1000));
-        assert!(!list.check_execute(0, 0x1000));
+        assert!(!list.check_execute(0, 0x1000, None));
+        assert!(!list.check_execute(0, 0x1000, None));
         // ...but still counts each hit.
         assert_eq!(hit_count(&list, id), 2);
     }
@@ -972,7 +1018,7 @@ mod tests {
         );
         let brk = list.add(exec_bp(0x1000, Some(0)));
         // The log point counts, the break point halts.
-        assert!(list.check_execute(0, 0x1000));
+        assert!(list.check_execute(0, 0x1000, None));
         assert_eq!(hit_count(&list, brk), 1);
     }
 
@@ -980,8 +1026,8 @@ mod tests {
     fn set_match_spec_updates_in_place_and_resets_skip_window() {
         let mut list = BreakpointList::new();
         let id = list.add(exec_bp(0x1000, Some(0)));
-        // Accrue a hit, then attach a skip-2 spec.
-        assert!(list.check_execute(0, 0x1000));
+        // Accrue a hit, then attach a skip-1 spec.
+        assert!(list.check_execute(0, 0x1000, None));
         list.set_match_spec(
             id,
             MatchSpec {
@@ -990,8 +1036,8 @@ mod tests {
             },
         );
         // The skip window restarts: first post-spec match is skipped.
-        assert!(!list.check_execute(0, 0x1000));
-        assert!(list.check_execute(0, 0x1000));
+        assert!(!list.check_execute(0, 0x1000, None));
+        assert!(list.check_execute(0, 0x1000, None));
         // hit_count survived the spec change (1 before + 1 after).
         assert_eq!(hit_count(&list, id), 2);
         let item = list.list().into_iter().find(|b| b.id == id).unwrap();
@@ -1033,97 +1079,99 @@ mod tests {
             },
         );
         // Execute carries no observed value, so the value-conditioned
-        // breakpoint can never fire.
-        assert!(!list.check_execute(0, 0x1000));
+        // breakpoint can never fire, context or not.
+        assert!(!list.check_execute(0, 0x1000, None));
+        assert!(!empty().check(|ctx| list.check_execute(0, 0x1000, Some(ctx))));
     }
 
     // -- Multi-byte (sized) value watchpoints -------------------------
 
-    /// A little 16-entry fake memory at base 0x1000, big-endian-ordered
-    /// bytes 0x12 0x34 0x56 0x78 ... so a 32-bit big-endian read at
-    /// 0x1000 yields 0x12345678.
-    fn fake_mem(addr: u32) -> u8 {
-        const BYTES: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
-        BYTES
-            .get((addr.wrapping_sub(0x1000)) as usize)
-            .copied()
-            .unwrap_or(0)
+    /// 12 34 56 78 at 0x1000.
+    fn bytes_at_1000(order: ByteOrder) -> Machine {
+        Machine::new(order).with_bytes(0x1000, &[0x12, 0x34, 0x56, 0x78])
+    }
+
+    fn sized_watch(list: &mut BreakpointList, value: u32, value_size: u8) -> BreakpointId {
+        list.add_with_spec(
+            mem_bp(0x1000, BreakpointType::write(), Some(0)),
+            MatchSpec {
+                value: Some(value),
+                value_size,
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
     fn sized_watch_covers_consecutive_bytes() {
         let mut list = BreakpointList::new();
-        list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                value: Some(0x12345678),
-                value_size: 4,
-                ..Default::default()
-            },
-        );
+        sized_watch(&mut list, 0x1234_5678, 4);
+        let machine = bytes_at_1000(ByteOrder::BigEndian);
         // A write to any byte of 0x1000..=0x1003 is a candidate and the
-        // assembled 32-bit value matches.
-        assert!(list.check_memory_access_batch(0, &[(0x1003, true, 0x78)], true, fake_mem));
+        // whole 32-bit value matches.
+        assert!(accesses(&mut list, 0, &[write(0x1003, 0x78)], &machine));
         // The byte just past the span is not covered.
-        assert!(!list.check_memory_access_batch(0, &[(0x1004, true, 0x00)], true, fake_mem));
+        assert!(!accesses(&mut list, 0, &[write(0x1004, 0x00)], &machine));
     }
 
     #[test]
-    fn sized_watch_assembles_big_endian_value() {
+    fn sized_watch_reads_a_big_endian_value() {
         let mut list = BreakpointList::new();
-        list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                value: Some(0x12345678),
-                value_size: 4,
-                ..Default::default()
-            },
-        );
-        assert!(list.check_memory_access_batch(0, &[(0x1000, true, 0x12)], true, fake_mem));
+        sized_watch(&mut list, 0x1234_5678, 4);
+        let machine = bytes_at_1000(ByteOrder::BigEndian);
+        assert!(accesses(&mut list, 0, &[write(0x1000, 0x12)], &machine));
 
         // Wrong target: no fire even though a covered byte was written.
-        let mut list2 = BreakpointList::new();
-        list2.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                value: Some(0xDEADBEEF),
-                value_size: 4,
-                ..Default::default()
-            },
-        );
-        assert!(!list2.check_memory_access_batch(0, &[(0x1000, true, 0x12)], true, fake_mem));
+        let mut other = BreakpointList::new();
+        sized_watch(&mut other, 0xDEAD_BEEF, 4);
+        assert!(!accesses(&mut other, 0, &[write(0x1000, 0x12)], &machine));
     }
 
     #[test]
-    fn sized_watch_assembles_little_endian_value() {
+    fn sized_watch_reads_a_little_endian_value() {
         let mut list = BreakpointList::new();
-        list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                // Little-endian read of 12 34 56 78 -> 0x78563412.
-                value: Some(0x78563412),
-                value_size: 4,
-                ..Default::default()
-            },
-        );
-        assert!(list.check_memory_access_batch(0, &[(0x1002, true, 0x56)], false, fake_mem));
+        // Little-endian read of 12 34 56 78 -> 0x78563412.
+        sized_watch(&mut list, 0x7856_3412, 4);
+        let machine = bytes_at_1000(ByteOrder::LittleEndian);
+        assert!(accesses(&mut list, 0, &[write(0x1002, 0x56)], &machine));
     }
 
     #[test]
-    fn sized_watch_supports_24_bit_width() {
+    fn a_16_bit_watch_fires_on_the_whole_value() {
+        // 0x3412 little-endian at 0x1000 (a value above 255).
         let mut list = BreakpointList::new();
-        list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                // 24-bit big-endian read of 12 34 56 -> 0x123456.
-                value: Some(0x123456),
-                value_size: 3,
-                ..Default::default()
-            },
-        );
-        assert!(list.check_memory_access_batch(0, &[(0x1002, true, 0x56)], true, fake_mem));
+        let id = sized_watch(&mut list, 0x3412, 2);
+        let machine = bytes_at_1000(ByteOrder::LittleEndian);
+        let instruction = [write(0x1000, 0x12), write(0x1001, 0x34)];
+        assert!(accesses(&mut list, 0, &instruction, &machine));
+        assert_eq!(hit_count(&list, id), 1, "one hit for the two bytes");
+        // Its low byte alone does not fire a watch on the whole value.
+        let mut low_byte = BreakpointList::new();
+        sized_watch(&mut low_byte, 0x12, 2);
+        assert!(!accesses(&mut low_byte, 0, &instruction, &machine));
+    }
+
+    #[test]
+    fn a_24_bit_watch_fires_on_the_whole_value() {
+        // 24-bit big-endian read of 12 34 56 -> 0x123456.
+        let mut list = BreakpointList::new();
+        sized_watch(&mut list, 0x12_3456, 3);
+        let big = bytes_at_1000(ByteOrder::BigEndian);
+        assert!(accesses(&mut list, 0, &[write(0x1002, 0x56)], &big));
         // 0x1003 is outside the 3-byte span.
-        assert!(!list.check_memory_access_batch(0, &[(0x1003, true, 0x78)], true, fake_mem));
+        assert!(!accesses(&mut list, 0, &[write(0x1003, 0x78)], &big));
+
+        // The same bytes little-endian are 0x563412.
+        let mut little_list = BreakpointList::new();
+        sized_watch(&mut little_list, 0x56_3412, 3);
+        let little = bytes_at_1000(ByteOrder::LittleEndian);
+        assert!(accesses(
+            &mut little_list,
+            0,
+            &[write(0x1001, 0x34)],
+            &little
+        ));
+        assert!(!accesses(&mut list, 0, &[write(0x1001, 0x34)], &little));
     }
 
     #[test]
@@ -1137,10 +1185,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        // read_byte must never be consulted for a single-byte watch:
-        // panic if it is, proving the accessed byte is used directly.
-        let panicking = |_: u32| -> u8 { panic!("single-byte watch must not peek memory") };
-        assert!(list.check_memory_access_batch(0, &[(0x2000, true, 0x42)], true, panicking));
+        // Memory must never be read for a one-byte watch: the read panics,
+        // proving the accessed byte is used directly.
+        let mut ctx = CpuExprContext::new(
+            |_| None,
+            |_| panic!("a one-byte watch must not read memory"),
+            ByteOrder::BigEndian,
+        );
+        assert!(list.check_accesses(0, &[write(0x2000, 0x42)], &mut ctx));
     }
 
     #[test]
@@ -1148,107 +1200,38 @@ mod tests {
         // A 32-bit watch whose four covered bytes are all written in one
         // instruction must count a single hit, not four.
         let mut list = BreakpointList::new();
-        let id = list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
-            MatchSpec {
-                value: Some(0x12345678),
-                value_size: 4,
-                ..Default::default()
-            },
-        );
-        let accesses = [
-            (0x1000, true, 0x12),
-            (0x1001, true, 0x34),
-            (0x1002, true, 0x56),
-            (0x1003, true, 0x78),
+        let id = sized_watch(&mut list, 0x1234_5678, 4);
+        let instruction = [
+            write(0x1000, 0x12),
+            write(0x1001, 0x34),
+            write(0x1002, 0x56),
+            write(0x1003, 0x78),
         ];
-        assert!(list.check_memory_access_batch(0, &accesses, true, fake_mem));
+        assert!(accesses(
+            &mut list,
+            0,
+            &instruction,
+            &bytes_at_1000(ByteOrder::BigEndian)
+        ));
         assert_eq!(hit_count(&list, id), 1);
-    }
-
-    #[test]
-    fn batch_value_agnostic_watch_fires_without_peek() {
-        let mut list = BreakpointList::new();
-        let id = list.add(mem_bp(0x1000, BreakpointType::write(), Some(0)));
-        // No value predicate -> read_byte is never needed.
-        let panicking = |_: u32| -> u8 { panic!("value-agnostic watch must not peek") };
-        assert!(list.check_memory_access_batch(0, &[(0x1000, true, 0xAB)], true, panicking));
-        assert_eq!(hit_count(&list, id), 1);
-    }
-
-    #[test]
-    fn batch_ignores_wrong_direction_and_cpu() {
-        let mut list = BreakpointList::new();
-        list.add(mem_bp(0x1000, BreakpointType::write(), Some(0)));
-        // A read access never trips a write-only watch.
-        assert!(!list.check_memory_access_batch(0, &[(0x1000, false, 0)], true, fake_mem));
-        // The right access on the wrong CPU is filtered out.
-        assert!(!list.check_memory_access_batch(1, &[(0x1000, true, 0)], true, fake_mem));
     }
 
     #[test]
     fn value_width_clamps_to_one_through_four() {
-        assert_eq!(
+        let width = |value_size| {
             MatchSpec {
-                value_size: 0,
+                value_size,
                 ..Default::default()
             }
-            .value_width(),
-            1
-        );
-        assert_eq!(
-            MatchSpec {
-                value_size: 1,
-                ..Default::default()
-            }
-            .value_width(),
-            1
-        );
-        assert_eq!(
-            MatchSpec {
-                value_size: 3,
-                ..Default::default()
-            }
-            .value_width(),
-            3
-        );
-        assert_eq!(
-            MatchSpec {
-                value_size: 9,
-                ..Default::default()
-            }
-            .value_width(),
-            4
-        );
+            .value_width()
+        };
+        assert_eq!(width(0), 1);
+        assert_eq!(width(1), 1);
+        assert_eq!(width(3), 3);
+        assert_eq!(width(9), 4);
     }
 
-    /// Minimal [`ExprContext`] over a fixed register map plus a sparse
-    /// big-endian memory map (absent bytes read as `0`).
-    struct TestCtx {
-        regs: std::collections::BTreeMap<&'static str, i64>,
-        mem: std::collections::BTreeMap<u32, u8>,
-    }
-
-    impl ExprContext for TestCtx {
-        fn register(&mut self, name: &str) -> Option<i64> {
-            self.regs.get(name).copied()
-        }
-        fn read_mem(&mut self, addr: u32, width: u8) -> i64 {
-            let mut v: i64 = 0;
-            for i in 0..width as u32 {
-                let byte = *self.mem.get(&addr.wrapping_add(i)).unwrap_or(&0);
-                v = (v << 8) | byte as i64;
-            }
-            v
-        }
-    }
-
-    fn ctx_with(pairs: &[(&'static str, i64)]) -> TestCtx {
-        TestCtx {
-            regs: pairs.iter().copied().collect(),
-            mem: std::collections::BTreeMap::new(),
-        }
-    }
+    // -- Conditions -----------------------------------------------------
 
     #[test]
     fn expr_execute_fires_only_when_condition_holds() {
@@ -1260,13 +1243,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut yes = ctx_with(&[("d0", 5)]);
-        let mut no = ctx_with(&[("d0", 4)]);
+        let yes = empty().with_registers(&[("d0", 5)]);
+        let no = empty().with_registers(&[("d0", 4)]);
         // Condition false -> no fire, no hit counted.
-        assert!(!list.check_execute_ctx(0, 0x1000, Some(&mut no)));
+        assert!(!no.check(|ctx| list.check_execute(0, 0x1000, Some(ctx))));
         assert_eq!(hit_count(&list, id), 0);
         // Condition true -> fire.
-        assert!(list.check_execute_ctx(0, 0x1000, Some(&mut yes)));
+        assert!(yes.check(|ctx| list.check_execute(0, 0x1000, Some(ctx))));
         assert_eq!(hit_count(&list, id), 1);
     }
 
@@ -1280,9 +1263,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        // The value-/expression-agnostic entry can't evaluate the
-        // condition, so an expression breakpoint stays silent there.
-        assert!(!list.check_execute(0, 0x1000));
+        // With no context the condition can't be evaluated, so the
+        // breakpoint stays silent.
+        assert!(!list.check_execute(0, 0x1000, None));
         assert_eq!(hit_count(&list, id), 0);
     }
 
@@ -1296,8 +1279,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut ctx = ctx_with(&[("d0", 5)]);
-        assert!(!list.check_execute_ctx(0, 0x1000, Some(&mut ctx)));
+        let machine = empty().with_registers(&[("d0", 5)]);
+        assert!(!machine.check(|ctx| list.check_execute(0, 0x1000, Some(ctx))));
         assert_eq!(hit_count(&list, id), 0);
     }
 
@@ -1311,17 +1294,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Fires even on the context-less path because the blank expression
-        // is treated as absent.
-        assert!(list.check_execute(0, 0x1000));
+        // Fires even with no context because the blank expression is
+        // treated as absent.
+        assert!(list.check_execute(0, 0x1000, None));
         assert_eq!(hit_count(&list, id), 1);
     }
 
     #[test]
     fn expr_watch_combines_with_value_predicate() {
         // A write watch that only fires when the stored word is 0x1234 AND
-        // a1 points above 0xFF0000. The context supplies the assembled
-        // value (0x1234) via `read_mem` and the register `a1`.
+        // a1 points above 0xFF0000. The context supplies the whole value
+        // (0x1234) and the register `a1`.
         let mut list = BreakpointList::new();
         let id = list.add_with_spec(
             mem_bp(0x1000, BreakpointType::write(), Some(0)),
@@ -1332,47 +1315,40 @@ mod tests {
                 ..Default::default()
             },
         );
-        let accesses = [(0x1000, true, 0x12), (0x1001, true, 0x34)];
-        let mem: std::collections::BTreeMap<u32, u8> = [(0x1000, 0x12), (0x1001, 0x34)].into();
+        let instruction = [write(0x1000, 0x12), write(0x1001, 0x34)];
         // Value matches but expression is false -> no fire.
-        let mut low = ctx_with(&[("a1", 0x100)]);
-        low.mem = mem.clone();
-        assert!(!list.check_memory_access_batch_ctx(0, &accesses, &mut low));
+        let low = empty()
+            .with_registers(&[("a1", 0x100)])
+            .with_bytes(0x1000, &[0x12, 0x34]);
+        assert!(!accesses(&mut list, 0, &instruction, &low));
         assert_eq!(hit_count(&list, id), 0);
         // Value matches and expression holds -> fire once.
-        let mut high = ctx_with(&[("a1", 0xFF_8000)]);
-        high.mem = mem;
-        assert!(list.check_memory_access_batch_ctx(0, &accesses, &mut high));
+        let high = empty()
+            .with_registers(&[("a1", 0xFF_8000)])
+            .with_bytes(0x1000, &[0x12, 0x34]);
+        assert!(accesses(&mut list, 0, &instruction, &high));
         assert_eq!(hit_count(&list, id), 1);
     }
 
     #[test]
-    fn ctx_batch_sized_watch_reads_value_through_context() {
-        // Without an explicit expression, the ctx batch still assembles a
-        // sized watch's observed value from `read_mem`.
+    fn a_watch_condition_reads_memory_through_the_context() {
         let mut list = BreakpointList::new();
         let id = list.add_with_spec(
-            mem_bp(0x1000, BreakpointType::write(), Some(0)),
+            mem_bp(0x10, BreakpointType::write(), Some(0)),
             MatchSpec {
-                value: Some(0x12345678),
-                value_size: 4,
+                expr: Some("[0x20].w == 0x0102".into()),
                 ..Default::default()
             },
         );
-        let mut ctx = ctx_with(&[]);
-        ctx.mem = [
-            (0x1000, 0x12),
-            (0x1001, 0x34),
-            (0x1002, 0x56),
-            (0x1003, 0x78),
-        ]
-        .into();
-        assert!(list.check_memory_access_batch_ctx(0, &[(0x1003, true, 0x78)], &mut ctx));
+        let wrong = Machine::new(ByteOrder::LittleEndian).with_bytes(0x20, &[0x01, 0x02]);
+        assert!(!accesses(&mut list, 0, &[write(0x10, 0)], &wrong));
+        let right = Machine::new(ByteOrder::LittleEndian).with_bytes(0x20, &[0x02, 0x01]);
+        assert!(accesses(&mut list, 0, &[write(0x10, 0)], &right));
         assert_eq!(hit_count(&list, id), 1);
     }
 
     #[test]
-    fn expr_watch_fails_closed_without_context() {
+    fn expr_watch_fails_closed_on_a_register_the_cpu_has_not() {
         let mut list = BreakpointList::new();
         let id = list.add_with_spec(
             mem_bp(0x1000, BreakpointType::write(), Some(0)),
@@ -1381,8 +1357,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        // No ctx -> the conditional watch can't be verified, stays silent.
-        assert!(!list.check_memory_access_batch(0, &[(0x1000, true, 0xAB)], true, fake_mem));
+        // The context names no `d0`: the condition can't be verified, so
+        // the watch stays silent.
+        assert!(!accesses(&mut list, 0, &[write(0x1000, 0xAB)], &empty()));
         assert_eq!(hit_count(&list, id), 0);
     }
 }

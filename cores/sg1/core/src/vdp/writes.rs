@@ -15,8 +15,8 @@
 //! - [`Vdp::set_event_watch`] arms the debugger's event breakpoints on the
 //!   same writes: a transfer finishing, a palette colour written, a
 //!   transfer into the sprite table, a tile rewritten. The VDP raises only
-//!   what the watch asks for, and the system checks what was raised after
-//!   each instruction ([`Vdp::take_raised_events`]).
+//!   what the watch asks for, and the debugger drains what was raised after
+//!   each instruction ([`Vdp::raised_events_mut`]).
 //!
 //! Every write path has one hook, behind the check of `Vdp::recording`
 //! that the line table already pays: with nothing recorded a write costs
@@ -74,6 +74,7 @@ use retro_core::capture::{
     arm_recorder, CaptureRecording, FrameWrite, FrameWrites, VideoMemorySources, WriteKind,
     WriteLog, WriteOrigin, Writer, WORDS_PER_RECORD,
 };
+use retro_core::debug::{ParamSet, RaisedEvents};
 
 use super::recording::{PaletteRedraw, Recording};
 use super::Vdp;
@@ -90,13 +91,13 @@ const VRAM_BYTES: usize = 0x1_0000;
 const TILE_BYTES: usize = 32;
 /// The tiles of VRAM.
 const TILES: usize = VRAM_BYTES / TILE_BYTES;
-/// The most events raised between two takes; past it a raised event is
-/// dropped. One is enough to stop the debugger.
-const MOST_RAISED_EVENTS: usize = 16;
+/// The most events kept between two drains by the debugger; past it a
+/// raised event is counted, not kept. One is enough to stop the debugger.
+const MOST_RAISED_EVENTS: usize = 4096;
 
 /// The memory a record wrote: bits 0-7 of its word 4, and the param of the
 /// transfer-finished event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriteTarget {
     /// Video memory: tiles, maps, the sprite table, the scroll table.
     Vram = 0,
@@ -130,7 +131,7 @@ impl WriteTarget {
 
 /// An event a debugger breakpoint can stop on, raised by a write to video
 /// memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoEvent {
     /// A transfer from 68000 memory, a fill or a copy has written all its
     /// data into the memory named.
@@ -150,131 +151,36 @@ pub enum VideoEvent {
 /// ([`Vdp::set_event_watch`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VideoEventWatch {
-    /// The memories whose transfers raise their end: bit 0 VRAM, 1 CRAM,
-    /// 2 VSRAM.
-    transfer_targets: u8,
-    /// The colours whose writes raise an event, bit `n` colour `n`.
-    palette_colours: u64,
+    /// The memories whose transfers raise their end, each its
+    /// [`WriteTarget`] code.
+    pub transfer_targets: ParamSet<1>,
+    /// The colours whose writes raise an event.
+    pub palette_colours: ParamSet<1>,
     /// A transfer into the sprite table raises an event.
-    sprite_table: bool,
-    /// The tiles whose rewriting raises an event, bit `n % 64` of word
-    /// `n / 64` tile `n`.
-    tiles: Vec<u64>,
+    pub sprite_table: bool,
+    /// The tiles whose rewriting raises an event.
+    pub tiles: ParamSet<{ TILES / 64 }>,
 }
 
 impl VideoEventWatch {
-    /// Watch for the end of a transfer into `target`.
-    pub fn transfers_into(&mut self, target: WriteTarget) -> &mut Self {
-        self.transfer_targets |= 1 << target as u8;
-        self
-    }
-
-    /// Watch for writes of `colour` (0-63; another value watches nothing).
-    pub fn palette_colour(&mut self, colour: u32) -> &mut Self {
-        if colour < 64 {
-            self.palette_colours |= 1 << colour;
-        }
-        self
-    }
-
-    /// Watch for writes of any colour.
-    pub fn every_palette_colour(&mut self) -> &mut Self {
-        self.palette_colours = u64::MAX;
-        self
-    }
-
-    /// Watch for transfers into the sprite table.
-    pub fn sprite_table(&mut self) -> &mut Self {
-        self.sprite_table = true;
-        self
-    }
-
-    /// Watch for writes that change `tile` (0-2047; another value watches
-    /// nothing).
-    pub fn tile(&mut self, tile: u32) -> &mut Self {
-        if (tile as usize) < TILES {
-            self.tile_words()[tile as usize / 64] |= 1 << (tile % 64);
-        }
-        self
-    }
-
-    /// Watch for writes that change any tile.
-    pub fn every_tile(&mut self) -> &mut Self {
-        self.tile_words().fill(u64::MAX);
-        self
-    }
-
     /// Whether the watch asks for nothing.
     pub fn is_empty(&self) -> bool {
-        self.transfer_targets == 0
-            && self.palette_colours == 0
+        self.transfer_targets.is_empty()
+            && self.palette_colours.is_empty()
             && !self.sprite_table
-            && self.tiles.iter().all(|&word| word == 0)
-    }
-
-    fn tile_words(&mut self) -> &mut Vec<u64> {
-        if self.tiles.is_empty() {
-            self.tiles = vec![0; TILES / 64];
-        }
-        &mut self.tiles
+            && self.tiles.is_empty()
     }
 
     fn watches_tiles(&self) -> bool {
         !self.tiles.is_empty()
     }
 
-    fn watches_tile(&self, tile: usize) -> bool {
-        self.tiles
-            .get(tile / 64)
-            .is_some_and(|word| word & (1 << (tile % 64)) != 0)
-    }
-
     fn watches(&self, event: VideoEvent) -> bool {
         match event {
-            VideoEvent::TransferComplete(target) => {
-                self.transfer_targets & (1 << target as u8) != 0
-            }
-            VideoEvent::PaletteWrite(colour) => {
-                colour < 64 && self.palette_colours & (1 << colour) != 0
-            }
+            VideoEvent::TransferComplete(target) => self.transfer_targets.contains(target as u32),
+            VideoEvent::PaletteWrite(colour) => self.palette_colours.contains(u32::from(colour)),
             VideoEvent::SpriteTableTransfer => self.sprite_table,
-            VideoEvent::TileRewritten(tile) => self.watches_tile(usize::from(tile)),
-        }
-    }
-}
-
-/// The events raised since the last take ([`Vdp::take_raised_events`]),
-/// each once, at most 16.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RaisedEvents {
-    events: [VideoEvent; MOST_RAISED_EVENTS],
-    len: usize,
-}
-
-impl Default for RaisedEvents {
-    fn default() -> Self {
-        Self {
-            events: [VideoEvent::SpriteTableTransfer; MOST_RAISED_EVENTS],
-            len: 0,
-        }
-    }
-}
-
-impl RaisedEvents {
-    /// The events, in the order they were first raised.
-    pub fn iter(&self) -> impl Iterator<Item = VideoEvent> + '_ {
-        self.events[..self.len].iter().copied()
-    }
-
-    /// Whether nothing was raised.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn raise(&mut self, event: VideoEvent) {
-        if self.len < MOST_RAISED_EVENTS && !self.events[..self.len].contains(&event) {
-            self.events[self.len] = event;
-            self.len += 1;
+            VideoEvent::TileRewritten(tile) => self.tiles.contains(u32::from(tile)),
         }
     }
 }
@@ -282,7 +188,7 @@ impl RaisedEvents {
 /// The debugger's watch and what it raised.
 pub(super) struct EventState {
     watch: VideoEventWatch,
-    raised: RaisedEvents,
+    raised: RaisedEvents<VideoEvent>,
 }
 
 impl EventState {
@@ -363,7 +269,7 @@ impl LiveWrites {
             log.clear();
         }
         if let Some(events) = &mut self.events {
-            events.raised = RaisedEvents::default();
+            events.raised.clear();
         }
         self.fill = None;
         self.before.clear();
@@ -508,7 +414,7 @@ impl Vdp {
                     events => {
                         *events = Some(EventState {
                             watch,
-                            raised: RaisedEvents::default(),
+                            raised: RaisedEvents::new(MOST_RAISED_EVENTS),
                         })
                     }
                 }
@@ -529,18 +435,15 @@ impl Vdp {
         }
     }
 
-    /// The events raised since the last take, and none from then on until
-    /// the next write raises one.
+    /// The events raised since the debugger last drained them, while its
+    /// event breakpoints watch something ([`Self::set_event_watch`]), else
+    /// `None`. The debugger drains them after each instruction.
     #[inline(always)]
-    pub fn take_raised_events(&mut self) -> RaisedEvents {
-        match self
-            .recording
+    pub fn raised_events_mut(&mut self) -> Option<&mut RaisedEvents<VideoEvent>> {
+        self.recording
             .as_deref_mut()
             .and_then(|recording| recording.live.events.as_mut())
-        {
-            Some(events) if !events.raised.is_empty() => std::mem::take(&mut events.raised),
-            _ => RaisedEvents::default(),
-        }
+            .map(|events| &mut events.raised)
     }
 
     /// Who wrote each byte of VRAM and in which frame, while video memory
@@ -1086,29 +989,38 @@ mod tests {
 
     #[test]
     fn an_event_is_raised_once_and_only_when_watched() {
-        let mut raised = RaisedEvents::default();
-        for _ in 0..3 {
-            raised.raise(VideoEvent::PaletteWrite(5));
-        }
-        for tile in 0..40 {
-            raised.raise(VideoEvent::TileRewritten(tile));
-        }
-        assert_eq!(raised.iter().count(), MOST_RAISED_EVENTS);
-        assert_eq!(raised.iter().next(), Some(VideoEvent::PaletteWrite(5)));
-
         let mut watch = VideoEventWatch::default();
         assert!(watch.is_empty());
-        watch.palette_colour(5).tile(2047).tile(2048);
+        watch.palette_colours.insert(5);
+        watch.tiles.insert(2047);
+        watch.tiles.insert(2048);
         assert!(watch.watches(VideoEvent::PaletteWrite(5)));
         assert!(!watch.watches(VideoEvent::PaletteWrite(6)));
         assert!(watch.watches(VideoEvent::TileRewritten(2047)));
         assert!(!watch.watches(VideoEvent::TileRewritten(0)));
         assert!(!watch.watches(VideoEvent::SpriteTableTransfer));
         assert!(!watch.watches(VideoEvent::TransferComplete(WriteTarget::Vram)));
-        watch.transfers_into(WriteTarget::Cram).sprite_table();
+        watch.transfer_targets.insert(WriteTarget::Cram as u32);
+        watch.sprite_table = true;
         assert!(watch.watches(VideoEvent::TransferComplete(WriteTarget::Cram)));
         assert!(!watch.watches(VideoEvent::TransferComplete(WriteTarget::Vram)));
         assert!(watch.watches(VideoEvent::SpriteTableTransfer));
+
+        let mut state = EventState {
+            watch,
+            raised: RaisedEvents::new(MOST_RAISED_EVENTS),
+        };
+        for _ in 0..3 {
+            state.raise(VideoEvent::PaletteWrite(5));
+        }
+        state.raise(VideoEvent::PaletteWrite(6));
+        state.raise(VideoEvent::TileRewritten(2047));
+        let mut drained = Vec::new();
+        state.raised.drain(|event| drained.push(event));
+        assert_eq!(
+            drained,
+            [VideoEvent::PaletteWrite(5), VideoEvent::TileRewritten(2047)]
+        );
     }
 
     #[test]

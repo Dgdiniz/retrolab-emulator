@@ -134,11 +134,13 @@ fn read_counter(emu: &mut SnesEmulator, addr: u32) -> u16 {
 }
 
 /// Read the GSU's `R0` back through the `$3000/$3001` MMIO window (little-
-/// endian). Side-effect-free for a stopped GSU: the catch-up is a no-op and
-/// only `$3031` reads clear the IRQ latch.
+/// endian), on the live bus as the S-CPU reads it. Changes nothing the test
+/// looks at for a stopped GSU: the catch-up is a no-op and only `$3031`
+/// reads clear the IRQ latch.
 fn read_gsu_r0(emu: &mut SnesEmulator) -> u16 {
-    let bytes = emu.read_memory_debug(0x3000, 2);
-    u16::from(bytes[0]) | (u16::from(bytes[1]) << 8)
+    let low = u16::from(emu.bus_mut().read(0x3000));
+    let high = u16::from(emu.bus_mut().read(0x3001));
+    low | (high << 8)
 }
 
 fn loaded(reset: &[u8], irq: &[u8], kernel: &[u8]) -> SnesEmulator {

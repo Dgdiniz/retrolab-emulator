@@ -270,6 +270,21 @@ impl Coprocessor for Sdd1Chip {
         self.read_mmc(offset)
     }
 
+    /// The S-CPU's view of the chip read without a side effect: the MMC ROM
+    /// window through the bank latches. `None` for the registers, and for an
+    /// address a channel armed for decompression reads from: a read there is
+    /// a byte of the transfer the chip decompresses.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        if offset >= SDD1_REG_WINDOW_BASE {
+            return None;
+        }
+        let addr24 = 0xC0_0000 + offset;
+        let armed = self.sdd1_enable & self.xfer_enable;
+        let decompressing =
+            (0..8).any(|ch| armed & (1 << ch) != 0 && self.dma_shadow[ch].addr == addr24);
+        (!decompressing).then(|| self.read_mmc(offset))
+    }
+
     fn write(&mut self, offset: u32, value: u8, _master_cycle: u64) {
         self.accesses += 1;
         if offset >= SDD1_REG_WINDOW_BASE {

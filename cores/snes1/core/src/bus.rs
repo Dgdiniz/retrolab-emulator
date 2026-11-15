@@ -84,6 +84,7 @@ use std::sync::Arc;
 use retro_core::capture::{CaptureRecording, WriteOrigin};
 use retro_core::cartridge::SourcePlace;
 use retro_core::cpu::Addressable;
+use retro_core::debug::{Access, AccessLog};
 
 use crate::apu::Apu;
 use crate::cartridge::{BusSpeed, MapPlan, MapTarget, SnesCartridge, CX4_CHIP_ID};
@@ -342,14 +343,21 @@ pub struct SnesBus {
     /// state is refreshed once per frame by `system.rs` from the input
     /// manager via [`SnesBus::set_controller_buttons`].
     controllers: [StandardPad; 2],
-    /// When set, CPU bus reads/writes are appended to [`Self::debug_events`]
-    /// so the emulator can match read/write watchpoints and PPU/APU
-    /// write events. The debugger arms this (via [`SnesBus::set_debug_armed`])
-    /// only when at least one watch/event breakpoint exists, so the fast
-    /// path pays nothing.
+    /// When set, the CPU's bus reads and writes are logged in
+    /// [`Self::accesses`] and its writes to the PPU registers and the APU
+    /// ports in [`Self::debug_events`], so the emulator can match
+    /// watchpoints and those write events after the instruction. The
+    /// debugger arms this (via [`SnesBus::set_debug_armed`]) only when at
+    /// least one watch/event breakpoint exists, so the fast path pays
+    /// nothing.
     debug_armed: bool,
-    /// Raw CPU accesses recorded this instruction (drained per step by
-    /// `system.rs`). Always empty unless [`Self::debug_armed`] is set.
+    /// The bytes the CPU read and wrote this instruction, for the
+    /// watchpoints (checked and cleared per step by `system.rs`). Always
+    /// empty unless [`Self::debug_armed`] is set.
+    accesses: AccessLog,
+    /// The PPU-register and APU-port writes the CPU made this instruction,
+    /// for their event breakpoints. Always empty unless
+    /// [`Self::debug_armed`] is set.
     debug_events: Vec<BusDebugEvent>,
     /// Master cycles accumulated by the CPU's memory accesses since the
     /// last [`Self::begin_cpu_instruction`]. Each `read`/`write` on the
@@ -411,25 +419,16 @@ pub enum PageHandler {
     OpenBus,
 }
 
-/// A raw bus access recorded for the debugger when watch/event
-/// breakpoints are armed.
+/// A CPU write to a PPU register or an APU port, recorded for the
+/// debugger's write events when watch/event breakpoints are armed.
 ///
-/// The bus records these per CPU access (only while
-/// [`SnesBus::debug_armed`] is set) and the emulator drains + matches
-/// them after each instruction. `Read`/`Write` carry the full 24-bit
-/// address (matched against read/write watchpoints); `PpuRegWrite` and
-/// `ApuPortWrite` carry the decoded register/port for the matching SNES
-/// event breakpoints. DMA-engine traffic uses the internal typed
-/// read/write paths and is intentionally **not** recorded here, only
-/// CPU-initiated accesses are observed.
+/// The bus records these per CPU write (only while
+/// [`SnesBus::debug_armed`] is set) beside the access log the watchpoints
+/// read, and the emulator matches them after each instruction. DMA-engine
+/// traffic uses the internal typed read/write paths and is intentionally
+/// **not** recorded here, only CPU-initiated accesses are observed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BusDebugEvent {
-    /// A CPU bus read of `addr` (includes instruction fetches). `value`
-    /// is the byte returned, so value-matched read watchpoints can fire.
-    Read { addr: u32, value: u8 },
-    /// A CPU bus write of `addr`. `value` is the byte stored, so
-    /// value-matched write watchpoints can fire.
-    Write { addr: u32, value: u8 },
     /// A write to PPU register `$2100 | reg` (`reg` is `$00-$3F`).
     PpuRegWrite { reg: u8 },
     /// A write to APU mailbox port `port` (0-3), i.e. `$2140-$2143`.
@@ -521,6 +520,7 @@ impl SnesBus {
             apu_cycle: 0,
             controllers: [StandardPad::new(); 2],
             debug_armed: false,
+            accesses: AccessLog::new(),
             debug_events: Vec::new(),
             instr_master_cycles: 0,
             instr_accesses: 0,
@@ -551,15 +551,16 @@ impl SnesBus {
         (self.instr_master_cycles, self.instr_accesses)
     }
 
-    /// Arm or disarm bus-level debug recording. When `armed`, CPU
-    /// reads/writes are captured into [`Self::debug_events`]; disarming
-    /// clears any pending records so a later session starts clean.
-    /// Mirrored from the debugger's watch/event-breakpoint state once
-    /// per frame by `system.rs`.
+    /// Arm or disarm bus-level debug recording. When `armed`, the CPU's
+    /// reads and writes are logged ([`Self::accesses`]) and its register
+    /// and port writes recorded ([`Self::debug_events`]); disarming clears
+    /// any pending records so a later session starts clean. Mirrored from
+    /// the debugger's watch/event-breakpoint state once per frame by
+    /// `system.rs`.
     pub fn set_debug_armed(&mut self, armed: bool) {
         self.debug_armed = armed;
         if !armed {
-            self.debug_events.clear();
+            self.clear_debug_events();
         }
     }
 
@@ -568,16 +569,22 @@ impl SnesBus {
         self.debug_armed
     }
 
-    /// Borrow the raw bus accesses recorded since the last
+    /// The bytes the CPU read and wrote since the last
+    /// [`SnesBus::clear_debug_events`], in order.
+    pub fn accesses(&self) -> &[Access] {
+        self.accesses.as_slice()
+    }
+
+    /// The PPU-register and APU-port writes recorded since the last
     /// [`SnesBus::clear_debug_events`].
     pub fn debug_events(&self) -> &[BusDebugEvent] {
         &self.debug_events
     }
 
-    /// Drop all recorded bus accesses. The emulator clears the buffer
-    /// before each measured instruction (so debug-capture reads don't
-    /// leak in) and after draining it.
+    /// Drop the access log and the recorded writes. The emulator clears
+    /// them before each measured instruction and after checking them.
     pub fn clear_debug_events(&mut self) {
+        self.accesses.clear();
         self.debug_events.clear();
     }
 
@@ -1353,6 +1360,78 @@ impl SnesBus {
         }
     }
 
+    /// The byte a read of an A-bus address would give, read without side
+    /// effects, for the debugger's own reads: the memory viewer, the
+    /// disassembly, the trace's operands and pointers, the call stack's
+    /// opcode and a condition's memory reads.
+    ///
+    /// Work RAM and its mirror give their bytes, and the cartridge's ROM
+    /// and RAM theirs, routed through the page table and the map plan as a
+    /// read is. A coprocessor's window answers through the chip's own peek
+    /// ([`SnesCartridge::peek_chip`]), which gives the ROM or RAM behind it
+    /// and nothing for a register; where the chip cannot answer, and on an
+    /// unmapped page, the peek gives the open-bus value, as a read of
+    /// nothing would. The B-bus and CPU register pages read 0, because a
+    /// read of a register can change it (a latch, a flag cleared by its
+    /// read, a port that steps its address). A peek counts no cycle, moves
+    /// no latch, records no access and catches no coprocessor up.
+    pub fn peek(&self, address: u32) -> u8 {
+        let addr24 = address & 0x00FF_FFFF;
+        let low = addr24 & 0xFFFF;
+        match self.page_table[(addr24 >> 12) as usize] {
+            PageHandler::Wram => self.wram[(addr24 - 0x7E_0000) as usize],
+            PageHandler::WramMirror => self.wram[(addr24 & 0x1FFF) as usize],
+            PageHandler::Cartridge { slot_index } => self.peek_slot(slot_index, addr24),
+            PageHandler::BBus if self.cart_claims_bbus_mmio && (0x2200..=0x23FF).contains(&low) => {
+                self.peek_planned(addr24)
+            }
+            PageHandler::CpuMmio
+                if self.cart_claims_expansion_mmio && (0x4800..=0x48FF).contains(&low) =>
+            {
+                self.peek_planned(addr24)
+            }
+            PageHandler::BBus | PageHandler::CpuMmio => 0,
+            PageHandler::OpenBus => self.mdr,
+        }
+    }
+
+    /// [`SnesBus::peek`] of a chip window carved out of a register page,
+    /// found through the map plan as the read path finds it.
+    fn peek_planned(&self, addr24: u32) -> u8 {
+        match self
+            .cartridge_plan
+            .as_deref()
+            .and_then(|plan| plan.resolve(addr24))
+        {
+            Some(resolved) => self.peek_slot(resolved.slot_index, addr24),
+            None => self.mdr,
+        }
+    }
+
+    /// [`SnesBus::peek`] of an address the map plan's slot `slot_index`
+    /// covers.
+    fn peek_slot(&self, slot_index: u16, addr24: u32) -> u8 {
+        let (Some(plan), Some(cart)) = (self.cartridge_plan.as_deref(), self.cartridge.as_deref())
+        else {
+            return self.mdr;
+        };
+        let Some(slot) = plan.slots.get(usize::from(slot_index)) else {
+            return self.mdr;
+        };
+        if !slot.contains(addr24) {
+            return self.mdr;
+        }
+        let offset = slot.compute_target_offset(addr24);
+        match slot.target {
+            MapTarget::Rom { base_offset } => cart.read_rom(base_offset + offset),
+            MapTarget::Sram { base_offset } => cart.read_sram(base_offset + offset),
+            MapTarget::ChipMmio { chip_id, base } => {
+                cart.peek_chip(chip_id, base + offset).unwrap_or(self.mdr)
+            }
+            MapTarget::OpenBus => self.mdr,
+        }
+    }
+
     /// Battery SRAM bytes of the installed cartridge, or `None` when no
     /// cartridge is installed or it carries no SRAM. Backs
     /// `EmulatorCore::get_save_ram`.
@@ -1965,6 +2044,20 @@ impl SnesBus {
     }
 }
 
+/// The bus as the debugger reads it: an [`Addressable`] over
+/// [`SnesBus::peek`], for the disassembler, the trace's address
+/// resolution and the call stack's opcode read. Reads change nothing;
+/// writes are dropped.
+pub struct SnesPeekBus<'a>(pub &'a SnesBus);
+
+impl Addressable for SnesPeekBus<'_> {
+    fn read(&mut self, addr: u32) -> u8 {
+        self.0.peek(addr)
+    }
+
+    fn write(&mut self, _addr: u32, _value: u8) {}
+}
+
 /// What a map-plan target holds at `offset` into its slot.
 fn target_place(target: MapTarget, offset: u32) -> SourcePlace {
     use crate::cartridge::{
@@ -2054,7 +2147,11 @@ impl Addressable for SnesBus {
         self.instr_accesses += 1;
         let value = self.read_full(addr);
         if self.debug_armed {
-            self.debug_events.push(BusDebugEvent::Read { addr, value });
+            self.accesses.push(Access {
+                address: addr,
+                write: false,
+                value,
+            });
         }
         if self.io_trace.is_some() && is_watched_io(addr) {
             self.record_io_access(false, addr, value);
@@ -2070,7 +2167,11 @@ impl Addressable for SnesBus {
         self.instr_master_cycles += self.cycles_for(addr) as u64;
         self.instr_accesses += 1;
         if self.debug_armed {
-            self.debug_events.push(BusDebugEvent::Write { addr, value });
+            self.accesses.push(Access {
+                address: addr,
+                write: true,
+                value,
+            });
             if let Some(ev) = classify_b_bus_write(addr) {
                 self.debug_events.push(ev);
             }

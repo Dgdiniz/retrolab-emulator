@@ -196,6 +196,17 @@ impl Coprocessor for BankMapperChip {
             .unwrap_or(0xFF)
     }
 
+    /// A ROM-window byte through the banks as they are set; nothing is
+    /// counted.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        Some(
+            self.rom
+                .get(self.physical_offset(offset))
+                .copied()
+                .unwrap_or(0xFF),
+        )
+    }
+
     fn write(&mut self, offset: u32, value: u8, _master_cycle: u64) {
         self.accesses += 1;
         // Only Codemasters programs its banks via ROM-window writes; SEGA

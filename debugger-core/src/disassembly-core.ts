@@ -9,11 +9,36 @@
  */
 
 import { hex, hexBytes } from './format-core'
+import { parseEventTag } from './watchpoints-core'
 
 export interface BreakpointLike {
   id?: number
   enabled: boolean
   breakpoint: { address: number }
+}
+
+/** A listed breakpoint with the CPU it is on, as `listBreakpoints()` returns it. */
+export interface CpuBreakpointLike extends BreakpointLike {
+  breakpoint: { address: number; bp_type?: unknown; cpu_id?: number | null; event?: unknown }
+}
+
+/**
+ * The address breakpoints of one CPU: the ones its disassembly marks and
+ * its gutter toggles. Two CPUs of a console share numeric addresses (the
+ * 68000 and the Z80, the 65816 and the SPC700), and the cores fire a
+ * breakpoint only on the CPU it names. Event breakpoints have no address
+ * and are left out, whether the list carries the core's `{ Event }` tag
+ * or a host has moved the event to `breakpoint.event`. A breakpoint listed
+ * with no CPU counts as the primary CPU's: `addBreakpoint` stores CPU 0
+ * when it is given none.
+ */
+export function breakpointsOnCpu<T extends CpuBreakpointLike>(list: readonly T[], cpu: number): T[] {
+  return list.filter(
+    (bp) =>
+      parseEventTag(bp.breakpoint.bp_type) === null &&
+      parseEventTag(bp.breakpoint.event) === null &&
+      (bp.breakpoint.cpu_id ?? 0) === cpu,
+  )
 }
 
 /**

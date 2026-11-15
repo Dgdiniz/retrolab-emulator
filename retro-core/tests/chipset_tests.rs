@@ -66,6 +66,12 @@ impl Coprocessor for FakeChip {
         self.counter = self.counter.wrapping_add(value as u64);
     }
 
+    /// The byte a read gives, below `0x100`; the window past it is one this
+    /// chip cannot read without a side effect.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        (offset < 0x100).then(|| (self.counter as u8).wrapping_add(offset as u8))
+    }
+
     fn observe_write(&mut self, _addr: u32, value: u8) {
         self.observed = self.observed.wrapping_add(value as u64);
     }
@@ -266,6 +272,62 @@ fn out_of_range_id_reads_none_and_writes_noop() {
     // Must not panic and must not affect the existing chip.
     set.write(9, 0, 0xFF, 0);
     assert_eq!(set.read(0, 0, 0), Some(0));
+}
+
+/// A chip that answers no peek: the trait's default.
+struct OpaqueChip(ExpansionChipInfo);
+
+impl Coprocessor for OpaqueChip {
+    fn info(&self) -> &ExpansionChipInfo {
+        &self.0
+    }
+    fn read(&mut self, _offset: u32, _master_cycle: u64) -> u8 {
+        0x5A
+    }
+    fn write(&mut self, _offset: u32, _value: u8, _master_cycle: u64) {}
+    fn reset(&mut self, _master_clock_hz: u64) {}
+    fn serialize(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn restore(&mut self, _data: &[u8], _master_clock_hz: u64) {}
+    fn debug_state(&self) -> ExpansionChipState {
+        ExpansionChipState {
+            chip_type: self.0.chip_type,
+            registers: Vec::new(),
+            internal_ram: None,
+            program_counter: None,
+            cycle_count: 0,
+        }
+    }
+    fn label(&self) -> &str {
+        "opaque"
+    }
+}
+
+#[test]
+fn a_peek_reads_what_a_read_would_without_a_side_effect() {
+    let mut set = ChipSet::default();
+    set.push(FakeChip::boxed(ExpansionChipType::DSP1, "a"));
+    set.write(0, 0, 0x10, 100);
+    assert_eq!(set.peek(0, 0x05), Some(0x15));
+    assert_eq!(set.peek(0, 0x200), None, "a window the chip cannot peek");
+    let state = debug_of(&set, 0);
+    assert_eq!(reg(&state, "accesses"), 1, "a peek is no access");
+    assert_eq!(reg(&state, "last_cycle"), 100, "nor does it move the clock");
+    assert_eq!(set.read(0, 0x05, 200), Some(0x15), "the read agrees");
+}
+
+#[test]
+fn a_chip_that_answers_no_peek_and_a_missing_one_give_none() {
+    let mut set = ChipSet::default();
+    set.push(Box::new(OpaqueChip(ExpansionChipInfo {
+        name: "opaque".to_string(),
+        chip_type: ExpansionChipType::SDD1,
+        description: String::new(),
+        features: Vec::new(),
+    })));
+    assert_eq!(set.peek(0, 0), None);
+    assert_eq!(set.peek(7, 0), None);
 }
 
 #[test]

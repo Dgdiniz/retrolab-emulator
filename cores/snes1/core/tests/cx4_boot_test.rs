@@ -9,6 +9,7 @@
 #![cfg(feature = "chip-cx4")]
 
 use retro_core::cartridge::ExpansionChipType;
+use retro_core::cpu::Addressable;
 use retro_core::EmulatorCore;
 use snes1_core::{detect_preset, PresetKind, SnesEmulator};
 
@@ -103,8 +104,8 @@ fn synthetic_cx4_scpu_reaches_the_6000_window() {
     // mismatch means the map slot or the page promotion is broken.
     emu.write_memory_debug(0x00_6000, &[0x5A]);
     assert_eq!(
-        emu.read_memory_debug(0x00_6000, 1),
-        vec![0x5A],
+        emu.bus_mut().read(0x00_6000),
+        0x5A,
         "S-CPU must reach the Cx4 data RAM via the promoted $6000 page"
     );
 
@@ -112,8 +113,8 @@ fn synthetic_cx4_scpu_reaches_the_6000_window() {
     // arms the HG51B169, so it stays halted and a booting game's busy-poll
     // exits immediately instead of hanging.
     assert_eq!(
-        emu.read_memory_debug(0x00_7F53, 1),
-        vec![0x00],
+        emu.bus_mut().read(0x00_7F53),
+        0x00,
         "an unarmed Cx4 status must read idle so a busy-poll never hangs"
     );
 

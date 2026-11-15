@@ -154,6 +154,10 @@ impl GenesisCartridge for ComposableCartridge {
         self.chips.write(chip_id, offset, value, master_cycle);
     }
 
+    fn peek_chip(&self, chip_id: u8, offset: u32) -> Option<u8> {
+        self.chips.peek(chip_id, offset)
+    }
+
     fn catch_up_chip(&mut self, master_cycle: u64) {
         self.chips.catch_up_all(master_cycle);
     }

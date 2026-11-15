@@ -95,6 +95,16 @@ pub trait GenesisCartridge: Send {
         let _ = (chip_id, offset, value, master_cycle);
     }
 
+    /// The byte a read of coprocessor MMIO at `offset` would give, read
+    /// without a side effect (no catch-up, no count, no change), or `None`
+    /// when the chip cannot answer without one (a register whose read acts)
+    /// ([`Coprocessor::peek`](retro_core::cartridge::Coprocessor::peek)).
+    /// Default: no chip at that id.
+    fn peek_chip(&self, chip_id: u8, offset: u32) -> Option<u8> {
+        let _ = (chip_id, offset);
+        None
+    }
+
     /// Advance every chip's clock to `master_cycle` (called once per frame).
     fn catch_up_chip(&mut self, master_cycle: u64) {
         let _ = master_cycle;
@@ -260,6 +270,29 @@ pub trait GenesisCartridge: Send {
                 base.wrapping_add(resolved.target_offset),
                 master_cycle,
             ),
+            MapTarget::OpenBus => 0xFF,
+        }
+    }
+
+    /// The byte a read of `addr` would give, read without a side effect, for
+    /// the debugger: ROM and SRAM as [`read_bus`](Self::read_bus) reads them,
+    /// a chip's window as its [`peek_chip`](Self::peek_chip) gives it, and
+    /// open bus (`0xFF`) where the chip cannot answer without acting or
+    /// nothing is mapped.
+    fn peek_bus(&self, addr: u32) -> u8 {
+        let Some(resolved) = self.map_plan().resolve(addr) else {
+            return 0xFF;
+        };
+        match self.map_plan().slots[resolved.slot_index as usize].target {
+            MapTarget::Rom { base_offset } => {
+                self.read_rom(base_offset.wrapping_add(resolved.target_offset))
+            }
+            MapTarget::Sram { base_offset } => {
+                self.read_sram(base_offset.wrapping_add(resolved.target_offset))
+            }
+            MapTarget::ChipMmio { chip_id, base } => self
+                .peek_chip(chip_id, base.wrapping_add(resolved.target_offset))
+                .unwrap_or(0xFF),
             MapTarget::OpenBus => 0xFF,
         }
     }

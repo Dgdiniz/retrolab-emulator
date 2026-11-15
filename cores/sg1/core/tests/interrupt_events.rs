@@ -6,6 +6,7 @@
 mod helpers;
 
 use helpers::M68kProgram;
+use retro_core::debug::DebugEvent;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -56,7 +57,7 @@ fn running(rom: &[u8]) -> GenesisEmulator {
 }
 
 fn break_on(emu: &mut GenesisEmulator, event: GenesisEvent) -> u32 {
-    let (code, param) = event.to_code_param();
+    let (code, param) = event.code_param();
     emu.debugger().add_breakpoint(Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event { code, param },

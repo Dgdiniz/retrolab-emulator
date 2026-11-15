@@ -60,6 +60,7 @@ pub fn run(args: TraceToTextArgs) -> Result<()> {
 /// Render the 68000 trace without disassembly (opcode word only), for the
 /// no-ROM case.
 fn convert_m68k_trace_to_text_opcode_only(data: &[u8]) -> String {
+    use retro_core::debug::TraceEntry;
     use sg1_core::debugger::{TraceEntryBinary, TRACE_ENTRY_SIZE};
     let mut out = String::with_capacity((data.len() / TRACE_ENTRY_SIZE.max(1)) * 200);
     for chunk in data.as_chunks::<TRACE_ENTRY_SIZE>().0 {

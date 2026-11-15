@@ -379,6 +379,15 @@ pub trait Coprocessor: Send {
     /// Write the chip MMIO.
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64);
 
+    /// The byte a read at `offset` would give, read for a debugger without
+    /// a side effect: no catch-up, no counter, no latch, no state changed.
+    /// `None` when the chip cannot answer so (a register whose read changes
+    /// the chip, a window the chip computes); the console then gives the
+    /// value a read of nothing gives. The default answers `None`.
+    fn peek(&self, _offset: u32) -> Option<u8> {
+        None
+    }
+
     /// Passive bus observation. Called when the console writes a range the
     /// chip *observes* but does not *own* (e.g. the S-DD1 spying on the DMA
     /// registers at `$43xx`). Default no-op: the vast majority of chips
@@ -570,6 +579,13 @@ impl ChipSet {
     /// Read the chip `id`'s MMIO. `None` if no such chip.
     pub fn read(&mut self, id: u8, offset: u32, master_cycle: u64) -> Option<u8> {
         self.get_mut(id).map(|c| c.read(offset, master_cycle))
+    }
+
+    /// Chip `id`'s byte at `offset`, read without a side effect
+    /// ([`Coprocessor::peek`]); `None` if no such chip, or when the chip
+    /// cannot answer without one.
+    pub fn peek(&self, id: u8, offset: u32) -> Option<u8> {
+        self.get(id)?.peek(offset)
     }
 
     /// Write the chip `id`'s MMIO. No-op if no such chip.

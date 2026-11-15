@@ -5,9 +5,11 @@
  * `RetroEmulator` methods. The tracing UI
  * resolves a {@link TraceCpuSpec} for the focused CPU and then calls
  * `emulator[spec.<fn>](...)` dynamically, so it never branches on core/CPU
- * inline. Keeping the name + entry-size table here (pure data) gives both
- * debuggers' tracing one source of truth and lets the wiring be unit-tested
- * without WASM.
+ * inline. Keeping the name table here (pure data) gives both debuggers'
+ * tracing one source of truth and lets the wiring be unit-tested without
+ * WASM. The size of an entry is not in the table: the core reports it
+ * ({@link traceEntrySize}), so a reader cuts and counts entries by the
+ * size the core writes.
  *
  *   m68k   (sg1 cpu0)  setTracingEnabled / getTraceFlushData / ...
  *   z80    (sg1 cpu1)  setZ80TracingEnabled / getZ80TraceFlushData / ...
@@ -30,10 +32,12 @@ export interface TraceCpuSpec {
   clearFlushed: string
   /** Method: turn a binary chunk into human-readable trace text. */
   convertChunkToText: string
-  /** Bytes per on-disk trace entry (export chunk alignment). */
-  entrySize: number
-  /** Bytes per progress-stats entry (the live "N entries" estimate). */
-  statsEntrySize: number
+  /**
+   * Method: the size in bytes of one of this CPU's trace entries. An export
+   * is cut into whole entries of this size, and the live stats count
+   * entries with it.
+   */
+  getEntrySize: string
   /** UI label for the record button / stats (`68K`, `Z80`, `65816`, `SPC700`, `GSU`, `Cx4`). */
   uiLabel: string
   /** Filename token for the exported trace (`68k`, `z80`, `65816`, `spc700`, `gsu`, `cx4`). */
@@ -41,13 +45,14 @@ export interface TraceCpuSpec {
 }
 
 const M68K: TraceCpuSpec = {
+  // `needsTraceFlush()` asks about every CPU's ring; a debugger that
+  // traces one CPU at a time reads it as that CPU's.
   setEnabled: 'setTracingEnabled',
   needsFlush: 'needsTraceFlush',
   getFlushData: 'getTraceFlushData',
   clearFlushed: 'clearTraceFlushed',
   convertChunkToText: 'convertTraceChunkToText',
-  entrySize: 84,
-  statsEntrySize: 74,
+  getEntrySize: 'getTraceEntrySize',
   uiLabel: '68K',
   fileLabel: '68k',
 }
@@ -58,8 +63,7 @@ const Z80: TraceCpuSpec = {
   getFlushData: 'getZ80TraceFlushData',
   clearFlushed: 'clearZ80TraceFlushed',
   convertChunkToText: 'convertZ80TraceChunkToText',
-  entrySize: 38,
-  statsEntrySize: 34,
+  getEntrySize: 'getZ80TraceEntrySize',
   uiLabel: 'Z80',
   fileLabel: 'z80',
 }
@@ -71,8 +75,7 @@ const W65816: TraceCpuSpec = {
   getFlushData: 'getTraceFlushData',
   clearFlushed: 'clearTraceFlushed',
   convertChunkToText: 'convertTraceChunkToText',
-  entrySize: 44,
-  statsEntrySize: 44,
+  getEntrySize: 'getTraceEntrySize',
   uiLabel: '65816',
   fileLabel: '65816',
 }
@@ -85,8 +88,7 @@ const SPC700: TraceCpuSpec = {
   getFlushData: 'getSpc700TraceFlushData',
   clearFlushed: 'clearSpc700TraceFlushed',
   convertChunkToText: 'convertSpc700TraceChunkToText',
-  entrySize: 24,
-  statsEntrySize: 24,
+  getEntrySize: 'getSpc700TraceEntrySize',
   uiLabel: 'SPC700',
   fileLabel: 'spc700',
 }
@@ -98,10 +100,7 @@ const SUPERFX: TraceCpuSpec = {
   getFlushData: 'getSuperfxTraceFlushData',
   clearFlushed: 'clearSuperfxTraceFlushed',
   convertChunkToText: 'convertSuperfxTraceChunkToText',
-  // Must equal the Rust `TRACE_ENTRY_SIZE_GSU` (52 bytes: master_cycle(8)
-  // pbr_pc(4) sfr(2) rombr(1) rambr(1) bytes_len(1) bytes(3) r[16](32)).
-  entrySize: 52,
-  statsEntrySize: 52,
+  getEntrySize: 'getSuperfxTraceEntrySize',
   uiLabel: 'GSU',
   fileLabel: 'gsu',
 }
@@ -113,10 +112,7 @@ const HG51B: TraceCpuSpec = {
   getFlushData: 'getHg51bTraceFlushData',
   clearFlushed: 'clearHg51bTraceFlushed',
   convertChunkToText: 'convertHg51bTraceChunkToText',
-  // Must equal the Rust `TRACE_ENTRY_SIZE_CX4` (93 bytes: cycles(8) pc(4)
-  // opcode(2) p(2) flags(1) a(4) acch(4) accl(4) gpr[16](64)).
-  entrySize: 93,
-  statsEntrySize: 93,
+  getEntrySize: 'getHg51bTraceEntrySize',
   uiLabel: 'Cx4',
   fileLabel: 'cx4',
 }
@@ -133,4 +129,17 @@ const TRACE_SPECS: Record<CpuKind, TraceCpuSpec> = {
 /** Trace binding spec for a CPU kind. */
 export function traceCpuSpecForKind(kind: CpuKind): TraceCpuSpec {
   return TRACE_SPECS[kind]
+}
+
+/**
+ * The size in bytes of one entry of a CPU's trace, as the core reports it
+ * through the spec's `getEntrySize` method; 0 when the emulator has no
+ * such method or reports no positive whole number.
+ */
+export function traceEntrySize(emulator: unknown, spec: TraceCpuSpec): number {
+  if (typeof emulator !== 'object' || emulator === null) return 0
+  const read = (emulator as Record<string, unknown>)[spec.getEntrySize]
+  if (typeof read !== 'function') return 0
+  const size: unknown = read.call(emulator)
+  return typeof size === 'number' && Number.isInteger(size) && size > 0 ? size : 0
 }

@@ -25,8 +25,8 @@ pub mod video;
 // Re-export main types
 pub use audio::{AudioRingBuffer, ChipSampleBuffer, IntegerRateConverter};
 pub use debug::{
-    disassemble_window, select_tier, BreakpointList, BusWatchpointHook, CoverageBitmap,
-    DisasmDriver, ExecutionTier, TierSelectorInputs, TraceStats, TracingState,
+    disassemble_window, select_tier, BreakpointList, CoverageBitmap, DisasmDriver, ExecutionTier,
+    TierSelectorInputs, TraceStats, TracingState,
 };
 pub use debugger::DebuggerCore;
 pub use emulator::{EmulatorCore, StepResult};

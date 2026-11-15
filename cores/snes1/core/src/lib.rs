@@ -14,6 +14,7 @@ pub mod controller;
 pub mod coverage;
 pub mod debugger;
 pub mod dma;
+pub mod expr_ctx;
 pub mod golden;
 pub mod input_schedule;
 pub mod irq;
@@ -24,7 +25,7 @@ pub mod system;
 pub mod system_regs;
 pub mod trace_format;
 
-pub use bus::{IoAccess, PageHandler, SnesBus};
+pub use bus::{IoAccess, PageHandler, SnesBus, SnesPeekBus};
 pub use cartridge::{
     detect_dsp1_layout, detect_preset, detect_preset_with_threshold, detected_manifest,
     exhirom_preset, hirom_preset, lorom_preset, manifest_to_map_plan, parse_manifest, rom_sha256,
@@ -42,10 +43,11 @@ pub use debugger::cpu_state_gsu;
 #[cfg(feature = "chip-cx4")]
 pub use debugger::cpu_state_hg51b;
 pub use debugger::{
-    cpu_state_65816, cpu_state_spc700, snes_events, SnesDebugger, SnesEvent, TraceEntryBinary65816,
-    TraceEntryBinaryCx4, TraceEntryBinaryGsu, TraceEntryBinarySpc700, TRACE_ENTRY_SIZE_65816,
-    TRACE_ENTRY_SIZE_CX4, TRACE_ENTRY_SIZE_GSU, TRACE_ENTRY_SIZE_SPC700,
+    cartridge_cpu_spec, cpu_state_65816, cpu_state_spc700, snes_debugger, snes_events,
+    SnesDebugConsole, SnesDebugger, SnesEvent, TraceEntryBinary65816, TraceEntryBinaryCx4,
+    TraceEntryBinaryGsu, TraceEntryBinarySpc700, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU,
 };
+pub use expr_ctx::wdc65816_register;
 pub use ppu::tile::TilemapEntry;
 pub use ppu::{
     window_layer, EventWatch, LineState, OffsetPerTileTable, Ppu, PpuAccessCtx, PpuDebugEvent,

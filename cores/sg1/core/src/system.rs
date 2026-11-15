@@ -5,8 +5,13 @@ pub mod savestate_impl;
 
 use crate::bus::AddressBus;
 use crate::cartridge::composable::CartridgeManifest;
+use crate::cpu68k::calls::{call_step, CallStep};
 use crate::cpu68k::M68k;
-use crate::debugger::{GenesisDebugger, GenesisEvent};
+use crate::debugger::{
+    genesis_debugger, record_z80_trace, video_event_watch, GenesisDebugger, GenesisEvent,
+    TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU,
+};
+use crate::expr_ctx::m68k_register;
 use crate::input_manager::InputManager;
 use crate::io::devices::genesis_3button::Genesis3ButtonDevice;
 use crate::io::devices::genesis_6button::Genesis6ButtonDevice;
@@ -18,6 +23,7 @@ use retro_core::capture::{
     PixelSources, RenderedLayer, VideoMemorySources,
 };
 use retro_core::cpu::Addressable;
+use retro_core::debug::{trace_to_text, Access, AccessLog, ByteOrder, CpuExprContext};
 use retro_core::video::{crop_rgba, LineStateTable, PixelImage, VideoDebugger};
 
 use retro_core::*;
@@ -37,7 +43,7 @@ type CartridgeSavePayload = (
 /// Offsets are tried smallest-first so the shortest matching
 /// predecessor wins.
 fn probe_offsets(cpu_id: usize) -> &'static [u32] {
-    if cpu_id == 1 {
+    if cpu_id == SOUND_CPU {
         &[1, 2, 3, 4]
     } else {
         &[2, 4, 6, 8, 10]
@@ -48,10 +54,11 @@ fn probe_offsets(cpu_id: usize) -> &'static [u32] {
 /// `Code`-kind `DisasmRow`. Shared by the `disassemble_window` driver
 /// and `GenesisEmulator::decode_at`.
 fn decode_one(emu: &mut GenesisEmulator, cpu_id: usize, addr: u32) -> DisasmRow {
-    if cpu_id == 1 {
+    if cpu_id == SOUND_CPU {
         // Z80: reuse the trace-format-aware decoder.
-        let mut z80_bus = emu.bus.create_z80_bus();
-        let (text, size) = crate::z80::disasm::disassemble_at(&mut z80_bus, addr as u16);
+        let z80_bus = emu.bus.create_z80_bus();
+        let (text, size) =
+            crate::z80::disasm::disassemble_at(&mut z80_bus.peek_view(), addr as u16);
         let trace_text = crate::z80::disasm::to_trace_format(&text);
         let (mnemonic, operands) = if let Some(pos) = trace_text.find(' ') {
             (
@@ -63,7 +70,7 @@ fn decode_one(emu: &mut GenesisEmulator, cpu_id: usize, addr: u32) -> DisasmRow 
         };
         let mut bytes = Vec::with_capacity(size as usize);
         for i in 0..size {
-            bytes.push(z80_bus.read((addr as u16).wrapping_add(i) as u32));
+            bytes.push(z80_bus.peek((addr as u16).wrapping_add(i) as u32));
         }
         DisasmRow {
             address: addr,
@@ -227,8 +234,10 @@ pub struct GenesisEmulator {
     // Cached framebuffer (updated from VDP)
     cached_framebuffer: Framebuffer,
 
-    // Last PC where we checked for breakpoint (to avoid double-counting)
-    last_bp_checked_pc: Option<u32>,
+    /// The bytes the 68000's last instruction accessed, for the watchpoint
+    /// check: the bus's word accesses expanded byte by byte, the log kept
+    /// from one instruction to the next.
+    watch_accesses: AccessLog,
 
     /// Bounded ring buffer holding mixed stereo samples ready for the
     /// host. Capacity ~ 4 frames stereo @ 44.1 kHz/60 fps so the host
@@ -290,9 +299,6 @@ pub struct GenesisEmulator {
     /// YM2612 cycles already clocked during step mode Z80 interleaving.
     /// Reset each scanline.
     step_ym_cycles_clocked: u32,
-
-    /// Currently focused CPU for debugging (0 = 68K, 1 = Z80).
-    focused_cpu: usize,
 
     /// Staged cartridge manifest applied on the next [`Self::load_rom`],
     /// overriding heuristic detection. Set from the host via
@@ -620,7 +626,7 @@ impl GenesisEmulator {
             .connect_device(Box::new(Genesis3ButtonDevice::new()));
 
         Self {
-            debugger: GenesisDebugger::new_with_system_info(system_info.clone()),
+            debugger: genesis_debugger(system_info.clone()),
             input_manager: InputManager::new(),
             system_info,
             cpu: M68k::new(),
@@ -642,7 +648,7 @@ impl GenesisEmulator {
             bus_refresh_target: 128,
             running: false,
             cached_framebuffer: Framebuffer::new(320, 224),
-            last_bp_checked_pc: None,
+            watch_accesses: AccessLog::new(),
 
             // ~4 frames stereo @ 44.1 kHz/60 fps; bounded, overflow
             // drops oldest samples (host already drained them in the
@@ -677,7 +683,6 @@ impl GenesisEmulator {
             step_z80_executed: 0,
             step_z80_credit_numer: 0,
             step_ym_cycles_clocked: 0,
-            focused_cpu: 0,
             cartridge_manifest_override: None,
             last_rom: Vec::new(),
             instruction_access_logging: false,
@@ -877,7 +882,7 @@ impl GenesisEmulator {
         self.run_frame_fast_inner(true, false);
         // The fast loop writes no CPU state; a paused debugger shows where
         // the frame ended.
-        self.update_debugger_state();
+        self.refresh_debugger_state();
         true
     }
 
@@ -1168,76 +1173,6 @@ impl GenesisEmulator {
         &self.debugger
     }
 
-    /// Set the debugger's execution mode. A pause also writes the CPU states
-    /// the debugger reports: a game running with no breakpoint and no trace
-    /// runs the fast loop, which never writes them, so without it a pause
-    /// would report the state of the last reset or step.
-    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
-        self.debugger.set_execution_mode(mode);
-        if mode == ExecutionMode::Paused {
-            self.update_debugger_state();
-        }
-    }
-
-    // ===== Tracing Methods =====
-
-    /// Enable or disable execution tracing.
-    pub fn set_tracing_enabled(&mut self, enabled: bool) {
-        self.debugger.set_tracing_enabled(enabled);
-    }
-
-    /// Check if tracing is enabled.
-    pub fn is_tracing_enabled(&self) -> bool {
-        self.debugger.is_68k_tracing_enabled()
-    }
-
-    /// Check if trace buffer needs to be flushed.
-    pub fn needs_trace_flush(&self) -> bool {
-        self.debugger.needs_trace_flush()
-    }
-
-    /// Get trace data ready for flushing.
-    pub fn get_trace_flush_data(&self) -> &[u8] {
-        self.debugger.get_trace_flush_data()
-    }
-
-    /// Clear flushed trace data.
-    pub fn clear_trace_flushed(&mut self) {
-        self.debugger.clear_trace_flushed();
-    }
-
-    /// Get tracing statistics.
-    pub fn get_trace_stats(&self) -> retro_core::TraceStats {
-        self.debugger.get_trace_stats()
-    }
-
-    // ===== Z80 Tracing =====
-
-    /// Enable or disable Z80 execution tracing.
-    pub fn set_z80_tracing_enabled(&mut self, enabled: bool) {
-        self.debugger.set_z80_tracing_enabled(enabled);
-    }
-
-    /// Check if Z80 tracing is enabled.
-    pub fn is_z80_tracing_enabled(&self) -> bool {
-        self.debugger.is_z80_tracing_enabled()
-    }
-
-    /// Check if Z80 trace buffer needs to be flushed.
-    pub fn needs_z80_trace_flush(&self) -> bool {
-        self.debugger.needs_z80_trace_flush()
-    }
-
-    /// Get Z80 trace data ready for flushing.
-    pub fn get_z80_trace_flush_data(&self) -> &[u8] {
-        self.debugger.get_z80_trace_flush_data()
-    }
-
-    /// Clear flushed Z80 trace data.
-    pub fn clear_z80_trace_flushed(&mut self) {
-        self.debugger.clear_z80_trace_flushed();
-    }
-
     /// Get the number of frames executed.
     pub fn frame_count(&self) -> u64 {
         self.frame_count
@@ -1468,8 +1403,10 @@ impl GenesisEmulator {
         };
 
         // The machine becomes the savestate's, which ends a frame: a frame
-        // held part of the way through is dropped.
+        // held part of the way through is dropped, and the calls the call
+        // stack holds belong to the machine replaced.
         self.held_frame = None;
+        self.debugger.machine_replaced();
 
         // Apply state to all components
         self.cpu.from_savestate(&state.cpu68k);
@@ -1867,9 +1804,9 @@ impl GenesisEmulator {
         let mut instructions = Vec::with_capacity(count as usize);
         let mut current_addr = addr as u16;
 
-        let mut z80_bus = self.bus.create_z80_bus();
+        let z80_bus = self.bus.create_z80_bus();
         for _ in 0..count {
-            let (text, size) = disasm::disassemble_at(&mut z80_bus, current_addr);
+            let (text, size) = disasm::disassemble_at(&mut z80_bus.peek_view(), current_addr);
 
             // Convert to lowercase trace format:
             // "LD BC, $1FD9" -> "ld bc,$1FD9"
@@ -1888,7 +1825,7 @@ impl GenesisEmulator {
             // Collect raw bytes
             let mut bytes = Vec::with_capacity(size as usize);
             for i in 0..size {
-                bytes.push(z80_bus.read(current_addr.wrapping_add(i) as u32));
+                bytes.push(z80_bus.peek(current_addr.wrapping_add(i) as u32));
             }
 
             instructions.push(Instruction {
@@ -1920,6 +1857,7 @@ impl GenesisEmulator {
 
         // Can't step if Z80 is in reset or bus is requested by 68K
         if self.bus.is_z80_reset() || self.bus.is_z80_bus_requested() {
+            self.refresh_debugger_state();
             return StepResult {
                 cycles: 0,
                 breakpoint_hit: false,
@@ -1929,7 +1867,7 @@ impl GenesisEmulator {
 
         // Capture pre-execution state for trace and history
         let pre_pc = self.z80.pc;
-        let z80_tracing = self.debugger.is_z80_tracing_enabled();
+        let z80_tracing = self.debugger.tracing(SOUND_CPU);
         let scanline = self.bus.vdp().timing().scanline;
 
         // Check for interrupts before stepping
@@ -1942,21 +1880,18 @@ impl GenesisEmulator {
             total_cycles += irq_cycles;
         }
 
-        // Read raw instruction bytes at PC (up to 4) and disassemble BEFORE step
-        let mut raw_bytes = [0u8; 4];
-        for i in 0..4u16 {
-            raw_bytes[i as usize] = z80_bus.read(pre_pc.wrapping_add(i) as u32);
-        }
+        // The instruction's bytes at PC (up to 4), read without side effects
+        // and disassembled before the step.
+        let raw_bytes = z80_bus.instruction_bytes(pre_pc);
         let (disasm_text, _) = crate::z80::disasm::disassemble_from_bytes(pre_pc, &raw_bytes);
 
         // Record Z80 trace BEFORE step (captures pre-execution state, matching run_frame)
         if z80_tracing {
-            self.debugger
-                .record_z80_trace(&self.z80, 0, scanline, raw_bytes);
+            record_z80_trace(&mut self.debugger, &self.z80, scanline, raw_bytes);
         }
 
         // Coverage: mark the Z80 PC we are about to execute from.
-        self.debugger.record_coverage_z80(pre_pc);
+        self.debugger.record_coverage(SOUND_CPU, u32::from(pre_pc));
 
         // Execute one Z80 instruction
         let cycles = self.z80.step(&mut z80_bus);
@@ -1968,18 +1903,22 @@ impl GenesisEmulator {
         z80_bus.clock_psg(total_cycles);
 
         // Record Z80 instruction history using pre-execution PC and disassembly
-        {
-            let trace = InstructionTrace {
-                address: pre_pc as u32,
+        self.debugger.record_history(
+            SOUND_CPU,
+            InstructionTrace {
+                address: u32::from(pre_pc),
                 instruction: disasm_text,
                 registers_before: Vec::new(),
                 cycle_count: total_cycles,
-            };
-            self.debugger.record_z80_history(trace);
-        }
+            },
+        );
 
-        // Check Z80 breakpoints
-        let bp_hit = self.debugger.check_z80_breakpoint(self.z80.pc as u32);
+        // A breakpoint where the Z80 goes next stops this step: the check its
+        // own step makes, the only one any Z80 breakpoint gets.
+        let bp_hit = self
+            .debugger
+            .check_execute_next(SOUND_CPU, u32::from(self.z80.pc), None);
+        self.refresh_debugger_state();
 
         StepResult {
             cycles: total_cycles,
@@ -1991,7 +1930,7 @@ impl GenesisEmulator {
     /// Get known instruction boundaries before an address.
     /// Returns addresses in ascending order (oldest to newest).
     pub fn get_boundaries_before(&self, addr: u32, count: usize) -> Vec<u32> {
-        self.debugger.get_boundaries_before(addr, count)
+        self.debugger.console().get_boundaries_before(addr, count)
     }
 
     /// Disassemble using known instruction boundaries (bsnes-style).
@@ -2015,7 +1954,10 @@ impl GenesisEmulator {
         let mut instructions = Vec::new();
 
         // Get known boundaries before PC
-        let boundaries_before = self.debugger.get_boundaries_before(pc, before_count);
+        let boundaries_before = self
+            .debugger
+            .console()
+            .get_boundaries_before(pc, before_count);
 
         // Disassemble each known boundary before PC
         for &addr in &boundaries_before {
@@ -2161,11 +2103,11 @@ impl GenesisEmulator {
         }
     }
 
-    /// Update debugger with current CPU state (both 68K and Z80).
-    fn update_debugger_state(&mut self) {
-        // Build CPU state for M68000 (CPU ID 0)
+    /// The 68000's and the Z80's registers as they are now, the CPU states
+    /// the debugger reports.
+    fn cpu_states(&self) -> Vec<CpuState> {
         let m68k_state = CpuState {
-            cpu_id: 0,
+            cpu_id: MAIN_CPU,
             registers: vec![
                 // Data registers (D0-D7)
                 RegisterValue {
@@ -2247,9 +2189,8 @@ impl GenesisEmulator {
             flags: self.cpu.sr as u32, // Status register contains flags
         };
 
-        // Build CPU state for Z80 (CPU ID 1)
         let z80_state = CpuState {
-            cpu_id: 1,
+            cpu_id: SOUND_CPU,
             registers: vec![
                 RegisterValue {
                     name: "A".to_string(),
@@ -2304,8 +2245,7 @@ impl GenesisEmulator {
             flags: self.z80.f as u32,
         };
 
-        // Update debugger with both CPUs
-        self.debugger.update_cpu_states(vec![m68k_state, z80_state]);
+        vec![m68k_state, z80_state]
     }
 
     /// Refresh the 68K pending interrupt level from the current VDP state.
@@ -2343,7 +2283,7 @@ impl GenesisEmulator {
 
     /// Fast step: execute one 68K instruction with minimal overhead.
     /// Skips: disassembly, register snapshots, instruction history, boundary recording,
-    /// breakpoint checks, and update_debugger_state(). Used by run_frame_fast() when
+    /// breakpoint checks, and refresh_debugger_state(). Used by run_frame_fast() when
     /// no debug features are active.
     /// Returns the number of CPU cycles consumed (including FIFO wait).
     fn step_fast(&mut self) -> u32 {
@@ -2375,7 +2315,7 @@ impl GenesisEmulator {
         // Record coverage BEFORE stepping so the bitmap reflects every
         // PC the CPU actually executed from, regardless of whether the
         // instruction succeeded or trapped.
-        self.debugger.record_coverage_68k(self.cpu.pc);
+        self.debugger.record_coverage(MAIN_CPU, self.cpu.pc);
 
         // Execute one CPU instruction
         let cycles = self.cpu.step(&mut self.bus);
@@ -2442,7 +2382,7 @@ impl GenesisEmulator {
     /// caller passes to [`Self::drain_watchpoints`]. Otherwise the bus stays on
     /// its zero-overhead path.
     fn arm_watchpoints(&mut self) -> bool {
-        let armed = self.debugger.has_watchpoints() || self.instruction_access_logging;
+        let armed = self.debugger.has_watchpoints_or_events() || self.instruction_access_logging;
         if armed {
             self.bus.set_watch_armed(true);
         }
@@ -2460,7 +2400,7 @@ impl GenesisEmulator {
         }
         let events = self.bus.take_watch_events();
         let dmas = self.bus.take_watch_dmas();
-        let hit = self.debugger.has_watchpoints() && self.watchpoint_hit(&events);
+        let hit = self.debugger.has_watchpoints_or_events() && self.watchpoint_hit(&events);
         self.bus.set_watch_armed(false);
         if self.instruction_access_logging {
             self.instruction_access_log = InstructionAccessLog {
@@ -2475,47 +2415,98 @@ impl GenesisEmulator {
     /// Whether the accesses one instruction made fire a read or write
     /// watchpoint.
     ///
-    /// A word access is expanded to its covered byte addresses so a watch on
-    /// either byte fires. Read watchpoints also see instruction/operand
-    /// fetches because the bus cannot distinguish a prefetch from a data read;
-    /// write watchpoints are exact (a fetch never writes). Prefer execute
-    /// breakpoints for code and write/RAM watches for data.
+    /// A word access is expanded to its two bytes, the high one at its
+    /// address, so a watch on either byte fires. Read watchpoints also see
+    /// instruction/operand fetches because the bus cannot distinguish a
+    /// prefetch from a data read; write watchpoints are exact (a fetch never
+    /// writes). Prefer execute breakpoints for code and write/RAM watches
+    /// for data. A sized watch's value and a condition's memory are read
+    /// through the bus's peek, after the instruction.
     fn watchpoint_hit(&mut self, events: &[(u32, u8, bool, u16)]) -> bool {
-        // Expand each word access to its covered bytes so single-address
-        // and multi-byte watches both see every touched byte. The batch
-        // check then fires each watch at most once for the instruction.
-        let mut accesses: Vec<(u32, bool, u8)> = Vec::with_capacity(events.len() * 2);
-        for &(addr, size, is_write, value) in events {
-            for off in 0..size as u32 {
-                // The recorded `value` is a byte (size 1) or big-endian
-                // word (size 2); pick the byte that lives at this offset
-                // so value-matched watchpoints compare the right one.
-                let byte = if size == 2 && off == 0 {
-                    (value >> 8) as u8
-                } else {
-                    (value & 0xFF) as u8
-                };
-                accesses.push((addr.wrapping_add(off), is_write, byte));
+        self.watch_accesses.clear();
+        for &(address, size, write, value) in events {
+            if size == 2 {
+                self.watch_accesses
+                    .push_word_big_endian(address, write, value);
+            } else {
+                self.watch_accesses.push(Access {
+                    address,
+                    write,
+                    value: value as u8,
+                });
             }
         }
-        // One bus borrow serves both the sized-watch value peek and any
-        // conditional-expression evaluation: the expression context reads
-        // memory through the same bus, so there's no separate peek closure.
-        // `cpu` / `bus` / `debugger` are disjoint fields of `self`.
-        let mut ctx = crate::expr_ctx::M68kExprContext::new(&self.cpu, &mut self.bus);
+        let (cpu, bus) = (&self.cpu, &self.bus);
+        let mut context = CpuExprContext::new(
+            |name| m68k_register(cpu, name),
+            |address| bus.peek_byte(address),
+            ByteOrder::BigEndian,
+        );
         self.debugger
-            .should_break_watch_batch_ctx(&accesses, &mut ctx)
+            .check_accesses(MAIN_CPU, self.watch_accesses.as_slice(), &mut context)
     }
 
-    /// Evaluate execute breakpoints at `pc` on the 68K, threading a live
-    /// expression context (registers + bus) so conditional breakpoints
-    /// (`MatchSpec.expr`) can be checked. `cpu` / `bus` / `debugger` are
-    /// disjoint fields, so the shared CPU borrow and mutable bus borrow in
-    /// the context coexist with the mutable debugger borrow.
+    /// Check the 68000's execute breakpoints before the instruction at `pc`
+    /// runs ([`retro_core::debug::DebuggerState::check_execute`]: the
+    /// instruction a stop left the CPU at runs unchecked), a condition read
+    /// from the registers and, through the bus's peek, memory as they are.
     fn check_execute_breakpoint(&mut self, pc: u32) -> bool {
-        let mut ctx = crate::expr_ctx::M68kExprContext::new(&self.cpu, &mut self.bus);
+        let (cpu, bus) = (&self.cpu, &self.bus);
+        let mut context = CpuExprContext::new(
+            |name| m68k_register(cpu, name),
+            |address| bus.peek_byte(address),
+            ByteOrder::BigEndian,
+        );
         self.debugger
-            .should_break_ctx(pc, BreakpointType::execute(), &mut ctx)
+            .check_execute(MAIN_CPU, pc, Some(&mut context))
+    }
+
+    /// Check them after an instruction, at `next_pc`, for the instruction
+    /// that runs next ([`retro_core::debug::DebuggerState::check_execute_next`]:
+    /// the check before that instruction then passes, so each instruction
+    /// is checked once).
+    fn check_next_execute_breakpoint(&mut self, next_pc: u32) -> bool {
+        let (cpu, bus) = (&self.cpu, &self.bus);
+        let mut context = CpuExprContext::new(
+            |name| m68k_register(cpu, name),
+            |address| bus.peek_byte(address),
+            ByteOrder::BigEndian,
+        );
+        self.debugger
+            .check_execute_next(MAIN_CPU, next_pc, Some(&mut context))
+    }
+
+    /// Keep the 68000's call stack for the instruction at `pc`, whose first
+    /// word is `opcode`, once it has run ([`call_step`]): a call pushes a
+    /// frame whose return address is the address after the call, a return
+    /// takes the innermost frame off.
+    fn maintain_call_stack(&mut self, pc: u32, opcode: u16) {
+        match call_step(opcode) {
+            CallStep::Call { length } => self.debugger.push_call(
+                MAIN_CPU,
+                StackFrame {
+                    call_address: pc,
+                    return_address: pc.wrapping_add(length),
+                    function_name: None,
+                },
+            ),
+            CallStep::Return => self.debugger.pop_call(MAIN_CPU),
+            CallStep::Other => {}
+        }
+    }
+
+    /// The 68000 took an interrupt at `interrupted`, the address it was
+    /// about to run: keep a frame for it, its call and its return address
+    /// both that address, which the handler's `RTE` takes off.
+    fn push_interrupt_frame(&mut self, interrupted: u32) {
+        self.debugger.push_call(
+            MAIN_CPU,
+            StackFrame {
+                call_address: interrupted,
+                return_address: interrupted,
+                function_name: None,
+            },
+        );
     }
 
     /// Lightweight debug step: execute one 68K instruction with breakpoint checking
@@ -2530,6 +2521,7 @@ impl GenesisEmulator {
         }
 
         self.refresh_vdp_interrupt_level();
+        let interrupted = self.cpu.pc;
         let pending_level = self.cpu.pending_irq_level;
         let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
         if irq_cycles > 0 {
@@ -2537,6 +2529,7 @@ impl GenesisEmulator {
             self.master_cycles += irq_cycles as u64;
             self.step_master_clocks_accumulated +=
                 (irq_cycles as u64) * (self.region.cpu_divider() as u64);
+            self.push_interrupt_frame(interrupted);
         }
         let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
@@ -2554,14 +2547,10 @@ impl GenesisEmulator {
         }
 
         let pc = self.cpu.pc;
-        let opcode = self.bus.read_word(pc);
+        let opcode = self.bus.peek_word(pc);
 
         // Breakpoint check (before execution)
-        let breakpoint_hit_before = if self.last_bp_checked_pc == Some(pc) {
-            false
-        } else {
-            self.check_execute_breakpoint(pc)
-        };
+        let breakpoint_hit_before = self.check_execute_breakpoint(pc);
 
         // Capture lightweight state for trace (stack-only, zero heap allocations)
         let sr_before = self.cpu.sr;
@@ -2575,7 +2564,7 @@ impl GenesisEmulator {
         self.bus.ym2612_mut().current_cpu_cycle = self.master_cycles;
         self.bus.m68k_cycle = self.master_cycles;
 
-        self.debugger.record_coverage_68k(pc);
+        self.debugger.record_coverage(MAIN_CPU, pc);
 
         let watch_armed = self.arm_watchpoints();
         let cycles = self.cpu.step(&mut self.bus);
@@ -2601,8 +2590,7 @@ impl GenesisEmulator {
         self.master_cycles += total_cycles as u64;
 
         // Trace recording (conditional, uses pre-allocated buffer -- zero heap allocs)
-        if self.debugger.is_68k_tracing_enabled() {
-            use crate::debugger::TraceEntryBinary;
+        if self.debugger.tracing(MAIN_CPU) {
             let trace_entry = TraceEntryBinary::new(
                 pc,
                 sr_before,
@@ -2613,20 +2601,10 @@ impl GenesisEmulator {
                 total_cycles_before,
                 scanline_before,
             );
-            self.debugger.record_trace(&trace_entry);
+            self.debugger.record_trace(MAIN_CPU, &trace_entry);
         }
 
-        // Call stack tracking (push/pop on existing Vec, no String allocations)
-        if (opcode & 0xFFC0) == 0x4E80 {
-            let instr_len = self.cpu.pc.wrapping_sub(pc);
-            self.debugger.push_call(retro_core::types::StackFrame {
-                call_address: pc,
-                return_address: pc.wrapping_add(instr_len),
-                function_name: None,
-            });
-        } else if opcode == 0x4E75 || opcode == 0x4E77 || opcode == 0x4E73 {
-            self.debugger.pop_call();
-        }
+        self.maintain_call_stack(pc, opcode);
 
         let total_master_clocks = (total_cycles as u64) * (self.region.cpu_divider() as u64);
         self.step_master_clocks_accumulated += total_master_clocks;
@@ -2635,13 +2613,13 @@ impl GenesisEmulator {
         self.bus.vdp_mut().tick_vint_delay(total_master_clocks);
         let video_event = self.video_event_hit();
 
-        // Breakpoint check (after execution)
+        // Breakpoint check (after execution), for the instruction that runs
+        // next
         let new_pc = self.cpu.pc;
         let breakpoint_hit_after = if new_pc != pc {
-            self.last_bp_checked_pc = Some(new_pc);
-            self.check_execute_breakpoint(new_pc)
+            self.check_next_execute_breakpoint(new_pc)
         } else {
-            self.last_bp_checked_pc = None;
+            self.debugger.forget_checked(MAIN_CPU);
             false
         };
 
@@ -2666,7 +2644,7 @@ impl GenesisEmulator {
     /// first instruction, as one on an execute breakpoint at its entry does.
     /// Nothing is checked while no event or watch breakpoint is armed.
     fn interrupt_event_hit(&mut self, level: u8) -> bool {
-        if !self.debugger.has_watchpoints() {
+        if !self.debugger.has_watchpoints_or_events() {
             return false;
         }
         match level {
@@ -2685,21 +2663,19 @@ impl GenesisEmulator {
     /// the way into a line, as a watchpoint's does; a fill finishing as the
     /// 68000 runs on stops after the instruction it finished during.
     fn video_event_hit(&mut self) -> bool {
-        let raised = self.bus.vdp_mut().take_raised_events();
-        let mut hit = false;
-        for event in raised.iter() {
-            hit |= self.debugger.check_event(GenesisEvent::from(event));
+        match self.bus.vdp_mut().raised_events_mut() {
+            Some(raised) if !raised.is_empty() => self.debugger.check_raised(raised),
+            _ => false,
         }
-        hit
     }
 
     /// Arm the VDP's watch on writes to video memory from the enabled event
-    /// breakpoints ([`crate::debugger::GenesisDebugger::video_event_watch`]),
-    /// or clear it when none asks. The debugger loops do this as each pass
-    /// begins, and a step the host asks for before it runs.
+    /// breakpoints ([`video_event_watch`]), or clear it when none asks. The
+    /// debugger loops do this as each pass begins, and a step the host asks
+    /// for before it runs.
     fn arm_video_events(&mut self) {
-        let watch = if self.debugger.has_watchpoints() {
-            self.debugger.video_event_watch()
+        let watch = if self.debugger.has_watchpoints_or_events() {
+            video_event_watch(self.debugger.breakpoints())
         } else {
             None
         };
@@ -2972,7 +2948,7 @@ impl GenesisEmulator {
     /// on every line. Short-circuits to `false` (zero cost) unless an event or
     /// watch breakpoint is armed, so the debug tiers can call it unconditionally.
     fn check_frame_events(&mut self, scanline: u16, vblank: bool, vint: bool, hint: bool) -> bool {
-        if !self.debugger.has_watchpoints() {
+        if !self.debugger.has_watchpoints_or_events() {
             return false;
         }
         let mut brk = self.debugger.check_event(GenesisEvent::Scanline(scanline));
@@ -3082,7 +3058,7 @@ impl GenesisEmulator {
     /// Shared fast-path frame body: runs a complete frame using
     /// step_fast() with no debug overhead. Skips debugger execution
     /// mode checks, breakpoints, disassembly, instruction history,
-    /// register snapshots, and update_debugger_state().
+    /// register snapshots, and refresh_debugger_state().
     ///
     /// `present` gates the two presentation-only tail steps. When
     /// `false` (a headless netplay rollback/catch-up frame), audio
@@ -3171,7 +3147,7 @@ impl GenesisEmulator {
             // Clock ratios (from master clock):
             //   Z80: master / 15, 68K/YM2612: master / 7
             //   So Z80_cycles = 68K_cycles * 7 / 15
-            let z80_tracing = self.debugger.is_z80_tracing_enabled();
+            let z80_tracing = self.debugger.tracing(SOUND_CPU);
             let z80_scanline = self.bus.vdp().timing().scanline;
             let psg_target = self.region.master_clocks_per_scanline() / 15;
 
@@ -3242,13 +3218,13 @@ impl GenesisEmulator {
                     let mut z80_bus = self.bus.create_z80_bus();
                     while z80_cycles_executed < z80_target {
                         if z80_tracing {
-                            let pc = self.z80.pc;
-                            let mut raw_bytes = [0u8; 4];
-                            for i in 0..4u16 {
-                                raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                            }
-                            self.debugger
-                                .record_z80_trace(&self.z80, 0, z80_scanline, raw_bytes);
+                            let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                            record_z80_trace(
+                                &mut self.debugger,
+                                &self.z80,
+                                z80_scanline,
+                                raw_bytes,
+                            );
                         }
                         let (processed, irq_cycles) =
                             self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
@@ -3260,7 +3236,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -3292,13 +3269,13 @@ impl GenesisEmulator {
                     let mut z80_bus = self.bus.create_z80_bus();
                     while z80_cycles_executed < z80_max {
                         if z80_tracing {
-                            let pc = self.z80.pc;
-                            let mut raw_bytes = [0u8; 4];
-                            for i in 0..4u16 {
-                                raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                            }
-                            self.debugger
-                                .record_z80_trace(&self.z80, 0, z80_scanline, raw_bytes);
+                            let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                            record_z80_trace(
+                                &mut self.debugger,
+                                &self.z80,
+                                z80_scanline,
+                                raw_bytes,
+                            );
                         }
                         let (processed, irq_cycles) =
                             self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
@@ -3310,7 +3287,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -3399,7 +3377,7 @@ impl GenesisEmulator {
     /// Lightweight debug frame execution: uses step_debug_light() which adds only
     /// breakpoint checking and trace recording on top of the fast path, without the
     /// heavy per-instruction allocations of the full debug path (no disassembly,
-    /// no register snapshots, no instruction history, no update_debugger_state).
+    /// no register snapshots, no instruction history, no refresh_debugger_state).
     /// This is the middle tier between run_frame_fast() and run_frame().
     /// A frame held part of the way through is finished instead: the call
     /// is the rest of that frame, and an event breakpoint holds the frame
@@ -3454,11 +3432,13 @@ impl GenesisEmulator {
 
                 self.refresh_vdp_interrupt_level();
 
+                let interrupted = self.cpu.pc;
                 let pending_level = self.cpu.pending_irq_level;
                 let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
                 if irq_cycles > 0 {
                     self.handle_interrupt_ack(pending_level);
                     self.master_cycles += irq_cycles as u64;
+                    self.push_interrupt_frame(interrupted);
                 }
                 // The interrupt events are the interrupts taken here, not those
                 // requested: a request the 68000's mask holds back, or the
@@ -3472,15 +3452,14 @@ impl GenesisEmulator {
                 // costs nothing unless an event/watch breakpoint is armed.
                 if self.check_frame_events(scanline as u16, ev_vblank, ev_vint, ev_hint) {
                     self.hold_at_event(scanline, cycles_per_scanline, irq_cycles + m68k_overshoot);
-                    self.debugger.set_execution_mode(ExecutionMode::Paused);
-                    self.update_debugger_state();
+                    self.set_execution_mode(ExecutionMode::Paused);
                     self.update_cached_framebuffer();
                     return PassEnd::Stopped;
                 }
                 (cycles_per_scanline, irq_cycles + m68k_overshoot)
             };
 
-            let z80_tracing = self.debugger.is_z80_tracing_enabled();
+            let z80_tracing = self.debugger.tracing(SOUND_CPU);
             let z80_scanline = self.bus.vdp().timing().scanline;
             let psg_target = self.region.master_clocks_per_scanline() / 15;
 
@@ -3503,9 +3482,8 @@ impl GenesisEmulator {
                     .set_hblank_approx(cycles_executed + step_result.cycles, cycles_per_scanline);
 
                 if step_result.breakpoint_hit {
-                    self.debugger.set_execution_mode(ExecutionMode::Paused);
                     self.z80_irq_pending = z80_irq;
-                    self.update_debugger_state();
+                    self.set_execution_mode(ExecutionMode::Paused);
                     self.update_cached_framebuffer();
                     return PassEnd::Stopped;
                 }
@@ -3549,13 +3527,13 @@ impl GenesisEmulator {
                     let mut z80_bus = self.bus.create_z80_bus();
                     while z80_cycles_executed < z80_target {
                         if z80_tracing {
-                            let pc = self.z80.pc;
-                            let mut raw_bytes = [0u8; 4];
-                            for i in 0..4u16 {
-                                raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                            }
-                            self.debugger
-                                .record_z80_trace(&self.z80, 0, z80_scanline, raw_bytes);
+                            let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                            record_z80_trace(
+                                &mut self.debugger,
+                                &self.z80,
+                                z80_scanline,
+                                raw_bytes,
+                            );
                         }
                         let (processed, irq_cyc) =
                             self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
@@ -3567,7 +3545,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -3595,13 +3574,13 @@ impl GenesisEmulator {
                     let mut z80_bus = self.bus.create_z80_bus();
                     while z80_cycles_executed < z80_max {
                         if z80_tracing {
-                            let pc = self.z80.pc;
-                            let mut raw_bytes = [0u8; 4];
-                            for i in 0..4u16 {
-                                raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                            }
-                            self.debugger
-                                .record_z80_trace(&self.z80, 0, z80_scanline, raw_bytes);
+                            let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                            record_z80_trace(
+                                &mut self.debugger,
+                                &self.z80,
+                                z80_scanline,
+                                raw_bytes,
+                            );
                         }
                         let (processed, irq_cyc) =
                             self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
@@ -3613,7 +3592,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -3768,7 +3748,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -3796,7 +3777,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -4045,6 +4027,7 @@ impl GenesisEmulator {
         self.refresh_vdp_interrupt_level();
 
         // Process any pending interrupts BEFORE the next instruction
+        let interrupted = self.cpu.pc;
         let pending_level = self.cpu.pending_irq_level;
         let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
         if irq_cycles > 0 {
@@ -4052,6 +4035,7 @@ impl GenesisEmulator {
             self.master_cycles += irq_cycles as u64;
             self.step_master_clocks_accumulated +=
                 (irq_cycles as u64) * (self.region.cpu_divider() as u64);
+            self.push_interrupt_frame(interrupted);
         }
         let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
@@ -4075,22 +4059,18 @@ impl GenesisEmulator {
         // Capture PC AFTER interrupt processing (interrupt may have changed PC)
         let pc = self.cpu.pc;
 
-        // Read opcode for call stack tracking
-        // Note: This reads from bus but we'll reset cycles before cpu.step()
-        let opcode = self.bus.read_word(pc);
+        // Read the opcode for the call stack and the trace, without side
+        // effects
+        let opcode = self.bus.peek_word(pc);
 
-        // Check for execute breakpoint at current PC (before execution)
-        // But skip if we already checked this PC in the previous step's "after" check
-        let breakpoint_hit_before = if self.last_bp_checked_pc == Some(pc) {
-            false // Already counted in previous step
-        } else {
-            self.check_execute_breakpoint(pc)
-        };
+        // Check for an execute breakpoint at the current PC before the
+        // instruction; it passes where a stop left the CPU, or where the
+        // previous step's check after its instruction looked already
+        let breakpoint_hit_before = self.check_execute_breakpoint(pc);
 
-        // Disassemble current instruction for history
-        // Note: This also reads from bus but we'll reset cycles before cpu.step()
+        // Disassemble current instruction for history, without side effects
         use crate::cpu68k::disasm;
-        let (disasm_str, instr_bytes) = disasm::disassemble_one(&mut self.bus, pc);
+        let (disasm_str, _) = disasm::disassemble_one(&mut self.bus.peek_view(), pc);
 
         // Capture registers before execution
         let registers_before = vec![
@@ -4135,7 +4115,7 @@ impl GenesisEmulator {
         // Record coverage BEFORE stepping so the bitmap mirrors the
         // step_fast / step_debug_light paths and stays consistent
         // regardless of which execution mode the user landed in.
-        self.debugger.record_coverage_68k(pc);
+        self.debugger.record_coverage(MAIN_CPU, pc);
 
         // Execute one CPU instruction
         let watch_armed = self.arm_watchpoints();
@@ -4224,7 +4204,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             self.step_ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         self.step_z80_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -4260,8 +4241,7 @@ impl GenesisEmulator {
 
         // Record trace entry (if tracing is enabled)
         // Uses state captured BEFORE execution to match reference trace format
-        if self.debugger.is_68k_tracing_enabled() {
-            use crate::debugger::TraceEntryBinary;
+        if self.debugger.tracing(MAIN_CPU) {
             let trace_entry = TraceEntryBinary::new(
                 pc,
                 sr_before,
@@ -4272,28 +4252,13 @@ impl GenesisEmulator {
                 total_cycles_before,
                 scanline_before,
             );
-            self.debugger.record_trace(&trace_entry);
+            self.debugger.record_trace(MAIN_CPU, &trace_entry);
         }
 
-        // Call stack tracking
-        // JSR: 0x4E80-0x4EBF (various addressing modes)
-        if (opcode & 0xFFC0) == 0x4E80 {
-            // JSR - push return address to call stack
-            let return_addr = pc.wrapping_add(instr_bytes);
-            self.debugger.push_call(retro_core::types::StackFrame {
-                call_address: pc,
-                return_address: return_addr,
-                function_name: None,
-            });
-        }
-        // RTS (0x4E75) / RTR (0x4E77) / RTE (0x4E73): all three pop
-        // the topmost call-stack frame, so we treat them uniformly.
-        else if matches!(opcode, 0x4E75 | 0x4E77 | 0x4E73) {
-            self.debugger.pop_call();
-        }
+        self.maintain_call_stack(pc, opcode);
 
         // Record instruction boundary (for bsnes-style disassembly)
-        self.debugger.record_instruction_boundary(pc);
+        self.debugger.console_mut().record_instruction_boundary(pc);
 
         // Record instruction in history
         let trace = InstructionTrace {
@@ -4302,7 +4267,7 @@ impl GenesisEmulator {
             registers_before,
             cycle_count: cycles,
         };
-        self.debugger.record_instruction(trace);
+        self.debugger.record_history(MAIN_CPU, trace);
 
         // Accumulate master clocks for VDP timing (will be processed at start of next step)
         // Convert total CPU cycles (instruction + refresh penalty + FIFO wait) to master clocks
@@ -4319,16 +4284,15 @@ impl GenesisEmulator {
         let video_event = self.video_event_hit();
 
         // Update debugger state AFTER step to reflect new register values
-        self.update_debugger_state();
+        self.refresh_debugger_state();
 
-        // Check for breakpoint at NEW PC after execution (only if different from old PC)
+        // Check for breakpoint at NEW PC after execution (only if different
+        // from old PC), for the instruction that runs next
         let new_pc = self.cpu.pc;
         let breakpoint_hit_after = if new_pc != pc {
-            // Remember we checked this PC for next step
-            self.last_bp_checked_pc = Some(new_pc);
-            self.check_execute_breakpoint(new_pc)
+            self.check_next_execute_breakpoint(new_pc)
         } else {
-            self.last_bp_checked_pc = None;
+            self.debugger.forget_checked(MAIN_CPU);
             false
         };
 
@@ -4442,11 +4406,13 @@ impl GenesisEmulator {
                 self.refresh_vdp_interrupt_level();
 
                 // Process pending interrupts (cycles count toward scanline budget)
+                let interrupted = self.cpu.pc;
                 let pending_level = self.cpu.pending_irq_level;
                 let irq_cycles = self.cpu.process_pending_interrupts(&mut self.bus);
                 if irq_cycles > 0 {
                     self.handle_interrupt_ack(pending_level);
                     self.master_cycles += irq_cycles as u64;
+                    self.push_interrupt_frame(interrupted);
                 }
                 // The interrupt events are the interrupts taken here; one
                 // taken later, in a step, is checked there.
@@ -4462,8 +4428,7 @@ impl GenesisEmulator {
                         cycles_per_scanline,
                         irq_cycles + m68k_overshoot,
                     );
-                    self.debugger.set_execution_mode(ExecutionMode::Paused);
-                    self.update_debugger_state();
+                    self.set_execution_mode(ExecutionMode::Paused);
                     self.update_cached_framebuffer();
                     self.frame_runner_owns_beam = false;
                     return PassEnd::Stopped;
@@ -4473,7 +4438,7 @@ impl GenesisEmulator {
 
             // Interleaved 68K + Z80 + YM2612 execution (same approach as run_frame_fast)
             let has_rom = self.bus.cartridge().is_some();
-            let z80_tracing = self.debugger.is_z80_tracing_enabled();
+            let z80_tracing = self.debugger.tracing(SOUND_CPU);
             let z80_scanline = self.bus.vdp().timing().scanline;
             let psg_target = self.region.master_clocks_per_scanline() / 15;
 
@@ -4488,7 +4453,7 @@ impl GenesisEmulator {
             let mut early_exit = false;
             // When focused on Z80, step_z80() handles Z80 execution and audio
             // clocking internally; skip the interleaving to avoid double-stepping.
-            let z80_focused = self.focused_cpu == 1;
+            let z80_focused = self.debugger.focused_cpu() == SOUND_CPU;
 
             while has_rom && cycles_executed < cycles_per_scanline {
                 let exec_mode = self.debugger.get_execution_mode();
@@ -4501,8 +4466,8 @@ impl GenesisEmulator {
                             cycles_per_scanline,
                         );
                         if step_result.breakpoint_hit {
-                            self.debugger.set_execution_mode(ExecutionMode::Paused);
                             self.z80_irq_pending = z80_irq;
+                            self.set_execution_mode(ExecutionMode::Paused);
                             self.update_cached_framebuffer();
                             self.frame_runner_owns_beam = false;
                             return PassEnd::Stopped;
@@ -4558,14 +4523,10 @@ impl GenesisEmulator {
                         let mut z80_bus = self.bus.create_z80_bus();
                         while z80_cycles_executed < z80_target {
                             if z80_tracing {
-                                let pc = self.z80.pc;
-                                let mut raw_bytes = [0u8; 4];
-                                for i in 0..4u16 {
-                                    raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                                }
-                                self.debugger.record_z80_trace(
+                                let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                                record_z80_trace(
+                                    &mut self.debugger,
                                     &self.z80,
-                                    0,
                                     z80_scanline,
                                     raw_bytes,
                                 );
@@ -4580,7 +4541,8 @@ impl GenesisEmulator {
                                 z80_bus.clock_ym2612(ym_c);
                                 ym_cycles_clocked += ym_c;
                             }
-                            self.debugger.record_coverage_z80(self.z80.pc);
+                            self.debugger
+                                .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                             let zc = self.z80.step(&mut z80_bus);
                             z80_cycles_executed += zc;
                             let ym_c = (zc * 15 / 7)
@@ -4621,13 +4583,13 @@ impl GenesisEmulator {
                     let mut z80_bus = self.bus.create_z80_bus();
                     while z80_cycles_executed < z80_max {
                         if z80_tracing {
-                            let pc = self.z80.pc;
-                            let mut raw_bytes = [0u8; 4];
-                            for i in 0..4u16 {
-                                raw_bytes[i as usize] = z80_bus.read(pc.wrapping_add(i) as u32);
-                            }
-                            self.debugger
-                                .record_z80_trace(&self.z80, 0, z80_scanline, raw_bytes);
+                            let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
+                            record_z80_trace(
+                                &mut self.debugger,
+                                &self.z80,
+                                z80_scanline,
+                                raw_bytes,
+                            );
                         }
                         let (processed, irq_cycles) =
                             self.z80.check_interrupts(&mut z80_bus, z80_irq, false);
@@ -4639,7 +4601,8 @@ impl GenesisEmulator {
                             z80_bus.clock_ym2612(ym_c);
                             ym_cycles_clocked += ym_c;
                         }
-                        self.debugger.record_coverage_z80(self.z80.pc);
+                        self.debugger
+                            .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                         let zc = self.z80.step(&mut z80_bus);
                         z80_cycles_executed += zc;
                         let ym_c = (zc * 15 / 7)
@@ -4699,10 +4662,11 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     fn reset(&mut self) {
-        // Reset debugger state first (ensures clean execution mode)
+        // Reset debugger state first (ensures clean execution mode). The
+        // calls the call stack holds belong to the machine the reset ends.
         self.debugger.set_execution_mode(ExecutionMode::Paused);
-        self.debugger.clear_instruction_boundaries();
-        self.last_bp_checked_pc = None;
+        self.debugger.console_mut().clear_instruction_boundaries();
+        self.debugger.machine_replaced();
         // The machine starts over: a frame held part of the way through is
         // dropped, not finished.
         self.held_frame = None;
@@ -4760,17 +4724,13 @@ impl EmulatorCore for GenesisEmulator {
         // before the first step or frame (the platform opens its debugger
         // right after a load) shows the reset vector instead of nothing.
         // It reads the registers only: nothing here runs or changes state.
-        self.update_debugger_state();
-    }
-
-    fn step(&mut self) -> StepResult {
-        self.step_cpu(self.focused_cpu)
+        self.refresh_debugger_state();
     }
 
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
         match cpu_id {
-            0 => self.step_68k_internal(),
-            1 => self.step_z80(),
+            MAIN_CPU => self.step_68k_internal(),
+            SOUND_CPU => self.step_z80(),
             _ => StepResult {
                 cycles: 0,
                 breakpoint_hit: false,
@@ -4780,19 +4740,17 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     fn focused_cpu(&self) -> usize {
-        self.focused_cpu
+        self.debugger.focused_cpu()
     }
 
     fn set_focused_cpu(&mut self, cpu_id: usize) {
-        if cpu_id < self.system_info.cpus.len() {
-            self.focused_cpu = cpu_id;
-        }
+        self.debugger.set_focused_cpu(cpu_id);
     }
 
     fn disassemble_cpu(&mut self, cpu_id: usize, addr: u32, count: u32) -> Vec<Instruction> {
         match cpu_id {
-            0 => Self::disassemble_at(self, addr, count),
-            1 => Self::disassemble_z80_at(self, addr, count),
+            MAIN_CPU => Self::disassemble_at(self, addr, count),
+            SOUND_CPU => Self::disassemble_z80_at(self, addr, count),
             _ => Vec::new(),
         }
     }
@@ -4881,8 +4839,7 @@ impl EmulatorCore for GenesisEmulator {
             .unwrap_or(false);
 
         if !same_rom {
-            self.debugger.clear_coverage(0);
-            self.debugger.clear_coverage(1);
+            self.debugger.clear_all_coverage();
 
             // Swapping in a *different* cartridge is a power cycle, not a
             // press of the reset button: on real hardware you eject the cart
@@ -5066,6 +5023,25 @@ impl EmulatorCore for GenesisEmulator {
 
     fn debugger(&mut self) -> &mut dyn DebuggerCore {
         &mut self.debugger
+    }
+
+    fn debugger_ref(&self) -> &dyn DebuggerCore {
+        &self.debugger
+    }
+
+    fn refresh_debugger_state(&mut self) {
+        let states = self.cpu_states();
+        self.debugger.set_cpu_states(states);
+    }
+
+    /// The 68000's entries disassembled from memory as it is now, the Z80's
+    /// from the bytes each entry holds.
+    fn trace_to_text(&mut self, cpu_id: usize, data: &[u8]) -> Option<String> {
+        match cpu_id {
+            MAIN_CPU => Some(trace_to_text::<TraceEntryBinary, Self>(data, self)),
+            SOUND_CPU => Some(trace_to_text::<TraceEntryBinaryZ80, ()>(data, &mut ())),
+            _ => None,
+        }
     }
 
     fn read_memory_debug(&mut self, addr: u32, size: u32) -> Vec<u8> {
@@ -6397,7 +6373,7 @@ mod tests {
         genesis.load_rom(&rom).unwrap();
 
         // Update debugger state to populate CPU states
-        genesis.update_debugger_state();
+        genesis.refresh_debugger_state();
 
         // Get CPU states from debugger
         let cpu_states = genesis.debugger().get_cpu_states();

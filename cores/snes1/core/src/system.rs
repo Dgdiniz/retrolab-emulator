@@ -41,12 +41,17 @@ use retro_core::*;
 use wdc65816::instructions::FLAG_I;
 use wdc65816::Wdc65816;
 
+use retro_core::debug::{trace_to_text, ByteOrder, CpuExprContext};
+
 use crate::debugger::{
-    cpu_state_65816, cpu_state_spc700, snes_events, SnesDebugger, SnesEvent, TraceEntryBinary65816,
+    cartridge_cpu_spec, cpu_state_65816, cpu_state_spc700, snes_debugger, snes_events,
+    SnesDebugger, SnesEvent, TraceEntryBinary65816, TraceEntryBinarySpc700, CARTRIDGE_CPU,
+    MAIN_CPU, SOUND_CPU,
 };
+use crate::expr_ctx::wdc65816_register;
 use crate::trace_format::{effective_address, EffRegs};
 
-use crate::bus::{BusDebugEvent, IoAccess, SnesBus};
+use crate::bus::{BusDebugEvent, IoAccess, SnesBus, SnesPeekBus};
 use crate::cartridge::{
     copier_header_length, detect_preset_with_threshold, detected_manifest, rom_sha256,
     try_parse_header, CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset,
@@ -154,8 +159,6 @@ pub struct SnesEmulator {
 
     input_manager: GenericInputManager,
 
-    focused_cpu: usize,
-
     header: Option<SnesHeader>,
     preset_kind: Option<PresetKind>,
     rom_size: usize,
@@ -223,9 +226,6 @@ pub struct SnesEmulator {
     /// frame loop honours it by pausing and returning. Reset at the top
     /// of every instrumented frame.
     pending_break: bool,
-    /// Reused buffer for draining the bus's per-instruction debug events
-    /// without reallocating each step.
-    debug_event_scratch: Vec<BusDebugEvent>,
 
     /// VBlank NMI *delivery* state, modelling the 5A22's NMI latency in a
     /// phase-independent way. The `$4210` NMI flag is latched the instant
@@ -341,7 +341,7 @@ impl SnesEmulator {
         // reallocation.
         let framebuffer = Framebuffer::new(MAX_FB_WIDTH, MAX_FB_HEIGHT);
 
-        let debugger = SnesDebugger::new(system_info.clone());
+        let debugger = snes_debugger(system_info.clone());
 
         Self {
             system_info,
@@ -360,7 +360,6 @@ impl SnesEmulator {
             audio_pending_drain: Vec::new(),
             audio_enabled: false,
             input_manager: default_input_manager(),
-            focused_cpu: 0,
             header: None,
             preset_kind: None,
             rom_size: 0,
@@ -379,7 +378,6 @@ impl SnesEmulator {
             nmi_deliver_countdown: 0,
             irq_cycles: VecDeque::new(),
             irq_read_early: None,
-            debug_event_scratch: Vec::new(),
             present: true,
             capture_boundary_requested: false,
             held_at_capture_boundary: false,
@@ -721,7 +719,8 @@ impl SnesEmulator {
             frame_base_cycle: self.frame_base_cycle,
             frame_count: self.frame_count,
             timing: crate::scheduler::timing_to_state(&self.timing),
-            focused_cpu: self.focused_cpu as u8,
+            // Kept for the layout; the focus is the host's, not the machine's.
+            focused_cpu: 0,
             audio_enabled: self.audio_enabled,
         }
     }
@@ -786,9 +785,10 @@ impl SnesEmulator {
         // its frame is in progress, its `VBlankStart` finishes its picture.
         self.held_at_capture_boundary = false;
         self.capture_boundary_requested = false;
-        self.focused_cpu =
-            (payload.focused_cpu as usize).min(self.system_info.cpus.len().saturating_sub(1));
         self.audio_enabled = payload.audio_enabled;
+        // The calls the debugger saw belong to the machine the state
+        // replaced; the history stays, it records what ran.
+        self.debugger.machine_replaced();
 
         // Host-side audio is not in the wire format: clear the ring and
         // reset the resampler so playback resumes from the restored APU
@@ -1135,38 +1135,12 @@ impl SnesEmulator {
         )
     }
 
-    /// `true` iff `cpu_id` has executed an instruction from `addr`
-    /// (coverage bitmap). `cpu_id` 0 = 65C816 (24-bit), 1 = SPC700
-    /// (16-bit); any other id reads as uncovered. Mirrors SG1's
-    /// `is_covered()` so the disassembly panel can grey out cold regions.
-    pub fn is_covered(&self, cpu_id: usize, addr: u32) -> bool {
-        match cpu_id {
-            0 => self.debugger.is_covered_65816(addr),
-            1 => self.debugger.is_covered_spc700(addr),
-            _ => false,
-        }
-    }
-
-    /// `(total_addressable_bytes, covered_bytes)` for `cpu_id`'s coverage
-    /// bitmap: 65C816 spans the full 24-bit space (`0x100_0000`), the
-    /// SPC700 its 16-bit space (`0x1_0000`). Mirrors the pair SG1's
-    /// `coverage_stats()` returns so the host can render a percentage.
-    pub fn coverage_stats(&self, cpu_id: usize) -> (u64, u64) {
-        match cpu_id {
-            0 => (0x0100_0000, u64::from(self.debugger.coverage_count_65816())),
-            1 => (
-                0x0001_0000,
-                u64::from(self.debugger.coverage_count_spc700()),
-            ),
-            _ => (0, 0),
-        }
-    }
-
     /// Write `data` to the 65C816 address space starting at `addr` for
     /// debugging. This drives the live bus, so writes to register space take
     /// effect with their normal side effects (matching what a CPU store would
     /// do); plain WRAM/SRAM edits behave as the memory editor expects.
-    /// [`EmulatorCore::read_memory_debug`] reads through the same bus.
+    /// [`EmulatorCore::read_memory_debug`] reads through the bus's
+    /// side-effect-free peek instead.
     ///
     /// A write to a PPU register is not one the frame made: until the next
     /// frame's line 1, a repaint and a layer render draw from the registers
@@ -1952,10 +1926,28 @@ impl SnesEmulator {
         self.disarm_debugger_hooks();
         self.run_frame_fast();
         self.sync_spc_trace_enable();
-        self.sync_gsu_trace_enable();
+        self.sync_cartridge_trace_enable();
         self.sync_debug_arm();
-        self.update_debugger_state();
+        self.refresh_debugger_state();
         true
+    }
+
+    /// Run one 65C816 instruction and nothing else: no scheduler event is
+    /// handled, no frame closed, and the debugger records nothing. For
+    /// looking at one instruction in isolation (register-level tests); a
+    /// host steps through [`EmulatorCore::step_cpu`], which the trait's
+    /// `step` calls for the focused CPU. From a capture boundary, the
+    /// events the frame loop handles before the next instruction come
+    /// first, so the instruction runs against the state it would in the
+    /// loop.
+    pub fn step_without_events(&mut self) -> StepResult {
+        self.leave_capture_boundary();
+        let delta = self.step_cpu_internal();
+        StepResult {
+            cycles: delta.min(u32::MAX as u64) as u32,
+            breakpoint_hit: false,
+            instruction_executed: true,
+        }
     }
 
     /// Run the frame in progress, or the next one, on the fast or the
@@ -1963,7 +1955,7 @@ impl SnesEmulator {
     fn run_frame_on_tier(&mut self, tier: ExecutionTier) {
         match tier {
             ExecutionTier::Fast => self.run_frame_fast(),
-            ExecutionTier::LightDebug => self.run_frame_instrumented(false),
+            ExecutionTier::LightDebug => self.run_frame_instrumented(),
             ExecutionTier::FullDebug => self.run_frame_full(),
         }
     }
@@ -1971,16 +1963,20 @@ impl SnesEmulator {
     /// Run one frame with per-instruction debug hooks (the `LightDebug`
     /// tier). Before each 65C816 instruction we check execute breakpoints,
     /// record coverage, and, when 65C816 tracing is enabled, capture a
-    /// binary trace entry. `full` additionally refreshes the cached
-    /// CPU-state snapshots; the tier dispatch passes `false`.
+    /// binary trace entry; after it, keep the call stack and check the
+    /// watchpoints and the events. Everything the debugger reads for
+    /// itself goes through the bus's side-effect-free peek, so a frame run
+    /// here leaves the machine as the fast loop leaves it.
     ///
-    /// A breakpoint hit flips the execution mode to `Paused` and returns
-    /// mid-frame; the next frame call goes on with the same frame (see
-    /// [`Self::enter_frame`]), so a frame broken into pieces ends where
-    /// one run whole ends, with the same state. Each pass handles the
-    /// events due first, as [`Self::run_frame_fast`] does, then runs
-    /// instructions up to the next event.
-    fn run_frame_instrumented(&mut self, full: bool) {
+    /// A breakpoint hit pauses the debugger (refreshing its CPU states) and
+    /// returns mid-frame; the next frame call goes on with the same frame
+    /// (see [`Self::enter_frame`]), so a frame broken into pieces ends where
+    /// one run whole ends, with the same state. After a stop at an execute
+    /// breakpoint, the instruction there runs first, unchecked, so running
+    /// on goes on from the stop. Each pass handles the events due first, as
+    /// [`Self::run_frame_fast`] does, then runs instructions up to the next
+    /// event.
+    fn run_frame_instrumented(&mut self) {
         // An event in the batch that reached the capture boundary may have
         // matched an event breakpoint. The frame loop honours a match once
         // the whole batch is handled, and the events after the boundary
@@ -1996,10 +1992,7 @@ impl SnesEmulator {
                 // coprocessor captured so far are flushed as at a frame's
                 // end; a breakpoint match waits for the rest of the batch.
                 self.drain_spc_trace();
-                self.drain_gsu_trace();
-                if full {
-                    self.update_debugger_state();
-                }
+                self.drain_cartridge_trace();
                 return;
             }
             // Inline events (VBlank/NMI/IRQ/HDMA/scanline set `pending_break`)
@@ -2011,13 +2004,13 @@ impl SnesEmulator {
                 // pause, so the next call opens the next frame.
                 self.end_of_frame_bookkeeping();
                 if hit {
-                    self.finish_paused_frame(full);
+                    self.finish_paused_frame();
                     return;
                 }
                 break;
             }
             if hit {
-                self.finish_paused_frame(full);
+                self.finish_paused_frame();
                 return;
             }
 
@@ -2026,23 +2019,29 @@ impl SnesEmulator {
 
             while self.master_cycles < target {
                 let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
-                if self.debugger.check_execute_65816(pc24) {
-                    self.finish_paused_frame(full);
+                let stop = {
+                    let mut context = expr_context(&self.cpu, &self.bus);
+                    self.debugger
+                        .check_execute(MAIN_CPU, pc24, Some(&mut context))
+                };
+                if stop {
+                    self.finish_paused_frame();
                     return;
                 }
-                self.debugger.record_coverage_65816(pc24);
-                if self.debugger.is_tracing_enabled(0) {
+                self.debugger.record_coverage(MAIN_CPU, pc24);
+                if self.debugger.tracing(MAIN_CPU) {
                     let entry = self.capture_trace_65816();
-                    self.debugger.record_trace_65816(&entry);
+                    self.debugger.record_trace(MAIN_CPU, &entry);
                 }
-                self.maintain_call_stack_65816(pc24);
-                // Discard the bus reads the debug capture above performed
-                // so the watchpoint scan only sees this instruction's own
-                // CPU accesses.
+                // Drop what was recorded between two instructions (a
+                // host's write while the frame was stopped) so the
+                // watchpoints see only this instruction's own accesses.
                 if self.debug_armed {
                     self.bus.clear_debug_events();
                 }
+                let start = self.step_start_65816(pc24);
                 self.step_cpu_internal();
+                self.maintain_call_stack_65816(start);
                 // Watchpoints + PPU/APU write events (recorded by the bus),
                 // DSP-register events (recorded by the APU during a mailbox
                 // catch-up), and the inline DMA-start event all funnel into
@@ -2053,17 +2052,14 @@ impl SnesEmulator {
                         | self.drain_apu_dsp_events()
                         | self.pending_break)
                 {
-                    self.finish_paused_frame(full);
+                    self.finish_paused_frame();
                     return;
                 }
             }
         }
 
         self.drain_spc_trace();
-        self.drain_gsu_trace();
-        if full {
-            self.update_debugger_state();
-        }
+        self.drain_cartridge_trace();
     }
 
     /// The `FullDebug` tier. Reached only when the execution mode is not
@@ -2073,7 +2069,7 @@ impl SnesEmulator {
     /// modes single-step.
     fn run_frame_full(&mut self) {
         if self.debugger.get_execution_mode() == ExecutionMode::Paused {
-            self.update_debugger_state();
+            self.refresh_debugger_state();
             return;
         }
         self.debug_single_step_65816();
@@ -2081,25 +2077,32 @@ impl SnesEmulator {
     }
 
     /// Advance exactly one 65C816 instruction with full instrumentation
-    /// (coverage + trace + state refresh), draining any scheduler events
-    /// that fall at the new master-cycle boundary so the PPU stays
-    /// consistent. Used by the step modes and `EmulatorCore::step_cpu`.
-    fn debug_single_step_65816(&mut self) {
+    /// (coverage, trace, call stack, history, state refresh), draining any
+    /// scheduler events that fall at the new master-cycle boundary so the
+    /// PPU stays consistent. The step a host asks for
+    /// ([`EmulatorCore::step_cpu`] on the 65C816) and the step modes both
+    /// run it. The history records the instruction at the PC as the step
+    /// starts. The step runs the instruction whatever execute breakpoint
+    /// sits at it, so the next execute check is made afresh.
+    fn debug_single_step_65816(&mut self) -> StepResult {
         self.enter_frame_for_step();
         let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
-        self.debugger.record_coverage_65816(pc24);
-        if self.debugger.is_tracing_enabled(0) {
+        self.debugger.record_coverage(MAIN_CPU, pc24);
+        if self.debugger.tracing(MAIN_CPU) {
             let entry = self.capture_trace_65816();
-            self.debugger.record_trace_65816(&entry);
+            self.debugger.record_trace(MAIN_CPU, &entry);
         }
-        self.maintain_call_stack_65816(pc24);
-        self.record_history_65816(pc24);
-        // Drop the bus reads the capture above performed before the real
-        // step so the watchpoint scan sees only this instruction.
+        let history = self.history_entry_65816(pc24);
+        self.debugger.record_history(MAIN_CPU, history);
+        // Drop what was recorded between two instructions so the
+        // watchpoint scan sees only this instruction.
         if self.debug_armed {
             self.bus.clear_debug_events();
         }
-        self.step_cpu_internal();
+        let start = self.step_start_65816(pc24);
+        let delta = self.step_cpu_internal();
+        self.maintain_call_stack_65816(start);
+        self.debugger.forget_checked(MAIN_CPU);
         self.drain_events_and_maybe_close_frame();
         // A single step always pauses, so the hit result isn't acted on,
         // but the recorders are still drained to keep watchpoint/event hit
@@ -2110,8 +2113,13 @@ impl SnesEmulator {
             self.pending_break = false;
         }
         self.drain_spc_trace();
-        self.drain_gsu_trace();
-        self.update_debugger_state();
+        self.drain_cartridge_trace();
+        self.refresh_debugger_state();
+        StepResult {
+            cycles: delta.min(u32::MAX as u64) as u32,
+            breakpoint_hit: false,
+            instruction_executed: true,
+        }
     }
 
     /// Before a debugger step: leave the capture boundary if the core is
@@ -2173,11 +2181,11 @@ impl SnesEmulator {
     }
 
     /// Snapshot the live 65C816 state into a binary trace entry, resolving
-    /// the effective-address bracket against the bus (indirect modes need
-    /// live memory). Called **before** the instruction executes, matching
-    /// bsnes-plus, so the registers and raster position describe the state
-    /// the instruction sees.
-    fn capture_trace_65816(&mut self) -> TraceEntryBinary65816 {
+    /// the effective-address bracket against memory (indirect modes need
+    /// it), read through the bus's side-effect-free peek. Called **before**
+    /// the instruction executes, matching bsnes-plus, so the registers and
+    /// raster position describe the state the instruction sees.
+    fn capture_trace_65816(&self) -> TraceEntryBinary65816 {
         let pbr = self.cpu.pbr;
         let pc = self.cpu.pc;
         let pbr_pc = ((pbr as u32) << 16) | pc as u32;
@@ -2188,7 +2196,8 @@ impl SnesEmulator {
         let m8 = emulation || (p & 0x20) != 0;
         let x8 = emulation || (p & 0x10) != 0;
 
-        let opcode = self.bus.read(pbr_pc);
+        let mut bus = SnesPeekBus(&self.bus);
+        let opcode = bus.read(pbr_pc);
         let info = &wdc65816::decode::OPCODE_TABLE[opcode as usize];
         let size = (1 + info.mode.operand_size(m8, x8)).min(4);
 
@@ -2198,7 +2207,7 @@ impl SnesEmulator {
             // Operand bytes are fetched within the program bank, wrapping
             // the 16-bit PC, exactly as the CPU's own fetch does.
             let addr = ((pbr as u32) << 16) | (pc.wrapping_add(i as u16) as u32);
-            bytes[i as usize] = self.bus.read(addr);
+            bytes[i as usize] = bus.read(addr);
         }
 
         let regs = EffRegs {
@@ -2209,7 +2218,7 @@ impl SnesEmulator {
             db: self.cpu.dbr,
             pbr_pc,
         };
-        let eff = effective_address(&mut self.bus, info.mode, &bytes[..size as usize], &regs);
+        let eff = effective_address(&mut bus, info.mode, &bytes[..size as usize], &regs);
 
         // V / H are derived from the live master cycle, decoded against
         // `frame_base_cycle` (see `raster_position`) so the trace column
@@ -2241,88 +2250,54 @@ impl SnesEmulator {
         }
     }
 
-    /// Set the debugger's execution mode. A pause also refreshes the register
-    /// snapshots the debugger reports: a game running with no breakpoint and no
-    /// trace runs the fast loop, which never refreshes them, so without it a
-    /// pause would report the state of the last reset or step.
-    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
-        self.debugger.set_execution_mode(mode);
-        if mode == ExecutionMode::Paused {
-            self.update_debugger_state();
-        }
-    }
-
-    /// Refresh the debugger's cached register snapshots for every CPU
-    /// (65C816 from the main CPU, SPC700 from the APU, and, on an SA-1, Super FX
-    /// or Cx4 cart, the chip's CPU as slot 2).
-    fn update_debugger_state(&mut self) {
-        let s0 = cpu_state_65816(&self.cpu);
-        let s1 = cpu_state_spc700(self.bus.apu().spc700());
-        let mut states = vec![s0, s1];
-        // Each chip's snapshot stamps `cpu_id = 0` (the SA-1's comes from the
-        // shared 65816 helper); rewrite it to the real slot index (2).
-        if let Some(mut s2) = self
-            .bus
-            .cartridge_ref()
-            .and_then(|c| c.secondary_cpu_state())
-        {
-            s2.cpu_id = 2;
-            states.push(s2);
-        }
-        self.debugger.set_cpu_states(states);
-    }
-
-    /// Mirror the debugger's SPC700 (cpu 1) tracing flag into the APU so
+    /// Mirror the debugger's SPC700 tracing flag into the APU so
     /// [`crate::apu::Apu::catch_up_to`] captures a trace entry before each
     /// SPC700 step. The APU runs via lazy catch-up deep inside mailbox
     /// accesses where the debugger isn't reachable, so this flag is the
     /// bridge, kept fresh at every debug entry point.
     fn sync_spc_trace_enable(&mut self) {
-        let on = self.debugger.is_tracing_enabled(1);
+        let on = self.debugger.tracing(SOUND_CPU);
         self.bus.apu_mut().set_spc_trace_enabled(on);
     }
 
     /// Move the SPC700 trace entries the APU captured this frame into the
-    /// debugger's cpu-1 tracing buffer, preserving SPC execution order.
-    /// Draining empties the APU buffer for the next catch-up window.
+    /// debugger's SPC700 trace, preserving SPC execution order. Draining
+    /// empties the APU buffer for the next catch-up window.
     fn drain_spc_trace(&mut self) {
         let entries = self.bus.apu_mut().take_spc_trace();
-        for e in &entries {
-            self.debugger.record_trace_spc700(e);
+        for entry in &entries {
+            self.debugger.record_trace(SOUND_CPU, entry);
         }
     }
 
-    /// Mirror the debugger's cpu-2 tracing flag into the cartridge so the
-    /// slot-2 chip's `catch_up` burst captures a trace entry before each step
-    /// of its CPU, the Super FX's GSU or the Cx4. That CPU runs deep inside
-    /// the chip (mailbox catch-up + the per-instruction burst hook) where the
-    /// debugger isn't reachable, so this flag is the bridge, kept fresh at
-    /// every debug entry point (a no-op on any other cart).
-    fn sync_gsu_trace_enable(&mut self) {
-        let on = self.debugger.is_tracing_enabled(2);
+    /// Mirror the debugger's tracing flag for the cartridge's CPU into the
+    /// cartridge so the chip's `catch_up` burst captures a trace entry
+    /// before each step of its CPU, the Super FX's GSU or the Cx4. That CPU
+    /// runs deep inside the chip (mailbox catch-up + the per-instruction
+    /// burst hook) where the debugger isn't reachable, so this flag is the
+    /// bridge, kept fresh at every debug entry point. A cartridge with no
+    /// CPU that traces (a plain one, an SA-1) never has the flag set: its
+    /// slot takes no trace.
+    fn sync_cartridge_trace_enable(&mut self) {
+        let on = self.debugger.tracing(CARTRIDGE_CPU);
         if let Some(cart) = self.bus.cartridge_mut() {
             cart.set_secondary_trace_enabled(on);
         }
     }
 
-    /// Move the secondary-CPU trace entries the coprocessor captured this frame
-    /// into the debugger's cpu-2 tracing buffer, preserving execution order.
-    /// Draining empties the chip's buffer for the next catch-up window. The
-    /// entry format is chip-specific (Super FX GSU vs Cx4 HG51B169), so the
-    /// installed preset picks which ring parses the bytes.
-    fn drain_gsu_trace(&mut self) {
+    /// Move the trace entries the cartridge's CPU captured this frame into
+    /// the debugger's trace for it, preserving execution order. Draining
+    /// empties the chip's buffer for the next catch-up window. The slot's
+    /// entry size is the installed chip's (the GSU's or the Cx4's), set
+    /// when the ROM loaded.
+    fn drain_cartridge_trace(&mut self) {
         let raw = self
             .bus
             .cartridge_mut()
             .map(|c| c.take_secondary_trace())
             .unwrap_or_default();
-        if raw.is_empty() {
-            return;
-        }
-        if self.preset_kind == Some(PresetKind::Cx4) {
-            self.debugger.record_trace_cx4_bytes(&raw);
-        } else {
-            self.debugger.record_trace_gsu_bytes(&raw);
+        if !raw.is_empty() {
+            self.debugger.record_trace_bytes(CARTRIDGE_CPU, &raw);
         }
     }
 
@@ -2360,7 +2335,7 @@ impl SnesEmulator {
     /// them again from the debugger's state.
     fn disarm_debugger_hooks(&mut self) {
         self.drain_spc_trace();
-        self.drain_gsu_trace();
+        self.drain_cartridge_trace();
         self.bus.apu_mut().set_spc_trace_enabled(false);
         if let Some(cart) = self.bus.cartridge_mut() {
             cart.set_secondary_trace_enabled(false);
@@ -2369,72 +2344,53 @@ impl SnesEmulator {
     }
 
     /// The palette colours and the tiles the enabled `PaletteWrite` and
-    /// `TileChange` event breakpoints watch, or `None` when there is none:
-    /// the PPU then tests one bit per write instead of the breakpoint list.
+    /// `TileChange` event breakpoints watch, or `None` when they watch
+    /// nothing: the PPU then tests one bit per write instead of the
+    /// breakpoint list.
     fn video_memory_watch(&self) -> Option<crate::ppu::EventWatch> {
-        let mut watch = crate::ppu::EventWatch::new();
-        let mut any = false;
-        for info in self.debugger.list_breakpoints() {
-            if !info.enabled {
-                continue;
-            }
-            if let BreakpointType::Event { code, param } = info.breakpoint.bp_type {
-                match code {
-                    snes_events::PALETTE_WRITE => watch.watch_colour(param),
-                    snes_events::TILE_CHANGE => watch.watch_tile(param),
-                    _ => continue,
-                }
-                any = true;
-            }
-        }
-        any.then_some(watch)
+        let breakpoints = self.debugger.breakpoints();
+        let colours = breakpoints.watched_params(snes_events::PALETTE_WRITE);
+        let tiles = breakpoints.watched_params(snes_events::TILE_CHANGE);
+        (colours.is_some() || tiles.is_some()).then(|| crate::ppu::EventWatch {
+            colours: colours.unwrap_or_default(),
+            tiles: tiles.unwrap_or_default(),
+        })
     }
 
     /// Drain the palette and tile events the PPU raised and match them
     /// against their event breakpoints. Returns `true` when any matched;
     /// every event is checked, so the hit counts stay right.
     fn drain_ppu_debug_events(&mut self) -> bool {
-        let mut hit = false;
-        let debugger = &mut self.debugger;
-        self.bus.ppu_mut().drain_debug_events(|event| {
-            let event = match event {
-                crate::ppu::PpuDebugEvent::PaletteWrite(colour) => SnesEvent::PaletteWrite(colour),
-                crate::ppu::PpuDebugEvent::TileChange(tile) => SnesEvent::TileChange(tile),
-            };
-            hit |= debugger.check_event(event);
-        });
-        hit
+        match self.bus.ppu_mut().raised_debug_events() {
+            Some(raised) if !raised.is_empty() => self.debugger.check_raised(raised),
+            _ => false,
+        }
     }
 
-    /// Drain the bus's recorded CPU accesses and match them against
-    /// read/write watchpoints and PPU/APU write events. Returns `true`
-    /// when any breakpoint matched. Every event is checked (no early
-    /// exit) so per-breakpoint hit counts stay accurate.
+    /// Check the instruction's recorded CPU accesses against the
+    /// watchpoints (each watch at most once, reading its whole value after
+    /// the instruction) and its PPU and APU writes against their events,
+    /// then drop the records. Returns `true` when any breakpoint matched;
+    /// every check runs (no early exit) so per-breakpoint hit counts stay
+    /// accurate.
     fn drain_bus_debug_events(&mut self) -> bool {
-        self.debug_event_scratch.clear();
-        self.debug_event_scratch
-            .extend_from_slice(self.bus.debug_events());
-        self.bus.clear_debug_events();
         // The palette and tile events the instruction's stores and its
         // general DMA raised in the PPU.
         let mut hit = self.drain_ppu_debug_events();
-        for ev in &self.debug_event_scratch {
-            let matched = match *ev {
-                BusDebugEvent::Read { addr, value } => self
-                    .debugger
-                    .check_memory_access_valued_65816(addr, false, value),
-                BusDebugEvent::Write { addr, value } => self
-                    .debugger
-                    .check_memory_access_valued_65816(addr, true, value),
-                BusDebugEvent::PpuRegWrite { reg } => {
-                    self.debugger.check_event(SnesEvent::PpuRegisterWrite(reg))
-                }
-                BusDebugEvent::ApuPortWrite { port } => {
-                    self.debugger.check_event(SnesEvent::ApuPortWrite(port))
-                }
-            };
-            hit |= matched;
+        if !self.bus.accesses().is_empty() {
+            let mut context = expr_context(&self.cpu, &self.bus);
+            hit |= self
+                .debugger
+                .check_accesses(MAIN_CPU, self.bus.accesses(), &mut context);
         }
+        for event in self.bus.debug_events() {
+            let event = match *event {
+                BusDebugEvent::PpuRegWrite { reg } => SnesEvent::PpuRegisterWrite(reg),
+                BusDebugEvent::ApuPortWrite { port } => SnesEvent::ApuPortWrite(port),
+            };
+            hit |= self.debugger.check_event(event);
+        }
+        self.bus.clear_debug_events();
         hit
     }
 
@@ -2450,74 +2406,95 @@ impl SnesEmulator {
         hit
     }
 
-    /// Pause the debugger and flush per-frame debug state on a mid-frame
-    /// break (execute breakpoint, watchpoint, or event hit). Shared by
-    /// every early-return site in the instrumented frame loop.
-    fn finish_paused_frame(&mut self, full: bool) {
-        self.debugger.set_execution_mode(ExecutionMode::Paused);
+    /// Pause the debugger on a mid-frame break (an execute breakpoint, a
+    /// watchpoint or an event hit), refreshing its CPU states, and flush
+    /// the traces. Shared by every early-return site in the instrumented
+    /// frame loop.
+    fn finish_paused_frame(&mut self) {
         // The SPC700 / GSU may have run (via mailbox catch-up) before the break
         // paused us mid-frame; flush their trace entries chronologically.
         self.drain_spc_trace();
-        self.drain_gsu_trace();
-        if full {
-            self.update_debugger_state();
+        self.drain_cartridge_trace();
+        EmulatorCore::set_execution_mode(self, ExecutionMode::Paused);
+    }
+
+    /// What the call stack needs to know of a 65C816 step before it runs:
+    /// the instruction's address and opcode (read through the peek), the
+    /// CPU's count of executed cycles and whether it was stopped.
+    fn step_start_65816(&self, pc24: u32) -> StepStart {
+        StepStart {
+            pc24,
+            opcode: self.bus.peek(pc24),
+            cycles: self.cpu.cycles_executed,
+            stopped: self.cpu.stopped,
         }
     }
 
-    /// Maintain the 65C816 call stack from the opcode about to execute at
-    /// `pc24`: push a frame on a subroutine/interrupt call
-    /// (JSR `$20` / JSR(abs,x) `$FC` / JSL `$22` / BRK `$00` / COP `$02`)
-    /// and pop on a return (RTS `$60` / RTL `$6B` / RTI `$40`). Opcode-only
-    /// classification, no allocation; the `function_name` stays `None`
-    /// (the core resolves no symbols). The return address is the next
-    /// instruction, wrapped inside the program bank like the CPU's own PC.
-    fn maintain_call_stack_65816(&mut self, pc24: u32) {
-        let opcode = self.bus.read(pc24);
-        let bank = pc24 & 0x00FF_0000;
-        let next = |size: u16| bank | (pc24 as u16).wrapping_add(size) as u32;
-        match opcode {
-            0x20 | 0xFC => self.debugger.push_call_65816(StackFrame {
-                call_address: pc24,
-                return_address: next(3),
-                function_name: None,
-            }),
-            0x22 => self.debugger.push_call_65816(StackFrame {
-                call_address: pc24,
-                return_address: next(4),
-                function_name: None,
-            }),
-            0x00 | 0x02 => self.debugger.push_call_65816(StackFrame {
-                call_address: pc24,
-                return_address: next(2),
-                function_name: None,
-            }),
-            0x60 | 0x6B | 0x40 => {
-                self.debugger.pop_call_65816();
+    /// Keep the 65C816 call stack after a step that began as `start`. An
+    /// instruction the step ran pushes a frame on a
+    /// subroutine or software-interrupt call (JSR `$20` / JSR(abs,x) `$FC`
+    /// / JSL `$22` / BRK `$00` / COP `$02`) and pops one on a return (RTS
+    /// `$60` / RTL `$6B` / RTI `$40`). A step that takes an interrupt
+    /// instead runs no instruction and pushes a frame whose call and return
+    /// addresses are both the interrupted address, which the handler's RTI
+    /// pops; so a call an interrupt preempts is pushed once, when it runs.
+    /// A step that finds the CPU stopped, or still waiting, does nothing.
+    /// The return address is the next instruction, wrapped inside the
+    /// program bank like the CPU's own PC; the `function_name` stays `None`
+    /// (the core resolves no symbols).
+    fn maintain_call_stack_65816(&mut self, start: StepStart) {
+        let pc24 = start.pc24;
+        if self.cpu.cycles_executed == start.cycles {
+            // No instruction ran: the CPU was stopped or still waits, or it
+            // took an interrupt.
+            if !start.stopped && !self.cpu.waiting {
+                self.debugger.push_call(
+                    MAIN_CPU,
+                    StackFrame {
+                        call_address: pc24,
+                        return_address: pc24,
+                        function_name: None,
+                    },
+                );
             }
+            return;
+        }
+        let bank = pc24 & 0x00FF_0000;
+        let call = |size: u16| StackFrame {
+            call_address: pc24,
+            return_address: bank | (pc24 as u16).wrapping_add(size) as u32,
+            function_name: None,
+        };
+        match start.opcode {
+            0x20 | 0xFC => self.debugger.push_call(MAIN_CPU, call(3)),
+            0x22 => self.debugger.push_call(MAIN_CPU, call(4)),
+            0x00 | 0x02 => self.debugger.push_call(MAIN_CPU, call(2)),
+            0x60 | 0x6B | 0x40 => self.debugger.pop_call(MAIN_CPU),
             _ => {}
         }
     }
 
-    /// Record the instruction at `pc24` into the 65C816 instruction
-    /// history with its pre-execution register snapshot. Called only from
-    /// the single-step path, where building the disassembly string and a
-    /// register snapshot per instruction is affordable.
-    fn record_history_65816(&mut self, pc24: u32) {
+    /// The history entry of the instruction at `pc24`, made before it runs:
+    /// its disassembly (read through the peek) and the registers it starts
+    /// from. Made only on the steps a host asks for, where building the
+    /// disassembly string and a register snapshot per instruction is
+    /// affordable.
+    fn history_entry_65816(&self, pc24: u32) -> InstructionTrace {
         let state = wdc65816::disasm::DisasmState {
             emulation: self.cpu.emulation,
             flag_m: self.cpu.p & 0x20 != 0,
             flag_x: self.cpu.p & 0x10 != 0,
         };
-        let (instruction, _len) = wdc65816::disasm::disassemble_at(&mut self.bus, pc24, &state);
-        let opcode = self.bus.read(pc24);
+        let mut bus = SnesPeekBus(&self.bus);
+        let (instruction, _len) = wdc65816::disasm::disassemble_at(&mut bus, pc24, &state);
+        let opcode = self.bus.peek(pc24);
         let cycle_count = wdc65816::decode::OPCODE_TABLE[opcode as usize].base_cycles as u32;
-        let registers_before = cpu_state_65816(&self.cpu).registers;
-        self.debugger.record_instruction_65816(InstructionTrace {
+        InstructionTrace {
             address: pc24,
             instruction,
-            registers_before,
+            registers_before: cpu_state_65816(&self.cpu).registers,
             cycle_count,
-        });
+        }
     }
 
     /// Bitmap-aware disassembly window around `pc` for the given CPU
@@ -2540,6 +2517,35 @@ impl SnesEmulator {
         let mut driver = SnesDisasmDriver { emu: self, cpu_id };
         retro_core::disassemble_window(&mut driver, pc, before_count, after_count)
     }
+}
+
+/// What [`SnesEmulator::maintain_call_stack_65816`] needs to know of a
+/// 65C816 step before it runs.
+#[derive(Clone, Copy)]
+struct StepStart {
+    /// The address of the instruction the step would run.
+    pc24: u32,
+    /// Its opcode, read through the peek.
+    opcode: u8,
+    /// The CPU's count of executed cycles: it moves only when the step
+    /// runs an instruction.
+    cycles: u64,
+    /// The CPU was stopped (STP), so the step runs nothing.
+    stopped: bool,
+}
+
+/// The context a breakpoint's condition and a watch's value are read in on
+/// the 65C816: its registers by name ([`wdc65816_register`]) and memory
+/// through the bus's side-effect-free peek, little-endian.
+fn expr_context<'a>(
+    cpu: &'a Wdc65816,
+    bus: &'a SnesBus,
+) -> CpuExprContext<impl FnMut(&str) -> Option<i64> + 'a, impl FnMut(u32) -> u8 + 'a> {
+    CpuExprContext::new(
+        move |name| wdc65816_register(cpu, name),
+        move |address| bus.peek(address),
+        ByteOrder::LittleEndian,
+    )
 }
 
 /// Side-effect-free [`Addressable`] view of the APU's SPC700 memory for
@@ -2613,7 +2619,7 @@ fn decode_one_snes(emu: &mut SnesEmulator, cpu_id: usize, addr: u32) -> DisasmRo
             flag_m: emu.cpu.p & 0x20 != 0,
             flag_x: emu.cpu.p & 0x10 != 0,
         };
-        let res = wdc65816::disasm::disassemble_one(&mut emu.bus, addr24, &state);
+        let res = wdc65816::disasm::disassemble_one(&mut SnesPeekBus(&emu.bus), addr24, &state);
         DisasmRow {
             address: addr24,
             kind: DisasmRowKind::Code,
@@ -2648,12 +2654,12 @@ impl retro_core::DisasmDriver for SnesDisasmDriver<'_> {
 
     fn is_covered(&self, addr: u32) -> bool {
         match self.cpu_id {
-            1 => self.emu.debugger.is_covered_spc700(addr & 0xFFFF),
             // The slot-2 CPU (the SA-1's 65816, the GSU or the Cx4) has no
             // coverage bitmap, so every row decodes as `Code` rather than an
             // `Unknown` placeholder.
-            2 => true,
-            _ => self.emu.debugger.is_covered_65816(addr & 0x00FF_FFFF),
+            CARTRIDGE_CPU => true,
+            SOUND_CPU => DebuggerCore::is_covered(&self.emu.debugger, SOUND_CPU, addr),
+            _ => DebuggerCore::is_covered(&self.emu.debugger, MAIN_CPU, addr),
         }
     }
 
@@ -2724,68 +2730,34 @@ impl EmulatorCore for SnesEmulator {
         // (non-hires) + overscan off -> resync the public display
         // dimensions to the default 256x224 view.
         self.sync_display_info();
+        // The calls the debugger saw belonged to the machine before the
+        // reset; the history stays, it records what ran.
+        self.debugger.machine_replaced();
         // Refresh the cached CPU-state snapshot so a debugger reading
         // `get_cpu_states()` right after load/reset sees the real
         // reset-vector PC + registers instead of the construction
         // defaults. Without this the disassembly view anchors at PC 0
         // until the first single-step.
-        self.update_debugger_state();
-    }
-
-    fn step(&mut self) -> StepResult {
-        // From the capture boundary, the events the frame loop handles
-        // before the next instruction come first, so the instruction runs
-        // against the state it would in the loop.
-        self.leave_capture_boundary();
-        let delta = self.step_cpu_internal();
-        StepResult {
-            cycles: delta.min(u32::MAX as u64) as u32,
-            breakpoint_hit: false,
-            instruction_executed: true,
-        }
+        self.refresh_debugger_state();
     }
 
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
         match cpu_id {
-            0 => {
-                // Single-stepping the 5A22 records coverage + a trace
-                // entry (when enabled) before executing, then refreshes
-                // the cached register snapshots.
+            MAIN_CPU => {
+                // The step a host asks for on the 5A22: coverage, a trace
+                // entry (when enabled), the call stack and the history,
+                // the events the instruction reached (RenderPos, VBlank,
+                // HBlank, NMI, IRQ, HDMA) handled and the frame closed at
+                // its boundary, as in the frame loop, then the cached
+                // register snapshots refreshed. Without the events a
+                // stepped run executes against a dead timeline that never
+                // advances past frame 0.
                 self.sync_spc_trace_enable();
-                self.sync_gsu_trace_enable();
+                self.sync_cartridge_trace_enable();
                 self.sync_debug_arm();
-                self.enter_frame_for_step();
-                let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
-                self.debugger.record_coverage_65816(pc24);
-                if self.debugger.is_tracing_enabled(0) {
-                    let entry = self.capture_trace_65816();
-                    self.debugger.record_trace_65816(&entry);
-                }
-                if self.debug_armed {
-                    self.bus.clear_debug_events();
-                }
-                let result = self.step();
-                // Fire the scheduler events this instruction reached
-                // (RenderPos/VBlank/HBlank/NMI/IRQ/HDMA) and close the frame
-                // at the boundary, mirroring the frame loop. Without this a
-                // single-stepped or instruction-bounded run executes against
-                // a dead, event-less timeline that never advances past
-                // frame 0, the cause of instruction-trace drift vs. a
-                // continuously-running reference.
-                self.drain_events_and_maybe_close_frame();
-                // The SPC700 can run via mailbox catch-up inside this one
-                // 5A22 step; flush whatever it captured.
-                if self.debug_armed {
-                    let _ = self.drain_bus_debug_events();
-                    let _ = self.drain_apu_dsp_events();
-                    self.pending_break = false;
-                }
-                self.drain_spc_trace();
-                self.drain_gsu_trace();
-                self.update_debugger_state();
-                result
+                self.debug_single_step_65816()
             }
-            2 => {
+            CARTRIDGE_CPU => {
                 // The slot-2 CPU: the SA-1's second 65816, the GSU or the Cx4.
                 // The chip owns the step and the catch-up anchor (the SA-1 also
                 // its deferred-wake, IRQ/NMI sampling and the timer tick), so we
@@ -2802,7 +2774,7 @@ impl EmulatorCore for SnesEmulator {
                         breakpoint_hit: false,
                         instruction_executed: false,
                     });
-                self.update_debugger_state();
+                self.refresh_debugger_state();
                 result
             }
             // The APU runs via lazy catch-up (mailbox access + the
@@ -2819,23 +2791,21 @@ impl EmulatorCore for SnesEmulator {
     }
 
     fn focused_cpu(&self) -> usize {
-        self.focused_cpu
+        self.debugger.focused_cpu()
     }
 
     fn set_focused_cpu(&mut self, cpu_id: usize) {
-        if cpu_id < self.system_info.cpus.len() {
-            self.focused_cpu = cpu_id;
-        }
+        self.debugger.set_focused_cpu(cpu_id);
     }
 
     fn run_frame(&mut self) {
         // Keep the APU's SPC700 trace capture in lock-step with the
-        // debugger's cpu-1 tracing flag before any catch-up runs this
+        // debugger's SPC700 tracing flag before any catch-up runs this
         // frame.
         self.sync_spc_trace_enable();
-        // Same for the slot-2 trace capture, the Super FX's GSU or the Cx4
-        // (no-op otherwise).
-        self.sync_gsu_trace_enable();
+        // Same for the cartridge CPU's trace capture, the Super FX's GSU
+        // or the Cx4 (no-op otherwise).
+        self.sync_cartridge_trace_enable();
         // Arm (or disarm) bus + APU debug-event recording to match the
         // current watch/event-breakpoint set before the loop runs.
         self.sync_debug_arm();
@@ -2844,7 +2814,7 @@ impl EmulatorCore for SnesEmulator {
         // or tracing are active, and the full path while paused / stepping.
         match self.debugger.execution_tier() {
             ExecutionTier::Fast => self.run_frame_fast(),
-            ExecutionTier::LightDebug => self.run_frame_instrumented(false),
+            ExecutionTier::LightDebug => self.run_frame_instrumented(),
             ExecutionTier::FullDebug => self.run_frame_full(),
         }
     }
@@ -2908,7 +2878,13 @@ impl EmulatorCore for SnesEmulator {
         // Hash the stripped ROM bytes (the manifest convention) so the
         // savestate envelope can refuse a state captured against a
         // different game. Survives `reset()` since the ROM stays loaded.
-        self.rom_hash = rom_sha256(data);
+        // Another game's coverage says nothing of this one's code: it is
+        // cleared, while loading the same bytes again keeps it.
+        let rom_hash = rom_sha256(data);
+        if rom_hash != self.rom_hash {
+            self.debugger.clear_all_coverage();
+        }
+        self.rom_hash = rom_hash;
         // Retain the raw bytes so `power_on_reset` can reconstruct a fresh
         // power-on machine (netplay cold boot) by re-running `load_rom`.
         self.last_rom = data.to_vec();
@@ -2944,6 +2920,7 @@ impl EmulatorCore for SnesEmulator {
         // map now that the cartridge is installed.
         let sram_size = self.bus.cartridge_sram().map(|s| s.len()).unwrap_or(0) as u32;
         self.debugger
+            .console_mut()
             .set_memory_sizes(self.rom_size as u32, sram_size);
 
         // A cartridge that hosts a steppable secondary CPU (the SA-1's second
@@ -2962,6 +2939,12 @@ impl EmulatorCore for SnesEmulator {
         if has_secondary {
             cpus.push(secondary_cpu_info(self.preset_kind));
         }
+        // The cartridge's CPU decides what slot 2 traces: the GSU's or the
+        // Cx4's entries, or nothing (the SA-1, a cartridge with no CPU). A
+        // different CPU rebuilds the slot; the same one keeps it.
+        let cartridge_cpu = cpus.get(CARTRIDGE_CPU).map(|cpu| cpu.architecture);
+        self.debugger
+            .configure_cpu(CARTRIDGE_CPU, cartridge_cpu_spec(cartridge_cpu));
         self.system_info.cpus = cpus;
         self.debugger.set_system_info(self.system_info.clone());
 
@@ -3070,14 +3053,70 @@ impl EmulatorCore for SnesEmulator {
         &mut self.debugger
     }
 
-    /// Reads through the live bus, as the CPU would: a read of a register
-    /// has its side effects, and every read sets the open-bus latch. Plain
-    /// memory (WRAM, ROM, SRAM) reads back unchanged; a read with no side
-    /// effects would need one per coprocessor, whose memories sit behind
-    /// their registers.
+    fn debugger_ref(&self) -> &dyn DebuggerCore {
+        &self.debugger
+    }
+
+    /// Refresh the debugger's cached register snapshots for every CPU
+    /// (65C816 from the main CPU, SPC700 from the APU, and, on an SA-1,
+    /// Super FX or Cx4 cart, the chip's CPU as slot 2).
+    fn refresh_debugger_state(&mut self) {
+        let mut states = vec![
+            cpu_state_65816(&self.cpu),
+            cpu_state_spc700(self.bus.apu().spc700()),
+        ];
+        // Each chip's snapshot stamps `cpu_id = 0` (the SA-1's comes from the
+        // shared 65816 helper); rewrite it to the real slot index.
+        if let Some(mut cartridge) = self
+            .bus
+            .cartridge_ref()
+            .and_then(|c| c.secondary_cpu_state())
+        {
+            cartridge.cpu_id = CARTRIDGE_CPU;
+            states.push(cartridge);
+        }
+        self.debugger.set_cpu_states(states);
+    }
+
+    /// The text of trace entries of CPU `cpu_id` in the formats of
+    /// bsnes-plus: the 65C816's, the SPC700's, and on slot 2 the GSU's or
+    /// the Cx4's, as the cartridge loaded says. `None` for a CPU with no
+    /// trace.
+    fn trace_to_text(&mut self, cpu_id: usize, data: &[u8]) -> Option<String> {
+        match cpu_id {
+            MAIN_CPU => Some(trace_to_text::<TraceEntryBinary65816, ()>(data, &mut ())),
+            SOUND_CPU => Some(trace_to_text::<TraceEntryBinarySpc700, ()>(data, &mut ())),
+            CARTRIDGE_CPU => match self
+                .system_info
+                .cpus
+                .get(CARTRIDGE_CPU)
+                .map(|cpu| cpu.architecture)
+            {
+                #[cfg(feature = "chip-superfx")]
+                Some(CpuArchitecture::SuperFx) => Some(trace_to_text::<
+                    crate::debugger::TraceEntryBinaryGsu,
+                    (),
+                >(data, &mut ())),
+                #[cfg(feature = "chip-cx4")]
+                Some(CpuArchitecture::Hg51b) => Some(trace_to_text::<
+                    crate::debugger::TraceEntryBinaryCx4,
+                    (),
+                >(data, &mut ())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Reads memory as the CPU sees it, through the bus's side-effect-free
+    /// peek: work RAM, ROM and the cartridge's RAM give their bytes, a
+    /// coprocessor's ROM or RAM window the bytes behind it, and a register
+    /// (the PPU's, the APU's ports, the 5A22's, a chip's) 0 or the
+    /// open-bus value, since reading it could change it. Nothing moves:
+    /// no latch, no clock, no coprocessor.
     fn read_memory_debug(&mut self, addr: u32, size: u32) -> Vec<u8> {
         (0..size)
-            .map(|i| self.bus.read(addr.wrapping_add(i)))
+            .map(|i| self.bus.peek(addr.wrapping_add(i)))
             .collect()
     }
 
@@ -3087,9 +3126,10 @@ impl EmulatorCore for SnesEmulator {
 
     fn disassemble_cpu(&mut self, cpu_id: usize, addr: u32, count: u32) -> Vec<Instruction> {
         // Forward-decode `count` instructions from `addr`. The 65C816
-        // uses the live bus + current M/X/E flags (immediate operand
-        // width depends on them); the SPC700 uses a side-effect-free
-        // view of its memory and the live `PSW.P` direct-page select.
+        // reads through the bus's side-effect-free peek with the current
+        // M/X/E flags (immediate operand width depends on them); the
+        // SPC700 uses a side-effect-free view of its memory and the live
+        // `PSW.P` direct-page select.
         match cpu_id {
             0 => {
                 let state = wdc65816::disasm::DisasmState {
@@ -3100,7 +3140,11 @@ impl EmulatorCore for SnesEmulator {
                 let mut out = Vec::with_capacity(count as usize);
                 let mut cursor = addr & 0x00FF_FFFF;
                 for _ in 0..count {
-                    let res = wdc65816::disasm::disassemble_one(&mut self.bus, cursor, &state);
+                    let res = wdc65816::disasm::disassemble_one(
+                        &mut SnesPeekBus(&self.bus),
+                        cursor,
+                        &state,
+                    );
                     let len = res.bytes_consumed.max(1);
                     out.push(Instruction {
                         address: cursor,
@@ -3204,7 +3248,7 @@ impl CaptureCore for SnesEmulator {
     /// ROM load or a state load drops it.
     fn run_to_capture_boundary(&mut self) {
         self.sync_spc_trace_enable();
-        self.sync_gsu_trace_enable();
+        self.sync_cartridge_trace_enable();
         self.sync_debug_arm();
         let tier = self.debugger.execution_tier();
         if tier == ExecutionTier::FullDebug {
@@ -4428,7 +4472,7 @@ mod tests {
         // The frame base starts at 0. Stepping the CPU once should
         // advance the master clock and refresh the snapshot to the
         // frame-relative raster position at that boundary.
-        emu.step();
+        emu.step_without_events();
         let (v, h) = emu.raster_position(emu.master_cycles);
         assert_eq!(emu.bus.cached_h_dot(), h);
         assert_eq!(emu.bus.cached_v_scanline(), v);

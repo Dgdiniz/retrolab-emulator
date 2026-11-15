@@ -16,6 +16,10 @@
  * tolerant of legacy/hand-written string inputs (`"execute"`, `"Read"`,
  * even the historical `"execution"`) so persisted files and lesson JSON
  * keep round-tripping.
+ *
+ * They also read what each CPU checks ({@link BreakpointChecks}, from
+ * `getBreakpointChecks(cpuId)`), so both panels offer only the breakpoints
+ * a CPU checks and say why they offer less.
  */
 
 /** Independent execute / read / write checks on one breakpoint. */
@@ -147,4 +151,121 @@ export function accessLabel(flags: AccessFlags): string {
 export function accessKey(flags: AccessFlags): string {
   const key = `${flags.exec ? 'e' : ''}${flags.read ? 'r' : ''}${flags.write ? 'w' : ''}`
   return key === '' ? 'none' : key
+}
+
+// -- What each CPU checks ---------------------------------------------
+//
+// A console's CPUs do not all check breakpoints: a sound CPU may check
+// none, or only some kinds. The core says what each CPU checks through
+// `getBreakpointChecks(cpuId)`, and the panels offer a user only that,
+// saying why where they offer less.
+
+/** What a CPU's breakpoints are checked for, as `getBreakpointChecks(cpuId)` reports it. */
+export interface BreakpointChecks {
+  /** Execute breakpoints stop the CPU before the instruction at their address. */
+  execute: boolean
+  /** Read and write watchpoints stop it after an instruction that touched their bytes. */
+  memory: boolean
+  /** A breakpoint's condition is evaluated against the CPU's registers and memory. */
+  conditions: boolean
+}
+
+/**
+ * Every check. A core that cannot say what a CPU checks (a build older
+ * than `getBreakpointChecks`) is taken to check everything, so a panel
+ * offers what it offered before cores said.
+ */
+export const ALL_BREAKPOINT_CHECKS: Readonly<BreakpointChecks> = Object.freeze({
+  execute: true,
+  memory: true,
+  conditions: true,
+})
+
+/**
+ * Normalize a raw `getBreakpointChecks` result. Anything that is not an
+ * object, and any field that is not a boolean, counts as checked: what a
+ * core does not say is offered, as before cores said.
+ */
+export function parseBreakpointChecks(raw: unknown): BreakpointChecks {
+  if (typeof raw !== 'object' || raw === null) return { ...ALL_BREAKPOINT_CHECKS }
+  const fields = raw as Record<string, unknown>
+  const read = (v: unknown): boolean => (typeof v === 'boolean' ? v : true)
+  return { execute: read(fields.execute), memory: read(fields.memory), conditions: read(fields.conditions) }
+}
+
+/**
+ * What CPU `cpuId` of `emulator` checks: its `getBreakpointChecks(cpuId)`,
+ * or every check when the emulator has no such method or the call throws.
+ */
+export function breakpointChecksOf(emulator: unknown, cpuId: number): BreakpointChecks {
+  const read =
+    typeof emulator === 'object' && emulator !== null
+      ? (emulator as { getBreakpointChecks?: unknown }).getBreakpointChecks
+      : undefined
+  if (typeof read !== 'function') return { ...ALL_BREAKPOINT_CHECKS }
+  try {
+    return parseBreakpointChecks(read.call(emulator, cpuId))
+  } catch {
+    return { ...ALL_BREAKPOINT_CHECKS }
+  }
+}
+
+/** The access flags a CPU's checks let a user set: execute, and read and write when memory is checked. */
+export function checkedAccess(checks: BreakpointChecks): AccessFlags {
+  return { exec: checks.execute, read: checks.memory, write: checks.memory }
+}
+
+/**
+ * Whether a breakpoint of these flags is one to offer on a CPU with these
+ * checks: it watches something, and nothing its CPU does not check.
+ */
+export function isAccessOffered(flags: AccessFlags, checks: BreakpointChecks): boolean {
+  if (isEmptyAccess(flags)) return false
+  return (!flags.exec || checks.execute) && (!(flags.read || flags.write) || checks.memory)
+}
+
+/**
+ * The access a click in a disassembly or code gutter leaves on the CPU's
+ * breakpoint at an address: `current` (that breakpoint's access, or
+ * {@link EMPTY_ACCESS} when there is none) with its exec bit flipped. An
+ * access left empty means the breakpoint goes. Clearing the bit is always
+ * allowed; setting it is refused, `null`, on a CPU that checks no execute
+ * breakpoints, where one would never stop it.
+ */
+export function gutterExecToggle(current: AccessFlags, checks: BreakpointChecks): AccessFlags | null {
+  if (!current.exec && !checks.execute) return null
+  return toggleFlag(current, 'exec')
+}
+
+/**
+ * Why a CPU is not offered every kind of breakpoint, as one sentence for a
+ * panel, or `null` when it checks everything. `cpuName` names the CPU
+ * (`"Z80"`); without one the sentence says "this CPU".
+ */
+export function breakpointChecksNote(checks: BreakpointChecks, cpuName?: string | null): string | null {
+  const cpu = cpuName ? `the ${cpuName}` : 'this CPU'
+  if (!checks.execute && !checks.memory) return `The emulator checks no breakpoints on ${cpu}.`
+  const unchecked: string[] = []
+  if (!checks.execute) unchecked.push('execute breakpoints')
+  if (!checks.memory) unchecked.push('read and write watchpoints')
+  if (!checks.conditions) unchecked.push('conditions')
+  return unchecked.length ? `The emulator does not check ${unchecked.join(' or ')} on ${cpu}.` : null
+}
+
+/**
+ * Why part of a breakpoint is never checked, or `null` when its CPU checks
+ * all of it: an access its CPU does not check, or a condition its CPU never
+ * evaluates. The sentence is {@link breakpointChecksNote}'s, about the CPU.
+ */
+export function breakpointUncheckedNote(
+  flags: AccessFlags,
+  hasCondition: boolean,
+  checks: BreakpointChecks,
+  cpuName?: string | null,
+): string | null {
+  const unchecked =
+    (flags.exec && !checks.execute) ||
+    ((flags.read || flags.write) && !checks.memory) ||
+    (hasCondition && !checks.conditions)
+  return unchecked ? breakpointChecksNote(checks, cpuName) : null
 }

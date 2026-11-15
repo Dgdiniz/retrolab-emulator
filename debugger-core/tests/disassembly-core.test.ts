@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  breakpointsOnCpu,
   classifyRow,
   enabledBreakpointAddresses,
   findExistingBreakpointId,
@@ -30,6 +31,32 @@ describe('disassembly-core > enabledBreakpointAddresses', () => {
       { enabled: true, breakpoint: { address: 0x100 } },
     ])
     expect(set.size).toBe(1)
+  })
+})
+
+describe('disassembly-core > breakpointsOnCpu', () => {
+  const EXEC = { Access: { exec: true, read: false, write: false } }
+  const list = [
+    { id: 1, enabled: true, breakpoint: { address: 0x0100, bp_type: EXEC, cpu_id: 0 } },
+    { id: 2, enabled: true, breakpoint: { address: 0x0100, bp_type: EXEC, cpu_id: 1 } },
+    { id: 3, enabled: true, breakpoint: { address: 0x0000, bp_type: { Event: { code: 1, param: 0 } }, cpu_id: null } },
+    { id: 4, enabled: false, breakpoint: { address: 0x0200, bp_type: EXEC, cpu_id: null } },
+    // An event as a host lists it once it has moved the event out of the tag.
+    { id: 5, enabled: true, breakpoint: { address: 0x0000, bp_type: 'event', event: { code: 5, param: 0 } } },
+    { id: 6, enabled: true, breakpoint: { address: 0x0300, bp_type: 'execute', cpu_id: 2 } },
+  ]
+
+  it('keeps the address breakpoints of the CPU asked for', () => {
+    expect(breakpointsOnCpu(list, 1).map((bp) => bp.id)).toEqual([2])
+    expect(breakpointsOnCpu(list, 2).map((bp) => bp.id)).toEqual([6])
+  })
+
+  it('counts a breakpoint listed with no CPU as the primary CPU one, and leaves events out', () => {
+    expect(breakpointsOnCpu(list, 0).map((bp) => bp.id)).toEqual([1, 4])
+  })
+
+  it('finds none on a CPU with none', () => {
+    expect(breakpointsOnCpu(list, 3)).toEqual([])
   })
 })
 

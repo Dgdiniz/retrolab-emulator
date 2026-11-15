@@ -291,7 +291,10 @@ fn with_no_breakpoint_the_frame_runs_on_the_fast_loop_and_raises_nothing() {
     for _ in 0..3 {
         emu.run_frame_fast();
         assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
-        assert!(emu.vdp_mut().take_raised_events().is_empty());
+        assert!(emu
+            .vdp_mut()
+            .raised_events_mut()
+            .is_none_or(|raised| raised.is_empty()));
     }
     emu.debugger().remove_breakpoint(id);
     assert_eq!(emu.debugger().execution_tier(), ExecutionTier::Fast);

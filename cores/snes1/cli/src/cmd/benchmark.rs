@@ -155,9 +155,13 @@ fn bench_tier(
     let start = Instant::now();
     for _ in 0..frames {
         emu.run_frame();
-        if drain_trace && emu.debugger().needs_trace_flush() {
-            let _ = emu.debugger().get_trace_flush_data(0);
-            let _ = emu.debugger().get_trace_flush_data(1);
+        if drain_trace && emu.debugger().any_trace_needs_flush() {
+            // Take the bytes and empty the ring, as a host does; the bytes
+            // go through `black_box` so the copy a host pays is kept.
+            for cpu in 0..2 {
+                std::hint::black_box(emu.debugger().get_trace_flush_data(cpu));
+                emu.debugger().clear_trace_flushed(cpu);
+            }
         }
         // A host takes the frame's writes as it goes; nothing when the log
         // is not recorded.

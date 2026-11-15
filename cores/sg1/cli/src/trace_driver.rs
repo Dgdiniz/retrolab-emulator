@@ -18,9 +18,11 @@ use std::ops::ControlFlow;
 
 use anyhow::Result;
 use indicatif::ProgressBar;
+use retro_core::debug::{TraceEntry, TraceText};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
 use sg1_core::debugger::{
-    TraceEntryBinary, TraceEntryBinaryZ80, TRACE_ENTRY_SIZE, Z80_TRACE_ENTRY_SIZE,
+    TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE,
+    Z80_TRACE_ENTRY_SIZE,
 };
 use sg1_core::GenesisEmulator;
 
@@ -176,18 +178,30 @@ where
     Ok(stats)
 }
 
-fn set_tracing(emu: &mut GenesisEmulator, cpu: TraceCpu, enabled: bool) {
+/// The debugger's id of the CPU traced.
+fn cpu_id(cpu: TraceCpu) -> usize {
     match cpu {
-        TraceCpu::M68k => emu.set_tracing_enabled(enabled),
-        TraceCpu::Z80 => emu.set_z80_tracing_enabled(enabled),
+        TraceCpu::M68k => MAIN_CPU,
+        TraceCpu::Z80 => SOUND_CPU,
     }
 }
 
+fn set_tracing(emu: &mut GenesisEmulator, cpu: TraceCpu, enabled: bool) {
+    emu.debugger().set_tracing_enabled(cpu_id(cpu), enabled);
+}
+
 fn needs_flush(emu: &GenesisEmulator, cpu: TraceCpu) -> bool {
-    match cpu {
-        TraceCpu::M68k => emu.needs_trace_flush(),
-        TraceCpu::Z80 => emu.needs_z80_trace_flush(),
-    }
+    emu.debugger_ref().needs_trace_flush(cpu_id(cpu))
+}
+
+/// Take the CPU's trace data and empty its ring.
+fn take_trace(emu: &mut GenesisEmulator, cpu: TraceCpu) -> Vec<u8> {
+    let data = emu
+        .debugger_ref()
+        .get_trace_flush_data(cpu_id(cpu))
+        .unwrap_or_default();
+    emu.debugger().clear_trace_flushed(cpu_id(cpu));
+    data
 }
 
 /// Drain the CPU's trace ring once and feed every formatted entry to
@@ -204,8 +218,7 @@ where
 {
     match cpu {
         TraceCpu::M68k => {
-            let data = emu.get_trace_flush_data().to_vec();
-            emu.clear_trace_flushed();
+            let data = take_trace(emu, cpu);
             for chunk in data.as_chunks::<TRACE_ENTRY_SIZE>().0 {
                 if let Some(entry) = TraceEntryBinary::from_bytes(chunk) {
                     let line = format_m68k_entry(&entry, emu, with_timing);
@@ -217,8 +230,7 @@ where
             }
         }
         TraceCpu::Z80 => {
-            let data = emu.get_z80_trace_flush_data().to_vec();
-            emu.clear_z80_trace_flushed();
+            let data = take_trace(emu, cpu);
             for chunk in data.as_chunks::<Z80_TRACE_ENTRY_SIZE>().0 {
                 if let Some(entry) = TraceEntryBinaryZ80::from_bytes(chunk) {
                     let line = format_z80_entry(&entry);
@@ -270,10 +282,9 @@ pub fn format_m68k_entry(
 /// Format one Z80 trace entry as a MAME-style text line, disassembling
 /// from the raw bytes captured with the entry.
 pub fn format_z80_entry(entry: &TraceEntryBinaryZ80) -> String {
-    use sg1_core::z80::disasm;
-    let (text, _) = disasm::disassemble_from_bytes(entry.pc, &entry.raw_bytes);
-    let mnemonic = disasm::to_trace_format(&text);
-    entry.to_text(&mnemonic)
+    let mut line = String::new();
+    entry.write_text(&mut (), &mut line);
+    line
 }
 
 /// Convert a raw 68000 binary trace blob to a multi-line text dump

@@ -14,6 +14,7 @@
 
 import type { DebugBridge } from './debug-bridge'
 import type { WebCore } from './core-resolver'
+import { traceEntrySize } from '@debugger-core/trace-spec-core'
 import { traceCpuSpec, type TraceCpuSpec } from './trace-ops'
 
 export interface TracingHandle {
@@ -68,13 +69,15 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
   let active = false
   let opfsAvailable = false
   let cpuId = 0
-  // Trace bindings + entry sizes for the CPU being recorded. Resolved
-  // afresh at record-start (the focus selector can move between runs)
-  // and held through export so the post-stop convert path uses the same
-  // CPU's entry size + converter. The worker gets the same entry size
-  // with `start`, so the export chunks it cuts hold whole entries of
-  // this CPU.
+  // Trace bindings for the CPU being recorded, and the size of its
+  // entries as the core reports it. Resolved afresh at record-start (the
+  // focus selector can move between runs) and held through export so the
+  // post-stop convert path uses the same CPU's entry size + converter.
+  // The worker gets the same entry size with `start`, so the export
+  // chunks it cuts hold whole entries of this CPU, and the live stats
+  // count entries with it.
   let spec: TraceCpuSpec = traceCpuSpec(core, cpuId)
+  let entrySize = 0
 
   // Export accumulator state, only relevant during a multi-chunk
   // export. Reset by `handleExportStarted` and torn down on success or
@@ -121,7 +124,7 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
         break
 
       case 'progress': {
-        const entries = Math.floor(bytes / spec.statsEntrySize)
+        const entries = entrySize > 0 ? Math.floor(bytes / entrySize) : 0
         if (elements.stats) {
           elements.stats.textContent = `${formatNumber(entries)} ${spec.uiLabel} entries`
         }
@@ -209,9 +212,8 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
     if (!emulator) return
 
     try {
-      const TRACE_ENTRY_SIZE = spec.entrySize
-      const numEntries = Math.floor(data.byteLength / TRACE_ENTRY_SIZE)
-      const remainder = data.byteLength % TRACE_ENTRY_SIZE
+      const numEntries = Math.floor(data.byteLength / entrySize)
+      const remainder = data.byteLength % entrySize
 
       console.log(`Processing export chunk ${chunkIndex + 1}/${totalChunks}:`)
       console.log(`  - Size: ${data.byteLength} bytes (${(data.byteLength / (1024 * 1024)).toFixed(1)} MB)`)
@@ -283,13 +285,21 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
       return
     }
 
-    cpuId = bridge.getFocusedCpu()
-    spec = traceCpuSpec(core, cpuId)
+    const focused = bridge.getFocusedCpu()
+    const focusedSpec = traceCpuSpec(core, focused)
+    const size = traceEntrySize(emulator, focusedSpec)
+    if (size === 0) {
+      console.warn(`Cannot start tracing: the core reports no ${focusedSpec.uiLabel} trace entry size`)
+      return
+    }
+    cpuId = focused
+    spec = focusedSpec
+    entrySize = size
 
     worker.postMessage({
       type: 'start',
       fileName: `trace_${spec.fileLabel}_${Date.now()}.bin`,
-      entrySize: spec.entrySize,
+      entrySize,
     })
 
     emulator[spec.setEnabled](true)
@@ -379,8 +389,10 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
       elements.startBtn.textContent = '⏺ Record'
     }
 
+    // `getTraceStats()` describes the main CPU's ring (CPU 0); another
+    // CPU's count comes from the bytes the worker reports.
     const emulator = bridge.getEmulator()
-    if (emulator && active && elements.stats) {
+    if (emulator && active && elements.stats && cpuId === 0) {
       try {
         const stats = emulator.getTraceStats()
         if (stats) {

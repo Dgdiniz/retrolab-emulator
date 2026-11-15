@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { traceCpuSpecForKind } from '@debugger-core/trace-spec-core'
 import type { CpuKind } from '@debugger-core/cpu-flags-core'
+
+// The size of one trace entry of each CPU, as the cores report it through
+// the CPU's `getEntrySize` binding; the page hands it to the worker with
+// `start`.
+const ENTRY_SIZES: Record<CpuKind, number> = { m68k: 84, z80: 38, w65816: 44, spc700: 24, superfx: 52, hg51b: 93 }
 
 // The worker runs here against an in-memory stand-in for the origin
 // private file system: one traces directory whose files are the chunks
@@ -108,7 +112,7 @@ describe('trace worker export', () => {
   const kinds: CpuKind[] = ['w65816', 'spc700', 'm68k', 'z80']
   for (const kind of kinds) {
     it(`cuts a ${kind} trace into chunks of whole entries of its own size`, async () => {
-      const { entrySize } = traceCpuSpecForKind(kind)
+      const entrySize = ENTRY_SIZES[kind]
       const { recorded, started, pieces } = await recordAndExport(entrySize, 25, 200)
 
       expect(started).toBeDefined()
@@ -125,8 +129,8 @@ describe('trace worker export', () => {
   }
 
   it('exports one 65816 entry, which is shorter than a 68000 entry, instead of calling the file empty', async () => {
-    const { entrySize } = traceCpuSpecForKind('w65816')
-    expect(entrySize).toBeLessThan(traceCpuSpecForKind('m68k').entrySize)
+    const entrySize = ENTRY_SIZES.w65816
+    expect(entrySize).toBeLessThan(ENTRY_SIZES.m68k)
     const { recorded, pieces } = await recordAndExport(entrySize, 1)
 
     expect(posted.find((m) => m.type === 'error')).toBeUndefined()
@@ -151,7 +155,7 @@ describe('trace worker export', () => {
 
   it('logs the first bytes of a chunk without decoding them as a 68000 entry', async () => {
     const log = vi.mocked(console.log)
-    const { pieces } = await recordAndExport(traceCpuSpecForKind('w65816').entrySize, 25, 200)
+    const { pieces } = await recordAndExport(ENTRY_SIZES.w65816, 25, 200)
     expect(pieces.length).toBeGreaterThan(1)
     const lines = log.mock.calls.map((args) => args.map(String).join(' '))
     expect(lines.some((line) => line.includes('First 16 bytes'))).toBe(true)

@@ -13,8 +13,10 @@
 //!
 //! The engine is deliberately self-contained and `core`-only (no host
 //! types): the host supplies machine state through the [`ExprContext`]
-//! trait, so the same parser/evaluator serves every console core. The
-//! grammar is a conventional C-like precedence ladder:
+//! trait, so the same parser/evaluator serves every console core.
+//! [`CpuExprContext`] is that context for one CPU, built from a function
+//! that names its registers and one that peeks its memory. The grammar is
+//! a conventional C-like precedence ladder:
 //!
 //! ```text
 //! or      := and  ( "||" and )*
@@ -51,7 +53,7 @@ pub trait ExprContext {
     /// not fire) rather than guessing a value.
     fn register(&mut self, name: &str) -> Option<i64>;
 
-    /// Read `width` (1, 2 or 4) bytes from memory at `addr`, zero-extended
+    /// Read `width` (1 to 4) bytes from memory at `addr`, zero-extended
     /// to `i64`, honouring the core's endianness. Must be side-effect free
     /// (a debugger peek), since it runs on the breakpoint check path.
     fn read_mem(&mut self, addr: u32, width: u8) -> i64;
@@ -229,6 +231,78 @@ impl Expr {
 /// `Err`, which the breakpoint path treats as "do not fire".
 pub fn eval_str(src: &str, ctx: &mut dyn ExprContext) -> Result<bool, ExprError> {
     Ok(Expr::parse(src)?.eval(ctx)? != 0)
+}
+
+// -- A CPU's context ---------------------------------------------------
+
+/// The order a CPU keeps the bytes of a value in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    /// The most significant byte first, at the lowest address (the 68000).
+    BigEndian,
+    /// The least significant byte first, at the lowest address (the 65816,
+    /// the Z80).
+    LittleEndian,
+}
+
+/// An [`ExprContext`] over one CPU: its registers through `registers`, a
+/// function from a lowercase name to the register's value (`None` for a
+/// name the CPU does not have), and its memory through `peek`, a function
+/// reading one byte at an address without side effects. `read_mem` reads
+/// `width` bytes from `peek` and puts them together in `order`.
+///
+/// A core builds one around a borrow of its CPU and its bus, for the length
+/// of one check:
+///
+/// ```text
+/// let mut context = CpuExprContext::new(
+///     |name| register_of(&cpu, name),
+///     |address| bus.peek(address),
+///     ByteOrder::LittleEndian,
+/// );
+/// ```
+pub struct CpuExprContext<R, P> {
+    registers: R,
+    peek: P,
+    order: ByteOrder,
+}
+
+impl<R, P> CpuExprContext<R, P>
+where
+    R: FnMut(&str) -> Option<i64>,
+    P: FnMut(u32) -> u8,
+{
+    /// A context reading registers through `registers` and memory through
+    /// `peek`, values in `order`.
+    pub fn new(registers: R, peek: P, order: ByteOrder) -> Self {
+        Self {
+            registers,
+            peek,
+            order,
+        }
+    }
+}
+
+impl<R, P> ExprContext for CpuExprContext<R, P>
+where
+    R: FnMut(&str) -> Option<i64>,
+    P: FnMut(u32) -> u8,
+{
+    fn register(&mut self, name: &str) -> Option<i64> {
+        (self.registers)(name)
+    }
+
+    fn read_mem(&mut self, addr: u32, width: u8) -> i64 {
+        let mut value: i64 = 0;
+        for index in 0..u32::from(width) {
+            let byte = i64::from((self.peek)(addr.wrapping_add(index)));
+            match self.order {
+                ByteOrder::BigEndian => value = (value << 8) | byte,
+                ByteOrder::LittleEndian => value |= byte << (8 * index),
+            }
+        }
+        value
+    }
 }
 
 // -- Tokenizer --------------------------------------------------------
@@ -849,5 +923,77 @@ mod tests {
             ExprError::DivByZero.to_string(),
         ];
         assert!(msgs.iter().all(|m| !m.is_empty()));
+    }
+
+    // -- A CPU's context ------------------------------------------------
+
+    /// Four bytes at 0x100: 12 34 56 78; every other byte 0.
+    fn peek(address: u32) -> u8 {
+        const BYTES: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+        BYTES
+            .get(address.wrapping_sub(0x100) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn registers(name: &str) -> Option<i64> {
+        match name {
+            "a" => Some(0x1234),
+            "pc" => Some(0x80_8000),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_big_endian_cpu_reads_the_first_byte_as_the_most_significant() {
+        let mut ctx = CpuExprContext::new(registers, peek, ByteOrder::BigEndian);
+        assert_eq!(ctx.read_mem(0x100, 1), 0x12);
+        assert_eq!(ctx.read_mem(0x100, 2), 0x1234);
+        assert_eq!(ctx.read_mem(0x100, 3), 0x12_3456);
+        assert_eq!(ctx.read_mem(0x100, 4), 0x1234_5678);
+        assert_eq!(ctx.read_mem(0x102, 4), 0x5678_0000);
+    }
+
+    #[test]
+    fn a_little_endian_cpu_reads_the_first_byte_as_the_least_significant() {
+        let mut ctx = CpuExprContext::new(registers, peek, ByteOrder::LittleEndian);
+        assert_eq!(ctx.read_mem(0x100, 1), 0x12);
+        assert_eq!(ctx.read_mem(0x100, 2), 0x3412);
+        assert_eq!(ctx.read_mem(0x100, 3), 0x56_3412);
+        assert_eq!(ctx.read_mem(0x100, 4), 0x7856_3412);
+        assert_eq!(ctx.read_mem(0x0FF, 2), 0x1200);
+    }
+
+    #[test]
+    fn a_cpu_context_answers_the_registers_its_function_knows() {
+        let mut ctx = CpuExprContext::new(registers, peek, ByteOrder::LittleEndian);
+        assert_eq!(ctx.register("a"), Some(0x1234));
+        assert_eq!(ctx.register("d0"), None);
+        assert_eq!(
+            eval_str("a == 0x1234 && [0x100].w == 0x3412", &mut ctx),
+            Ok(true)
+        );
+        assert_eq!(
+            eval_str("d0 == 0", &mut ctx),
+            Err(ExprError::UnknownRegister("d0".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_cpu_context_may_borrow_what_it_reads() {
+        let memory = [0xAA_u8, 0xBB];
+        let mut reads = 0;
+        {
+            let mut ctx = CpuExprContext::new(
+                |_| None,
+                |address| {
+                    reads += 1;
+                    memory[address as usize]
+                },
+                ByteOrder::BigEndian,
+            );
+            assert_eq!(ctx.read_mem(0, 2), 0xAABB);
+        }
+        assert_eq!(reads, 2);
     }
 }

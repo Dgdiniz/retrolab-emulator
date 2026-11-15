@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use retro_core::cpu::Addressable;
 use retro_core::EmulatorCore;
 use snes1_core::SnesEmulator;
 
@@ -50,7 +51,12 @@ pub fn run(args: MemoryArgs) -> Result<()> {
         emu.run_frame();
     }
 
-    let data = emu.read_memory_debug(args.addr, args.len);
+    // Read through the live bus, as the CPU would: a coprocessor's window
+    // gives its bytes caught up to the present, and a register's read has
+    // its effects, which no longer matter once the run is over.
+    let data: Vec<u8> = (0..args.len)
+        .map(|i| emu.bus_mut().read(args.addr.wrapping_add(i)))
+        .collect();
     let dump = format_hex_dump(args.addr, &data);
 
     let header = format!(

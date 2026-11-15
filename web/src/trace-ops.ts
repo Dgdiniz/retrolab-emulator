@@ -1,5 +1,5 @@
 // trace-ops: pure mapping from (core, focused CPU) to the trace binding
-// names + entry sizes the tracing UI must use.
+// names the tracing UI must use.
 //
 // The standalone debugger records ONE CPU at a time (the focused one),
 // and its CPU selector offers two CPUs per core:
@@ -7,14 +7,15 @@
 //   sg1   cpu0 = 68000,  cpu1 = Z80
 //   snes1 cpu0 = 65C816, cpu1 = SPC700
 //
-// The binding names and entry sizes of every CPU's trace ring come from
+// The binding names of every CPU's trace ring come from
 // `@debugger-core/trace-spec-core`, keyed by CPU kind, the table RetroLab's
 // debugger reads too; this module only maps a selector slot to its kind.
 // `tracing.ts` resolves a {@link TraceCpuSpec} once at record-start and
 // calls `emulator[spec.<fn>](...)` dynamically, so it never branches on
-// core/cpu inline; it also hands `spec.entrySize` to the trace worker,
-// which cuts the export into chunks of whole entries. Keeping the mapping
-// pure lets us unit-test the wiring without WASM.
+// core/cpu inline; it also asks the core for the size of an entry
+// (`traceEntrySize`) and hands it to the trace worker, which cuts the
+// export into chunks of whole entries. Keeping the mapping pure lets us
+// unit-test the wiring without WASM.
 
 import type { CpuKind } from '@debugger-core/cpu-flags-core'
 import { traceCpuSpecForKind, type TraceCpuSpec } from '@debugger-core/trace-spec-core'

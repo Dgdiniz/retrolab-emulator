@@ -16,20 +16,23 @@
 
 import { hex, hexBytes, parseHexAddress } from '@debugger-core/format-core'
 import {
+  breakpointsOnCpu,
   enabledBreakpointAddresses,
   padDisasmRows,
   splitWindowCounts,
-  type BreakpointLike,
+  type CpuBreakpointLike,
 } from '@debugger-core/disassembly-core'
 import {
+  EMPTY_ACCESS,
+  breakpointChecksNote,
+  gutterExecToggle,
   isEmptyAccess,
   parseAccessFlags,
-  toggleFlag,
   type RawBpType,
 } from '@debugger-core/breakpoints-core'
-import { parseEventTag } from '@debugger-core/watchpoints-core'
-import type { DebugBridge, PanelHandle } from '../debug-bridge'
+import type { DebugBridge, Emulator, PanelHandle } from '../debug-bridge'
 import { saveBreakpoints } from './breakpoint-persistence'
+import { cpuChecksReader } from './cpu-checks'
 
 const DEFAULT_ROWS = 24
 const MIN_ROWS = 8
@@ -175,9 +178,12 @@ export function initDisassemblyPanel(bridge: DebugBridge): PanelHandle {
       }
 
       // The gutter marks the breakpoints a click on it toggles: this CPU's.
-      const shown = breakpointsOnCpu(emulator.listBreakpoints() ?? [], focusedCpu)
+      const shown = breakpointsOnCpu<ListedBreakpoint>(emulator.listBreakpoints() ?? [], focusedCpu)
       const enabledAddrs = enabledBreakpointAddresses(shown)
       const allAddrs = new Set<number>(shown.map((bp) => bp.breakpoint.address))
+      // On a CPU that checks no execute breakpoints a click adds none, and
+      // each row says why.
+      const execNote = executeNote(emulator, focusedCpu)
 
       const addrPad = focusedCpu === 0 ? 6 : 4
       const pcMask = focusedCpu === 0 ? 0x00ffffff : 0xffff
@@ -211,6 +217,7 @@ export function initDisassemblyPanel(bridge: DebugBridge): PanelHandle {
         highlightPc,
         showOpcodes,
         hexUpper,
+        execNote,
       })).join('')
 
       if (autoScroll) {
@@ -260,23 +267,18 @@ export function initDisassemblyPanel(bridge: DebugBridge): PanelHandle {
 }
 
 /** A breakpoint as `listBreakpoints()` returns it. */
-export interface ListedBreakpoint extends BreakpointLike {
+interface ListedBreakpoint extends CpuBreakpointLike {
   id: number
-  breakpoint: { address: number; bp_type?: unknown; cpu_id?: number | null }
 }
 
 /**
- * The address breakpoints of one CPU: the ones its disassembly marks and
- * its gutter toggles. The 68000 and the Z80 (or the 65816 and the SPC700)
- * share numeric addresses, and the cores fire a breakpoint only on the
- * CPU it names. Event breakpoints have no address and are left out. A
- * breakpoint listed with no CPU counts as the primary CPU's:
- * `addBreakpoint` stores CPU 0 when it is given none.
+ * Why a click in CPU `cpu`'s gutter adds no breakpoint, or `null` when it
+ * may: the CPU checks no execute breakpoints. The sentence is the one the
+ * breakpoints panel shows.
  */
-export function breakpointsOnCpu<T extends ListedBreakpoint>(list: readonly T[], cpu: number): T[] {
-  return list.filter(
-    (bp) => parseEventTag(bp.breakpoint.bp_type) === null && (bp.breakpoint.cpu_id ?? 0) === cpu,
-  )
+function executeNote(emulator: Emulator, cpu: number): string | null {
+  const { checks, name } = cpuChecksReader(emulator)(cpu)
+  return checks.execute ? null : breakpointChecksNote(checks, name)
 }
 
 /**
@@ -285,29 +287,32 @@ export function breakpointsOnCpu<T extends ListedBreakpoint>(list: readonly T[],
  * already at the address has only its exec bit flipped, so a read/write
  * watchpoint there keeps its other flags; clearing the last flag removes
  * it. Otherwise an execute breakpoint is added for that CPU. Another
- * CPU's breakpoint at the same address is left alone.
+ * CPU's breakpoint at the same address is left alone. On a CPU that
+ * checks no execute breakpoints nothing is set, and the returned sentence
+ * says why; clearing the bit there still works.
  *
  * The change then follows the same path as one made in the breakpoints
  * panel: the breakpoints list, the watchpoints list and the gutter are
  * redrawn, and the whole list is saved under the ROM's hash, so the next
  * load of the ROM restores it.
  */
-export function toggleExecBreakpoint(bridge: DebugBridge, address: number, cpu: number): void {
+export function toggleExecBreakpoint(bridge: DebugBridge, address: number, cpu: number): string | null {
   const emulator = bridge.getEmulator()
-  if (!emulator) return
+  if (!emulator) return null
   try {
     const existing = breakpointsOnCpu<ListedBreakpoint>(emulator.listBreakpoints() ?? [], cpu)
       .find((bp) => bp.breakpoint.address === address)
+    const { checks, name } = cpuChecksReader(emulator)(cpu)
+    const current = existing ? parseAccessFlags(existing.breakpoint.bp_type as RawBpType) : EMPTY_ACCESS
+    const flags = gutterExecToggle(current, checks)
+    if (flags === null) return breakpointChecksNote(checks, name)
 
-    if (existing) {
-      const flags = toggleFlag(parseAccessFlags(existing.breakpoint.bp_type as RawBpType), 'exec')
-      if (isEmptyAccess(flags)) {
-        emulator.removeBreakpoint(existing.id)
-      } else {
-        emulator.setBreakpointAccess(existing.id, flags.exec, flags.read, flags.write)
-      }
-    } else {
+    if (!existing) {
       emulator.addBreakpoint(address, 'execute', cpu)
+    } else if (isEmptyAccess(flags)) {
+      emulator.removeBreakpoint(existing.id)
+    } else {
+      emulator.setBreakpointAccess(existing.id, flags.exec, flags.read, flags.write)
     }
 
     bridge.refreshPanel('breakpoints')
@@ -317,6 +322,7 @@ export function toggleExecBreakpoint(bridge: DebugBridge, address: number, cpu: 
   } catch (err) {
     console.error('Failed to toggle breakpoint:', err)
   }
+  return null
 }
 
 interface RenderContext {
@@ -328,6 +334,8 @@ interface RenderContext {
   highlightPc: boolean
   showOpcodes: boolean
   hexUpper: boolean
+  /** Why a click adds no breakpoint on this CPU, or `null` when it does. */
+  execNote: string | null
 }
 
 function renderRow(row: Row, ctx: RenderContext | null): string {
@@ -356,6 +364,9 @@ function renderRow(row: Row, ctx: RenderContext | null): string {
     className += ' breakpoint'
     if (!bpEnabled) className += ' bp-disabled'
   }
+  // A click here would add a breakpoint the CPU never checks, so it adds none.
+  const note = isUnknown ? null : ctx.execNote
+  if (note !== null && !hasBreakpoint) className += ' no-exec'
 
   const addrText = applyCase(hex(addr, ctx.addrPad), ctx.hexUpper)
   let bytesText: string
@@ -371,7 +382,8 @@ function renderRow(row: Row, ctx: RenderContext | null): string {
   let gutter = ''
   if (hasBreakpoint) gutter = bpEnabled ? '●' : '○'
 
-  return `<div class="${className}" data-address="${escapeAttr(hex(addr, ctx.addrPad))}">
+  const title = note === null ? '' : ` title="${escapeAttr(note)}"`
+  return `<div class="${className}" data-address="${escapeAttr(hex(addr, ctx.addrPad))}"${title}>
     <span class="disasm-bp-gutter">${gutter}</span>
     <span class="disasm-address">${addrText}:</span>
     <span class="disasm-bytes">${bytesText}</span>

@@ -10,6 +10,11 @@
  * watchpoints panel via `breakpoint-persistence.ts` so the two panels
  * never clobber each other's entries on load.
  *
+ * A breakpoint is added on the focused CPU, and only of a kind that CPU
+ * checks (`getBreakpointChecks`): the form offers the others disabled, or
+ * nothing on a CPU that checks none, and says why. A row the CPU it names
+ * does not check is tagged, with the reason in its tooltip.
+ *
  * `window.toggleBreakpointEnabled` and `window.removeBreakpoint` are
  * exposed because the breakpoint list uses inline `onclick=` for the
  * toggle/remove buttons: the list's HTML is rebuilt on every update, and
@@ -18,8 +23,14 @@
 
 import { hex, parseHexAddress } from '@debugger-core/format-core'
 import {
+  breakpointChecksNote,
+  breakpointChecksOf,
+  breakpointUncheckedNote,
+  checkedAccess,
+  isAccessOffered,
   isEmptyAccess,
   parseAccessFlags,
+  shorthandToAccess,
   toggleFlag,
   type AccessFlags,
   type RawBpType,
@@ -37,6 +48,7 @@ import {
 } from '@debugger-core/watchpoints-core'
 import type { DebugBridge, PanelHandle } from '../debug-bridge'
 import { loadBreakpoints, saveBreakpoints } from './breakpoint-persistence'
+import { cpuChecksReader, type CpuChecks } from './cpu-checks'
 
 /** Escape a string for safe interpolation into an HTML attribute. */
 function attr(s: string): string {
@@ -69,18 +81,23 @@ export function initBreakpointsPanel(bridge: DebugBridge): BreakpointsPanelHandl
    * Surfaces the headline subset useful for code breakpoints, a condition
    * expression plus hit-skip / action / one-shot. Range/value/mask carried
    * by the spec are preserved across an edit (the draft is seeded from the
-   * full spec) even though they aren't shown here.
+   * full spec) even though they aren't shown here. The condition is
+   * offered only on a CPU that evaluates conditions.
    */
-  function renderEditor(id: number): string {
+  function renderEditor(id: number, cpu: CpuChecks): string {
     const actionOpts = BREAKPOINT_ACTION_OPTIONS.map(
       (o) => `<option value="${o.value}"${o.value === draft.action ? ' selected' : ''}>${o.label}</option>`,
     ).join('')
     const errs = editErrors.length
       ? `<div class="wp-edit-errors">${attr(editErrors.join('. '))}</div>`
       : ''
+    const conditionTitle = cpu.checks.conditions
+      ? 'Optional expression over registers / memory. The breakpoint fires only when it evaluates non-zero. Operators: && || ! == != < <= > >= + - * / % &amp; | ^ ~ << >>. Memory: [addr] [addr].w [addr].l'
+      : attr(breakpointChecksNote(cpu.checks, cpu.name) ?? '')
+    const conditionLock = cpu.checks.conditions ? '' : ' disabled'
     return `
       <div class="watchpoint-editor" data-bp-edit="${id}">
-        <label class="wp-edit-field wp-edit-field--full"><span>Condition</span><input class="wp-edit-input wp-edit-expr" value="${attr(draft.expr)}" placeholder="(none) e.g. d0 == 5 && [0xFF0000].w > 0x100" title="Optional expression over registers / memory. The breakpoint fires only when it evaluates non-zero. Operators: && || ! == != < <= > >= + - * / % &amp; | ^ ~ << >>. Memory: [addr] [addr].w [addr].l" oninput="bpEditField('expr', this.value)"/></label>
+        <label class="wp-edit-field wp-edit-field--full"><span>Condition</span><input class="wp-edit-input wp-edit-expr" value="${attr(draft.expr)}" placeholder="(none) e.g. d0 == 5 && [0xFF0000].w > 0x100" title="${conditionTitle}"${conditionLock} oninput="bpEditField('expr', this.value)"/></label>
         <div class="wp-edit-grid">
           <label class="wp-edit-field"><span>Skip hits</span><input class="wp-edit-input" type="number" min="0" value="${draft.hitSkip}" oninput="bpEditField('hitSkip', this.value)"/></label>
           <label class="wp-edit-field"><span>Action</span><select oninput="bpEditField('action', this.value)">${actionOpts}</select></label>
@@ -95,6 +112,27 @@ export function initBreakpointsPanel(bridge: DebugBridge): BreakpointsPanelHandl
     `
   }
 
+  /**
+   * Offer the focused CPU only the kinds of breakpoint it checks: the
+   * others' options are disabled, and the whole form when it checks none.
+   * Returns why it offers less, or `null` when it offers everything.
+   */
+  function offerAddForm(focused: CpuChecks): string | null {
+    const options = Array.from(typeInput!.options)
+    for (const option of options) {
+      option.disabled = !isAccessOffered(shorthandToAccess(option.value), focused.checks)
+    }
+    const offered = options.filter((option) => !option.disabled)
+    if (offered.length > 0 && !offered.some((option) => option.value === typeInput!.value)) {
+      typeInput!.value = offered[0].value
+    }
+    const nothing = offered.length === 0
+    addrInput!.disabled = nothing
+    typeInput!.disabled = nothing
+    ;(addBtn as HTMLButtonElement).disabled = nothing
+    return breakpointChecksNote(focused.checks, focused.name)
+  }
+
   addBtn.addEventListener('click', () => {
     const addr = parseHexAddress(addrInput.value)
     if (addr === null) {
@@ -103,8 +141,10 @@ export function initBreakpointsPanel(bridge: DebugBridge): BreakpointsPanelHandl
     }
     const emulator = bridge.getEmulator()
     if (!emulator) return
+    const cpu = bridge.getFocusedCpu()
+    if (!isAccessOffered(shorthandToAccess(typeInput.value), breakpointChecksOf(emulator, cpu))) return
     try {
-      emulator.addBreakpoint(addr, typeInput.value)
+      emulator.addBreakpoint(addr, typeInput.value, cpu)
       addrInput.value = ''
       update()
       bridge.refreshPanel('disassembly')
@@ -125,25 +165,39 @@ export function initBreakpointsPanel(bridge: DebugBridge): BreakpointsPanelHandl
         (bp: any) => parseEventTag(bp.breakpoint.bp_type as RawBpType) === null,
       )
 
+      const cpuChecks = cpuChecksReader(emulator)
+      const offerNote = offerAddForm(cpuChecks(bridge.getFocusedCpu()))
+      const noteHtml = offerNote
+        ? `<div class="bp-checks-note" style="color: #d7ba7d; font-size: 11px; padding: 2px 0 4px;">${attr(offerNote)}</div>`
+        : ''
+
       if (breakpoints.length === 0) {
-        list!.innerHTML = '<div style="color: #858585;">No breakpoints</div>'
+        list!.innerHTML = noteHtml + '<div style="color: #858585;">No breakpoints</div>'
         return
       }
 
-      list!.innerHTML = breakpoints.map((bp: any) => {
+      list!.innerHTML = noteHtml + breakpoints.map((bp: any) => {
         const addrStr = hex(bp.breakpoint.address, 6)
         const enabledClass = bp.enabled ? '' : ' disabled'
         const enabledIcon = bp.enabled ? '●' : '○'
         const enabledTitle = bp.enabled ? 'Click to disable' : 'Click to enable'
         const enabledColor = bp.enabled ? '#e51400' : '#555'
         const flags = parseAccessFlags(bp.breakpoint.bp_type as RawBpType)
+        const cpu = cpuChecks(bp.breakpoint.cpu_id ?? 0)
+        const settable = checkedAccess(cpu.checks)
+        // A flag the row's CPU does not check can be cleared, never set.
         const flag = (on: boolean, which: 'exec' | 'read' | 'write', letter: string, title: string) =>
-          `<label class="bp-flag" title="${title}"><input type="checkbox" ${on ? 'checked' : ''} onchange="toggleBreakpointAccess(${bp.id}, '${which}')"/>${letter}</label>`
-        const summaryText = matchSpecSummary(parseMatchSpec(bp.match_spec))
+          `<label class="bp-flag" title="${title}"><input type="checkbox" ${on ? 'checked' : ''}${on || settable[which] ? '' : ' disabled'} onchange="toggleBreakpointAccess(${bp.id}, '${which}')"/>${letter}</label>`
+        const spec = parseMatchSpec(bp.match_spec)
+        const summaryText = matchSpecSummary(spec)
         const summary = summaryText
           ? `<span class="wp-summary" title="${attr(summaryText)}">${attr(summaryText)}</span>`
           : ''
-        const editor = editingId === bp.id ? renderEditor(bp.id) : ''
+        const uncheckedText = breakpointUncheckedNote(flags, spec.expr !== null, cpu.checks, cpu.name)
+        const unchecked = uncheckedText
+          ? `<span class="bp-unchecked" title="${attr(uncheckedText)}" style="color: #d7ba7d; font-size: 11px;">not checked</span>`
+          : ''
+        const editor = editingId === bp.id ? renderEditor(bp.id, cpu) : ''
 
         return `
           <div class="breakpoint-item${enabledClass}" data-bp-id="${bp.id}">
@@ -152,6 +206,7 @@ export function initBreakpointsPanel(bridge: DebugBridge): BreakpointsPanelHandl
               <span class="breakpoint-address">${addrStr}</span>
               <span class="breakpoint-access">${flag(flags.exec, 'exec', 'E', 'Break on execute')}${flag(flags.read, 'read', 'R', 'Break on read')}${flag(flags.write, 'write', 'W', 'Break on write')}</span>
               ${summary}
+              ${unchecked}
               <span style="color: #6a9955; font-size: 11px;">Hits: ${bp.hit_count}</span>
             </div>
             <div class="breakpoint-actions">

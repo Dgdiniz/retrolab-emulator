@@ -152,6 +152,16 @@ impl Hg51b {
         }
     }
 
+    /// What the S-CPU's read of `address` (`$6000-$7FFF`) gives, for the
+    /// data RAM and the gap after it; `None` for the registers. The same
+    /// answer as [`Self::read_window`], which reads nothing it changes.
+    pub fn peek_window(&self, address: u16, open_bus: u8) -> Option<u8> {
+        match Window::at(address) {
+            Window::Registers => None,
+            Window::DataRam(_) | Window::Gap => Some(self.read_window(address, open_bus)),
+        }
+    }
+
     /// The S-CPU writes `value` to `address` (`$6000-$7FFF`).
     pub fn write_window(&mut self, address: u16, value: u8) {
         match Window::at(address) {

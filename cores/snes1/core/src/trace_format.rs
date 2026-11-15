@@ -42,6 +42,7 @@ use crate::debugger::TraceEntryBinaryCx4;
 use crate::debugger::TraceEntryBinaryGsu;
 use crate::debugger::{TraceEntryBinary65816, TraceEntryBinarySpc700};
 use retro_core::cpu::Addressable;
+use retro_core::debug::TraceText;
 use wdc65816::addressing::AddressingMode;
 use wdc65816::decode::{Mnemonic, OPCODE_TABLE};
 use wdc65816::disasm::{disassemble_at, DisasmState};
@@ -302,6 +303,37 @@ pub fn format_trace_line_cx4(e: &TraceEntryBinaryCx4) -> String {
     }
     line.push_str(&fmt_flags_cx4(e.flags));
     line
+}
+
+/// A 65C816 entry's line is [`format_trace_line_65816`]'s; the entry holds
+/// everything it needs.
+impl TraceText<()> for TraceEntryBinary65816 {
+    fn write_text(&self, _context: &mut (), out: &mut String) {
+        out.push_str(&format_trace_line_65816(self));
+    }
+}
+
+/// An SPC700 entry's line is [`format_trace_line_spc700`]'s.
+impl TraceText<()> for TraceEntryBinarySpc700 {
+    fn write_text(&self, _context: &mut (), out: &mut String) {
+        out.push_str(&format_trace_line_spc700(self));
+    }
+}
+
+/// A Super FX entry's line is [`format_trace_line_gsu`]'s.
+#[cfg(feature = "chip-superfx")]
+impl TraceText<()> for TraceEntryBinaryGsu {
+    fn write_text(&self, _context: &mut (), out: &mut String) {
+        out.push_str(&format_trace_line_gsu(self));
+    }
+}
+
+/// A Cx4 entry's line is [`format_trace_line_cx4`]'s.
+#[cfg(feature = "chip-cx4")]
+impl TraceText<()> for TraceEntryBinaryCx4 {
+    fn write_text(&self, _context: &mut (), out: &mut String) {
+        out.push_str(&format_trace_line_cx4(self));
+    }
 }
 
 /// Register snapshot needed to resolve an effective address.

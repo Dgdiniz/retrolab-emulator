@@ -231,7 +231,7 @@ fn step_to(emu: &mut SnesEmulator, address: u32) {
         if (u32::from(cpu.pbr) << 16) | u32::from(cpu.pc) == address {
             return;
         }
-        emu.step();
+        emu.step_without_events();
     }
     panic!("the processor never reached {address:#08x}");
 }

@@ -112,7 +112,7 @@ use retro_core::capture::{
     arm_recorder, CaptureRecording, FrameWrite, FrameWrites, VideoMemorySources, WriteKind,
     WriteLog, WriteOrigin, Writer,
 };
-use retro_core::BREAKPOINT_PARAM_ANY;
+use retro_core::debug::{ParamSet, RaisedEvents};
 
 use super::{Ppu, PpuAccessCtx};
 
@@ -142,7 +142,7 @@ pub mod port {
 
 /// An event the PPU raises for the debugger while a breakpoint watches for
 /// it; the emulator drains them and matches each against its breakpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PpuDebugEvent {
     /// A colour was written into CGRAM (the colour index).
     PaletteWrite(u8),
@@ -151,61 +151,29 @@ pub enum PpuDebugEvent {
     TileChange(u16),
 }
 
-/// The most events kept between two drains: past it, more are lost (a
-/// frame loop that never drains, a headless one, keeps no more than this).
+/// The most events kept between two drains: past it, more are counted as
+/// dropped (a frame loop that never drains, a headless one, keeps no more
+/// than this).
 const EVENT_CAP: usize = 4096;
 
 /// The palette colours and the tiles the debugger's breakpoints watch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventWatch {
-    /// One bit a colour.
-    colours: [u64; 4],
-    /// One bit a 4bpp tile.
-    tiles: [u64; 32],
-}
-
-/// Set bit `index` of `bits`, or every bit for [`BREAKPOINT_PARAM_ANY`];
-/// an index past the set watches nothing.
-fn watch_bit<const N: usize>(bits: &mut [u64; N], index: u32) {
-    if index == BREAKPOINT_PARAM_ANY {
-        bits.fill(u64::MAX);
-    } else if (index as usize) < N * 64 {
-        bits[index as usize / 64] |= 1 << (index % 64);
-    }
-}
-
-/// Whether bit `index` of `bits` is set.
-fn bit_set<const N: usize>(bits: &[u64; N], index: usize) -> bool {
-    bits.get(index / 64)
-        .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    /// The colours watched (0-255).
+    pub colours: ParamSet<4>,
+    /// The 4bpp tiles watched (0-2047).
+    pub tiles: ParamSet<32>,
 }
 
 impl EventWatch {
-    /// Watch nothing.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Watch colour `param` (0-255), or every colour for
-    /// [`BREAKPOINT_PARAM_ANY`].
-    pub fn watch_colour(&mut self, param: u32) {
-        watch_bit(&mut self.colours, param);
-    }
-
-    /// Watch tile `param` (0-2047), or every tile for
-    /// [`BREAKPOINT_PARAM_ANY`].
-    pub fn watch_tile(&mut self, param: u32) {
-        watch_bit(&mut self.tiles, param);
-    }
-
     /// Whether colour `colour` is watched.
     pub fn colour(&self, colour: usize) -> bool {
-        bit_set(&self.colours, colour)
+        self.colours.contains(colour as u32)
     }
 
     /// Whether tile `tile` is watched.
     pub fn tile(&self, tile: usize) -> bool {
-        bit_set(&self.tiles, tile)
+        self.tiles.contains(tile as u32)
     }
 }
 
@@ -264,8 +232,9 @@ pub(crate) struct LiveRecorders {
     writes: Option<WriteLog>,
     /// The palette colours and tiles the debugger's events watch.
     watch: Option<EventWatch>,
-    /// The events raised for the debugger and not drained yet.
-    events: Vec<PpuDebugEvent>,
+    /// The events raised for the debugger and not drained yet, each kept
+    /// once between two drains.
+    events: RaisedEvents<PpuDebugEvent>,
     /// Who writes the bytes the ports take next.
     writer: WriteOrigin,
     /// The places the transfer running now wrote.
@@ -279,7 +248,7 @@ impl LiveRecorders {
             sources: None,
             writes: None,
             watch: None,
-            events: Vec::new(),
+            events: RaisedEvents::new(EVENT_CAP),
             writer: WriteOrigin::processor(0),
             span: WriteSpan::default(),
         }
@@ -288,15 +257,6 @@ impl LiveRecorders {
     /// Nothing is armed.
     fn idle(&self) -> bool {
         self.sources.is_none() && self.writes.is_none() && self.watch.is_none()
-    }
-
-    /// Keep `event` for the debugger, unless the buffer is full or the
-    /// event raised just before it, with no drain between, is the same: a
-    /// DMA filling a tile raises one event, not one a byte.
-    fn raise(&mut self, event: PpuDebugEvent) {
-        if self.events.len() < EVENT_CAP && self.events.last() != Some(&event) {
-            self.events.push(event);
-        }
     }
 
     /// Add `record` to the log, when it is recorded.
@@ -410,14 +370,15 @@ impl Ppu {
         self.recorders.settle();
     }
 
-    /// Hand every event raised since the last drain to `each`, oldest
-    /// first, and forget them.
-    pub fn drain_debug_events(&mut self, mut each: impl FnMut(PpuDebugEvent)) {
-        if let Some(live) = self.recorders.live.as_deref_mut() {
-            for event in live.events.drain(..) {
-                each(event);
-            }
-        }
+    /// The events raised for the debugger since the last drain, each once
+    /// (a DMA filling a tile raises one event, not one a byte), for the
+    /// emulator to drain and check against its breakpoints; `None` while
+    /// nothing is armed.
+    pub fn raised_debug_events(&mut self) -> Option<&mut RaisedEvents<PpuDebugEvent>> {
+        self.recorders
+            .live
+            .as_deref_mut()
+            .map(|live| &mut live.events)
     }
 
     /// Name who writes the bytes the ports take next (kept only while
@@ -536,7 +497,7 @@ impl Ppu {
         if replaced != value && origin.writer() != Writer::Debugger as u32 {
             let tile = byte >> 5;
             if live.watch.as_ref().is_some_and(|watch| watch.tile(tile)) {
-                live.raise(PpuDebugEvent::TileChange(tile as u16));
+                live.events.raise(PpuDebugEvent::TileChange(tile as u16));
             }
         }
     }
@@ -581,7 +542,7 @@ impl Ppu {
                 .as_ref()
                 .is_some_and(|watch| watch.colour(colour))
         {
-            live.raise(PpuDebugEvent::PaletteWrite(colour as u8));
+            live.events.raise(PpuDebugEvent::PaletteWrite(colour as u8));
         }
     }
 
@@ -701,15 +662,53 @@ mod tests {
     }
 
     #[test]
+    fn an_event_raised_again_before_a_drain_is_kept_once() {
+        let mut ppu = Ppu::new();
+        let mut watch = EventWatch::default();
+        watch.colours.insert(retro_core::BREAKPOINT_PARAM_ANY);
+        ppu.set_event_watch(Some(watch));
+        let ctx = PpuAccessCtx {
+            mdr: 0,
+            h_dot: 0,
+            v_scanline: 0,
+        };
+        // Colour 3, colour 4, then colour 3 again, as one transfer would
+        // write them before the emulator drains.
+        for colour in [3u8, 4, 3] {
+            ppu.write_reg(0x21, colour, &ctx);
+            ppu.write_port_noted(0x22, 0x1F, &ctx);
+            ppu.write_port_noted(0x22, 0x00, &ctx);
+        }
+        let mut seen = Vec::new();
+        let raised = ppu.raised_debug_events().expect("the watch is armed");
+        raised.drain(|event| seen.push(event));
+        assert_eq!(
+            seen,
+            [
+                PpuDebugEvent::PaletteWrite(3),
+                PpuDebugEvent::PaletteWrite(4)
+            ]
+        );
+        // After the drain the same colour raises its event again.
+        ppu.write_reg(0x21, 3, &ctx);
+        ppu.write_port_noted(0x22, 0x1F, &ctx);
+        ppu.write_port_noted(0x22, 0x00, &ctx);
+        assert_eq!(
+            ppu.raised_debug_events().map(|raised| raised.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn a_watch_takes_one_place_every_place_or_none() {
-        let mut watch = EventWatch::new();
-        watch.watch_tile(2047);
-        watch.watch_colour(3);
+        let mut watch = EventWatch::default();
+        watch.tiles.insert(2047);
+        watch.colours.insert(3);
         assert!(watch.tile(2047) && !watch.tile(2046));
         assert!(watch.colour(3) && !watch.colour(4));
-        watch.watch_tile(2048);
+        watch.tiles.insert(2048);
         assert!(!watch.tile(2048), "past the tiles watches nothing");
-        watch.watch_colour(BREAKPOINT_PARAM_ANY);
+        watch.colours.insert(retro_core::BREAKPOINT_PARAM_ANY);
         assert!((0..256).all(|colour| watch.colour(colour)));
     }
 

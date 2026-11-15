@@ -1,6 +1,7 @@
 //! Motorola 68000 CPU emulation.
 
 pub mod addressing;
+pub mod calls;
 pub mod decode;
 pub mod disasm;
 pub mod exceptions;

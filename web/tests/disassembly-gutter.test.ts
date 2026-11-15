@@ -7,8 +7,17 @@ vi.mock('../src/panels/breakpoint-persistence', () => ({
 }))
 
 import { saveBreakpoints } from '../src/panels/breakpoint-persistence'
-import { breakpointsOnCpu, toggleExecBreakpoint } from '../src/panels/disassembly-panel'
+import { initDisassemblyPanel, toggleExecBreakpoint } from '../src/panels/disassembly-panel'
 import type { DebugBridge } from '../src/debug-bridge'
+
+interface Checks {
+  execute: boolean
+  memory: boolean
+  conditions: boolean
+}
+
+const ALL: Checks = { execute: true, memory: true, conditions: true }
+const NONE: Checks = { execute: false, memory: false, conditions: false }
 
 interface Flags {
   exec: boolean
@@ -35,8 +44,10 @@ const EXEC: Flags = { exec: true, read: false, write: false }
 
 // A WASM breakpoint list in memory, with the four calls the gutter toggle
 // makes. It stores what both cores store: `bp_type` in the tagged form,
-// and the CPU `addBreakpoint` was given, 0 when it was given none.
-function harness(initial: Seed[] = []) {
+// and the CPU `addBreakpoint` was given, 0 when it was given none. With
+// `checks`, the core says what each CPU checks, as both cores do; without,
+// it is a core that cannot say, and everything is checked.
+function harness(initial: Seed[] = [], checks: Checks[] | null = null) {
   let nextId = 1
   const list: FakeBreakpoint[] = initial.map((seed) => ({
     id: nextId++,
@@ -54,6 +65,12 @@ function harness(initial: Seed[] = []) {
     type: structuredClone(bp.breakpoint.bp_type),
   }))
   const emulator = {
+    ...(checks
+      ? {
+          getBreakpointChecks: vi.fn((cpu: number) => checks[cpu] ?? NONE),
+          getSystemInfo: () => ({ cpus: [{ name: 'Motorola 68000' }, { name: 'Zilog Z80' }] }),
+        }
+      : {}),
     listBreakpoints: vi.fn(() => list.map((bp) => structuredClone(bp))),
     addBreakpoint: vi.fn((address: number, type: string, cpu?: number) => {
       expect(type).toBe('execute')
@@ -101,7 +118,7 @@ describe('toggleExecBreakpoint (disassembly gutter click)', () => {
 
   it('adds an execute breakpoint at an empty address and saves the list with it', () => {
     const h = harness()
-    toggleExecBreakpoint(h.bridge, 0x000200, 0)
+    expect(toggleExecBreakpoint(h.bridge, 0x000200, 0)).toBeNull()
     expect(h.emulator.addBreakpoint).toHaveBeenCalledWith(0x000200, 'execute', 0)
     expect(saveBreakpoints).toHaveBeenCalledTimes(1)
     expect(h.saved).toEqual([[{ id: 1, address: 0x000200, cpu: 0, type: { Access: EXEC } }]])
@@ -216,19 +233,115 @@ describe('toggleExecBreakpoint on the second CPU', () => {
   })
 })
 
-describe('breakpointsOnCpu (what the gutter marks)', () => {
-  const list = [
-    { id: 1, enabled: true, breakpoint: { address: 0x0100, bp_type: { Access: EXEC }, cpu_id: 0 } },
-    { id: 2, enabled: true, breakpoint: { address: 0x0100, bp_type: { Access: EXEC }, cpu_id: 1 } },
-    { id: 3, enabled: true, breakpoint: { address: 0x0000, bp_type: { Event: { code: 1, param: 0 } }, cpu_id: null } },
-    { id: 4, enabled: false, breakpoint: { address: 0x0200, bp_type: { Access: EXEC }, cpu_id: null } },
-  ]
-
-  it('keeps the address breakpoints of the CPU asked for', () => {
-    expect(breakpointsOnCpu(list, 1).map((bp) => bp.id)).toEqual([2])
+// Both cores say what each CPU checks; the second CPUs check nothing.
+describe('toggleExecBreakpoint on a CPU that checks no execute breakpoints', () => {
+  beforeEach(() => {
+    vi.mocked(saveBreakpoints).mockReset()
   })
 
-  it('counts a breakpoint listed with no CPU as the primary CPU one, and leaves events out', () => {
-    expect(breakpointsOnCpu(list, 0).map((bp) => bp.id)).toEqual([1, 4])
+  it('adds nothing, saves nothing and says why', () => {
+    const h = harness([], [ALL, NONE])
+    expect(toggleExecBreakpoint(h.bridge, 0x0100, 1)).toBe(
+      'The emulator checks no breakpoints on the Zilog Z80.',
+    )
+    expect(h.emulator.getBreakpointChecks).toHaveBeenCalledWith(1)
+    expect(h.emulator.addBreakpoint).not.toHaveBeenCalled()
+    expect(h.refreshPanel).not.toHaveBeenCalled()
+    expect(saveBreakpoints).not.toHaveBeenCalled()
+  })
+
+  it('does not set the exec bit of a watchpoint there', () => {
+    const h = harness([{ address: 0x0100, cpu: 1, flags: { exec: false, read: false, write: true } }], [ALL, NONE])
+    expect(toggleExecBreakpoint(h.bridge, 0x0100, 1)).toBe(
+      'The emulator checks no breakpoints on the Zilog Z80.',
+    )
+    expect(h.emulator.setBreakpointAccess).not.toHaveBeenCalled()
+    expect(saveBreakpoints).not.toHaveBeenCalled()
+  })
+
+  it('still takes away an execute breakpoint set there before', () => {
+    const h = harness([{ address: 0x0100, cpu: 1 }], [ALL, NONE])
+    expect(toggleExecBreakpoint(h.bridge, 0x0100, 1)).toBeNull()
+    expect(h.emulator.removeBreakpoint).toHaveBeenCalledWith(1)
+    expect(saveBreakpoints).toHaveBeenCalledTimes(1)
+  })
+
+  it('adds as before on the CPU that checks everything', () => {
+    const h = harness([], [ALL, NONE])
+    expect(toggleExecBreakpoint(h.bridge, 0x000200, 0)).toBeNull()
+    expect(h.emulator.addBreakpoint).toHaveBeenCalledWith(0x000200, 'execute', 0)
+  })
+
+  it('says "this CPU" when the core names no CPU', () => {
+    const h = harness([], [ALL, NONE])
+    const emulator = { ...h.emulator, getSystemInfo: undefined }
+    const bridge = { getEmulator: () => emulator, refreshPanel: vi.fn() } as unknown as DebugBridge
+    expect(toggleExecBreakpoint(bridge, 0x0100, 1)).toBe('The emulator checks no breakpoints on this CPU.')
+  })
+})
+
+/** The disassembly view, holding the HTML the panel last drew. */
+function disassemblyPage() {
+  const view = { innerHTML: '', querySelector: () => null, querySelectorAll: () => [] }
+  const goto = { value: '', addEventListener: vi.fn() }
+  const ids: Record<string, unknown> = { 'disassembly-view': view, 'goto-address': goto }
+  vi.stubGlobal('document', { getElementById: (id: string) => ids[id] ?? null })
+  return view
+}
+
+/** One code row and one never-executed row on each CPU, and the breakpoints given. */
+function panelEmulator(breakpoints: unknown[] = []) {
+  return {
+    getCpuStates: () => [{ pc: 0x000200 }, { pc: 0x0100 }],
+    disassembleWindow: (_cpu: number, pc: number) => [
+      { address: pc, kind: 'code', bytes: [0x4e, 0x71], mnemonic: 'nop', operands: '' },
+      { address: pc + 2, kind: 'unknown', bytes: [], mnemonic: '', operands: '' },
+    ],
+    listBreakpoints: () => breakpoints,
+    getBreakpointChecks: (cpu: number) => (cpu === 0 ? ALL : NONE),
+    getSystemInfo: () => ({ cpus: [{ name: 'Motorola 68000' }, { name: 'Zilog Z80' }] }),
+  }
+}
+
+function drawn(emulator: unknown, focusedCpu: number): string {
+  const view = disassemblyPage()
+  const bridge = {
+    getEmulator: () => emulator,
+    getFocusedCpu: () => focusedCpu,
+    refreshPanel: vi.fn(),
+  } as unknown as DebugBridge
+  initDisassemblyPanel(bridge).update()
+  return view.innerHTML
+}
+
+describe('the disassembly gutter, as drawn', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("titles each code row of a CPU that checks no execute breakpoints with the reason", () => {
+    const html = drawn(panelEmulator(), 1)
+    expect(html).toContain('class="disasm-line current no-exec" data-address="0100" title="The emulator checks no breakpoints on the Zilog Z80."')
+    // A never-executed row takes no click, so it says nothing.
+    expect(html).toMatch(/class="disasm-line unknown" data-address="0102">/)
+  })
+
+  it('says nothing on a CPU that checks execute breakpoints', () => {
+    const html = drawn(panelEmulator(), 0)
+    expect(html).not.toContain('no-exec')
+    expect(html).not.toContain('title=')
+  })
+
+  it("marks only the focused CPU's address breakpoints, and lets a click take one away", () => {
+    const list = [
+      { id: 1, enabled: true, breakpoint: { address: 0x0100, bp_type: { Access: EXEC }, cpu_id: 0 } },
+      { id: 2, enabled: true, breakpoint: { address: 0x0000, bp_type: { Event: { code: 1, param: 0 } }, cpu_id: null } },
+    ]
+    // The 68000's breakpoint at $0100 is not the Z80's.
+    expect(drawn(panelEmulator(list), 1)).not.toMatch(/class="disasm-line[^"]* breakpoint/)
+    const onZ80 = [{ id: 3, enabled: true, breakpoint: { address: 0x0100, bp_type: { Access: EXEC }, cpu_id: 1 } }]
+    const html = drawn(panelEmulator(onZ80), 1)
+    // A breakpoint there can still be clicked away, so the row keeps its pointer.
+    expect(html).toContain('class="disasm-line current breakpoint" data-address="0100" title=')
   })
 })

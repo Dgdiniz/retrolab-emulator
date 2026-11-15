@@ -687,6 +687,31 @@ impl Coprocessor for Sa1Chip {
         }
     }
 
+    /// The S-CPU's view of the chip read without a side effect: ROM through
+    /// the Super MMC (with the vectors SCNT redirects), BW-RAM and I-RAM, as
+    /// they stand. `None` for the registers, and for BW-RAM while the
+    /// type-1 character conversion is armed: the chip makes those bytes as
+    /// they are read.
+    fn peek(&self, offset: u32) -> Option<u8> {
+        if offset >= SA1_ROM_BASE {
+            let snes_addr = offset - SA1_ROM_BASE;
+            Some(
+                self.interrupts
+                    .scpu_vector_byte(snes_addr)
+                    .unwrap_or_else(|| self.rom_via_mmc(snes_addr)),
+            )
+        } else if offset >= SA1_BWRAM_LINEAR_BASE {
+            (!self.dma.conversion_armed())
+                .then(|| self.bwram_linear_read(offset - SA1_BWRAM_LINEAR_BASE))
+        } else if offset >= SA1_BWRAM_BASE {
+            (!self.dma.conversion_armed()).then(|| self.bwram_window_read(offset - SA1_BWRAM_BASE))
+        } else if offset >= SA1_IRAM_BASE {
+            Some(self.iram_read(offset - SA1_IRAM_BASE))
+        } else {
+            None
+        }
+    }
+
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64) {
         self.catch_up(master_cycle);
         self.accesses += 1;

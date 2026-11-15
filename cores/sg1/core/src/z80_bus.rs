@@ -101,6 +101,57 @@ impl<'a> Z80Bus<'a> {
             _ => {}
         }
     }
+
+    /// The byte a Z80 read of `addr` would give, read without a side effect,
+    /// for the debugger: Z80 RAM, the YM2612's status, and the 68000's space
+    /// through the bank window as the cartridge's peek gives it
+    /// ([`GenesisCartridge::peek_bus`]: a coprocessor is neither caught up
+    /// nor counted). The write-only ports read `0xFF`, as they do for the
+    /// Z80.
+    pub fn peek(&self, addr: u32) -> u8 {
+        match addr & 0xFFFF {
+            0x0000..=0x3FFF => self.memory.z80_ram.as_slice()[(addr & 0x1FFF) as usize],
+            0x4000..=0x5FFF => self.ym2612.read_port((addr & 0x03) as u8),
+            0x8000..=0xFFFF => {
+                let addr_68k = *self.bank_register | (addr & 0x7FFF);
+                match addr_68k {
+                    0x000000..=0x3FFFFF => self
+                        .cartridge
+                        .as_deref()
+                        .map_or(0xFF, |cart| cart.peek_bus(addr_68k)),
+                    0xE00000..=0xFFFFFF => {
+                        self.memory.work_ram.as_slice()[(addr_68k & 0xFFFF) as usize]
+                    }
+                    _ => 0xFF,
+                }
+            }
+            _ => 0xFF,
+        }
+    }
+
+    /// The four bytes at `pc`, the longest Z80 instruction, read without a
+    /// side effect ([`Self::peek`]).
+    pub fn instruction_bytes(&self, pc: u16) -> [u8; 4] {
+        std::array::from_fn(|index| self.peek(u32::from(pc.wrapping_add(index as u16))))
+    }
+
+    /// The Z80's address space as the debugger reads it ([`Self::peek`]),
+    /// for the disassembly.
+    pub fn peek_view(&self) -> Z80PeekView<'_, 'a> {
+        Z80PeekView(self)
+    }
+}
+
+/// The Z80's address space as the debugger reads it: every read is a
+/// [`Z80Bus::peek`] and every write is dropped.
+pub struct Z80PeekView<'b, 'a>(&'b Z80Bus<'a>);
+
+impl Addressable for Z80PeekView<'_, '_> {
+    fn read(&mut self, addr: u32) -> u8 {
+        self.0.peek(addr)
+    }
+
+    fn write(&mut self, _addr: u32, _value: u8) {}
 }
 
 impl<'a> Addressable for Z80Bus<'a> {

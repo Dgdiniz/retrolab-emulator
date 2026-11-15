@@ -10,6 +10,7 @@ use anyhow::Result;
 use clap::Args;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::debugger::MAIN_CPU;
 
 #[derive(Args, Debug)]
 pub struct BenchmarkArgs {
@@ -68,7 +69,7 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     // Tier 2b: light debug with trace.
     emu.reset();
     emu.debugger().set_execution_mode(ExecutionMode::Running);
-    emu.set_tracing_enabled(true);
+    emu.debugger().set_tracing_enabled(MAIN_CPU, true);
     println!();
     println!("Running {n} frames with run_frame_debug_light() (trace active)...");
     let start = Instant::now();
@@ -76,7 +77,7 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         emu.run_frame_debug_light();
     }
     let ms_light_trace = report(start.elapsed().as_secs_f64() * 1000.0, n);
-    emu.set_tracing_enabled(false);
+    emu.debugger().set_tracing_enabled(MAIN_CPU, false);
 
     // Tier 3: full debug.
     emu.reset();

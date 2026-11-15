@@ -234,7 +234,8 @@ fn nearest_set_at_or_before_returns_the_most_recent_executed_address() {
     let pc = emu.cpu().pc;
     let nearest = emu
         .debugger_ref()
-        .coverage_nearest_set_at_or_before(0, pc.saturating_sub(1));
+        .coverage(0)
+        .and_then(|coverage| coverage.nearest_set_at_or_before(pc.saturating_sub(1)));
     assert!(
         nearest.is_some(),
         "After 30 steps there must be at least one covered address strictly before the live PC"
@@ -248,16 +249,7 @@ fn out_of_range_cpu_id_is_silently_ignored() {
     assert_eq!(emu.debugger_ref().coverage_stats(2), (0, 0));
     assert_eq!(emu.debugger_ref().coverage_stats(99), (0, 0));
     assert!(!emu.debugger_ref().is_covered(2, 0x100));
-    assert_eq!(
-        emu.debugger_ref()
-            .coverage_nearest_set_at_or_before(2, 0x100),
-        None
-    );
-    assert_eq!(
-        emu.debugger_ref()
-            .coverage_nearest_set_at_or_after(2, 0x100),
-        None
-    );
+    assert!(emu.debugger_ref().coverage(2).is_none());
 
     // Make sure clear_coverage on an invalid id doesn't panic and
     // doesn't accidentally wipe a real CPU's bitmap.

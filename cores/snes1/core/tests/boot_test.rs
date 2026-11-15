@@ -349,7 +349,7 @@ fn step_returns_master_cycles_after_load() {
     let mut emu = SnesEmulator::new();
     emu.load_rom(&rom).unwrap();
     let before = emu.master_cycles();
-    let result = emu.step();
+    let result = emu.step_without_events();
     assert!(result.instruction_executed);
     assert!(result.cycles > 0, "BRA must consume > 0 master clocks");
     assert_eq!(emu.master_cycles() - before, result.cycles as u64);

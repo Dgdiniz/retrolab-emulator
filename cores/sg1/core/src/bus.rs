@@ -249,23 +249,29 @@ impl AddressBus {
         }
     }
 
-    /// Side-effect-free single-byte peek for the debugger: the memory views
-    /// and the multi-byte value of a sized watchpoint. Unlike
-    /// [`Addressable::read`] it charges no bus cycles, logs no watch event
-    /// and changes no port's state. Reads the cartridge, work RAM and Z80 RAM
+    /// Side-effect-free single-byte peek for the debugger: the memory views,
+    /// the value of a sized watchpoint, a condition's memory, the opcode the
+    /// call stack classifies and the disassembly. Unlike
+    /// [`Addressable::read`] it charges no bus cycles, logs no watch event,
+    /// moves no open-bus latch and changes no port's state. Reads the
+    /// cartridge through its peek ([`GenesisCartridge::peek_bus`]: a
+    /// coprocessor's window is neither caught up nor counted, and one whose
+    /// read would act reads `0xFF`), work RAM and Z80 RAM
     /// (`$A00000-$A01FFF`, repeated at `$A02000`, whoever holds the Z80's
     /// bus); every other address returns 0, since a read of the I/O or VDP
     /// ports would change them. The VDP's memories have calls of their own.
-    pub fn peek_byte(&mut self, addr: u32) -> u8 {
+    pub fn peek_byte(&self, addr: u32) -> u8 {
         let a = addr & 0x00FFFFFF;
-        let mc = self.m68k_cycle;
         match a {
             0x000000..=0x7FFFFF => self
                 .cartridge
-                .as_mut()
-                .map(|cart| cart.read_bus(a, mc))
+                .as_ref()
+                .map(|cart| cart.peek_bus(a))
                 .unwrap_or(0xFF),
-            0xA00000..=0xA03FFF => self.memory.z80_ram.read(a & 0x1FFF),
+            0xA00000..=0xA03FFF => {
+                let ram = self.memory.z80_ram.as_slice();
+                ram[(a & 0x1FFF) as usize & (ram.len() - 1)]
+            }
             0xE00000..=0xFFFFFF => {
                 let ram = self.memory.work_ram.as_slice();
                 let mask = ram.len() - 1;
@@ -275,9 +281,15 @@ impl AddressBus {
         }
     }
 
+    /// The big-endian word at `addr`, two [`Self::peek_byte`]s, as the
+    /// 68000 reads a word.
+    pub fn peek_word(&self, addr: u32) -> u16 {
+        u16::from_be_bytes([self.peek_byte(addr), self.peek_byte(addr.wrapping_add(1))])
+    }
+
     /// The 68000's address space read through [`AddressBus::peek_byte`], for
     /// the debugger's views of it (the disassembly).
-    pub fn peek_view(&mut self) -> PeekView<'_> {
+    pub fn peek_view(&self) -> PeekView<'_> {
         PeekView(self)
     }
 
@@ -797,7 +809,7 @@ impl Default for AddressBus {
 /// The 68000's address space as the debugger reads it: every read is an
 /// [`AddressBus::peek_byte`] and every write is dropped, so a disassembly
 /// that runs over the I/O or VDP ports reads 0 there and changes nothing.
-pub struct PeekView<'a>(&'a mut AddressBus);
+pub struct PeekView<'a>(&'a AddressBus);
 
 impl Addressable for PeekView<'_> {
     fn read(&mut self, addr: u32) -> u8 {
@@ -808,7 +820,7 @@ impl Addressable for PeekView<'_> {
 
     /// Big-endian, as the 68000 reads a word.
     fn read_word(&mut self, addr: u32) -> u16 {
-        ((self.0.peek_byte(addr) as u16) << 8) | self.0.peek_byte(addr.wrapping_add(1)) as u16
+        self.0.peek_word(addr)
     }
 }
 

@@ -147,7 +147,7 @@ fn nmi_retrigger_when_enabled_during_latched_vblank() {
     // The bus flagged a pending NMI; step through the boundary drain,
     // the service, and the handler body.
     for _ in 0..10 {
-        emu.step();
+        emu.step_without_events();
     }
     assert_eq!(read_counter(&mut emu, 0x0000), 1);
 }
@@ -323,11 +323,11 @@ fn irq_reschedule_cancels_stale_event() {
     emu.bus_mut().write(0x4200, 0x20); // V-IRQ enable
     emu.bus_mut().write(0x4209, 0x64); // VTIMEL = 100
     emu.bus_mut().write(0x420A, 0x00);
-    emu.step(); // drain reschedule -> one IrqV armed
+    emu.step_without_events(); // drain reschedule -> one IrqV armed
     let before = emu.scheduler().pending_count();
 
     emu.bus_mut().write(0x4209, 0x96); // VTIMEL = 150
-    emu.step(); // reschedule: cancel old IrqV, arm new one
+    emu.step_without_events(); // reschedule: cancel old IrqV, arm new one
     let after = emu.scheduler().pending_count();
 
     assert_eq!(

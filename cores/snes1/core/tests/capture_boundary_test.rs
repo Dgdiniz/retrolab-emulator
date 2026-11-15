@@ -545,7 +545,7 @@ fn bare_steps_between_frames_count_inside_the_next_frame() {
     emu.run_frame();
     let armed_end = emu.master_cycles() + 262 * 1364;
     for _ in 0..50 {
-        emu.step();
+        emu.step_without_events();
     }
     emu.step_cpu(0);
     assert_eq!(emu.frame_count(), 1, "one step closes no frame");

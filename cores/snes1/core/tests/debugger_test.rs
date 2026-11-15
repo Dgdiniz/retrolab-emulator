@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use retro_core::cpu::Addressable;
+use retro_core::debug::{Access, ByteOrder, CpuExprContext, TraceEntry};
 use retro_core::{
     AudioInfo, Breakpoint, BreakpointType, CpuArchitecture, CpuInfo, CpuLocation, DebuggerCore,
     DisplayInfo, EmulatorCore, ExecutionMode, ExecutionTier, InputInfo, InstructionTrace,
@@ -19,15 +20,22 @@ use retro_core::{
 use wdc65816::addressing::AddressingMode;
 
 use snes1_core::{
-    effective_address, format_trace_line_65816, format_trace_line_spc700, EffRegs, SnesDebugger,
-    SnesEmulator, TraceEntryBinary65816, TraceEntryBinarySpc700, TRACE_ENTRY_SIZE_65816,
-    TRACE_ENTRY_SIZE_SPC700,
+    effective_address, format_trace_line_65816, format_trace_line_spc700, snes_debugger, EffRegs,
+    SnesEmulator, TraceEntryBinary65816, TraceEntryBinarySpc700, MAIN_CPU,
 };
 #[cfg(feature = "chip-superfx")]
-use snes1_core::{format_trace_line_gsu, TraceEntryBinaryGsu, TRACE_ENTRY_SIZE_GSU};
+use snes1_core::{format_trace_line_gsu, TraceEntryBinaryGsu};
+
+/// Bytes of one 65C816 trace entry.
+const SIZE_65816: usize = <TraceEntryBinary65816 as TraceEntry>::SIZE;
+/// Bytes of one SPC700 trace entry.
+const SIZE_SPC700: usize = <TraceEntryBinarySpc700 as TraceEntry>::SIZE;
+/// Bytes of one GSU trace entry.
+#[cfg(feature = "chip-superfx")]
+const SIZE_GSU: usize = <TraceEntryBinaryGsu as TraceEntry>::SIZE;
 
 /// Minimal two-CPU `SystemInfo` for constructing a standalone
-/// [`SnesDebugger`] in unit tests.
+/// [`snes1_core::SnesDebugger`] in unit tests.
 fn test_sysinfo() -> SystemInfo {
     SystemInfo {
         name: "Test".to_string(),
@@ -275,11 +283,11 @@ mod format_tests {
             bytes: [0xad, 0x34, 0x12, 0],
         };
         let bytes = e.to_bytes();
-        assert_eq!(bytes.len(), TRACE_ENTRY_SIZE_65816);
+        assert_eq!(bytes.len(), SIZE_65816);
         let back = TraceEntryBinary65816::from_bytes(&bytes).unwrap();
         assert_eq!(back, e);
         // Short buffers are rejected.
-        assert!(TraceEntryBinary65816::from_bytes(&bytes[..TRACE_ENTRY_SIZE_65816 - 1]).is_none());
+        assert!(TraceEntryBinary65816::from_bytes(&bytes[..SIZE_65816 - 1]).is_none());
     }
 }
 
@@ -410,20 +418,18 @@ mod format_tests_spc700 {
             bytes: [0x8f, 0x77, 0x20],
         };
         let bytes = e.to_bytes();
-        assert_eq!(bytes.len(), TRACE_ENTRY_SIZE_SPC700);
+        assert_eq!(bytes.len(), SIZE_SPC700);
         let back = TraceEntryBinarySpc700::from_bytes(&bytes).unwrap();
         assert_eq!(back, e);
         // Short buffers are rejected.
-        assert!(
-            TraceEntryBinarySpc700::from_bytes(&bytes[..TRACE_ENTRY_SIZE_SPC700 - 1]).is_none()
-        );
+        assert!(TraceEntryBinarySpc700::from_bytes(&bytes[..SIZE_SPC700 - 1]).is_none());
     }
 }
 
 /// Super FX GSU trace-line tests. There is no bsnes-plus GSU trace to diff
 /// against, so these pin our own layout (address / disasm / the 16-register
 /// file / SFR + status flags) so [`format_trace_line_gsu`] and the entry
-/// (de)serialization stay in lockstep with the `TRACE_ENTRY_SIZE_GSU` = 52
+/// (de)serialization stay in lockstep with the `SIZE_GSU` = 52
 /// contract shared with `debugger-core`'s `SUPERFX` `TraceCpuSpec`.
 #[cfg(feature = "chip-superfx")]
 mod format_tests_gsu {
@@ -502,11 +508,11 @@ mod format_tests_gsu {
             r,
         };
         let bytes = e.to_bytes();
-        assert_eq!(bytes.len(), TRACE_ENTRY_SIZE_GSU);
+        assert_eq!(bytes.len(), SIZE_GSU);
         let back = TraceEntryBinaryGsu::from_bytes(&bytes).unwrap();
         assert_eq!(back, e);
         // Short buffers are rejected.
-        assert!(TraceEntryBinaryGsu::from_bytes(&bytes[..TRACE_ENTRY_SIZE_GSU - 1]).is_none());
+        assert!(TraceEntryBinaryGsu::from_bytes(&bytes[..SIZE_GSU - 1]).is_none());
     }
 }
 
@@ -817,26 +823,26 @@ mod debugger_state_tests {
 
     #[test]
     fn coverage_records_executed_addresses() {
-        let mut d = SnesDebugger::new(test_sysinfo());
-        assert_eq!(d.coverage_count_65816(), 0);
-        d.record_coverage_65816(0x00_8000);
-        d.record_coverage_65816(0x00_8000); // idempotent
-        d.record_coverage_65816(0x00_8001);
-        assert!(d.is_covered_65816(0x00_8000));
-        assert!(d.is_covered_65816(0x00_8001));
-        assert!(!d.is_covered_65816(0x00_8002));
-        assert_eq!(d.coverage_count_65816(), 2);
+        let mut d = snes_debugger(test_sysinfo());
+        assert_eq!(d.coverage_stats(MAIN_CPU), (0x0100_0000, 0));
+        d.record_coverage(MAIN_CPU, 0x00_8000);
+        d.record_coverage(MAIN_CPU, 0x00_8000); // idempotent
+        d.record_coverage(MAIN_CPU, 0x00_8001);
+        assert!(d.is_covered(MAIN_CPU, 0x00_8000));
+        assert!(d.is_covered(MAIN_CPU, 0x00_8001));
+        assert!(!d.is_covered(MAIN_CPU, 0x00_8002));
+        assert_eq!(d.coverage_stats(MAIN_CPU), (0x0100_0000, 2));
     }
 
     #[test]
     fn execute_breakpoint_matches_pc() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         let id = d.add_breakpoint(exec_bp(0x00_8000));
         assert_eq!(d.list_breakpoints().len(), 1);
-        assert!(d.check_execute_65816(0x00_8000));
-        assert!(!d.check_execute_65816(0x00_8001));
+        assert!(d.check_execute(MAIN_CPU, 0x00_8000, None));
+        assert!(!d.check_execute(MAIN_CPU, 0x00_8001, None));
         d.enable_breakpoint(id, false);
-        assert!(!d.check_execute_65816(0x00_8000));
+        assert!(!d.check_execute(MAIN_CPU, 0x00_8000, None));
         d.remove_breakpoint(id);
         assert!(d.list_breakpoints().is_empty());
     }
@@ -852,7 +858,7 @@ mod debugger_state_tests {
 
     #[test]
     fn value_matched_watchpoint_fires_only_on_matching_byte() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         let id = d.add_breakpoint(write_bp(0x7E_0000));
         d.set_breakpoint_match_spec(
             id,
@@ -861,11 +867,18 @@ mod debugger_state_tests {
                 ..Default::default()
             },
         );
-        // Wrong byte: silent. Value-agnostic path: also silent.
-        assert!(!d.check_memory_access_valued_65816(0x7E_0000, true, 0x00));
-        assert!(!d.check_memory_access_65816(0x7E_0000, true));
+        let mut context = CpuExprContext::new(|_| None, |_| 0, ByteOrder::LittleEndian);
+        let write = |value| {
+            [Access {
+                address: 0x7E_0000,
+                write: true,
+                value,
+            }]
+        };
+        // Wrong byte: silent.
+        assert!(!d.check_accesses(MAIN_CPU, &write(0x00), &mut context));
         // Matching byte: fires.
-        assert!(d.check_memory_access_valued_65816(0x7E_0000, true, 0xAB));
+        assert!(d.check_accesses(MAIN_CPU, &write(0xAB), &mut context));
         let info = d
             .list_breakpoints()
             .into_iter()
@@ -877,7 +890,7 @@ mod debugger_state_tests {
 
     #[test]
     fn available_events_lists_the_snes_taxonomy() {
-        let d = SnesDebugger::new(test_sysinfo());
+        let d = snes_debugger(test_sysinfo());
         let events = d.available_events();
         assert_eq!(events.len(), 12, "all twelve SNES event classes advertised");
         // VBlank is paramless.
@@ -899,7 +912,7 @@ mod debugger_state_tests {
 
     #[test]
     fn tier_follows_breakpoints_tracing_and_mode() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         // Running + nothing instrumented -> Fast.
         assert_eq!(d.execution_tier(), ExecutionTier::Fast);
         // Tracing on any CPU -> LightDebug.
@@ -917,7 +930,7 @@ mod debugger_state_tests {
 
     #[test]
     fn record_trace_then_flush_returns_entry_bytes() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         // Tracing must be enabled for the buffer to accept entries.
         assert!(d.get_trace_flush_data(0).is_none());
         d.set_tracing_enabled(0, true);
@@ -930,9 +943,9 @@ mod debugger_state_tests {
             bytes: [0x78, 0, 0, 0],
             ..Default::default()
         };
-        d.record_trace_65816(&entry);
+        d.record_trace(MAIN_CPU, &entry);
         let data = d.get_trace_flush_data(0).expect("buffered entry");
-        assert_eq!(data.len(), TRACE_ENTRY_SIZE_65816);
+        assert_eq!(data.len(), SIZE_65816);
         let back = TraceEntryBinary65816::from_bytes(&data).unwrap();
         assert_eq!(back, entry);
         d.clear_trace_flushed(0);
@@ -941,7 +954,7 @@ mod debugger_state_tests {
 
     #[test]
     fn cpu_states_cover_both_cpus() {
-        let d = SnesDebugger::new(test_sysinfo());
+        let d = snes_debugger(test_sysinfo());
         let states = d.get_cpu_states();
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].cpu_id, 0);
@@ -956,7 +969,7 @@ mod debugger_state_tests {
 
     #[test]
     fn memory_regions_include_wram_and_aram() {
-        let d = SnesDebugger::new(test_sysinfo());
+        let d = snes_debugger(test_sysinfo());
         let regions = d.get_memory_regions();
         assert!(regions.iter().any(|r| r.name == "WRAM"));
         assert!(regions.iter().any(|r| r.name == "ARAM"));
@@ -1054,47 +1067,53 @@ mod callstack_history_tests {
 
     #[test]
     fn call_stack_storage_and_depth_cap() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         assert!(d.get_call_stack(0).is_empty());
         // Push well past the cap; growth must stop at the bound.
         for i in 0..400u32 {
-            d.push_call_65816(StackFrame {
-                call_address: 0x00_8000 + i,
-                return_address: 0x00_9000 + i,
-                function_name: None,
-            });
+            d.push_call(
+                MAIN_CPU,
+                StackFrame {
+                    call_address: 0x00_8000 + i,
+                    return_address: 0x00_9000 + i,
+                    function_name: None,
+                },
+            );
         }
         let depth = d.get_call_stack(0).len();
         assert_eq!(depth, 256, "call stack is bounded at MAX_CALL_STACK_DEPTH");
         // cpu 1 (SPC700) has no call stack.
         assert!(d.get_call_stack(1).is_empty());
         // A pop shrinks it by one.
-        d.pop_call_65816();
+        d.pop_call(MAIN_CPU);
         assert_eq!(d.get_call_stack(0).len(), depth - 1);
     }
 
     #[test]
     fn instruction_history_ring_keeps_last_1024() {
-        let mut d = SnesDebugger::new(test_sysinfo());
+        let mut d = snes_debugger(test_sysinfo());
         assert!(d.get_instruction_history(0, 10).is_empty());
         for i in 0..1100u32 {
-            d.record_instruction_65816(InstructionTrace {
-                address: i,
-                instruction: format!("nop #{i}"),
-                registers_before: Vec::new(),
-                cycle_count: 2,
-            });
+            d.record_history(
+                MAIN_CPU,
+                InstructionTrace {
+                    address: i,
+                    instruction: format!("nop #{i}"),
+                    registers_before: Vec::new(),
+                    cycle_count: 2,
+                },
+            );
         }
         let all = d.get_instruction_history(0, 5000);
         assert_eq!(all.len(), 1024, "ring keeps the last 1024 records");
-        // Newest at the back; oldest retained is 1100 - 1024 = 76.
-        assert_eq!(all.first().unwrap().address, 76);
-        assert_eq!(all.last().unwrap().address, 1099);
-        // A bounded request returns only the most recent N.
+        // Newest first; the oldest retained is 1100 - 1024 = 76.
+        assert_eq!(all.first().unwrap().address, 1099);
+        assert_eq!(all.last().unwrap().address, 76);
+        // A bounded request returns only the most recent N, newest first.
         let last3 = d.get_instruction_history(0, 3);
         assert_eq!(last3.len(), 3);
-        assert_eq!(last3[0].address, 1097);
-        assert_eq!(last3[2].address, 1099);
+        assert_eq!(last3[0].address, 1099);
+        assert_eq!(last3[2].address, 1097);
         // cpu 1 has no history.
         assert!(d.get_instruction_history(1, 10).is_empty());
     }
@@ -1134,9 +1153,9 @@ mod integration {
             .get_trace_flush_data(0)
             .expect("trace data after a traced frame");
         assert!(!data.is_empty());
-        assert_eq!(data.len() % TRACE_ENTRY_SIZE_65816, 0);
+        assert_eq!(data.len() % SIZE_65816, 0);
         // Every entry renders to a well-formed line without panicking.
-        for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_65816>().0.iter().take(64) {
+        for chunk in data.as_chunks::<SIZE_65816>().0.iter().take(64) {
             let entry = TraceEntryBinary65816::from_bytes(chunk).unwrap();
             let line = format_trace_line_65816(&entry);
             assert!(line.contains(" A:"));
@@ -1223,9 +1242,9 @@ mod integration {
         }
 
         assert!(!data.is_empty(), "cpu-2 tracing captured GSU instructions");
-        assert_eq!(data.len() % TRACE_ENTRY_SIZE_GSU, 0, "whole records only");
+        assert_eq!(data.len() % SIZE_GSU, 0, "whole records only");
         let mut saw_iwt = false;
-        for chunk in data.as_chunks::<TRACE_ENTRY_SIZE_GSU>().0 {
+        for chunk in data.as_chunks::<SIZE_GSU>().0 {
             let entry = TraceEntryBinaryGsu::from_bytes(chunk).unwrap();
             let line = format_trace_line_gsu(&entry);
             assert!(line.contains("R0:"), "R0 column: {line}");
@@ -1259,10 +1278,10 @@ mod integration {
             .debugger()
             .get_trace_flush_data(1)
             .expect("SPC700 trace data after a traced frame");
-        assert_eq!(data.len() % TRACE_ENTRY_SIZE_SPC700, 0);
+        assert_eq!(data.len() % SIZE_SPC700, 0);
 
         let lines: Vec<String> = data
-            .as_chunks::<TRACE_ENTRY_SIZE_SPC700>()
+            .as_chunks::<SIZE_SPC700>()
             .0
             .iter()
             .take(6)

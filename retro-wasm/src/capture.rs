@@ -1183,9 +1183,6 @@ mod tests {
         fn reset(&mut self) {
             unreachable!()
         }
-        fn step(&mut self) -> StepResult {
-            unreachable!()
-        }
         fn step_cpu(&mut self, _cpu_id: usize) -> StepResult {
             unreachable!()
         }
@@ -1244,6 +1241,12 @@ mod tests {
             unreachable!()
         }
         fn debugger(&mut self) -> &mut dyn DebuggerCore {
+            unreachable!()
+        }
+        fn debugger_ref(&self) -> &dyn DebuggerCore {
+            unreachable!()
+        }
+        fn refresh_debugger_state(&mut self) {
             unreachable!()
         }
         fn read_memory_debug(&mut self, _addr: u32, _size: u32) -> Vec<u8> {

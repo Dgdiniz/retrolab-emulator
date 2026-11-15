@@ -14,6 +14,9 @@
 //!   objects, typed-array copies, values serialized with maps as objects).
 //! - [`capture`]: the capture contract's marshallers, and
 //!   [`capture_bindings!`] for its methods.
+//! - [`debugger`]: the debugger's values (execution modes and breakpoint
+//!   types by name, the coverage figures), and [`debugger_bindings!`] for
+//!   its methods.
 //! - `test_support` (feature `test-support`): `test_support::shape`, a
 //!   description of a JavaScript value a test can compare.
 //!
@@ -22,6 +25,7 @@
 //! code `#[wasm_bindgen]` writes names that crate.
 
 pub mod capture;
+pub mod debugger;
 pub mod js;
 
 #[cfg(any(test, feature = "test-support"))]

@@ -160,15 +160,23 @@ fn default_title_confidence() -> String {
     "high".to_string()
 }
 
-/// Memory region information
+/// What a memory region holds, the same words on every console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryRegion {
+    /// The main CPU's work RAM.
     MainRam,
+    /// The video chip's memory: tiles, maps.
     VideoRam,
+    /// The sound CPU's RAM.
     AudioRam,
+    /// The cartridge's ROM.
     Rom,
+    /// The cartridge's battery-backed RAM.
     SaveRam,
-    Custom(u8),
+    /// The palette memory: the colours the video chip draws with.
+    PaletteRam,
+    /// The sprite table: each sprite's place, size and character.
+    SpriteTable,
 }
 
 /// Memory region metadata
@@ -389,15 +397,18 @@ pub enum BreakpointAction {
 ///
 /// 1. **range**: `address_end` widens an access match from the single
 ///    `address` to the inclusive span `[address, address_end]`.
-/// 2. **value**: for memory watchpoints only, the observed byte must
-///    satisfy `(observed & mask) <value_compare> value`.
+/// 2. **value**: for memory watchpoints only, the observed value must
+///    satisfy `(observed & mask) <value_compare> value`. A one-byte watch
+///    observes the byte the access moved; a wider one the whole value at
+///    its address after the instruction, read through the check's
+///    [`crate::debug::ExprContext`].
 /// 3. **expression**: an optional [`crate::debug::expr`] condition over
 ///    live registers / memory (`d0 == 5 && [0xFF0000].w > 0x100`). When
 ///    set, it must evaluate non-zero for the breakpoint to fire. A spec
-///    that carries an expression but is checked on a path without an
-///    evaluation context (or whose expression fails to parse / evaluate)
-///    fails **closed**, the breakpoint stays silent rather than firing on
-///    an unverifiable condition.
+///    that carries an expression but is checked with no evaluation context
+///    (or whose expression fails to parse / evaluate) fails **closed**:
+///    the breakpoint stays silent rather than firing on an unverifiable
+///    condition.
 /// 4. **hit-skip**: the first `hit_skip` otherwise-qualifying matches
 ///    are ignored before the breakpoint starts firing.
 /// 5. **action**: `Break` halts; `Log` counts and continues.
@@ -414,15 +425,15 @@ pub struct MatchSpec {
     /// Target value for a memory watchpoint. When `Some`, the access
     /// only matches if the observed value satisfies the comparison. For a
     /// multi-byte watchpoint (see `value_size`) the observed value is the
-    /// whole little/big-endian word assembled from the watched bytes.
+    /// whole value at the watched address, in the CPU's byte order.
     /// Ignored by execute and event breakpoints (no observed value).
     #[serde(default)]
     pub value: Option<u32>,
     /// Width in bytes of the value predicate (1-4). A width > 1 makes this
-    /// a multi-byte watchpoint: the observed value is assembled from
-    /// `value_size` consecutive bytes starting at the watched address
-    /// (honoring the core's endianness), and the coverage span widens to
-    /// `[address, address + value_size - 1]` so a write to *any* of those
+    /// a multi-byte watchpoint: the observed value is read from
+    /// `value_size` consecutive bytes starting at the watched address, in
+    /// the CPU's byte order, and the address span widens to
+    /// `[address, address + value_size - 1]` so an access to *any* of those
     /// bytes is a candidate. `0` is treated as `1` (single byte) so older
     /// serialized specs and plain byte watchpoints round-trip unchanged.
     #[serde(default)]
@@ -456,18 +467,16 @@ pub struct MatchSpec {
 }
 
 impl MatchSpec {
-    /// `true` when the spec carries a value predicate that needs the
-    /// observed byte to evaluate. Cores use this to decide whether the
-    /// value-aware [`crate::debug::BreakpointList::check_memory_access_valued`]
-    /// path is worth the extra debug read.
+    /// `true` when the spec carries a value predicate, which only an
+    /// access's observed value can satisfy.
     #[inline]
     pub fn needs_value(&self) -> bool {
         self.value.is_some()
     }
 
     /// The value predicate's byte width, clamped to the supported 1-4
-    /// range (`0` -> `1`). Drives both the coverage span and how many
-    /// consecutive bytes a core assembles into the observed value.
+    /// range (`0` -> `1`). Drives both the address span and how many
+    /// consecutive bytes are read into the observed value.
     #[inline]
     pub fn value_width(&self) -> u8 {
         self.value_size.clamp(1, 4)
@@ -491,7 +500,7 @@ impl MatchSpec {
         self.expr_source().is_some()
     }
 
-    /// Evaluate the value predicate against an observed byte. Returns
+    /// Evaluate the value predicate against an observed value. Returns
     /// `true` (no constraint) when no value target is set.
     #[inline]
     pub fn value_matches(&self, observed: u32) -> bool {
@@ -541,14 +550,77 @@ pub struct EventParamOption {
     pub label: String,
 }
 
+/// What an event a debugger can stop on is, in words every console shares,
+/// beside the code each console numbered it with. A host looks an event up
+/// by its kind; the code stays what a breakpoint stores. Each kind says what
+/// its `param` holds; a kind with no param reports 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// The beam entered vertical blank. No param.
+    VerticalBlank,
+    /// The vertical blank's interrupt reached the main CPU. No param.
+    VerticalBlankInterrupt,
+    /// An interrupt the beam's position raises (at a line or a dot) reached
+    /// the main CPU. No param.
+    RasterInterrupt,
+    /// The beam reached a line; the param is the line, as the console counts
+    /// its lines.
+    Line,
+    /// A transfer from memory started. No param.
+    TransferStart,
+    /// A transfer finished; the param is its target, coded as a frame-write
+    /// record carries it ([`crate::capture::FrameWrite::target`]).
+    TransferDone,
+    /// A transfer made line by line was set up for the frame. No param.
+    LineTransferSetUp,
+    /// A colour of the palette was written; the param is the colour's index.
+    PaletteWrite,
+    /// A write changed a tile; the param is the tile, as the 32-byte block
+    /// of video memory it is (its byte address divided by 32).
+    TileWrite,
+    /// A transfer wrote into the sprite table. No param.
+    SpriteTableWrite,
+    /// A video register was written; the param is the register's index.
+    VideoRegisterWrite,
+    /// The main CPU wrote a port of the sound system; the param is the port.
+    AudioPortWrite,
+    /// A sound chip's register was written; the param is the register's
+    /// index.
+    AudioRegisterWrite,
+}
+
+impl EventKind {
+    /// Whether an event of this kind carries a param.
+    pub const fn takes_param(self) -> bool {
+        match self {
+            Self::VerticalBlank
+            | Self::VerticalBlankInterrupt
+            | Self::RasterInterrupt
+            | Self::TransferStart
+            | Self::LineTransferSetUp
+            | Self::SpriteTableWrite => false,
+            Self::Line
+            | Self::TransferDone
+            | Self::PaletteWrite
+            | Self::TileWrite
+            | Self::VideoRegisterWrite
+            | Self::AudioPortWrite
+            | Self::AudioRegisterWrite => true,
+        }
+    }
+}
+
 /// One event class a core can break on, used to populate the UI's
-/// event-breakpoint picker. A core advertises its taxonomy through
-/// [`crate::DebuggerCore::available_events`]; retro-core stays agnostic
-/// about what the codes mean.
+/// event-breakpoint picker. A core advertises its catalogue through
+/// [`crate::DebuggerCore::available_events`], built from its
+/// [`crate::debug::events::EventSpec`] list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventClass {
     /// The `code` to store on a [`BreakpointType::Event`].
     pub code: u32,
+    /// What the event is, in words every console shares.
+    pub kind: EventKind,
     /// Human label for the event (e.g. "VBlank", "DMA start").
     pub label: String,
     /// Longer description of what the event fires on, if useful.

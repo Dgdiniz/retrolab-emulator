@@ -87,6 +87,10 @@ impl SnesCartridge for ComposableCartridge {
         self.chips.read(chip_id, offset, master_cycle).unwrap_or(0)
     }
 
+    fn peek_chip(&self, chip_id: u8, offset: u32) -> Option<u8> {
+        self.chips.peek(chip_id, offset)
+    }
+
     fn write_chip(&mut self, chip_id: u8, offset: u32, value: u8, master_cycle: u64) {
         self.chips.write(chip_id, offset, value, master_cycle);
     }

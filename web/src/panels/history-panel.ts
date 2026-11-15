@@ -1,6 +1,7 @@
 /**
- * History panel, instruction trace history for the focused CPU.
- * Mirrors RetroLab's history panel.
+ * History panel, instruction trace history for the focused CPU, newest
+ * first: the order the core returns it in, shown as it is. Mirrors
+ * RetroLab's history panel.
  *
  * Consumes `@debugger-core/format-core` for address formatting and the
  * `DebugBridge` for emulator access + focused CPU lookup.
@@ -40,7 +41,7 @@ export function initHistoryPanel(bridge: DebugBridge): PanelHandle {
 
       const addrPad = focusedCpuId === 0 ? 6 : 4
 
-      list!.innerHTML = history.slice().reverse().map((trace: any) => {
+      list!.innerHTML = history.map((trace: any) => {
         const addr = trace.address >>> 0
         let instText: string = trace.instruction
 

@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import {
   DEFAULT_MATCH_SPEC,
+  EVENT_CONDITIONS_NOTE,
+  EVENT_KINDS,
   EVENT_PARAM_ANY,
   VALUE_COMPARE_OPTIONS,
   VALUE_SIZE_OPTIONS,
@@ -13,8 +15,10 @@ import {
   matchSpecToWire,
   isDefaultMatchSpec,
   matchSpecSummary,
+  eventConditionsNote,
   validateMatchSpec,
   parseEventCatalog,
+  eventCodeForKind,
   isParamWildcard,
   parseEventTag,
   isWatchShorthand,
@@ -342,6 +346,7 @@ describe('parseEventCatalog', () => {
     expect(out).toEqual([
       {
         code: 7,
+        kind: null,
         label: 'PPU register write',
         description: 'Write to a PPU register',
         paramLabel: 'Register',
@@ -352,12 +357,24 @@ describe('parseEventCatalog', () => {
       },
       {
         code: 2,
+        kind: null,
         label: 'Event 2',
         description: null,
         paramLabel: null,
         paramOptions: [],
       },
     ])
+  })
+
+  it('reads the kind each entry names, null for a missing or unknown one', () => {
+    const out = parseEventCatalog([
+      { code: 12, kind: 'tile_write', label: 'Tile changed' },
+      { code: 7, kind: 'video_register_write' },
+      { code: 3 },
+      { code: 4, kind: 'a_kind_from_a_newer_core' },
+      { code: 5, kind: 9 },
+    ])
+    expect(out.map((e) => e.kind)).toEqual(['tile_write', 'video_register_write', null, null, null])
   })
 
   it('accepts camelCase param metadata', () => {
@@ -374,6 +391,42 @@ describe('parseEventCatalog', () => {
   it('treats a non-array param_options as empty', () => {
     const out = parseEventCatalog([{ code: 1, param_options: 'nope' }])
     expect(out[0].paramOptions).toEqual([])
+  })
+})
+
+describe('EVENT_KINDS', () => {
+  it('lists the thirteen kinds the cores name, each once', () => {
+    expect(EVENT_KINDS).toHaveLength(13)
+    expect(new Set(EVENT_KINDS).size).toBe(13)
+    expect(EVENT_KINDS).toContain('palette_write')
+    expect(EVENT_KINDS).toContain('transfer_done')
+  })
+})
+
+describe('eventCodeForKind', () => {
+  // The same kinds under each console's own codes.
+  const genesis = parseEventCatalog([
+    { code: 5, kind: 'transfer_done' },
+    { code: 6, kind: 'palette_write' },
+    { code: 8, kind: 'tile_write' },
+  ])
+  const snes = parseEventCatalog([
+    { code: 10, kind: 'transfer_done' },
+    { code: 11, kind: 'palette_write' },
+    { code: 12, kind: 'tile_write' },
+  ])
+
+  it("finds each console's code for a kind", () => {
+    expect(eventCodeForKind(genesis, 'tile_write')).toBe(8)
+    expect(eventCodeForKind(snes, 'tile_write')).toBe(12)
+    expect(eventCodeForKind(genesis, 'transfer_done')).toBe(5)
+    expect(eventCodeForKind(snes, 'palette_write')).toBe(11)
+  })
+
+  it('is null for a kind the console does not raise, or a catalogue with no kinds', () => {
+    expect(eventCodeForKind(genesis, 'audio_port_write')).toBeNull()
+    expect(eventCodeForKind([], 'tile_write')).toBeNull()
+    expect(eventCodeForKind(parseEventCatalog([{ code: 8 }]), 'tile_write')).toBeNull()
   })
 })
 
@@ -419,6 +472,7 @@ describe('parseEventTag', () => {
 const CATALOG: EventClass[] = [
   {
     code: 1,
+    kind: 'vertical_blank',
     label: 'VBlank',
     description: 'Vertical blank',
     paramLabel: null,
@@ -426,6 +480,7 @@ const CATALOG: EventClass[] = [
   },
   {
     code: 2,
+    kind: 'transfer_start',
     label: 'DMA start',
     description: null,
     paramLabel: 'Channel',
@@ -820,3 +875,22 @@ describe('expr field in match specs', () => {
     expect(bad.errors).toContain('Unbalanced brackets []')
   })
 })
+
+describe('watchpoints-core > eventConditionsNote', () => {
+  it('says nothing for an event breakpoint with no value test and no condition', () => {
+    expect(eventConditionsNote(DEFAULT_MATCH_SPEC)).toBeNull()
+    // What the core applies to an event, and what it ignores, never silences it.
+    expect(eventConditionsNote({ ...DEFAULT_MATCH_SPEC, hitSkip: 3, action: 'log', oneShot: true, addressEnd: 0x10 })).toBeNull()
+    // A blank condition is none.
+    expect(eventConditionsNote({ ...DEFAULT_MATCH_SPEC, expr: '   ' })).toBeNull()
+  })
+
+  it('says why one given a value test or a condition never fires', () => {
+    expect(eventConditionsNote({ ...DEFAULT_MATCH_SPEC, value: 0 })).toBe(EVENT_CONDITIONS_NOTE)
+    expect(eventConditionsNote({ ...DEFAULT_MATCH_SPEC, expr: 'd0 == 5' })).toBe(EVENT_CONDITIONS_NOTE)
+    expect(EVENT_CONDITIONS_NOTE).toBe(
+      'An event breakpoint checks no value or condition: with either set, it never fires.',
+    )
+  })
+})
+
