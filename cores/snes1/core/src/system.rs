@@ -808,7 +808,8 @@ impl SnesEmulator {
 
     /// Cold (power-on) reset: reload the current ROM into a fresh CPU and bus,
     /// which zeroes the 128 KiB work RAM; with no ROM loaded, run the ordinary
-    /// [`EmulatorCore::reset`] and then zero the work RAM.
+    /// [`EmulatorCore::reset`] and then zero the work RAM. The player's
+    /// controller setup is kept, with nothing it held still pressed.
     ///
     /// The plain `reset()` preserves WRAM (SNES *reset-button* semantics); this
     /// emulates a *power cycle*, which clears it. Netplay needs it: two peers must
@@ -836,6 +837,14 @@ impl SnesEmulator {
         // logic over the same ROM, the result is identical by construction.
         // Battery-backed SRAM is intentionally a fresh (empty) image: a game with
         // a save resumes through the seeded savestate transfer, NOT this cold boot.
+        //
+        // The player's input setup survives, as a console's controllers do (the
+        // input manager lives outside the machine and no savestate holds it),
+        // but what it holds pressed is let go: a host that stops forwarding
+        // input while it drives the ports, as netplay does, would never release
+        // a button held across the cycle, and the machine that boots would read
+        // it on one peer only.
+        self.input_manager.release_all();
         self.cpu = Wdc65816::new();
         if !self.last_rom.is_empty() {
             let rom = std::mem::take(&mut self.last_rom);
@@ -3767,6 +3776,78 @@ mod tests {
             guest.state_hash(),
             "cold reset must give both peers a byte-identical frame-0 baseline"
         );
+    }
+
+    #[test]
+    fn power_on_reset_keeps_the_input_setup_and_lets_go_of_held_input() {
+        // Netplay power-cycles both peers before its session. The controller
+        // setup is the player's (a remapped key, a pad with its mapping and
+        // dead zone, the port it feeds) and outlives the cycle, as a console's
+        // controllers do; what it holds pressed does not, since the host stops
+        // forwarding input to the core while the session drives the ports and
+        // the release never comes. Kept, a held key reaches the host's pads
+        // and not the guest's.
+        use crate::controller::{BTN_A, BTN_B, BTN_X};
+        use std::collections::HashMap;
+        let rom = synth_hirom_2kib_sram_rom();
+        let mut host = SnesEmulator::new();
+        host.load_rom(&rom).expect("host loads");
+        let mut keys = host.input_manager().get_keyboard_mapping();
+        keys.insert("KeyQ".to_string(), BTN_X);
+        let pad_buttons = HashMap::from([(0, BTN_A)]);
+        let input = host.input_manager_mut();
+        input.set_keyboard_mapping(keys.clone());
+        assert!(input.add_gamepad("gamepad-0"));
+        input.set_gamepad_mapping("gamepad-0", pad_buttons.clone());
+        input.set_gamepad_deadzone("gamepad-0", 0.3);
+        input.set_provider_port("gamepad-0", Some(1));
+        input.update_keyboard("KeyQ".to_string(), true);
+        input.update_gamepad_button("gamepad-0".to_string(), 0, true);
+        host.set_input(
+            0,
+            InputState {
+                buttons: 1 << BTN_B,
+            },
+        );
+        assert_eq!(
+            host.input_manager().get_port_state(0),
+            1 << BTN_X | 1 << BTN_B
+        );
+        assert_eq!(host.input_manager().get_port_state(1), 1 << BTN_A);
+
+        let mut guest = SnesEmulator::new();
+        guest.load_rom(&rom).expect("guest loads");
+        host.power_on_reset();
+        guest.power_on_reset();
+
+        let input = host.input_manager();
+        assert_eq!(
+            input.get_port_state(0),
+            0,
+            "a key or the override still held"
+        );
+        assert_eq!(input.get_port_state(1), 0, "the pad's button still held");
+        assert_eq!(input.get_keyboard_mapping(), keys);
+        assert_eq!(input.get_gamepad_mapping("gamepad-0"), pad_buttons);
+        assert_eq!(input.get_gamepad_deadzone("gamepad-0"), 0.3);
+        assert_eq!(input.provider_port("gamepad-0"), Some(1));
+
+        // The two peers play the same input from there and stay one machine.
+        for _ in 0..3 {
+            host.set_input(0, InputState { buttons: 0 });
+            guest.set_input(0, InputState { buttons: 0 });
+            host.run_frame_headless();
+            guest.run_frame_headless();
+            assert_eq!(host.state_hash(), guest.state_hash());
+        }
+
+        // And the setup still plays: the remapped key and the pad reach their
+        // ports.
+        let input = host.input_manager_mut();
+        input.update_keyboard("KeyQ".to_string(), true);
+        input.update_gamepad_button("gamepad-0".to_string(), 0, true);
+        assert_eq!(input.get_port_state(0), 1 << BTN_X);
+        assert_eq!(input.get_port_state(1), 1 << BTN_A);
     }
 
     #[test]

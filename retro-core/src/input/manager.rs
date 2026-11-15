@@ -481,6 +481,23 @@ impl GenericInputManager {
         }
     }
 
+    /// Let go of every held input: each keyboard's keys, each pad's buttons
+    /// and axes, and every port's direct override. What the host set up
+    /// stays: the providers, their mappings and dead zones, the port each
+    /// one feeds, the split keyboard. A console's power cycle calls it, so
+    /// that a button held across the cycle never reaches the machine that
+    /// boots (a host that stops forwarding input, as netplay does while it
+    /// drives the ports, would never release it).
+    pub fn release_all(&mut self) {
+        for wrapper in self.providers.values_mut() {
+            match wrapper {
+                ProviderWrapper::Keyboard(keyboard) => keyboard.clear(),
+                ProviderWrapper::Gamepad(gamepad) => gamepad.clear_state(),
+            }
+        }
+        self.clear_all_direct_overrides();
+    }
+
     /// Replace the default keyboard with two scoped keyboards
     /// (`keyboard-p1`, `keyboard-p2`) so P1 and P2 can use different
     /// halves of the same keyboard. No-op when `n_ports < 2`.
@@ -628,6 +645,48 @@ mod tests {
 
         let state = manager.get_port_state(1);
         assert!(state != 0);
+    }
+
+    #[test]
+    fn release_all_lets_go_of_every_held_input_and_keeps_the_setup() {
+        let mut manager = sg1_style_manager();
+        manager.set_keyboard_mapping(HashMap::from([("KeyQ".to_string(), 1)]));
+        assert!(manager.add_gamepad("gamepad-0"));
+        manager.set_gamepad_mapping("gamepad-0", HashMap::from([(0, 4), (14, 6)]));
+        manager.set_gamepad_deadzone("gamepad-0", 0.3);
+        manager.set_provider_port("gamepad-0", Some(1));
+
+        manager.update_keyboard("KeyQ".to_string(), true);
+        manager.update_gamepad_button("gamepad-0".to_string(), 0, true);
+        manager.update_gamepad_axis("gamepad-0".to_string(), 0, -1.0);
+        manager.set_direct_override(0, 1 << 7);
+        assert_eq!(manager.get_port_state(0), 1 << 1 | 1 << 7);
+        assert_ne!(manager.get_port_state(1), 0);
+
+        manager.release_all();
+
+        assert_eq!(
+            manager.get_port_state(0),
+            0,
+            "a key or the override still held"
+        );
+        assert_eq!(
+            manager.get_port_state(1),
+            0,
+            "a pad button or axis still held"
+        );
+        assert_eq!(manager.get_keyboard_mapping().get("KeyQ"), Some(&1));
+        assert_eq!(manager.get_gamepad_mapping("gamepad-0").get(&0), Some(&4));
+        assert_eq!(manager.get_gamepad_deadzone("gamepad-0"), 0.3);
+        assert_eq!(manager.provider_port("gamepad-0"), Some(1));
+        assert_eq!(manager.provider_port("keyboard"), Some(0));
+
+        manager.update_keyboard("KeyQ".to_string(), true);
+        assert_eq!(
+            manager.get_port_state(0),
+            1 << 1,
+            "the mapping still reads the key"
+        );
     }
 
     #[test]

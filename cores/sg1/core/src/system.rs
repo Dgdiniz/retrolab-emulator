@@ -1244,7 +1244,8 @@ impl GenesisEmulator {
     }
 
     /// Cold (power-on) reset: rebuild the emulator to the state [`Self::new`]
-    /// and `load_rom` give, so work RAM and Z80 RAM start zeroed.
+    /// and `load_rom` give, so work RAM and Z80 RAM start zeroed. Only the
+    /// player's controller setup is kept, with nothing it held still pressed.
     ///
     /// The plain `reset()` emulates the Genesis *reset button*, which
     /// preserves RAM on real hardware; this emulates a *power cycle*, which does
@@ -1274,19 +1275,30 @@ impl GenesisEmulator {
         //
         // Rebuild the whole machine to the state a freshly-constructed emulator +
         // `load_rom` produces (byte-for-byte what a just-joined guest holds),
-        // preserving only what is invariant across peers: the ROM image, the
+        // preserving what is invariant across peers: the ROM image, the
         // cartridge manifest override, and the video region (all three pinned
         // identical by the netplay handshake). Because both peers run this exact
         // logic over identical preserved inputs, the result is identical by
         // construction. Battery-backed SRAM is intentionally reset to a fresh
         // (empty) image: a game with a save resumes through the seeded savestate
         // transfer, NOT this cold boot, so both peers still start byte-identical.
+        //
+        // The player's input setup survives too, as a console's controllers do:
+        // the key mapping, the pads and their mappings and dead zones, the port
+        // each feeds, the split keyboard. It is the host's, not the machine's:
+        // no savestate holds it, so the peers' machines still match. What any of
+        // it holds pressed is let go, so a button held across the cycle (a host
+        // that stops forwarding input never releases it) cannot reach the
+        // machine that boots.
         let rom = std::mem::take(&mut self.last_rom);
         let manifest = self.cartridge_manifest_override.take();
         let region = self.region;
         let capture_recording = self.capture_recording;
+        let mut input_manager = std::mem::take(&mut self.input_manager);
+        input_manager.release_all();
 
         *self = GenesisEmulator::new();
+        self.input_manager = input_manager;
         // What a capture records is the host's setting, not the machine's.
         self.set_capture_recording(capture_recording);
         // Must precede `load_rom`, which reads it to build the cartridge.

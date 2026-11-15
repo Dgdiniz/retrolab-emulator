@@ -24,6 +24,7 @@ use retro_core::types::ExecutionMode;
 use retro_core::{DebuggerCore, EmulatorCore, InputState};
 use sg1_core::io::devices::genesis_3button::Genesis3ButtonDevice;
 use sg1_core::GenesisEmulator;
+use std::collections::HashMap;
 
 mod helpers;
 use helpers::MiniCartridgeBuilder;
@@ -317,4 +318,68 @@ fn muting_the_core_changes_the_state_hash() {
         "muting no longer perturbs hashed state: revisit the netplay mute routing \
          (core audible, host output muted), which exists because it does"
     );
+}
+
+/// Netplay power-cycles both peers before its session. The player's
+/// controller setup (a remapped key, a pad with its mapping and dead zone,
+/// the port it feeds) outlives the cycle, as a console's controllers do;
+/// what it holds pressed does not: the host stops forwarding input to the
+/// core while the session drives the ports, so the release never comes, and
+/// a key still held would reach the host's machine and not the guest's.
+#[test]
+fn a_power_cycle_keeps_the_input_setup_and_lets_go_of_held_input() {
+    let mut host = booted();
+    let mut keys = host.input_manager().get_keyboard_mapping();
+    keys.insert("KeyQ".to_string(), BTN_C.trailing_zeros());
+    let pad_buttons = HashMap::from([(0, BTN_B.trailing_zeros())]);
+    let input = host.input_manager_mut();
+    input.set_keyboard_mapping(keys.clone());
+    assert!(input.add_gamepad("gamepad-0"));
+    input.set_gamepad_mapping("gamepad-0", pad_buttons.clone());
+    input.set_gamepad_deadzone("gamepad-0", 0.3);
+    input.set_provider_port("gamepad-0", Some(1));
+    input.update_keyboard("KeyQ".to_string(), true);
+    input.update_gamepad_button("gamepad-0".to_string(), 0, true);
+    host.set_input(0, InputState { buttons: BTN_B });
+    assert_eq!(host.input_manager().get_port_state(0), BTN_C | BTN_B);
+    assert_eq!(host.input_manager().get_port_state(1), BTN_B);
+
+    let mut guest = booted();
+    host.power_on_reset();
+    guest.power_on_reset();
+
+    let input = host.input_manager();
+    assert_eq!(
+        input.get_port_state(0),
+        0,
+        "a key or the override still held"
+    );
+    assert_eq!(input.get_port_state(1), 0, "the pad's button still held");
+    assert_eq!(input.get_keyboard_mapping(), keys);
+    assert_eq!(input.get_gamepad_mapping("gamepad-0"), pad_buttons);
+    assert_eq!(input.get_gamepad_deadzone("gamepad-0"), 0.3);
+    assert_eq!(input.provider_port("gamepad-0"), Some(1));
+
+    // From there both peers play the same input and stay one machine: the
+    // ROM reads the pad all the time, so a key still held would show.
+    for frame in 0..240 {
+        let buttons = schedule(frame);
+        host.set_input(0, InputState { buttons });
+        guest.set_input(0, InputState { buttons });
+        host.run_frame_headless();
+        guest.run_frame_headless();
+        assert_eq!(
+            host.state_hash(),
+            guest.state_hash(),
+            "the peers parted at frame {frame}"
+        );
+    }
+
+    // And the setup still plays: the remapped key and the pad reach their
+    // ports.
+    let input = host.input_manager_mut();
+    input.update_keyboard("KeyQ".to_string(), true);
+    input.update_gamepad_button("gamepad-0".to_string(), 0, true);
+    assert_eq!(input.get_port_state(0), BTN_C);
+    assert_eq!(input.get_port_state(1), BTN_B);
 }

@@ -94,6 +94,10 @@ impl InputManager {
         self.0.clear_all_direct_overrides();
     }
 
+    pub fn release_all(&mut self) {
+        self.0.release_all();
+    }
+
     pub fn update_keyboard(&mut self, keycode: String, pressed: bool) {
         self.0.update_keyboard(keycode, pressed);
     }
