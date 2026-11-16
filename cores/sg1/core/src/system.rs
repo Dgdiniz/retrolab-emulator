@@ -2533,15 +2533,12 @@ impl GenesisEmulator {
         }
         let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
+        // A taken interrupt wakes the CPU, so a stopped one took none here.
         if self.cpu.stopped {
-            let idle_cycles = 4u32;
-            self.master_cycles += idle_cycles as u64;
-            self.step_master_clocks_accumulated +=
-                (idle_cycles as u64) * (self.region.cpu_divider() as u64);
-            self.last_step_cycles = idle_cycles;
+            let idle_cycles = self.idle_stopped_68000();
             return StepResult {
                 cycles: idle_cycles,
-                breakpoint_hit: false,
+                breakpoint_hit: self.video_event_hit(),
                 instruction_executed: false,
             };
         }
@@ -2929,6 +2926,30 @@ impl GenesisEmulator {
         } else {
             0
         }
+    }
+
+    /// One step of a stopped 68000 on a debugger step, doing to the rest of
+    /// the machine what [`Self::step_fast`] does for one: the bus counters
+    /// cleared and stamped, the CPU's idle cycles (`M68k::step` gives 4 and
+    /// changes nothing else), the DRAM refresh, and the transfers and
+    /// the delay before the vertical interrupt's request counted down by
+    /// that time. Without the countdown the request a program waits for in
+    /// `STOP` never comes, and the program never wakes. Returns the cycles
+    /// charged.
+    fn idle_stopped_68000(&mut self) -> u32 {
+        self.bus.cycles_executed = 0;
+        self.bus.vdp_wait_cycles = 0;
+        self.bus.ym2612_mut().current_cpu_cycle = self.master_cycles;
+        self.bus.m68k_cycle = self.master_cycles;
+        let idle_cycles = self.cpu.step(&mut self.bus);
+        let total_cycles = idle_cycles + self.bus_refresh_penalty();
+        self.master_cycles += total_cycles as u64;
+        let total_master_clocks = (total_cycles as u64) * (self.region.cpu_divider() as u64);
+        self.step_master_clocks_accumulated += total_master_clocks;
+        self.bus.vdp_mut().tick_dma(total_master_clocks);
+        self.bus.vdp_mut().tick_vint_delay(total_master_clocks);
+        self.last_step_cycles = total_cycles;
+        total_cycles
     }
 
     /// Advance every cartridge coprocessor to the current master cycle. Run
@@ -4039,19 +4060,16 @@ impl GenesisEmulator {
         }
         let interrupt_event = irq_cycles > 0 && self.interrupt_event_hit(pending_level);
 
-        // If CPU is halted (STOP instruction), just consume idle cycles
+        // A CPU stopped by STOP idles; a taken interrupt wakes it, so a
+        // stopped one took none here.
         if self.cpu.stopped {
-            let idle_cycles = 4u32;
-            self.master_cycles += idle_cycles as u64;
-            self.step_master_clocks_accumulated +=
-                (idle_cycles as u64) * (self.region.cpu_divider() as u64);
-            self.last_step_cycles = idle_cycles;
+            let idle_cycles = self.idle_stopped_68000();
             if held {
-                self.charge_held_frame(irq_cycles + idle_cycles);
+                self.charge_held_frame(idle_cycles);
             }
             return StepResult {
                 cycles: idle_cycles,
-                breakpoint_hit: false,
+                breakpoint_hit: self.video_event_hit(),
                 instruction_executed: false,
             };
         }

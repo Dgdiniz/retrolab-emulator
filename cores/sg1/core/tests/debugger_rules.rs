@@ -2,8 +2,10 @@
 //! program: what a call and a return do to the call stack on both debugger
 //! frame loops, the order of the history, which trace asks to be flushed,
 //! where running on from a stop goes, what a step a host asks for records,
-//! what a reset or a load empties, and that the debugger's own reads leave
-//! the machine as it was.
+//! what a reset or a load empties, that the debugger's own reads leave the
+//! machine as it was, and that a program waiting in `STOP` for its
+//! interrupt wakes on both debugger loops and under a host's steps as it
+//! does on the play loop.
 
 mod helpers;
 
@@ -445,4 +447,85 @@ fn a_live_read_of_the_svp_dram_runs_the_dsp_and_a_debugger_read_does_not() {
     let read = [emu.bus_mut().read(0x300000), emu.bus_mut().read(0x300001)];
     assert_eq!(peeked, read, "the peek reads the DRAM the 68000 reads");
     assert!(machine(&emu) != before, "the 68000's read ran the DSP");
+}
+
+// ===== A program waiting in STOP =====
+
+/// Turns the vertical interrupt on and waits for it in `STOP #$2300`,
+/// counting its wake-ups at `$FF0004`; the interrupt's handler counts its
+/// entries at `$FF0000`.
+fn stop_program() -> Vec<u8> {
+    let mut program = M68kProgram::new(0x1000, 0x200);
+    program.vector(30, 0x300);
+    #[rustfmt::skip]
+    program.org(0x200).words(&[
+        0x46FC, 0x2700,                 // $200: MOVE.W #$2700,SR
+        0x41F9, 0x00C0, 0x0004,         // $204: LEA $C00004,A0
+        0x30BC, 0x8164,                 // $20A: MOVE.W #$8164,(A0): display and vertical interrupt on
+    ]);
+    #[rustfmt::skip]
+    program.label("idle").words(&[
+        0x4E72, 0x2300,                 // $20E: STOP #$2300
+        0x5279, 0x00FF, 0x0004,         // $212: ADDQ.W #1,($FF0004).L
+    ]).branch(0x6000, "idle"); // $218: BRA.W $20E
+    #[rustfmt::skip]
+    program.org(0x300).words(&[
+        0x5279, 0x00FF, 0x0000,         // $300: ADDQ.W #1,($FF0000).L
+        0x4E73,                         // $306: RTE
+    ]);
+    program.build()
+}
+
+/// The handler's entries and the program's wake-ups, as `stop_program`
+/// counts them.
+fn wake_counts(emu: &GenesisEmulator) -> (u16, u16) {
+    let ram = emu.bus().memory().work_ram.as_slice();
+    (
+        u16::from_be_bytes([ram[0], ram[1]]),
+        u16::from_be_bytes([ram[4], ram[5]]),
+    )
+}
+
+#[test]
+fn a_program_waiting_in_stop_wakes_for_its_interrupt_on_both_debugger_loops() {
+    let mut play = loaded(&stop_program());
+    for _ in 0..60 {
+        play.run_frame_fast();
+    }
+    let on_play = wake_counts(&play);
+    assert!(
+        on_play.0 >= 50,
+        "play takes the interrupt each frame: {on_play:?}"
+    );
+
+    for (name, frame) in BOTH_LOOPS {
+        let mut emu = loaded(&stop_program());
+        // An execute breakpoint nothing reaches, which is what puts a host
+        // on a debugger loop.
+        emu.debugger().add_breakpoint(execute_at(0xFF_FFF0));
+        emu.debugger().set_execution_mode(ExecutionMode::Running);
+        for _ in 0..60 {
+            frame(&mut emu);
+        }
+        assert_eq!(wake_counts(&emu), on_play, "the {name} loop");
+    }
+}
+
+#[test]
+fn a_program_waiting_in_stop_wakes_for_its_interrupt_under_a_hosts_steps() {
+    let mut emu = loaded(&stop_program());
+    for _ in 0..3 {
+        emu.run_frame_fast();
+    }
+    assert!(emu.cpu().stopped, "the program waits in STOP");
+    let (entries_before, _) = wake_counts(&emu);
+    // A frame and a half of idle time: a stopped 68000 idles 4 cycles a step.
+    for _ in 0..48_000 {
+        emu.step_cpu(MAIN_CPU);
+    }
+    let (entries_after, _) = wake_counts(&emu);
+    assert!(
+        entries_after > entries_before,
+        "no vertical interrupt came: {entries_before} entries before the steps, {entries_after} after"
+    );
 }
