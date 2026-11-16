@@ -250,7 +250,7 @@ impl Default for GenesisIo {
 }
 
 // Savestate support
-use crate::system::savestate::IoState;
+use crate::savestate::IoState;
 
 impl GenesisIo {
     pub fn to_savestate(&self) -> IoState {

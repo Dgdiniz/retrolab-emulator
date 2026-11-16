@@ -637,8 +637,8 @@ impl Default for EnvelopeGenerator {
 }
 
 impl EnvelopeGenerator {
-    pub fn to_savestate(&self) -> crate::system::savestate::EnvelopeState {
-        crate::system::savestate::EnvelopeState {
+    pub fn to_savestate(&self) -> crate::savestate::EnvelopeState {
+        crate::savestate::EnvelopeState {
             attack_rate: self.attack_rate,
             decay_rate: self.decay_rate,
             sustain_level: self.sustain_level,
@@ -657,7 +657,7 @@ impl EnvelopeGenerator {
         }
     }
 
-    pub fn from_savestate(&mut self, s: &crate::system::savestate::EnvelopeState) {
+    pub fn from_savestate(&mut self, s: &crate::savestate::EnvelopeState) {
         self.attack_rate = s.attack_rate;
         self.decay_rate = s.decay_rate;
         self.sustain_level = s.sustain_level;

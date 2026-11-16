@@ -29,7 +29,7 @@ use retro_core::savestate::{
     RETRO_SAVESTATE_ENVELOPE_VERSION,
 };
 use retro_core::EmulatorCore;
-use sg1_core::system::savestate::SystemSaveState;
+use sg1_core::savestate::SystemSaveState;
 use sg1_core::system::GenesisEmulator;
 
 const ITERATIONS: usize = 200;

@@ -1397,8 +1397,8 @@ pub use addressing::{Reg16, Reg8};
 
 // Savestate support
 impl Z80 {
-    pub fn to_savestate(&self) -> crate::system::savestate::Z80State {
-        crate::system::savestate::Z80State {
+    pub fn to_savestate(&self) -> crate::savestate::Z80State {
+        crate::savestate::Z80State {
             a: self.a,
             f: self.f,
             b: self.b,
@@ -1434,7 +1434,7 @@ impl Z80 {
         }
     }
 
-    pub fn from_savestate(&mut self, state: &crate::system::savestate::Z80State) {
+    pub fn from_savestate(&mut self, state: &crate::savestate::Z80State) {
         self.a = state.a;
         self.f = state.f;
         self.b = state.b;

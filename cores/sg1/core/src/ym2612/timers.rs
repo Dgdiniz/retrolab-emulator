@@ -239,8 +239,8 @@ impl Default for Timers {
 }
 
 impl Timers {
-    pub fn to_savestate(&self) -> crate::system::savestate::Ym2612TimerState {
-        crate::system::savestate::Ym2612TimerState {
+    pub fn to_savestate(&self) -> crate::savestate::Ym2612TimerState {
+        crate::savestate::Ym2612TimerState {
             ta_period: self.ta_period,
             ta_load: self.ta_load,
             ta_counter: self.ta_counter,
@@ -253,7 +253,7 @@ impl Timers {
         }
     }
 
-    pub fn from_savestate(&mut self, s: &crate::system::savestate::Ym2612TimerState) {
+    pub fn from_savestate(&mut self, s: &crate::savestate::Ym2612TimerState) {
         self.ta_period = s.ta_period;
         self.ta_load = s.ta_load;
         self.ta_counter = s.ta_counter;

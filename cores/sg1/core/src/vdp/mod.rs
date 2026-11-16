@@ -4246,7 +4246,7 @@ impl Vdp {
 }
 
 // Savestate support
-use crate::system::savestate::{VdpState, VdpTimingState};
+use crate::savestate::{VdpState, VdpTimingState};
 
 impl Vdp {
     /// Switch the VDP's video region (NTSC/PAL). Only the region flag

@@ -1116,7 +1116,7 @@ impl AudioChip for Ym2612 {
         // Flush the samples owed for the clocks accumulated since the last write
         // (rendered at the current register state), then hand the caller what it
         // asked for. The drift-free sample *count* over time is owned by the
-        // system's cycles->samples converter (see `system.rs`), not by this buffer,
+        // system's cycles->samples converter (see `system/audio.rs`), not by this buffer,
         // so any whole samples beyond what the caller drains are a sub-sample
         // rounding tail that must NOT persist: carrying them would replay stale
         // audio on the next call after a register write has since changed the chip
@@ -1279,7 +1279,7 @@ impl AudioDebugger for Ym2612 {
 }
 
 // Savestate support
-use crate::system::savestate::Ym2612State;
+use crate::savestate::Ym2612State;
 
 impl Ym2612 {
     pub fn to_savestate(&self) -> Ym2612State {

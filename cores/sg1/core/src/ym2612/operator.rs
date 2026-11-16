@@ -429,8 +429,8 @@ impl Operator {
 }
 
 impl Operator {
-    pub fn to_savestate(&self) -> crate::system::savestate::Ym2612OperatorState {
-        crate::system::savestate::Ym2612OperatorState {
+    pub fn to_savestate(&self) -> crate::savestate::Ym2612OperatorState {
+        crate::savestate::Ym2612OperatorState {
             freq_number: self.freq_number,
             block: self.block,
             detune: self.detune,
@@ -446,7 +446,7 @@ impl Operator {
         }
     }
 
-    pub fn from_savestate(&mut self, s: &crate::system::savestate::Ym2612OperatorState) {
+    pub fn from_savestate(&mut self, s: &crate::savestate::Ym2612OperatorState) {
         self.freq_number = s.freq_number;
         self.block = s.block;
         self.detune = s.detune;

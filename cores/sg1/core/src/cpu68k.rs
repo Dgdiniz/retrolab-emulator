@@ -1433,8 +1433,8 @@ impl Default for M68k {
 
 // Savestate support
 impl M68k {
-    pub fn to_savestate(&self) -> crate::system::savestate::Cpu68kState {
-        crate::system::savestate::Cpu68kState {
+    pub fn to_savestate(&self) -> crate::savestate::Cpu68kState {
+        crate::savestate::Cpu68kState {
             d: self.d,
             a: self.a,
             pc: self.pc,
@@ -1447,7 +1447,7 @@ impl M68k {
         }
     }
 
-    pub fn from_savestate(&mut self, state: &crate::system::savestate::Cpu68kState) {
+    pub fn from_savestate(&mut self, state: &crate::savestate::Cpu68kState) {
         self.d = state.d;
         self.a = state.a;
         self.pc = state.pc;

@@ -513,7 +513,7 @@ impl Clockable for Psg {
 }
 
 // Savestate support
-use crate::system::savestate::{NoiseChannelState, PsgState, ToneChannelState};
+use crate::savestate::{NoiseChannelState, PsgState, ToneChannelState};
 
 impl Psg {
     pub fn to_savestate(&self) -> PsgState {

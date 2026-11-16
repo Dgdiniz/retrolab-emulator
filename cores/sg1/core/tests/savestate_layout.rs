@@ -22,7 +22,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use retro_core::EmulatorCore;
-use sg1_core::system::savestate::SAVE_STATE_VERSION;
+use sg1_core::savestate::SAVE_STATE_VERSION;
 use sg1_core::system::GenesisEmulator;
 
 /// Where the program's loop is: the PC a savestate of it holds.

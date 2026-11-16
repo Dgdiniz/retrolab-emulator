@@ -824,7 +824,7 @@ impl Addressable for PeekView<'_> {
     }
 }
 
-use crate::system::savestate::BusState;
+use crate::savestate::BusState;
 
 impl AddressBus {
     pub fn to_savestate(&self) -> BusState {

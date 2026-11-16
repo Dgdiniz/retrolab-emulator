@@ -74,8 +74,8 @@ fn load_state_accepts_legacy_format_without_magic() {
     // Build a savestate in the legacy format (bincode + zstd, no
     // envelope) and make sure load_state still accepts it, so the
     // savestates older builds wrote keep loading.
-    use sg1_core::system::savestate::*;
-    use sg1_core::system::savestate_impl::serialize_and_compress;
+    use sg1_core::savestate::serialize_and_compress;
+    use sg1_core::savestate::*;
 
     let rom = test_rom();
     let mut a = GenesisEmulator::new();
@@ -172,8 +172,8 @@ fn load_state_with_any_rom_takes_a_state_made_on_another_rom() {
 #[test]
 fn a_legacy_savestate_from_another_rom_is_refused_by_title_unless_any_rom() {
     use retro_core::savestate::{LoadStateError, RomCheck};
-    use sg1_core::system::savestate::*;
-    use sg1_core::system::savestate_impl::serialize_and_compress;
+    use sg1_core::savestate::serialize_and_compress;
+    use sg1_core::savestate::*;
 
     let (rom_a, rom_b) = two_builds();
     let mut a = GenesisEmulator::new();

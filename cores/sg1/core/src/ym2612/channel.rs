@@ -638,8 +638,8 @@ impl Channel {
 }
 
 impl Channel {
-    pub fn to_savestate(&self) -> crate::system::savestate::Ym2612ChannelState {
-        crate::system::savestate::Ym2612ChannelState {
+    pub fn to_savestate(&self) -> crate::savestate::Ym2612ChannelState {
+        crate::savestate::Ym2612ChannelState {
             operators: [
                 self.operators[0].to_savestate(),
                 self.operators[1].to_savestate(),
@@ -659,7 +659,7 @@ impl Channel {
         }
     }
 
-    pub fn from_savestate(&mut self, s: &crate::system::savestate::Ym2612ChannelState) {
+    pub fn from_savestate(&mut self, s: &crate::savestate::Ym2612ChannelState) {
         for i in 0..4 {
             self.operators[i].from_savestate(&s.operators[i]);
         }
