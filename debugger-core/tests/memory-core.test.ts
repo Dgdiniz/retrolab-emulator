@@ -2,9 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   REGION_ADDRESSES,
   REGION_TABS,
-  canSaveRom,
   editAbsoluteAddress,
-  hasRomHashChanged,
   isSnapshotRegion,
   mergeSeenHashes,
   parseGotoAddress,
@@ -76,36 +74,6 @@ describe('memory-core > editAbsoluteAddress', () => {
   })
 })
 
-describe('memory-core > canSaveRom', () => {
-  const baseOk = {
-    wasmReady: true,
-    romLoaded: true,
-    contextType: 'library',
-    saving: false,
-  }
-
-  it('allows save when all conditions are met', () => {
-    expect(canSaveRom(baseOk)).toBe(true)
-  })
-
-  it('blocks when already saving', () => {
-    expect(canSaveRom({ ...baseOk, saving: true })).toBe(false)
-  })
-
-  it('blocks when WASM is not ready', () => {
-    expect(canSaveRom({ ...baseOk, wasmReady: false })).toBe(false)
-  })
-
-  it('blocks when no ROM is loaded', () => {
-    expect(canSaveRom({ ...baseOk, romLoaded: false })).toBe(false)
-  })
-
-  it('blocks when context type is not library', () => {
-    expect(canSaveRom({ ...baseOk, contextType: 'project' })).toBe(false)
-    expect(canSaveRom({ ...baseOk, contextType: null })).toBe(false)
-  })
-})
-
 describe('memory-core > regionLabel', () => {
   it('returns the label for known regions', () => {
     expect(regionLabel('ram')).toBe('RAM')
@@ -132,25 +100,5 @@ describe('memory-core > mergeSeenHashes', () => {
 
   it('handles empty input lists', () => {
     expect(mergeSeenHashes([], 'a')).toEqual(['a'])
-  })
-})
-
-describe('memory-core > hasRomHashChanged', () => {
-  it('is true when hashes differ', () => {
-    expect(hasRomHashChanged({ oldHash: 'a', newHash: 'b' })).toBe(true)
-  })
-
-  it('is false when hashes match', () => {
-    expect(hasRomHashChanged({ oldHash: 'a', newHash: 'a' })).toBe(false)
-  })
-
-  it('treats null/undefined/empty as missing and returns true for any non-empty new hash', () => {
-    expect(hasRomHashChanged({ oldHash: null, newHash: 'a' })).toBe(true)
-    expect(hasRomHashChanged({ oldHash: undefined, newHash: 'a' })).toBe(true)
-    expect(hasRomHashChanged({ oldHash: '', newHash: 'a' })).toBe(true)
-  })
-
-  it('returns false when both are empty', () => {
-    expect(hasRomHashChanged({ oldHash: '', newHash: '' })).toBe(false)
   })
 })

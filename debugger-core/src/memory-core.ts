@@ -73,25 +73,6 @@ export function editAbsoluteAddress(opts: EditAbsoluteOptions): number {
   return opts.baseAddress + opts.offset
 }
 
-export interface SaveRomDecisionInput {
-  wasmReady: boolean
-  romLoaded: boolean
-  contextType: string | null | undefined
-  saving: boolean
-}
-
-/**
- * Decide whether the "Save ROM" button should be enabled. Moves the
- * disable/enable logic out of the template expression to keep it
- * testable and consistent.
- */
-export function canSaveRom(input: SaveRomDecisionInput): boolean {
-  if (input.saving) return false
-  if (!input.wasmReady) return false
-  if (!input.romLoaded) return false
-  return input.contextType === 'library'
-}
-
 /**
  * Short label for a region id (used in UI buttons / tooltips). Falls
  * back to the id itself for unknown regions so the helper is total.
@@ -103,9 +84,8 @@ export function regionLabel(regionId: string): string {
 
 /**
  * Append `newHash` to `seen` without duplicating. Returns the original
- * array reference when the hash is already present so callers can
- * short-circuit persistence writes (saving ROM without really changing
- * the hash list would otherwise be indistinguishable from a no-op).
+ * array reference when the hash is already present, so a caller can skip
+ * a write that would change nothing.
  */
 export function mergeSeenHashes(
   seen: ReadonlyArray<string>,
@@ -113,20 +93,4 @@ export function mergeSeenHashes(
 ): ReadonlyArray<string> {
   if (seen.includes(newHash)) return seen
   return [...seen, newHash]
-}
-
-export interface RomHashChange {
-  oldHash: string | null | undefined
-  newHash: string
-}
-
-/**
- * True when the newly-computed ROM hash differs from the one currently
- * tracked by the game context. `null`/`undefined`/empty-string "old"
- * values are treated as "missing" and therefore a change.
- */
-export function hasRomHashChanged(input: RomHashChange): boolean {
-  const prev = input.oldHash ?? ''
-  if (!prev) return !!input.newHash
-  return prev !== input.newHash
 }
