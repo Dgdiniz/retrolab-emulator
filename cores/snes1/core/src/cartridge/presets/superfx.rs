@@ -6,7 +6,7 @@
 //! registers (`$3000-$34FF`), and Game Pak RAM all route to the one
 //! [`SuperFxChip`](crate::cartridge::SuperFxChip) via
 //! [`MapTarget::ChipMmio`], split apart by the `base` sentinel each slot
-//! carries (see `cartridge/superfx/mod.rs` for the sentinel contract). ROM is
+//! carries (see `cartridge/chips/superfx/mod.rs` for the sentinel contract). ROM is
 //! chip-routed so RON/RAN arbitration can hand the S-CPU open bus while the
 //! GSU owns the ROM/RAM buses; while the GSU is idle the chip returns the real
 //! ROM byte, so this is transparent for a booting game.

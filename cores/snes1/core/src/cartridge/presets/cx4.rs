@@ -5,7 +5,7 @@
 //! console's S-CPU through a LoROM-shaped map. ROM, the `$6000-7FFF` window,
 //! and (only when a manifest declares it) cart RAM all route to the one
 //! [`Cx4Chip`](crate::cartridge::Cx4Chip) via [`MapTarget::ChipMmio`], split
-//! apart by the `base` sentinel each slot carries (see `cartridge/cx4/mod.rs`
+//! apart by the `base` sentinel each slot carries (see `cartridge/chips/cx4/mod.rs`
 //! for the sentinel contract). ROM is chip-routed so the HG51B169's bus
 //! arbitration can interpose while the DSP owns the cart bus; while the chip is
 //! idle it returns the real ROM byte, so this is transparent for a booting

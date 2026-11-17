@@ -1,10 +1,34 @@
-//! The chip ids and chip-address bases of the SA-1, the Super FX and the
-//! Cx4: what a map plan carries for a cartridge window the chip serves.
+//! The SNES's coprocessors, each an independent
+//! [`Coprocessor`](retro_core::cartridge::Coprocessor) the cartridge's chip
+//! set hosts, reachable at the `chip_id` its map plan carries: the DSP-1
+//! ([`Dsp1Chip`], [`Dsp1Hle`]), the S-DD1 ([`Sdd1Chip`]), the SPC7110
+//! ([`Spc7110Chip`]), the SA-1, the Super FX and the Cx4.
 //!
-//! They live apart from the chip modules so that the presets, the bus and
-//! the builder can name them in a build that leaves a chip's module out
-//! (its `chip-*` feature off): such a cartridge is refused at load, but the
-//! code that would have mapped it still compiles.
+//! The SA-1, the Super FX and the Cx4 each sit behind a Cargo feature
+//! (`support` says which this build carries). Their chip ids and
+//! chip-address bases, what a map plan carries for a cartridge window the
+//! chip serves, are here, apart from their modules, so that the presets,
+//! the bus and the builder can name them in a build that leaves a chip's
+//! module out (its `chip-*` feature off): such a cartridge is refused at
+//! load, but the code that would have mapped it still compiles.
+//!
+//! [`Dsp1Chip`]: super::Dsp1Chip
+//! [`Dsp1Hle`]: super::Dsp1Hle
+//! [`Sdd1Chip`]: super::Sdd1Chip
+//! [`Spc7110Chip`]: super::Spc7110Chip
+
+#[cfg(feature = "chip-cx4")]
+pub mod cx4;
+pub(super) mod dsp1;
+pub(super) mod dsp1_hle;
+pub(super) mod firmware;
+#[cfg(feature = "chip-sa1")]
+pub(super) mod sa1;
+pub(super) mod sdd1;
+pub(super) mod spc7110;
+#[cfg(feature = "chip-superfx")]
+pub(super) mod superfx;
+pub(super) mod support;
 
 /// `chip_id` the bus dispatch carries for the SA-1. Distinct from the DSP-1
 /// (id 1), S-DD1 (id 5), and SPC7110 (id 6) so a manifest can place each at

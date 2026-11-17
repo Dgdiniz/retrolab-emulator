@@ -35,7 +35,7 @@
 //! from those logs.
 
 #[cfg(feature = "chip-cx4")]
-use crate::cartridge::cx4::instructions::disassemble as disassemble_cx4;
+use crate::cartridge::chips::cx4::instructions::disassemble as disassemble_cx4;
 #[cfg(feature = "chip-cx4")]
 use crate::debugger::TraceEntryBinaryCx4;
 #[cfg(feature = "chip-superfx")]

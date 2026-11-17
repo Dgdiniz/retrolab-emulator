@@ -70,12 +70,12 @@ use retro_core::cartridge::{
     MapperInfo, SRAMType,
 };
 
-use crate::cartridge::chip_support::{unsupported_chip, unsupported_preset};
-use crate::cartridge::detect::{detect_preset_with_threshold, DEFAULT_DETECT_THRESHOLD};
-use crate::cartridge::dsp1::{
+use crate::cartridge::chips::dsp1::{
     detect_dsp1_layout, is_dsp1_kind, CoprocessorMode, Dsp1Layout, DEFAULT_MASTER_CLOCK_HZ,
     DSP1_CHIP_ID,
 };
+use crate::cartridge::chips::support::{unsupported_chip, unsupported_preset};
+use crate::cartridge::detect::{detect_preset_with_threshold, DEFAULT_DETECT_THRESHOLD};
 use crate::cartridge::factory::{
     Cx4Config, Sa1Config, Snes1ChipFactory, Spc7110Config, SuperFxConfig,
 };

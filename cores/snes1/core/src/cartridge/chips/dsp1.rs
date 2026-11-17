@@ -4,7 +4,7 @@
 //! behind its DR/SR register window. Behind it runs either the
 //! firmware-free HLE or, with the `nec-lle` feature, an emulated NEC
 //! uPD7725 (the `upd7725` crate) running a real DSP-1 firmware dump. The
-//! cartridge's combined [`MapPlan`](super::MapPlan) holds the stock
+//! cartridge's combined [`MapPlan`](crate::cartridge::MapPlan) holds the stock
 //! ROM/SRAM slots *plus* the DSP register window, so the bus dispatches
 //! ROM reads to the ROM and the DSP register window to the chip.
 //!
@@ -35,8 +35,8 @@
 //!
 //! **Backend selection.** The DSP-1 ships as a [`Dsp1Chip`] implementing
 //! the generic [`Coprocessor`] trait, placed at [`DSP1_CHIP_ID`] in a
-//! [`SnesCartridge`](super::SnesCartridge)'s chip set. Three backends sit behind the same
-//! register window:
+//! [`SnesCartridge`](crate::cartridge::SnesCartridge)'s chip set. Three
+//! backends sit behind the same register window:
 //!
 //! - **LLE**: a real uPD7725 (the `upd7725` crate, built only with the
 //!   `nec-lle` feature) running the firmware dump, lazily clocked (above).
@@ -65,8 +65,8 @@ use crate::savestate::Dsp1State;
 
 #[cfg(feature = "nec-lle")]
 use super::firmware::{ByteOrder, Dsp1Firmware, Dsp1Revision};
-use super::header::SnesHeader;
-use super::{BusSpeed, MapSlot, MapTarget};
+use crate::cartridge::header::SnesHeader;
+use crate::cartridge::{BusSpeed, MapSlot, MapTarget};
 
 /// `chip_id` the bus dispatch carries for the DSP-1. Matches the
 /// manifest convention (`chips[].id = 1`). A second NEC chip (ST010, ...)
@@ -233,9 +233,9 @@ enum Backend {
 /// The DSP-1 coprocessor as a [`Coprocessor`].
 ///
 /// Holds *only* the coprocessor state behind the DR/SR window, the
-/// ROM/SRAM live in the [`SnesCartridge`](super::SnesCartridge) whose chip set hosts this
-/// chip. The backend is either a firmware-running uPD7725 (LLE) or the idle
-/// stub; the firmware-free HLE backend lives in
+/// ROM/SRAM live in the [`SnesCartridge`](crate::cartridge::SnesCartridge)
+/// whose chip set hosts this chip. The backend is either a firmware-running
+/// uPD7725 (LLE) or the idle stub; the firmware-free HLE backend lives in
 /// [`Dsp1Hle`](super::dsp1_hle::Dsp1Hle) and is selected by the builder.
 pub struct Dsp1Chip {
     backend: Backend,
@@ -699,7 +699,7 @@ fn lle_chip(
 mod tests {
     use super::*;
     #[cfg(feature = "nec-lle")]
-    use crate::cartridge::firmware::ByteOrder;
+    use crate::cartridge::chips::firmware::ByteOrder;
     use crate::cartridge::MapTarget;
     #[cfg(feature = "nec-lle")]
     use crate::cartridge::{BusSpeed, MapPlan, MapSlot};

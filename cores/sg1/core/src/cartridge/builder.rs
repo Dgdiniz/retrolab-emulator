@@ -27,8 +27,8 @@ use retro_core::cartridge::{
     ExpansionChipInfo, ExpansionChipType, MapperId, MapperInfo, Region,
 };
 
-use crate::cartridge::detection::{calculate_genesis_checksum, detect_genesis_mapper};
-use crate::cartridge::parsers::{GenesisHeaderParser, SRAM_SIZE_LIMIT};
+use crate::cartridge::detect::{calculate_genesis_checksum, detect_genesis_mapper};
+use crate::cartridge::header::{GenesisHeaderParser, SRAM_SIZE_LIMIT};
 
 use super::board::{GenesisBoard, GenesisCartridge};
 use super::factory::{Sg1ChipFactory, DEFAULT_EEPROM_SIZE};

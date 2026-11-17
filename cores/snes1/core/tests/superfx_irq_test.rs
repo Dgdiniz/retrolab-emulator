@@ -19,7 +19,7 @@
 //!
 //! The GSU register/flag semantics are unit-tested in the `superfx-gsu` crate
 //! (`stop_clears_go_and_raises_irq`, `stop_irq_masked_by_cfgr`); the chip-level
-//! raise/clear in `cartridge::superfx` (`stop_raises_scpu_irq_and_read_3031_
+//! raise/clear in `cartridge::chips::superfx` (`stop_raises_scpu_irq_and_read_3031_
 //! clears_it`, `masked_stop_does_not_raise_irq`). The cases here pin the
 //! integration through the real 65C816 those layers stop short of.
 //!

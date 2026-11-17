@@ -30,7 +30,7 @@
 //! ## One chip, five windows
 //!
 //! The chip answers on five windows of the S-CPU's bus, routed here by
-//! [`super::presets::sa1_preset`] with a base that tells them apart:
+//! [`crate::cartridge::presets::sa1_preset`] with a base that tells them apart:
 //!
 //! - **Registers** (`SA1_MMIO_BASE`): `$2200-$23FF`, the bank folded away.
 //! - **I-RAM** (`SA1_IRAM_BASE`): `$3000-$37FF`, every bank the same 2 KiB.
@@ -81,7 +81,7 @@ use registers::{field, flag, Bytes};
 use timer::Sa1Timer;
 use varbit::Sa1VarBit;
 
-pub use crate::cartridge::chip_ids::{
+pub use crate::cartridge::chips::{
     SA1_BWRAM_BASE, SA1_BWRAM_LINEAR_BASE, SA1_IRAM_BASE, SA1_MMIO_BASE, SA1_ROM_BASE,
 };
 

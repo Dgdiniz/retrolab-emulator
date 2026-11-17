@@ -9,8 +9,8 @@
 //! **DCU** decompress port (`$50`/`$58`), and the write-gated **SRAM**
 //! (`$6000-7FFF`). All of them arrive here as
 //! [`MapTarget::ChipMmio`](retro_core::cartridge::MapTarget) dispatches from
-//! [`super::presets::spc7110_preset`], split apart by the `base` sentinel the
-//! slot carries:
+//! [`crate::cartridge::presets::spc7110_preset`], split apart by the `base`
+//! sentinel the slot carries:
 //!
 //! - **Registers** (`base = SPC7110_REG_BASE`): the CPU sees `$4800-483F`
 //!   (and `$4840-4842` for RTC carts); the chip receives `SPC7110_REG_BASE +
@@ -150,7 +150,7 @@ fn read_data_rom(rom: &[u8], real_rom_len: usize, logical: u32) -> u8 {
 /// decompressor and the data port), the flat `$4800-4842` register
 /// array, the three computed `dx/ex/fx` data-ROM window offsets, and the
 /// battery-backed SRAM. The directly-mapped program ROM windows live in the
-/// hosting [`SnesCartridge`](super::SnesCartridge); the chip only
+/// hosting [`SnesCartridge`](crate::cartridge::SnesCartridge); the chip only
 /// serves the routed MCU / DCU / SRAM windows and its own registers.
 pub struct Spc7110Chip {
     /// Cartridge ROM image (padded to a power of two), shared with the bus.

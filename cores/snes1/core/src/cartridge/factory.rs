@@ -22,14 +22,14 @@ use std::sync::Arc;
 use retro_core::cartridge::{ChipFactory, Coprocessor};
 
 #[cfg(feature = "chip-cx4")]
-use super::cx4::Cx4Chip;
-use super::dsp1::{is_dsp1_kind, select_dsp1_chip, CoprocessorMode, Dsp1Layout};
+use super::chips::cx4::Cx4Chip;
+use super::chips::dsp1::{is_dsp1_kind, select_dsp1_chip, CoprocessorMode, Dsp1Layout};
 #[cfg(feature = "chip-sa1")]
-use super::sa1::Sa1Chip;
-use super::sdd1::Sdd1Chip;
-use super::spc7110::Spc7110Chip;
+use super::chips::sa1::Sa1Chip;
+use super::chips::sdd1::Sdd1Chip;
+use super::chips::spc7110::Spc7110Chip;
 #[cfg(feature = "chip-superfx")]
-use super::superfx::SuperFxChip;
+use super::chips::superfx::SuperFxChip;
 
 /// SPC7110 build context the generic `build` signature can't carry: the
 /// unpadded ROM length (for `datarom_addr` wrapping), the battery SRAM size,

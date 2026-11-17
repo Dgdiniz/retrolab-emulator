@@ -21,8 +21,8 @@
 //!
 //! A single [`SuperFxChip`] answers on three disjoint bus windows, all routed
 //! here as [`MapTarget::ChipMmio`](retro_core::cartridge::MapTarget) from
-//! [`super::presets::superfx_preset`] and split apart by the `base` sentinel
-//! the slot carries:
+//! [`crate::cartridge::presets::superfx_preset`] and split apart by the
+//! `base` sentinel the slot carries:
 //!
 //! - **Registers** (`base = SUPERFX_MMIO_BASE`): `$3000-$34FF` (`$3000-301F`
 //!   R0-R15, `$3030-303F` control and status, `$3100-32FF` the instruction
@@ -61,7 +61,7 @@ use self::bus::{GsuBus, GsuPeekBus};
 use crate::debugger::{cpu_state_gsu, TraceEntryBinaryGsu};
 use crate::savestate::{CoprocessorState, SuperFxPixelCacheState, SuperFxState};
 
-pub use crate::cartridge::chip_ids::{SUPERFX_MMIO_BASE, SUPERFX_RAM_BASE, SUPERFX_ROM_BASE};
+pub use crate::cartridge::chips::{SUPERFX_MMIO_BASE, SUPERFX_RAM_BASE, SUPERFX_ROM_BASE};
 
 /// What the S-CPU reads from Game Pak ROM while the GSU holds the ROM bus
 /// (`SFR.G` and `SCMR.RON`), by the low nibble of the address. The same

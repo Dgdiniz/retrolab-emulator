@@ -1,6 +1,6 @@
 //! Genesis-specific ROM header parsers
 
-use super::detection::*;
+use super::detect::*;
 use retro_core::cartridge::detection::*;
 use retro_core::cartridge::*;
 

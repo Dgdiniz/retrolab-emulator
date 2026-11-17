@@ -4,10 +4,10 @@
 //! (`chip-sa1`, `chip-superfx`, `chip-cx4`, all on by default), so a build
 //! can leave a chip's module out. A cartridge that needs a chip the build
 //! has no module for is refused at load with
-//! [`BuildError::UnsupportedChip`](super::BuildError::UnsupportedChip)
+//! [`BuildError::UnsupportedChip`](crate::cartridge::BuildError::UnsupportedChip)
 //! naming the chip, which a host maps to another core.
 
-use super::PresetKind;
+use crate::cartridge::PresetKind;
 
 /// Whether this build carries the SA-1 (the `chip-sa1` feature).
 pub const CHIP_SA1_BUILT: bool = cfg!(feature = "chip-sa1");

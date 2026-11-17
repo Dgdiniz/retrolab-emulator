@@ -17,8 +17,8 @@
 //!
 //! A single [`Cx4Chip`] answers on three disjoint bus windows, all routed here
 //! as [`MapTarget::ChipMmio`](retro_core::cartridge::MapTarget) from
-//! [`super::presets::cx4_preset`] and split apart by the `base` sentinel each
-//! slot carries:
+//! [`crate::cartridge::presets::cx4_preset`] and split apart by the `base`
+//! sentinel each slot carries:
 //!
 //! - **MMIO + data RAM** (`base = CX4_MMIO_BASE`): the `$6000-7FFF` window in
 //!   both system-bank halves. The slot folds the source bank away (stride `0`),
@@ -76,7 +76,7 @@ use retro_core::types::{CpuState, Instruction};
 use crate::debugger::{cpu_state_hg51b, TraceEntryBinaryCx4};
 use crate::savestate::{ConverterState, CoprocessorState, Cx4State};
 
-pub use crate::cartridge::chip_ids::{CX4_CHIP_ID, CX4_MMIO_BASE, CX4_RAM_BASE, CX4_ROM_BASE};
+pub use crate::cartridge::chips::{CX4_CHIP_ID, CX4_MMIO_BASE, CX4_RAM_BASE, CX4_ROM_BASE};
 
 /// The HG51B169's own clock (20 MHz), independent of and slower than the SNES
 /// master clock (~21.477 MHz NTSC). The lazy [`catch_up`](Cx4Chip::catch_up)

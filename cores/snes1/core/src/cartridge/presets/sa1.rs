@@ -4,7 +4,7 @@
 //! set of windows that no stock preset knows about, so it owns its whole plan.
 //! Every window routes to the one [`Sa1Chip`](crate::cartridge::Sa1Chip) via
 //! [`MapTarget::ChipMmio`], split apart by the `base` sentinel the slot carries
-//! (see `cartridge/sa1/mod.rs` for the sentinel contract):
+//! (see `cartridge/chips/sa1/mod.rs` for the sentinel contract):
 //!
 //! - **MMIO** `$00-3F/$80-BF:2200-23FF` -> `SA1_MMIO_BASE` (`0` bank stride, so
 //!   a register access arrives as `SA1_MMIO_BASE + (reg - 0x2200)`). The

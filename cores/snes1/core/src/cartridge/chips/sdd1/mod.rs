@@ -32,7 +32,7 @@
 //!
 //! A single [`Sdd1Chip`] answers on two disjoint bus windows, both routed
 //! here as `MapTarget::ChipMmio` dispatches (see the map in
-//! [`super::presets::sdd1_preset`]):
+//! [`crate::cartridge::presets::sdd1_preset`]):
 //!
 //! - **Registers `$4800-$480F`.** Carved out of the CpuMmio page by the
 //!   bus and dispatched with `base = SDD1_REG_WINDOW_BASE`, so the chip
@@ -108,7 +108,7 @@ struct DmaShadow {
 /// four MMC super-bank latches, and the two enable bitmasks, plus the
 /// decompression working set (the per-channel DMA shadow and the pending
 /// output buffer). The ROM/SRAM windows and program banks live in the
-/// [`SnesCartridge`](super::SnesCartridge) that hosts this chip;
+/// [`SnesCartridge`](crate::cartridge::SnesCartridge) that hosts this chip;
 /// the chip only ever serves the `$C0-$FF` MMC window and its own registers.
 pub struct Sdd1Chip {
     /// Cartridge ROM image, shared with the bus (the MMC indexes into it and

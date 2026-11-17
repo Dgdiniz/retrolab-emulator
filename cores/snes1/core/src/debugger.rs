@@ -41,7 +41,7 @@ use spc700::Spc700;
 use superfx_gsu::Gsu;
 
 #[cfg(feature = "chip-cx4")]
-use crate::cartridge::cx4::hg51b::Hg51b;
+use crate::cartridge::chips::cx4::hg51b::Hg51b;
 use crate::ppu::PpuDebugEvent;
 use wdc65816::Wdc65816;
 

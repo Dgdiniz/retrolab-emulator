@@ -29,7 +29,7 @@ default = ["chip-sa1", "chip-superfx", "chip-cx4", "nec-lle"]
 # out. All three modules are this tree's own; the SA-1's and the Super FX's
 # follow ares (ISC) where ares holds the same code. With a feature off, a
 # cartridge that needs the chip is refused at load with
-# `BuildError::UnsupportedChip` naming it (`cartridge/chip_support.rs`),
+# `BuildError::UnsupportedChip` naming it (`cartridge/chips/support.rs`),
 # and the host picks another core.
 chip-sa1 = []
 chip-superfx = ["dep:superfx-gsu"]
@@ -38,7 +38,7 @@ chip-cx4 = []
 # dump. On by default, like the three chips; the crate is this tree's own
 # and follows ares (ISC) where ares holds the same code, as the SA-1's
 # and the Super FX's modules do. Off, a DSP-1 game runs on the
-# firmware-free HLE (`cartridge/dsp1_hle/`), a staged firmware is ignored,
+# firmware-free HLE (`cartridge/chips/dsp1_hle/`), a staged firmware is ignored,
 # and a forced `CoprocessorMode::Lle` installs an idle stub whose label
 # says the emulation is not built.
 nec-lle = ["dep:upd7725"]

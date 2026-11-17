@@ -55,7 +55,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------
 
 PicoDrive's SVP files, in cpus/ssp1601/ and
-cores/sg1/core/src/cartridge/composable/chips/svp.rs
+cores/sg1/core/src/cartridge/chips/svp.rs
 https://github.com/notaz/picodrive
 
 Copyright (c) Gražvydas "notaz" Ignotas, 2008
@@ -85,7 +85,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------
 
 The SPC7110 emulator by byuu and neviksti, in
-cores/snes1/core/src/cartridge/spc7110/
+cores/snes1/core/src/cartridge/chips/spc7110/
 
 SPC7110 emulator - version 0.04 (2010-02-14)
 Copyright (c) 2008-2010, byuu and neviksti
@@ -104,8 +104,8 @@ or in connection with the use or performance of this software.
 
 ------------------------------------------------------------------------
 
-ares, in cores/snes1/core/src/cartridge/sa1/, cpus/superfx-gsu/ and
-cpus/upd7725/
+ares, in cores/snes1/core/src/cartridge/chips/sa1/, cpus/superfx-gsu/
+and cpus/upd7725/
 https://github.com/ares-emulator/ares
 
 ares
@@ -132,6 +132,7 @@ The positions of the video chip's access slots in
 cores/sg1/core/src/vdp/mod.rs are Roger Sanders's measurements, as Exodus
 documents them (https://github.com/RogerSanders/Exodus).
 
-The S-DD1 decompressor in cores/snes1/core/src/cartridge/sdd1/decomp.rs
-is written from the public-domain code of Andreas Naive, who worked out
-the chip's algorithm.
+The S-DD1 decompressor in
+cores/snes1/core/src/cartridge/chips/sdd1/decomp.rs is written from the
+public-domain code of Andreas Naive, who worked out the chip's
+algorithm.
