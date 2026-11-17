@@ -92,9 +92,9 @@ impl GenesisEmulator {
         };
 
         // The machine becomes the savestate's, which ends a frame: a frame
-        // held part of the way through is dropped, and the calls the call
-        // stack holds belong to the machine replaced.
-        self.held_frame = None;
+        // in progress is dropped, and the calls the call stack holds belong
+        // to the machine replaced.
+        self.drop_frame();
         self.debugger.machine_replaced();
 
         // Apply state to all components

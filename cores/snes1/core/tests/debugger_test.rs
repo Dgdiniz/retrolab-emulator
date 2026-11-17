@@ -914,12 +914,12 @@ mod debugger_state_tests {
     fn tier_follows_breakpoints_tracing_and_mode() {
         let mut d = snes_debugger(test_sysinfo());
         // Running + nothing instrumented -> Fast.
-        assert_eq!(d.execution_tier(), ExecutionTier::Fast);
+        assert_eq!(d.execution_tier(), ExecutionTier::Play);
         // Tracing on any CPU -> LightDebug.
         d.set_tracing_enabled(0, true);
         assert_eq!(d.execution_tier(), ExecutionTier::LightDebug);
         d.set_tracing_enabled(0, false);
-        assert_eq!(d.execution_tier(), ExecutionTier::Fast);
+        assert_eq!(d.execution_tier(), ExecutionTier::Play);
         // A breakpoint -> LightDebug.
         d.add_breakpoint(exec_bp(0x1234));
         assert_eq!(d.execution_tier(), ExecutionTier::LightDebug);

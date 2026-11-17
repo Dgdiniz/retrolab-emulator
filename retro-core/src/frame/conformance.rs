@@ -12,11 +12,14 @@
 //!
 //! The program must, from its first frame on: run one instruction several
 //! times a frame, the first time before its first interrupt; make a call
-//! and return from it before its first interrupt; wait for an interrupt
-//! once a frame, well before the interrupt comes; and take that interrupt
-//! every frame from outside any call. A check that compares two machines
-//! compares their state hashes, so every check holds the debugger to
-//! changing nothing of the machine.
+//! and return from it before its first interrupt, and again after the
+//! machine starts over; wait for an interrupt once a frame, well before
+//! the interrupt comes; and take that interrupt every frame from outside
+//! any call, on a CPU that runs the handler's first instruction in the step
+//! that takes the interrupt, where the core handles what falls due (a host
+//! step stops in front of the handler's first instruction only there). A
+//! check that compares two machines compares their state hashes, so every
+//! check holds the debugger to changing nothing of the machine.
 
 use crate::debug::{ExecutionTier, MAIN_CPU};
 use crate::golden::arm_everything;
@@ -25,7 +28,9 @@ use crate::types::{
 };
 use crate::EmulatorCore;
 
-use super::{finish_held_frame, run_frame_headless, run_to_capture_boundary, DebugMachine};
+use super::{
+    finish_held_frame, run_frame_headless, run_frame_on, run_to_capture_boundary, DebugMachine,
+};
 
 /// Frames a check that looks at a run of frames runs.
 const FRAMES: u64 = 6;
@@ -40,6 +45,8 @@ pub struct FrameCoreUnderTest<E> {
     /// A new emulator with the program loaded and nothing run, its debugger
     /// running with nothing instrumented.
     pub build: fn() -> E,
+    /// The program [`Self::build`] loads, for a check that loads it again.
+    pub rom: Vec<u8>,
     /// The core's hash of everything its savestate holds.
     pub state_hash: fn(&E) -> u64,
     /// The hashes of the parts the state hash is made of, each named, so a
@@ -52,7 +59,10 @@ pub struct FrameCoreUnderTest<E> {
     /// and that does not branch to itself.
     pub repeated_address: u32,
     /// The first instruction of the interrupt handler the program enters
-    /// every frame, from outside any call.
+    /// every frame, from outside any call. On a CPU that runs the handler's
+    /// first instruction in the step that takes the interrupt, the
+    /// interrupt is taken where the core handles what falls due: a host
+    /// step stops in front of the handler's first instruction only there.
     pub handler_address: u32,
     /// A call the program makes before its first interrupt: the address of
     /// the call instruction and the address its return comes back to.
@@ -98,6 +108,8 @@ macro_rules! frame_conformance_tests {
             the_play_tier_records_coverage,
             a_cpu_that_cannot_run_calls_no_hook,
             profiled_runs_the_play_machine,
+            the_play_tier_runs_with_nothing_armed,
+            a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -753,7 +765,7 @@ pub fn run_full_refreshes_when_paused_and_steps_once<E: DebugMachine>(
 pub fn the_play_tier_records_coverage<E: DebugMachine>(core: &FrameCoreUnderTest<E>) {
     let address = core.repeated_address;
     let mut played = (core.build)();
-    assert_eq!(played.debugger_ref().execution_tier(), ExecutionTier::Fast);
+    assert_eq!(played.debugger_ref().execution_tier(), ExecutionTier::Play);
     played.run_frame();
     assert!(played.debugger_ref().is_covered(MAIN_CPU, address));
     assert!(played.debugger_ref().coverage_stats(MAIN_CPU).1 > 0);
@@ -825,8 +837,90 @@ pub fn profiled_runs_the_play_machine<E: DebugMachine>(core: &FrameCoreUnderTest
                 profile.due_ns + profile.run_ns + profile.close_ns <= profile.total_ns,
                 "frame {frame}: the parts fit in the whole"
             );
+            let chips = profile.chips();
+            for (i, chip) in chips.iter().enumerate() {
+                assert!(
+                    !chip.chip.is_empty(),
+                    "frame {frame}: every part has a name"
+                );
+                assert!(
+                    chips[..i].iter().all(|other| other.chip != chip.chip),
+                    "frame {frame}: {} is listed once",
+                    chip.chip
+                );
+            }
         }
     }
     #[cfg(target_arch = "wasm32")]
     let _ = core;
+}
+
+/// A frame call on the play tier runs with the debugger disarmed, whatever
+/// is set: the play tier's machine, nothing stopped, counted or traced;
+/// the next frame call on the debugger's tier finds it armed again.
+pub fn the_play_tier_runs_with_nothing_armed<E: DebugMachine>(core: &FrameCoreUnderTest<E>) {
+    let mut play = (core.build)();
+    let mut armed = (core.build)();
+    arm_everything(&mut armed);
+    for frame in 1..=FRAMES {
+        play.run_frame();
+        run_frame_on(&mut armed, ExecutionTier::Play);
+        assert!(
+            !paused(&armed),
+            "frame {frame}: nothing stops the play tier"
+        );
+        assert_eq!(
+            (core.state_hash)(&armed),
+            (core.state_hash)(&play),
+            "frame {frame}: the play tier with checks set parts from it in {:?}",
+            parted(core, &armed, &play)
+        );
+    }
+    assert!(
+        all_hits(&armed).iter().all(|&n| n == 0),
+        "no breakpoint counted"
+    );
+    assert!(traced(&armed).iter().all(|&n| n == 0), "nothing traced");
+    assert!(call_stack(&armed).is_empty());
+    assert!(history(&armed).is_empty());
+
+    armed.run_frame();
+    assert!(
+        all_hits(&armed).iter().any(|&n| n > 0),
+        "the debugger's tier finds it armed again"
+    );
+}
+
+/// A reset, a load of the program and a load of a savestate each empty the
+/// main CPU's call stack (the machine they leave made none of its calls)
+/// and keep its history (what ran is still what ran).
+pub fn a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history<E: DebugMachine>(
+    core: &FrameCoreUnderTest<E>,
+) {
+    let (site, _) = core.call;
+    let state = (core.build)().save_state();
+    assert!(!state.is_empty(), "a new machine saves its state");
+    let mut e = (core.build)();
+    let into_the_call = |e: &mut E| {
+        step_to(e, site, "host steps to the call");
+        let depth = call_stack(e).len();
+        e.step_cpu(MAIN_CPU);
+        assert_eq!(call_stack(e).len(), depth + 1, "the call pushed a frame");
+        history(e)
+    };
+
+    let kept = into_the_call(&mut e);
+    e.reset();
+    assert!(call_stack(&e).is_empty(), "after a reset");
+    assert_eq!(history(&e), kept, "a reset keeps the history");
+
+    let kept = into_the_call(&mut e);
+    e.load_rom(&core.rom).expect("the program loads again");
+    assert!(call_stack(&e).is_empty(), "after a load of the program");
+    assert_eq!(history(&e), kept, "a load of the program keeps the history");
+
+    let kept = into_the_call(&mut e);
+    e.load_state(&state).expect("the state loads");
+    assert!(call_stack(&e).is_empty(), "after a state load");
+    assert_eq!(history(&e), kept, "a state load keeps the history");
 }

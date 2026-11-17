@@ -52,6 +52,7 @@ pub fn run_frame<M: FrameMachine, T: Tier<M>>(m: &mut M, tier: &mut T) -> FrameC
             break;
         }
         if stop {
+            m.present_stop();
             tier.stopped(m);
             return FrameCall::Stopped;
         }
@@ -63,6 +64,7 @@ pub fn run_frame<M: FrameMachine, T: Tier<M>>(m: &mut M, tier: &mut T) -> FrameC
                 while m.now() < target {
                     if m.machine_step(&mut run, tier).is_none() || tier.stop_requested(m) {
                         m.end_run(run);
+                        m.present_stop();
                         tier.stopped(m);
                         return FrameCall::Stopped;
                     }
@@ -71,6 +73,7 @@ pub fn run_frame<M: FrameMachine, T: Tier<M>>(m: &mut M, tier: &mut T) -> FrameC
             None => {
                 if m.machine_step(&mut run, tier).is_none() || tier.stop_requested(m) {
                     m.end_run(run);
+                    m.present_stop();
                     tier.stopped(m);
                     return FrameCall::Stopped;
                 }
@@ -82,47 +85,67 @@ pub fn run_frame<M: FrameMachine, T: Tier<M>>(m: &mut M, tier: &mut T) -> FrameC
     FrameCall::Ended
 }
 
-/// The frame call a host makes: arm the debugger as its state asks, then
-/// the loop `tier` names (`Fast`: the play tier; `LightDebug`: the
-/// debugger's tier while it runs; `FullDebug`: [`run_full`]).
+/// The frame call a host makes: the loop `tier` names (`Play`: the play
+/// tier, run with the debugger disarmed for its length; `LightDebug`: the
+/// debugger's tier while it runs; `FullDebug`: [`run_full`]), the debugger
+/// armed as its state asks for the two debug tiers.
 pub fn run_frame_on<M: DebugMachine>(m: &mut M, tier: ExecutionTier) -> FrameCall {
-    m.arm();
+    if tier != ExecutionTier::Play {
+        m.arm();
+    }
     run_tier(m, tier)
 }
 
-/// The loop `tier` names, armed already.
+/// The loop `tier` names; the debug tiers armed already.
 fn run_tier<M: DebugMachine>(m: &mut M, tier: ExecutionTier) -> FrameCall {
     match tier {
-        ExecutionTier::Fast => run_frame(m, &mut Play),
+        ExecutionTier::Play => play_frame(m),
         ExecutionTier::LightDebug => run_frame(m, &mut LightDebug),
         ExecutionTier::FullDebug => run_full(m),
     }
 }
 
+/// A frame call on the play tier, the debugger disarmed for its length and
+/// armed again after: the play tier checks nothing, so nothing may be left
+/// armed to record what no check will read (a video chip's events raised
+/// for a breakpoint the play tier never drains, which the next debug frame
+/// would stop on).
+fn play_frame<M: DebugMachine>(m: &mut M) -> FrameCall {
+    m.disarm();
+    let call = run_frame(m, &mut Play);
+    m.arm();
+    call
+}
+
 /// The debugger's tier while it is paused or stepping. Paused, it writes
 /// the CPU states the debugger shows and runs nothing; in a step mode it
 /// makes one host step, then pauses (the step wrote the states already).
+/// Either way the host's picture shows the frame as far as it is drawn
+/// ([`FrameMachine::present_stop`]).
 pub fn run_full<M: DebugMachine>(m: &mut M) -> FrameCall {
     if m.debug_state().get_execution_mode() == ExecutionMode::Paused {
         m.refresh_debugger_state();
+        m.present_stop();
         return FrameCall::Stopped;
     }
     step_on_full(m);
     m.debug_state_mut()
         .set_execution_mode(ExecutionMode::Paused);
+    m.present_stop();
     FrameCall::Stopped
 }
 
 /// The step a host asks for on the main CPU, the one step of the frame
 /// loop: what is due before its instruction is handled first, as a pass
 /// of the loop handles it, then the step runs on the [`FullDebug`] tier,
-/// then what it made due is handled and the frame closed if the step
-/// passed its end (the next frame opens with the next step or frame call,
-/// as after a frame call). The instruction runs whatever execute
-/// breakpoint sits at it, so the next execute check is made afresh; what
-/// the step's checks find is counted, never acted on. A host step never
-/// asks for the capture boundary, and a frame held there is left first,
-/// as the loop leaves it.
+/// then what it made due is handled as the loop's passes that run no step
+/// handle it, until a deadline is ahead of the clock or the frame's end
+/// is reached, and the frame closed if it is (the next frame opens with
+/// the next step or frame call, as after a frame call). The instruction
+/// runs whatever execute breakpoint sits at it, so the next execute check
+/// is made afresh; what the step's checks find is counted, never acted on.
+/// A host step never asks for the capture boundary, and a frame held there
+/// is left first, as the loop leaves it.
 pub fn host_step<M: DebugMachine>(m: &mut M) -> StepResult {
     m.arm();
     step_on_full(m)
@@ -137,12 +160,7 @@ fn step_on_full<M: DebugMachine>(m: &mut M) -> StepResult {
     let stepped = m.machine_step(&mut run, &mut tier);
     m.end_run(run);
     m.debug_state_mut().forget_checked(MAIN_CPU);
-    // A frame the step ended is closed and left so: the next step or frame
-    // call opens the next one, as after a frame call that ran its frame to
-    // the end, so the machine at a frame's end is the same either way.
-    if m.handle_due(frame_end, &mut tier) == Due::FrameEnd {
-        m.close_frame();
-    }
+    handle_due_after_step(m, &mut tier, frame_end);
     if m.armed() {
         m.debug_state_mut().clear_stop();
     }
@@ -183,6 +201,35 @@ fn handle_due_before_step<M: FrameMachine, H: StepHooks<M>>(
     frame_end
 }
 
+/// After a host step's instruction, what it made due, as the loop's passes
+/// that run no step handle it: until a deadline is ahead of the clock
+/// (once, for a core whose step keeps its own timetable). A frame whose
+/// end that reaches is closed and left so: the next step or frame call
+/// opens the next one, as after a frame call that ran its frame to the
+/// end, so the machine at a frame's end is the same either way. A line
+/// whose time something the step began uses up as soon as it starts (a
+/// transfer that stalls the CPU) is due at its start, so the frame's end
+/// can need more than one pass.
+fn handle_due_after_step<M: FrameMachine, H: StepHooks<M>>(
+    m: &mut M,
+    hooks: &mut H,
+    frame_end: u64,
+) {
+    loop {
+        match m.handle_due(frame_end, hooks) {
+            Due::FrameEnd => {
+                m.close_frame();
+                break;
+            }
+            Due::Held => break,
+            Due::Continue => {}
+        }
+        if !m.next_deadline(frame_end).is_some_and(|due| due <= m.now()) {
+            break;
+        }
+    }
+}
+
 /// Finish a frame [`FrameMachine::frame_held`] reports, before a save: its
 /// rest runs on the play tier with the debugger disarmed for its length,
 /// so no breakpoint, watchpoint or event stops it and nothing of it is
@@ -194,9 +241,7 @@ pub fn finish_held_frame<M: DebugMachine>(m: &mut M) -> bool {
     if !m.frame_held() {
         return false;
     }
-    m.disarm();
-    run_frame(m, &mut Play);
-    m.arm();
+    play_frame(m);
     m.refresh_debugger_state();
     true
 }
@@ -208,11 +253,9 @@ pub fn finish_held_frame<M: DebugMachine>(m: &mut M) -> bool {
 /// coverage, as the play tier records it. The same machine as a presented
 /// frame.
 pub fn run_frame_headless<M: DebugMachine>(m: &mut M) {
-    m.disarm();
     m.set_presenting(false);
-    run_frame(m, &mut Play);
+    play_frame(m);
     m.set_presenting(true);
-    m.arm();
 }
 
 /// Run to the capture boundary on the loop the debugger's state selects

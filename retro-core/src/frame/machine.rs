@@ -88,17 +88,21 @@ pub trait FrameMachine: Sized {
         hooks: &mut H,
     ) -> Option<Stepped>;
 
-    /// The frame's end: count it, arm the next frame's timetable, present
-    /// it. The next [`Self::enter_frame`] opens the next frame.
+    /// The frame's end: count it and arm the next frame's timetable. The
+    /// picture and the sound are finished where a core handles its frame's
+    /// end ([`Self::handle_due`]), so the profiler sees that work. The next
+    /// [`Self::enter_frame`] opens the next frame.
     fn close_frame(&mut self);
 
     /// Before a host step: leave a hold at the capture boundary the way the
     /// frame loop leaves it, then [`Self::enter_frame`].
     fn enter_step<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> u64;
 
-    /// Whether a frame is in progress: a frame call that stopped, a host
-    /// step, a reset or a load made part of the way through a frame leaves
-    /// one; a frame call that ran its frame to the end does not.
+    /// Whether a frame is in progress: a frame call that stopped or a host
+    /// step leaves one; a frame call that ran its frame to the end does
+    /// not. After a reset or a load, a core whose savestate holds a frame
+    /// in progress goes on with it, and one whose savestate cannot drops
+    /// it.
     fn frame_in_progress(&self) -> bool;
 
     /// Whether a frame is held part of the way through in a way the
@@ -116,4 +120,12 @@ pub trait FrameMachine: Sized {
     /// Whether a frame's end presents (the host's picture and sound); a
     /// headless frame turns it off.
     fn set_presenting(&mut self, on: bool);
+
+    /// A frame call stopped part of the way through its frame (a
+    /// breakpoint, a watchpoint, an event, the debugger paused or
+    /// stepping): make the picture the host reads show the frame as far as
+    /// it is drawn. A core that draws its lines straight into that picture
+    /// has nothing to do.
+    #[inline(always)]
+    fn present_stop(&mut self) {}
 }

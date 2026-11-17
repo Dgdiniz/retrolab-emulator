@@ -13,6 +13,7 @@ mod helpers;
 use helpers::M68kRomBuilder;
 use retro_core::cpu::Addressable;
 use retro_core::input::{InputDevice, InputProvider};
+use retro_core::types::InputState;
 use retro_core::EmulatorCore;
 use sg1_core::io::devices::{Genesis3ButtonDevice, Genesis6ButtonDevice};
 use sg1_core::system::GenesisEmulator;
@@ -146,6 +147,14 @@ fn test_minirom_3button_controller_th_high() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(0) {
         port.connect_device(Box::new(device));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        0,
+        InputState {
+            buttons: provider.get_state(),
+        },
+    );
 
     // Run ROM (reduced steps)
     for _ in 0..150 {
@@ -218,6 +227,14 @@ fn test_minirom_3button_controller_th_low() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(0) {
         port.connect_device(Box::new(device));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        0,
+        InputState {
+            buttons: provider.get_state(),
+        },
+    );
 
     // Run ROM (reduced steps)
     for _ in 0..150 {
@@ -295,6 +312,14 @@ fn test_minirom_3button_controller_th_toggle() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(0) {
         port.connect_device(Box::new(device));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        0,
+        InputState {
+            buttons: provider.get_state(),
+        },
+    );
 
     // Run ROM (reduced steps)
     for _ in 0..200 {
@@ -376,6 +401,14 @@ fn test_minirom_6button_controller_cycle_sequence() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(0) {
         port.connect_device(Box::new(device));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        0,
+        InputState {
+            buttons: provider.get_state(),
+        },
+    );
 
     // Run ROM (reduced steps)
     for _ in 0..300 {
@@ -460,6 +493,14 @@ fn test_minirom_port1_vs_port2() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(0) {
         port.connect_device(Box::new(device1));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        0,
+        InputState {
+            buttons: provider1.get_state(),
+        },
+    );
 
     // Setup Port 2 with DOWN pressed
     let mut device2 = Genesis3ButtonDevice::new();
@@ -469,6 +510,14 @@ fn test_minirom_port1_vs_port2() {
     if let Some(port) = emu.bus_mut().io_mut().port_mut(1) {
         port.connect_device(Box::new(device2));
     }
+    // A frame's opening hands each pad the buttons its player holds in
+    // the input manager, as a host's input reaches it.
+    emu.set_input(
+        1,
+        InputState {
+            buttons: provider2.get_state(),
+        },
+    );
 
     // Run ROM (it ends in an endless loop, so extra steps leave the results alone)
     for _ in 0..300 {

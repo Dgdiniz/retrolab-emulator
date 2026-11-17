@@ -17,6 +17,7 @@ use retro_core::capture::{
 };
 use retro_core::cartridge::{SOURCE_COPROCESSOR, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
 use retro_core::cpu::Addressable;
+use retro_core::frame::run_frame_on;
 use retro_core::{EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::vdp::WriteTarget;
 use sg1_core::GenesisEmulator;
@@ -158,7 +159,7 @@ fn every_byte_names_its_writer_and_where_it_came_from() {
     let mut program = boot_writes_program();
     let rom = program.build();
     let mut emu = recording(&rom);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let sources = emu.video_memory_sources().expect("armed");
     assert_eq!(sources.origins().len(), 0x1_0000);
     assert_eq!(sources.frames().len(), 0x1_0000);
@@ -261,7 +262,7 @@ fn a_frame_s_writes_are_its_transfers_fills_copies_and_port_stores_in_order() {
     let mut program = boot_writes_program();
     let rom = program.build();
     let mut emu = recording(&rom);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let writes = emu.take_frame_writes().expect("armed");
     assert_eq!(writes.dropped, 0);
     let records = records(&writes);
@@ -324,7 +325,7 @@ fn a_frame_s_writes_are_its_transfers_fills_copies_and_port_stores_in_order() {
 
     // A take empties the record; an idle frame writes nothing.
     assert_eq!(emu.take_frame_writes(), Some(FrameWrites::default()));
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     assert_eq!(emu.take_frame_writes(), Some(FrameWrites::default()));
 }
 
@@ -367,7 +368,7 @@ fn paced_program() -> Vec<u8> {
 fn taken_at_each_boundary_the_writes_are_what_built_the_frame_held_there() {
     let mut emu = recording(&paced_program());
     for _ in 0..3 {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
     emu.run_to_capture_boundary();
     let _ = emu.take_frame_writes();
@@ -392,7 +393,7 @@ fn taken_at_each_boundary_the_writes_are_what_built_the_frame_held_there() {
     }
     // The rest of the held frame: its own upload, in the vertical blank.
     let frame = emu.capture_frame_snapshot().frame as u32;
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let rest = emu.take_frame_writes().expect("armed");
     let rest = records(&rest);
     assert_eq!(rest.len(), 1);
@@ -433,7 +434,7 @@ fn past_its_cap_a_take_counts_what_it_dropped() {
     let stores_made = |emu: &GenesisEmulator| emu.cpu().d[2] + u32::from(emu.cpu().pc == count);
     let mut frames = 0;
     while stores_made(&emu) <= 40_000 {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         frames += 1;
         assert!(frames < 60);
     }
@@ -452,7 +453,7 @@ fn past_its_cap_a_take_counts_what_it_dropped() {
         assert_eq!(record[6], (i as u32) & 0x0EEE);
     }
     // The count starts again with the next take.
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let next = emu.take_frame_writes().expect("armed");
     assert_eq!(next.dropped, 0);
     assert_eq!(
@@ -474,7 +475,7 @@ fn turned_on_each_starts_empty_and_a_reset_a_load_and_a_new_rom_empty_it() {
             && writes == FrameWrites::default()
     };
     assert!(empty(&mut emu));
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let state = emu.save_state_at_frame_end();
     assert!(!empty(&mut emu), "the first frame wrote");
 
@@ -488,18 +489,18 @@ fn turned_on_each_starts_empty_and_a_reset_a_load_and_a_new_rom_empty_it() {
     // Asked again, a recorder already on keeps what it holds.
     EmulatorCore::reset(&mut emu);
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     emu.set_capture_recording(writes_recorded());
     assert!(!empty(&mut emu));
 
     EmulatorCore::reset(&mut emu);
     assert!(empty(&mut emu), "a reset empties them");
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     emu.load_state(&state).expect("the savestate loads");
     assert!(empty(&mut emu), "a savestate load empties them");
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     emu.load_rom(&paced_program()).expect("another program");
     assert_eq!(emu.capture_recording(), writes_recorded());
     assert!(empty(&mut emu), "a new ROM empties them");
@@ -512,11 +513,7 @@ fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
 
 #[test]
 fn recording_the_writes_changes_nothing_on_any_frame_loop() {
-    for frame_loop in [
-        ExecutionTier::Fast,
-        ExecutionTier::LightDebug,
-        ExecutionTier::FullDebug,
-    ] {
+    for frame_loop in [ExecutionTier::Play, ExecutionTier::LightDebug] {
         for rom in [boot_writes_program().build(), paced_program()] {
             let mut plain = GenesisEmulator::new();
             plain.load_rom(&rom).expect("the program loads");
@@ -533,11 +530,7 @@ fn recording_the_writes_changes_nothing_on_any_frame_loop() {
             let mut audio = (Vec::new(), Vec::new());
             for frame in 0..10 {
                 for emu in [&mut plain, &mut recorded] {
-                    match frame_loop {
-                        ExecutionTier::Fast => emu.run_frame_fast(),
-                        ExecutionTier::LightDebug => emu.run_frame_debug_light(),
-                        ExecutionTier::FullDebug => EmulatorCore::run_frame(emu),
-                    }
+                    run_frame_on(emu, frame_loop);
                 }
                 if frame % 3 == 0 {
                     let _ = recorded.take_frame_writes();
@@ -566,7 +559,7 @@ fn the_sources_resolve_to_rom_offsets_work_ram_and_nothing() {
     let mut program = boot_writes_program();
     let rom = program.build();
     let mut emu = recording(&rom);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let sources = emu.video_memory_sources().expect("armed");
     let hash = emu.state_hash();
     let addresses: Vec<u32> = sources.origins()[..0x10]
@@ -626,7 +619,7 @@ fn banked_program() -> Vec<u8> {
 fn a_banked_source_resolves_through_the_banks_as_they_stand() {
     let rom = banked_program();
     let mut emu = recording(&rom);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     let sources = emu.video_memory_sources().expect("armed");
     let vram = emu.vdp().get_vram();
     for i in 0..16 {

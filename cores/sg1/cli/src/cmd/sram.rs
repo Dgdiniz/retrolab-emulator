@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use retro_core::EmulatorCore;
+use retro_core::frame::run_frame_on;
+use retro_core::{EmulatorCore, ExecutionTier};
 
 #[derive(Args, Debug)]
 pub struct SramArgs {
@@ -69,7 +70,7 @@ fn dump(args: DumpArgs) -> Result<()> {
 
     println!("Running {} frames...", args.frames);
     for _ in 0..args.frames {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
 
     match emu.get_save_ram() {
@@ -104,7 +105,7 @@ fn load(args: LoadArgs) -> Result<()> {
 
     println!("Running {} frames...", args.frames);
     for _ in 0..args.frames {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
 
     if let Some(ref ss_path) = args.screenshot {

@@ -1,7 +1,6 @@
 //! The capture contract (`retro_core::capture::CaptureCore`) on this
 //! console, and the picture and snapshot helpers it reads.
 
-use super::frame::{HeldFrame, HoldReason};
 use super::GenesisEmulator;
 #[cfg(doc)]
 use crate::debugger::GenesisDebugger;
@@ -23,15 +22,15 @@ pub struct GenesisSnapshotConsole {
 
 impl GenesisEmulator {
     /// The number of the frame whose picture the host's framebuffer shows:
-    /// the frames finished, plus one while a frame is held at its capture
-    /// boundary or at an event breakpoint past it (on the boundary's line or
-    /// a later one), where the framebuffer holds the held frame's finished
-    /// picture (it is counted once it ends). A frame held before its
-    /// boundary is numbered by the frames finished: the framebuffer shows
-    /// its lines drawn so far over the frame before's.
+    /// the frames finished, plus one while a frame in progress is on its
+    /// capture boundary's line or a later one (held at the boundary, or
+    /// stopped in its vertical blanking), where the framebuffer holds that
+    /// frame's finished picture (it is counted once it ends). A frame
+    /// stopped before its boundary is numbered by the frames finished: the
+    /// framebuffer shows its lines drawn so far over the frame before's.
     fn picture_frame(&self) -> u64 {
         let boundary = u32::from(self.bus.vdp().first_vblank_line());
-        let finished = self.held_frame.is_some_and(|held| held.line >= boundary);
+        let finished = self.frame_open && self.frame_line >= boundary;
         self.frame_count + u64::from(finished)
     }
 
@@ -53,14 +52,15 @@ impl GenesisEmulator {
 ///
 /// How this core keeps the contract:
 ///
-/// - A frame is held at its capture boundary by the capture call, or at an
-///   event breakpoint, at the line it fires on; the snapshot, the pixel
-///   sources and the line sprites number the frames finished, plus one
-///   while the frame is held on the boundary's line or past it, where the
-///   framebuffer shows its finished picture.
-/// - A save finishes any held frame on the loop a player runs, whatever
-///   the debugger is doing, so no breakpoint stops it;
-///   [`EmulatorCore::save_state`] returns no bytes while a frame is held.
+/// - A frame is held at its capture boundary by the capture call, and left
+///   part of the way through by a stop or a host step; the snapshot, the
+///   pixel sources and the line sprites number the frames finished, plus
+///   one while the frame in progress is on the boundary's line or past it,
+///   where the framebuffer shows its finished picture.
+/// - A save finishes any frame in progress on the play tier, whatever the
+///   debugger is doing, so no breakpoint stops it;
+///   [`EmulatorCore::save_state`] returns no bytes while a frame is in
+///   progress.
 /// - The repaint, a layer, the pixel sources and the line sprites draw each
 ///   line the line table holds from its record (the lines below a stop part
 ///   of the way down from the frame before's) and every other line from the
@@ -89,28 +89,21 @@ impl CaptureCore for GenesisEmulator {
         self.bus.vdp().capture_recording()
     }
 
-    /// The frame loop is the one the debugger's state picks
-    /// ([`GenesisDebugger::execution_tier`]: the loop a player runs while no
-    /// debug feature is armed); [`GenesisEmulator::run_to_capture_boundary_with`]
-    /// chooses it. A frame held before its boundary (at an event breakpoint)
-    /// runs on to it.
+    /// On the tier the debugger's state picks
+    /// ([`GenesisDebugger::execution_tier`]: the play tier while no debug
+    /// feature is armed), through the frame driver
+    /// (`retro_core::frame::run_to_capture_boundary`). A frame stopped
+    /// before its boundary runs on to it.
     fn run_to_capture_boundary(&mut self) {
-        let frame_loop = self.debugger.execution_tier();
-        self.run_to_capture_boundary_with(frame_loop);
+        retro_core::frame::run_to_capture_boundary(self);
     }
 
     fn at_capture_boundary(&self) -> bool {
-        matches!(
-            self.held_frame,
-            Some(HeldFrame {
-                reason: HoldReason::CaptureBoundary,
-                ..
-            })
-        )
+        self.held_at_capture_boundary
     }
 
-    /// A held frame is finished ([`GenesisEmulator::finish_held_frame`]),
-    /// then the state saved.
+    /// A frame in progress is finished
+    /// ([`GenesisEmulator::finish_held_frame`]), then the state saved.
     fn save_state_at_frame_end(&mut self) -> Vec<u8> {
         self.finish_held_frame();
         <Self as EmulatorCore>::save_state(self)

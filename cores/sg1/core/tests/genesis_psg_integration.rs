@@ -322,6 +322,9 @@ fn test_psg_frame_count_increments() {
     let mut emu = GenesisEmulator::new();
     emu.reset(); // Initialize
 
+    // A reset pauses the debugger, and a paused frame call runs nothing.
+    emu.debugger().set_execution_mode(ExecutionMode::Running);
+
     assert_eq!(emu.frame_count(), 0);
 
     emu.run_frame();

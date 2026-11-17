@@ -24,8 +24,8 @@ use crate::vdp::{VideoEvent, VideoEventWatch, WriteTarget};
 use crate::z80::disasm;
 use crate::z80::Z80;
 
-/// The 68000's CPU id.
-pub const MAIN_CPU: usize = 0;
+/// The 68000's CPU id: the main CPU, the one the frame loop steps.
+pub use retro_core::debug::MAIN_CPU;
 
 /// The Z80's CPU id.
 pub const SOUND_CPU: usize = 1;
@@ -103,9 +103,9 @@ pub mod genesis_events {
 /// The interrupt events and a transfer into the sprite table take no param;
 /// a scanline takes the `V` counter, a finished transfer the memory it
 /// wrote, a palette write its colour and a rewritten tile its number. Every
-/// one is checked on the debugger's frame loops and their steps, none on
-/// the loop a player runs, so a breakpoint on any of them moves the frame
-/// onto the light debugger loop.
+/// one is checked on the debugger's tiers and their steps, none on the
+/// play tier, so a breakpoint on any of them moves the frame onto the light
+/// debug tier.
 pub const GENESIS_EVENTS: &[EventSpec] = &[
     EventSpec {
         code: genesis_events::VBLANK,
@@ -179,7 +179,7 @@ pub const GENESIS_EVENTS: &[EventSpec] = &[
 ///
 /// Each variant is the `(code, param)` pair ([`DebugEvent::code_param`])
 /// the host stores in [`retro_core::types::BreakpointType::Event`]. The
-/// debugger's frame loops and their steps make the variant where the event
+/// debugger's tiers and their steps make the variant where the event
 /// happens and check it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenesisEvent {
@@ -275,7 +275,7 @@ pub fn video_event_watch(breakpoints: &BreakpointList) -> Option<VideoEventWatch
 /// as instruction starts, and the Z80 trace's running cycle count.
 #[derive(Debug, Default)]
 pub struct GenesisDebugConsole {
-    /// Every address the full loop has seen the 68000 start an instruction
+    /// Every address a host step has seen the 68000 start an instruction
     /// at, for [`GenesisEmulator::disassemble_around_pc`].
     instruction_boundaries: HashSet<u32>,
     /// The cycles the Z80's traced instructions have counted: the total an

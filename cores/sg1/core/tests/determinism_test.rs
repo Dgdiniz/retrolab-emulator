@@ -20,7 +20,9 @@
 //! netplay uses, so they also prove the headless path is
 //! bit-equivalent to a presented frame for state purposes.
 
+use retro_core::frame::run_frame_on;
 use retro_core::types::ExecutionMode;
+use retro_core::ExecutionTier;
 use retro_core::{DebuggerCore, EmulatorCore, InputState};
 use sg1_core::io::devices::genesis_3button::Genesis3ButtonDevice;
 use sg1_core::GenesisEmulator;
@@ -178,7 +180,7 @@ fn diff_parts(a: &GenesisEmulator, b: &GenesisEmulator) -> String {
 
 /// Presented (audible) frames and headless frames must land on
 /// **identical serialized machine state**. Netplay runs the local peer's
-/// frames audibly (`run_frame_fast`) but re-simulates rolled-back or
+/// frames audibly (the play tier) but re-simulates rolled-back or
 /// caught-up spans headlessly (`run_frame_headless`); if the two diverged,
 /// the confirmed-frame checksum ladder would fire a full resync on every
 /// remote input. Audio must therefore be *synthesized* (converter + chip
@@ -193,7 +195,7 @@ fn audible_and_headless_frames_hash_identically() {
         let buttons = schedule(frame);
         audible.set_input(0, InputState { buttons });
         headless.set_input(0, InputState { buttons });
-        audible.run_frame_fast(); // presents: mixes + pushes audio ring
+        run_frame_on(&mut audible, ExecutionTier::Play); // presents: mixes + pushes audio ring
         headless.run_frame_headless(); // suppresses presentation only
         assert_eq!(
             audible.state_hash(),
@@ -225,8 +227,8 @@ fn headless_resim_after_rollback_matches_audible_run() {
         let buttons = schedule(frame);
         reference.set_input(0, InputState { buttons });
         rolled_back.set_input(0, InputState { buttons });
-        reference.run_frame_fast();
-        rolled_back.run_frame_fast();
+        run_frame_on(&mut reference, ExecutionTier::Play);
+        run_frame_on(&mut rolled_back, ExecutionTier::Play);
         if frame == K - 1 {
             snapshot = rolled_back.save_state();
         }
@@ -239,7 +241,7 @@ fn headless_resim_after_rollback_matches_audible_run() {
         let buttons = schedule(frame);
         reference.set_input(0, InputState { buttons });
         rolled_back.set_input(0, InputState { buttons });
-        reference.run_frame_fast();
+        run_frame_on(&mut reference, ExecutionTier::Play);
         rolled_back.run_frame_headless();
         assert_eq!(
             reference.state_hash(),

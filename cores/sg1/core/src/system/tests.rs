@@ -137,16 +137,17 @@ fn test_reset() {
 }
 
 #[test]
-fn a_pause_reports_where_the_fast_loop_stopped() {
+fn a_pause_reports_where_the_play_tier_stopped() {
+    use retro_core::frame::run_frame_on;
     use retro_core::DebuggerCore;
 
     let mut genesis = GenesisEmulator::new();
     genesis.load_rom(&create_test_rom()).unwrap();
     genesis.set_execution_mode(ExecutionMode::Running);
     for _ in 0..3 {
-        genesis.run_frame_fast();
+        run_frame_on(&mut genesis, ExecutionTier::Play);
     }
-    // The fast loop writes no CPU state: the debugger still holds the one
+    // The play tier writes no CPU state: the debugger still holds the one
     // the reset wrote.
     assert_eq!(genesis.debugger().get_cpu_states()[0].pc, 0x400);
 
@@ -538,13 +539,13 @@ fn test_write_watchpoint_fires_on_ram_write() {
     });
 
     // First instruction at the reset PC is the MOVE.W.
-    let result = genesis.step();
-
-    assert!(
-        result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "write watchpoint should fire on the RAM write"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
 }
 
 #[test]
@@ -562,13 +563,13 @@ fn test_write_watchpoint_ignores_unrelated_address() {
         condition: None,
     });
 
-    let result = genesis.step();
-
-    assert!(
-        !result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "watchpoint on an unwritten address must not fire"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
 }
 
 #[test]
@@ -587,13 +588,13 @@ fn test_read_watchpoint_does_not_fire_on_write() {
         condition: None,
     });
 
-    let result = genesis.step();
-
-    assert!(
-        !result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "read watchpoint must not fire on a write access"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
 }
 
 #[test]
@@ -619,12 +620,13 @@ fn test_value_matched_write_watchpoint_fires_on_matching_byte() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "value watchpoint should fire when the written byte matches"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
 }
 
 #[test]
@@ -650,12 +652,13 @@ fn test_value_matched_write_watchpoint_ignores_other_values() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        !result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "value watchpoint must stay silent when the written byte differs"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
 }
 
 #[test]
@@ -681,12 +684,13 @@ fn test_value_matched_watchpoint_picks_low_byte_of_word() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "value watchpoint should match the low byte of a word write"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
 }
 
 /// MOVE.L #$12345678, ($00FF0000).L ; BRA.S *: writes a full 32-bit
@@ -727,14 +731,15 @@ fn test_sized_32bit_watchpoint_fires_on_assembled_long() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
-        "32-bit watch should fire when the assembled long matches"
-    );
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
     // The four covered bytes are all written this instruction, but the
     // watch must count a single hit, not one per byte.
-    assert_eq!(watch_hits(&genesis, id), 1);
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
+        "32-bit watch should fire when the assembled long matches"
+    );
 }
 
 #[test]
@@ -760,12 +765,13 @@ fn test_sized_32bit_watchpoint_ignores_other_values() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        !result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "32-bit watch must stay silent when the assembled long differs"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
 }
 
 #[test]
@@ -795,12 +801,13 @@ fn test_sized_16bit_watchpoint_fires_via_consecutive_byte() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "16-bit watch should fire when the assembled word matches"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
 }
 
 #[test]
@@ -828,12 +835,16 @@ fn test_conditional_execute_breakpoint_fires_when_expression_true() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
+    // A host step runs whatever breakpoint sits at its instruction: the
+    // check is the debugger's tier's, which stops before the instruction.
+    genesis.set_execution_mode(ExecutionMode::Running);
+    genesis.run_frame();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "conditional execute breakpoint should fire when its expression holds"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
+    assert_eq!(genesis.cpu().pc, 0x400, "it stops before the instruction");
 }
 
 #[test]
@@ -859,12 +870,14 @@ fn test_conditional_execute_breakpoint_silent_when_expression_false() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        !result.breakpoint_hit,
+    genesis.set_execution_mode(ExecutionMode::Running);
+    genesis.run_frame();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "conditional execute breakpoint must stay silent when its expression is false"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
+    assert_eq!(genesis.frame_count(), 1, "nothing stopped the frame");
 }
 
 #[test]
@@ -892,12 +905,13 @@ fn test_conditional_watchpoint_reads_memory_in_expression() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        1,
         "conditional watchpoint should fire when its memory expression holds"
     );
-    assert_eq!(watch_hits(&genesis, id), 1);
 }
 
 #[test]
@@ -923,12 +937,13 @@ fn test_conditional_watchpoint_silent_when_expression_false() {
         },
     );
 
-    let result = genesis.step();
-    assert!(
-        !result.breakpoint_hit,
+    // A host step counts what its checks find and stops on none of them.
+    genesis.step();
+    assert_eq!(
+        watch_hits(&genesis, id),
+        0,
         "conditional watchpoint must stay silent when its memory expression is false"
     );
-    assert_eq!(watch_hits(&genesis, id), 0);
 }
 
 #[test]

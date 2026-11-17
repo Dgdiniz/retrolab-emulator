@@ -5,14 +5,16 @@
 //!
 //! A golden test uses it; the records it makes are kept outside this tree,
 //! beside the manifest `genesis.txt`, in the folder
-//! [`retro_core::golden::GoldenDir`] finds. They are made on the frame
-//! loop a player runs ([`FrameLoop::Fast`]).
+//! [`retro_core::golden::GoldenDir`] finds. They are made on the play tier,
+//! the loop a player runs ([`run_golden`]); every other tier is held to them
+//! ([`run_golden_on`]).
 
+use retro_core::frame::run_frame_on;
 pub use retro_core::golden::{
     crop_framebuffer_rgb, first_divergence, hash_samples, Divergence, FrameRecord, GoldenEntry,
     GoldenSpec,
 };
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_core::ExecutionTier;
 
 use crate::io::devices::Genesis6ButtonDevice as Pad;
 use crate::GenesisEmulator;
@@ -42,48 +44,44 @@ pub const BUTTONS: [(&str, u32); 12] = [
     ("mode", Pad::BTN_MODE),
 ];
 
-/// Which of the core's three frame loops a golden run drives. A host
-/// picks one per frame from what the debugger is doing; a record is made
-/// with one of them throughout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameLoop {
-    /// What a player runs: no debugger work at all.
-    Fast,
-    /// Breakpoints and tracing only.
-    LightDebug,
-    /// The full debugger loop (`EmulatorCore::run_frame`).
-    FullDebug,
-}
-
-impl FrameLoop {
-    /// Advance `emu` one presented frame on this loop.
-    pub fn run_frame(self, emu: &mut GenesisEmulator) {
-        match self {
-            FrameLoop::Fast => emu.run_frame_fast(),
-            FrameLoop::LightDebug => emu.run_frame_debug_light(),
-            FrameLoop::FullDebug => <GenesisEmulator as EmulatorCore>::run_frame(emu),
-        }
-    }
-}
-
-/// Drive `emu` through `spec` on `frame_loop`, calling `on_shot(frame,
+/// Drive `emu` through `spec` on the play tier, calling `on_shot(frame,
 /// width, height, rgb)` at each listed shot and `on_audio(samples)` with
 /// every frame's samples, and return one record per frame. `emu` must
-/// have its ROM loaded; the run puts the machine in the running mode and
-/// arms audio capture.
+/// have its ROM loaded; audio capture is armed by the run. The tier is
+/// named, not picked from the debugger's state: a reset the spec asks for
+/// pauses this core's debugger, and a paused debugger's tier runs nothing.
 pub fn run_golden(
     emu: &mut GenesisEmulator,
     spec: &GoldenSpec,
-    frame_loop: FrameLoop,
     on_shot: impl FnMut(u64, u32, u32, &[u8]),
     on_audio: impl FnMut(&[f32]),
 ) -> Vec<FrameRecord> {
-    // The frame loops only advance a machine that is running.
-    emu.debugger().set_execution_mode(ExecutionMode::Running);
     retro_core::golden::run_golden(
         emu,
         spec,
-        |emu| frame_loop.run_frame(emu),
+        |emu| {
+            run_frame_on(emu, ExecutionTier::Play);
+        },
+        GenesisEmulator::state_hash,
+        on_shot,
+        on_audio,
+    )
+}
+
+/// [`run_golden`] with every frame on `tier` through the frame driver
+/// (`retro_core::golden::run_golden_on`): held to the records, it shows
+/// the tier runs the play tier's machine.
+pub fn run_golden_on(
+    emu: &mut GenesisEmulator,
+    spec: &GoldenSpec,
+    tier: ExecutionTier,
+    on_shot: impl FnMut(u64, u32, u32, &[u8]),
+    on_audio: impl FnMut(&[f32]),
+) -> Vec<FrameRecord> {
+    retro_core::golden::run_golden_on(
+        emu,
+        spec,
+        tier,
         GenesisEmulator::state_hash,
         on_shot,
         on_audio,

@@ -39,6 +39,20 @@ pub trait StepHooks<M> {
     /// breakpoint matched. The play tier never calls it.
     #[inline(always)]
     fn raised<F: FnOnce(&mut M) -> bool>(&mut self, _m: &mut M, _check: F) {}
+
+    /// The core starts the work of one part of its machine that the
+    /// profiler times apart, named by `chip` (a chip, or other work a core
+    /// wants seen on its own, such as its audio mix), the same name every
+    /// time for the same work. Spans do not nest: each ends at the next
+    /// [`Self::chip_finish`].
+    #[inline(always)]
+    fn chip_start(&mut self, _chip: &'static str) {}
+
+    /// The work [`Self::chip_start`] began has ended; `units` is how much
+    /// of it was done, in the unit the core counts it in (instructions for
+    /// a CPU), 0 where nothing is counted.
+    #[inline(always)]
+    fn chip_finish(&mut self, _units: u32) {}
 }
 
 /// No hooks at all: a step that records nothing and checks nothing.

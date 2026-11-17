@@ -117,8 +117,14 @@ fn test_breakpoint_execution_stops() {
     };
     emu.debugger().add_breakpoint(bp);
 
-    // Step first instruction
-    emu.step();
+    // Run: the frame stops in front of the instruction at the breakpoint
+    emu.debugger().set_execution_mode(ExecutionMode::Running);
+    emu.run_frame();
+    assert_eq!(
+        emu.debugger().get_execution_mode(),
+        ExecutionMode::Paused,
+        "the breakpoint stops the frame"
+    );
 
     // CPU state after first instruction
     let cpu_states = emu.debugger().get_cpu_states();
@@ -128,6 +134,12 @@ fn test_breakpoint_execution_stops() {
         .find(|r| r.name == "D0")
         .unwrap();
     assert_eq!(d0.value, 1, "D0 should be 1 after first instruction");
+    let d1 = cpu_states[0]
+        .registers
+        .iter()
+        .find(|r| r.name == "D1")
+        .unwrap();
+    assert_eq!(d1.value, 0, "the instruction at the breakpoint has not run");
 
     // PC should be at breakpoint location
     let pc = cpu_states[0]
@@ -175,20 +187,26 @@ fn test_breakpoint_multiple_hits() {
     };
     emu.debugger().add_breakpoint(bp);
 
-    // Three passes of MOVEQ + DBRA: six steps, the last DBRA falling through
-    for _ in 0..6 {
-        emu.step();
+    // Each Run stops at the loop's start, in front of its pass: the first
+    // in front of the first instruction, then once a pass, D1 counting
+    // down as DBRA leaves it. Run after a stop runs the instruction there
+    // unchecked.
+    for (pass, d1) in [(1, 2), (2, 1), (3, 0)] {
+        emu.debugger().set_execution_mode(ExecutionMode::Running);
+        emu.run_frame();
+        assert_eq!(
+            emu.debugger().get_execution_mode(),
+            ExecutionMode::Paused,
+            "run {pass} stops on the breakpoint"
+        );
+        assert_eq!(emu.cpu().pc, 0x400, "run {pass} stops at the loop's start");
+        assert_eq!(emu.cpu().d[1] & 0xFFFF, d1, "D1 at stop {pass}");
+        let breakpoints = emu.debugger().list_breakpoints();
+        assert_eq!(
+            breakpoints[0].hit_count, pass,
+            "Breakpoint should be hit once per pass of the loop"
+        );
     }
-
-    assert_eq!(emu.cpu().pc, 0x406, "the loop should have run out");
-    assert_eq!(emu.cpu().d[1] & 0xFFFF, 0xFFFF, "DBRA leaves D1.W at -1");
-
-    // Each pass reaches 0x400 once: three hits
-    let breakpoints = emu.debugger().list_breakpoints();
-    assert_eq!(
-        breakpoints[0].hit_count, 3,
-        "Breakpoint should be hit once per pass of the loop"
-    );
 }
 
 #[test]
@@ -213,9 +231,15 @@ fn test_breakpoint_disabled_not_triggered() {
     let bp_id = emu.debugger().add_breakpoint(bp);
     emu.debugger().enable_breakpoint(bp_id, false);
 
-    // Step through both instructions
-    emu.step();
-    emu.step();
+    // Run a frame: it passes 0x402 and does not stop there
+    emu.debugger().set_execution_mode(ExecutionMode::Running);
+    emu.run_frame();
+    assert_eq!(
+        emu.debugger().get_execution_mode(),
+        ExecutionMode::Running,
+        "the frame ran to its end"
+    );
+    assert_eq!(emu.cpu().d[1], 2, "the instruction at 0x402 ran");
 
     // Disabled breakpoint should not have been hit
     let breakpoints = emu.debugger().list_breakpoints();
@@ -287,33 +311,24 @@ fn test_memory_breakpoint_read() {
     };
     emu.debugger().add_breakpoint(bp);
 
-    // Execute MOVE.L #imm, A0
-    let result = emu.step();
-    assert!(!result.breakpoint_hit, "MOVE.L #imm, A0 reads only ROM");
+    // Execute MOVE.L #imm, A0. A host step counts what its checks find
+    // and stops on none of it: the step is a stop of its own.
+    emu.step();
 
     // Breakpoint should not be hit yet
     let breakpoints = emu.debugger().list_breakpoints();
     assert_eq!(breakpoints[0].hit_count, 0, "Read breakpoint not hit yet");
 
     // Execute MOVE.W (A0), D1 - this reads from memory
-    let result = emu.step();
+    emu.step();
 
-    // The read of 0xFF1000 fires the watchpoint: the step reports the hit
-    // and the breakpoint counts it
-    assert!(
-        result.breakpoint_hit,
-        "the read of 0xFF1000 should fire the watchpoint"
-    );
+    // The read of 0xFF1000 fires the watchpoint: the breakpoint counts it
     let breakpoints = emu.debugger().list_breakpoints();
     assert_eq!(breakpoints[0].hit_count, 1, "Read breakpoint hit once");
     assert_eq!(emu.cpu().d[1] & 0xFFFF, 0x1234, "D1 holds the word read");
 
     // The NOP after it does not read 0xFF1000: no new hit
-    let result = emu.step();
-    assert!(
-        !result.breakpoint_hit,
-        "the NOP should not fire the watchpoint"
-    );
+    emu.step();
     let breakpoints = emu.debugger().list_breakpoints();
     assert_eq!(
         breakpoints[0].hit_count, 1,
@@ -409,15 +424,16 @@ fn test_step_over_breakpoints() {
         );
     }
 
-    // Both breakpoints should have been hit once
+    // A host step runs the instruction at a breakpoint and makes no
+    // execute check: the steps went over both, counting no hit
     let breakpoints = emu.debugger().list_breakpoints();
     assert_eq!(
-        breakpoints[0].hit_count, 1,
-        "First breakpoint should be hit once"
+        breakpoints[0].hit_count, 0,
+        "a step counts no hit of the first breakpoint"
     );
     assert_eq!(
-        breakpoints[1].hit_count, 1,
-        "Second breakpoint should be hit once"
+        breakpoints[1].hit_count, 0,
+        "a step counts no hit of the second breakpoint"
     );
 }
 

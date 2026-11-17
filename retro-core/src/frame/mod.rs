@@ -10,13 +10,16 @@
 //! - the loop: handle what is due, run steps to the next deadline, close
 //!   the frame ([`run_frame`]);
 //! - the frame loops a host picks between ([`run_frame_on`]): the play
-//!   tier ([`Play`]), the debugger's tier while it runs ([`LightDebug`]),
-//!   and its tier while it is paused or stepping ([`run_full`]);
-//! - the step a host asks for ([`host_step`]), the headless frame
-//!   ([`run_frame_headless`]), a held frame finished before a save
-//!   ([`finish_held_frame`]), the capture boundary
-//!   ([`run_to_capture_boundary`]) and the profiler
-//!   ([`run_frame_profiled`]).
+//!   tier ([`Play`], run with the debugger disarmed), the debugger's tier
+//!   while it runs ([`LightDebug`]), and its tier while it is paused or
+//!   stepping ([`run_full`]);
+//! - the step a host asks for ([`host_step`]: what is due before its
+//!   instruction handled first, and what it made due after, as the loop's
+//!   passes handle them), the headless frame ([`run_frame_headless`]), a
+//!   held frame finished before a save ([`finish_held_frame`]), the capture
+//!   boundary ([`run_to_capture_boundary`]) and the profiler
+//!   ([`run_frame_profiled`], which times the parts of the machine a core
+//!   names with [`StepHooks::chip_start`]).
 //!
 //! The debugger's work around a step is written once too, in the tiers,
 //! over the adapter each core supplies ([`DebugMachine`]): the execute
@@ -39,8 +42,10 @@
 //! Every hook takes its tier as a type parameter, so each tier's loop is a
 //! function of its own. The play tier's hooks are empty
 //! `#[inline(always)]` bodies but for the main CPU's coverage: a check a
-//! handler hands to [`StepHooks::raised`] is never run, the stop tests
-//! fold to `false`, and nothing is called through a pointer.
+//! handler hands to [`StepHooks::raised`] is never run, the profiler's
+//! spans ([`StepHooks::chip_start`], [`StepHooks::chip_finish`]) are
+//! nothing, the stop tests fold to `false`, and nothing is called through
+//! a pointer.
 
 mod adapter;
 #[cfg(feature = "frame-conformance")]
@@ -63,6 +68,6 @@ pub use driver::{
 pub use hooks::{Flow, Part, StepHooks, Tier};
 pub use machine::{Due, FrameMachine, Stepped};
 #[cfg(not(target_arch = "wasm32"))]
-pub use profile::{FrameProfile, Profiled};
+pub use profile::{ChipTime, FrameProfile, Profiled, DEFAULT_SAMPLE_PERIOD, MAX_PROFILED_CHIPS};
 pub use queue::{DueBatch, EventQueue};
 pub use tiers::{FullDebug, LightDebug, Play};

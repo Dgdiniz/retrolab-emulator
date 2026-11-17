@@ -123,7 +123,7 @@ impl BreakpointList {
     }
 
     /// `true` when no breakpoints are registered. Useful for the
-    /// execution-tier selector to pick the fast path without any debug
+    /// execution-tier selector to pick the play tier without any debug
     /// overhead.
     pub fn is_empty(&self) -> bool {
         self.breakpoints.is_empty()

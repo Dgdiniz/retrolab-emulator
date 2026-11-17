@@ -122,9 +122,11 @@ impl SnesEmulator {
                 // RenderPos lands at dot 22, the active display has
                 // resumed, so the line is no longer in horizontal blank.
                 self.bus.system_regs_mut().set_hblank(false);
+                hooks.chip_start("PPU");
                 self.bus
                     .ppu_mut()
                     .render_scanline(scanline, &mut self.framebuffer);
+                hooks.chip_finish(0);
                 hooks.raised(self, |m| {
                     m.debugger.check_event(SnesEvent::Scanline(scanline))
                 });
@@ -156,7 +158,9 @@ impl SnesEmulator {
                 // line counters for every HDMA-enabled channel. The
                 // stolen cycles fold into the frame budget like a CPU
                 // stall.
+                hooks.chip_start("HDMA");
                 let stolen = self.bus.hdma_init_frame();
+                hooks.chip_finish(0);
                 self.master_cycles += stolen;
                 self.bus
                     .system_regs_mut()
@@ -177,7 +181,9 @@ impl SnesEmulator {
                 self.bus.set_raster_snapshot(h, v);
                 // Per-scanline HDMA: one transfer pattern per active
                 // channel, then advance the line counters.
+                hooks.chip_start("HDMA");
                 let stolen = self.bus.hdma_run_line();
+                hooks.chip_finish(0);
                 self.master_cycles += stolen;
                 self.bus
                     .system_regs_mut()
@@ -193,7 +199,9 @@ impl SnesEmulator {
                 if self.held_at_capture_boundary {
                     self.held_at_capture_boundary = false;
                 } else {
+                    hooks.chip_start("framebuffer");
                     self.finish_picture();
+                    hooks.chip_finish(0);
                 }
                 // Interlace field toggle, alternates once per frame
                 // even when the interlace bit itself is off, which
@@ -292,17 +300,23 @@ impl SnesEmulator {
                 // 32 kHz sample clock to the frame boundary, synthesising
                 // any S-DSP samples that came due. Then pull those 32 kHz
                 // samples through the resampler into the host audio ring.
+                hooks.chip_start("APU");
                 self.bus.apu_mut().catch_up_to(self.master_cycles);
+                hooks.chip_finish(0);
                 // The APU catch-up above advances all serialized audio
                 // state; only the host-ring drain (resample) is
                 // presentation, so a headless frame skips just that.
                 if self.present {
+                    hooks.chip_start("audio mix");
                     self.drain_apu_to_host_audio();
+                    hooks.chip_finish(0);
                 }
                 // Keep a cartridge coprocessor (DSP-1, ...) ticking across
                 // a frame with no register traffic, bounding its catch-up
                 // staleness to one frame just like the APU above.
+                hooks.chip_start("cartridge");
                 self.bus.catch_up_coprocessor(self.master_cycles);
+                hooks.chip_finish(0);
             }
             _ => {}
         }
@@ -427,7 +441,9 @@ impl SnesEmulator {
         }
         self.scheduler.give_back(events);
         if at_vblank {
+            hooks.chip_start("framebuffer");
             self.finish_picture();
+            hooks.chip_finish(0);
             self.held_at_capture_boundary = true;
             self.capture_boundary_cycle = bound;
         }

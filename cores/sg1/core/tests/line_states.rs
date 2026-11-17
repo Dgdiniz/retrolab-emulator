@@ -18,6 +18,7 @@ use retro_core::capture::{
     layer, planes, CaptureCore, CaptureRecording, SpriteFate, NO_COLUMN, NO_PALETTE,
 };
 use retro_core::debug::DebugEvent;
+use retro_core::frame::{run_frame_on, run_to_capture_boundary_on};
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
@@ -222,7 +223,7 @@ fn recording(rom: &[u8]) -> GenesisEmulator {
     let mut emu = running(rom);
     emu.set_capture_recording(line_states());
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
     emu
 }
@@ -277,7 +278,7 @@ fn the_picture_drawn_again_from_the_table_is_the_picture_byte_for_byte() {
 
         // After the vertical interrupt put everything back, the journal
         // undoes it for every line.
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         let picture = emu.picture_from_line_states().expect("line states on");
         assert_eq!(picture.rgba, shown(&emu), "after the whole frame");
     }
@@ -293,7 +294,7 @@ fn the_picture_drawn_again_from_the_table_is_the_picture_byte_for_byte() {
 fn the_effects_are_real_drawn_again_from_the_end_of_the_frame_they_flatten() {
     let mut emu = running(&raster_program());
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
     emu.run_to_capture_boundary();
     let live = shown(&emu);
@@ -443,8 +444,8 @@ fn drawing_again_moves_nothing_a_savestate_holds() {
 
     // And the frame ends as one nothing was drawn again in does.
     let mut whole = recording(&raster_program());
-    whole.run_frame_fast();
-    emu.run_frame_fast();
+    run_frame_on(&mut whole, ExecutionTier::Play);
+    run_frame_on(&mut emu, ExecutionTier::Play);
     assert_eq!(emu.state_hash(), whole.state_hash());
 }
 
@@ -464,7 +465,7 @@ fn after_a_stop_part_of_the_way_down_the_lines_below_are_the_frame_before() {
     let mut emu = recording(&raster_program());
     let frame = emu.frame_count();
     let id = break_on(&mut emu, GenesisEvent::Scanline(100));
-    emu.run_frame_debug_light();
+    run_frame_on(&mut emu, ExecutionTier::LightDebug);
     emu.debugger().remove_breakpoint(id);
     assert_eq!(emu.vdp().timing().scanline, 100);
 
@@ -508,14 +509,14 @@ fn after_a_stop_part_of_the_way_down_the_lines_below_are_the_frame_before() {
 fn armed_part_of_the_way_through_a_frame_the_table_holds_the_lines_after() {
     let mut emu = running(&raster_program());
     for _ in 0..WARM_UP {
-        emu.run_frame_debug_light();
+        run_frame_on(&mut emu, ExecutionTier::LightDebug);
     }
     let id = break_on(&mut emu, GenesisEvent::Scanline(100));
-    emu.run_frame_debug_light();
+    run_frame_on(&mut emu, ExecutionTier::LightDebug);
     emu.debugger().remove_breakpoint(id);
     emu.set_capture_recording(line_states());
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_to_capture_boundary_with(ExecutionTier::LightDebug);
+    run_to_capture_boundary_on(&mut emu, ExecutionTier::LightDebug);
     assert!(emu.at_capture_boundary());
 
     let table = emu.line_states().expect("line states on");
@@ -669,11 +670,7 @@ fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
 
 #[test]
 fn recording_changes_nothing_on_any_frame_loop() {
-    for frame_loop in [
-        ExecutionTier::Fast,
-        ExecutionTier::LightDebug,
-        ExecutionTier::FullDebug,
-    ] {
+    for frame_loop in [ExecutionTier::Play, ExecutionTier::LightDebug] {
         for rom in [raster_program(), direct_colour_program()] {
             let mut plain = running(&rom);
             let mut recorded = running(&rom);
@@ -681,11 +678,7 @@ fn recording_changes_nothing_on_any_frame_loop() {
             let mut audio = (Vec::new(), Vec::new());
             for frame in 0..12 {
                 for emu in [&mut plain, &mut recorded] {
-                    match frame_loop {
-                        ExecutionTier::Fast => emu.run_frame_fast(),
-                        ExecutionTier::LightDebug => emu.run_frame_debug_light(),
-                        ExecutionTier::FullDebug => EmulatorCore::run_frame(emu),
-                    }
+                    run_frame_on(emu, frame_loop);
                 }
                 assert_eq!(
                     recorded.state_hash(),
@@ -724,7 +717,7 @@ fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not(
     assert!(all_unrecorded(&emu));
 
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     assert!(!all_unrecorded(&emu));
     emu.load_state(&state).expect("the savestate loads");
     assert!(all_unrecorded(&emu));
@@ -737,7 +730,7 @@ fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not(
     emu.power_on_reset();
     assert_eq!(emu.capture_recording(), line_states());
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     assert!(!all_unrecorded(&emu));
 
     // Disarmed, nothing is kept.
@@ -767,7 +760,7 @@ fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not(
         };
         emu.set_capture_recording(wanted);
         assert_eq!(emu.capture_recording(), wanted);
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         assert!(emu.line_states().is_some(), "{wanted:?} keeps the table");
     }
     // The writes are recorded as they are made: they keep no line table.
@@ -838,8 +831,8 @@ fn where_each_pixel_came_from_is_the_frame_s_and_working_it_out_moves_nothing() 
         assert_eq!(emu.state_hash(), hash, "nothing a savestate holds moved");
         assert_eq!(shown(&emu), picture, "the picture shown did not move");
         // And the frame goes on as one nothing was worked out in.
-        emu.run_frame_fast();
-        twin.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
+        run_frame_on(&mut twin, ExecutionTier::Play);
         assert_eq!(emu.state_hash(), twin.state_hash());
         assert_eq!(shown(&emu), shown(&twin));
     }

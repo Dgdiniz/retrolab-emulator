@@ -3,11 +3,11 @@
 //!
 //! The SNES core has a single `run_frame()` that dispatches on
 //! `debugger.execution_tier()`: clean (Running, no breakpoints, no tracing) ->
-//! Fast; a breakpoint or tracing flips it to LightDebug. We therefore drive
+//! Play; a breakpoint or tracing flips it to LightDebug. We therefore drive
 //! each tier purely through the public `DebuggerCore` trait, no core-private
 //! hooks, mirroring `sg1-cli benchmark`:
 //!
-//! - **fast**: clean state (Fast tier).
+//! - **fast**: clean state (the Play tier).
 //! - **light**: one never-hit execute breakpoint (LightDebug tier).
 //! - **light-trace**: 65C816 tracing on (LightDebug tier + trace recording);
 //!   the trace buffer is drained each time it asks to flush so memory stays

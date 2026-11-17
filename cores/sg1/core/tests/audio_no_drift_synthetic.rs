@@ -12,7 +12,9 @@
 //! Uses a synthetic ROM rather than a real game so it can run on
 //! every push without ROM dependencies or audio I/O.
 
+use retro_core::frame::run_frame_on;
 use retro_core::types::ExecutionMode;
+use retro_core::ExecutionTier;
 use retro_core::{DebuggerCore, EmulatorCore};
 use sg1_core::GenesisEmulator;
 
@@ -49,13 +51,13 @@ fn audio_no_drift_synthetic_60s() {
     // 3600 overshoots by ~0.08 s and manufactures ~0.13 % phantom drift that
     // has nothing to do with the rate converter it is meant to guard.
     //
-    // `run_frame_fast()` skips debugger overhead but takes the same
-    // audio path as `run_frame()`, so the drift assertion is still
+    // The play tier skips debugger overhead but takes the same
+    // audio path as every tier, so the drift assertion is still
     // meaningful while CI wall-clock stays under ~20 s.
     let refresh_rate_hz = f64::from(emu.system_info().display.refresh_rate);
     let frames = (refresh_rate_hz * SECONDS as f64).round() as u64;
     for _ in 0..frames {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         // Drain on every frame to mirror what the host does in
         // production. This also keeps the bounded ring from
         // overflowing, which would otherwise count as silently

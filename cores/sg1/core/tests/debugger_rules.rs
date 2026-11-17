@@ -1,37 +1,26 @@
-//! The rules the debugger keeps on the Mega Drive, each shown on a small
-//! program: what a call and a return do to the call stack on both debugger
-//! frame loops, the order of the history, which trace asks to be flushed,
-//! where running on from a stop goes, what a step a host asks for records,
-//! what a reset or a load empties, that the debugger's own reads leave the
-//! machine as it was, and that a program waiting in `STOP` for its
-//! interrupt wakes on both debugger loops and under a host's steps as it
-//! does on the play loop.
+//! The rules the debugger keeps on the Mega Drive that are the console's
+//! own, each shown on a small program: what the 68000's calls of each
+//! length and their returns do to the call stack, what the Z80's own step
+//! leaves in the debugger, and that the debugger's own reads of every
+//! chip's window leave the machine as it was.
+//!
+//! The rules of the frame loops and the host step (running on from a stop,
+//! what a host step records, a program waiting in `STOP` waking on every
+//! tier and under host steps, what a reset or a load empties) are the frame
+//! driver's conformance suite, run on this core in `frame_conformance.rs`;
+//! the history's order and the trace rings' are `retro_core`'s own tests.
 
 mod helpers;
 
 use helpers::M68kProgram;
 use retro_core::cpu::Addressable;
 use retro_core::debug::TraceEntry;
-use retro_core::types::{Breakpoint, BreakpointId, BreakpointType, StackFrame};
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_core::frame::run_frame_on;
+use retro_core::types::{Breakpoint, BreakpointType, StackFrame};
+use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::cartridge::composable::parse_manifest;
-use sg1_core::debugger::{TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU};
+use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU};
 use sg1_core::GenesisEmulator;
-
-/// A frame of one of the debugger's frame loops.
-type FrameLoop = fn(&mut GenesisEmulator);
-
-/// The light debugger loop, as a frame call.
-fn light_frame(emu: &mut GenesisEmulator) {
-    emu.run_frame_debug_light();
-}
-
-/// The full debugger loop, as a frame call.
-fn full_frame(emu: &mut GenesisEmulator) {
-    <GenesisEmulator as EmulatorCore>::run_frame(emu);
-}
-
-const BOTH_LOOPS: [(&str, FrameLoop); 2] = [("light", light_frame), ("full", full_frame)];
 
 fn execute_at(address: u32) -> Breakpoint {
     Breakpoint {
@@ -42,20 +31,12 @@ fn execute_at(address: u32) -> Breakpoint {
     }
 }
 
-fn hits(emu: &GenesisEmulator, id: BreakpointId) -> u32 {
-    emu.debugger_ref()
-        .list_breakpoints()
-        .iter()
-        .find(|info| info.id == id)
-        .map(|info| info.hit_count)
-        .expect("the breakpoint is listed")
-}
-
-/// Run frames of `frame` from the running mode until the debugger pauses.
-fn run_to_a_stop(emu: &mut GenesisEmulator, frame: FrameLoop) {
+/// Run frames on the debugger's light tier from the running mode until it
+/// pauses.
+fn run_to_a_stop(emu: &mut GenesisEmulator) {
     emu.debugger().set_execution_mode(ExecutionMode::Running);
     for _ in 0..10 {
-        frame(emu);
+        run_frame_on(emu, ExecutionTier::LightDebug);
         if emu.debugger_ref().get_execution_mode() == ExecutionMode::Paused {
             return;
         }
@@ -118,7 +99,7 @@ fn calls_program() -> Vec<u8> {
 }
 
 #[test]
-fn a_call_returns_past_itself_and_both_loops_keep_the_same_stack() {
+fn a_call_returns_past_itself() {
     let stops = [0x230, 0x244, 0x230, 0x20C];
     let expected: [&[(u32, u32)]; 4] = [
         // In leaf, called by outer, called by main.
@@ -130,62 +111,18 @@ fn a_call_returns_past_itself_and_both_loops_keep_the_same_stack() {
         // Idle: every call returned.
         &[],
     ];
-    for (name, frame) in BOTH_LOOPS {
-        let mut emu = loaded(&calls_program());
-        for &stop in &stops {
-            emu.debugger().add_breakpoint(execute_at(stop));
-        }
-        for (stop, frames) in stops.iter().zip(expected) {
-            run_to_a_stop(&mut emu, frame);
-            assert_eq!(emu.cpu().pc, *stop, "the {name} loop stops at ${stop:X}");
-            assert_eq!(calls(&emu), frames, "the {name} loop at ${stop:X}");
-        }
-    }
-}
-
-// ===== The history =====
-
-#[test]
-fn the_history_lists_the_newest_instruction_first() {
     let mut emu = loaded(&calls_program());
-    for _ in 0..4 {
-        emu.step_cpu(MAIN_CPU);
+    for &stop in &stops {
+        emu.debugger().add_breakpoint(execute_at(stop));
     }
-    // MOVE at $200, JSR at $204, BSR.W at $240, NOP at $230.
-    assert_eq!(history(&emu, MAIN_CPU, 10), [0x230, 0x240, 0x204, 0x200]);
-    assert_eq!(history(&emu, MAIN_CPU, 2), [0x230, 0x240]);
+    for (stop, frames) in stops.iter().zip(expected) {
+        run_to_a_stop(&mut emu);
+        assert_eq!(emu.cpu().pc, *stop, "the light tier stops at ${stop:X}");
+        assert_eq!(calls(&emu), frames, "at ${stop:X}");
+    }
 }
 
-// ===== A host's step =====
-
-#[test]
-fn a_step_over_a_call_and_its_return_records_each_and_keeps_the_stack() {
-    let mut emu = loaded(&calls_program());
-    let mut recorded = Vec::new();
-    let mut stacks = Vec::new();
-    for _ in 0..6 {
-        let pc = emu.cpu().pc;
-        let step = emu.step_cpu(MAIN_CPU);
-        assert!(step.instruction_executed);
-        recorded.push(pc);
-        // One entry a step, the newest the instruction just stepped.
-        assert_eq!(
-            history(&emu, MAIN_CPU, 100),
-            recorded.iter().rev().copied().collect::<Vec<_>>()
-        );
-        stacks.push(calls(&emu));
-    }
-    assert_eq!(recorded, [0x200, 0x204, 0x240, 0x230, 0x232, 0x244]);
-    let expected: [&[(u32, u32)]; 6] = [
-        &[],
-        &[(0x204, 0x20A)],
-        &[(0x204, 0x20A), (0x240, 0x244)],
-        &[(0x204, 0x20A), (0x240, 0x244)],
-        &[(0x204, 0x20A)],
-        &[(0x204, 0x20A)],
-    ];
-    assert_eq!(stacks, expected);
-}
+// ===== The Z80's own step =====
 
 /// A Z80 program: `LD SP,$2000`, then `JR` to itself.
 const Z80_PROGRAM: [u8; 5] = [0x31, 0x00, 0x20, 0x18, 0xFE];
@@ -207,7 +144,7 @@ fn stepping_the_z80_leaves_its_state_in_the_debugger() {
     assert_eq!(history(&emu, SOUND_CPU, 10), [3, 0]);
 }
 
-// ===== Running on from a stop =====
+// ===== The debugger's own reads =====
 
 /// main counts in D0 round a loop whose second instruction, a NOP at
 /// `$206`, takes the breakpoint.
@@ -223,139 +160,6 @@ fn counting_program() -> Vec<u8> {
     program.build()
 }
 
-#[test]
-fn running_on_from_a_stop_runs_the_instruction_there_and_stops_at_the_next_hit() {
-    for (name, frame) in BOTH_LOOPS {
-        let mut emu = loaded(&counting_program());
-        let id = emu.debugger().add_breakpoint(execute_at(0x206));
-
-        run_to_a_stop(&mut emu, frame);
-        assert_eq!(
-            (emu.cpu().pc, emu.cpu().d[0], hits(&emu, id)),
-            (0x206, 1, 1),
-            "{name}: the first stop"
-        );
-
-        // Running on runs the NOP the stop left the 68000 at, goes round
-        // the loop once and stops at the breakpoint's next hit.
-        run_to_a_stop(&mut emu, frame);
-        assert_eq!(
-            (emu.cpu().pc, emu.cpu().d[0], hits(&emu, id)),
-            (0x206, 2, 2),
-            "{name}: the next stop"
-        );
-    }
-}
-
-#[test]
-fn a_savestate_loaded_at_a_stop_is_checked_where_it_resumes() {
-    for (name, frame) in BOTH_LOOPS {
-        let mut emu = loaded(&counting_program());
-        let id = emu.debugger().add_breakpoint(execute_at(0x206));
-        run_to_a_stop(&mut emu, frame);
-        let state = emu.save_state();
-        run_to_a_stop(&mut emu, frame);
-        assert_eq!(emu.cpu().d[0], 2, "{name}");
-
-        // The savestate puts the 68000 back on the NOP with D0 at 1. The
-        // breakpoint there is checked again: it stops the run before the
-        // loop goes round, where the stop just left behind would have let
-        // the NOP run unchecked and stopped only at D0 = 2.
-        emu.load_state(&state).expect("the savestate loads");
-        assert_eq!((emu.cpu().pc, emu.cpu().d[0]), (0x206, 1), "{name}");
-        run_to_a_stop(&mut emu, frame);
-        assert_eq!(emu.cpu().d[0], 1, "{name}: stopped in the same round");
-        assert_eq!(hits(&emu, id), 3, "{name}");
-    }
-}
-
-// ===== A reset or a load =====
-
-#[test]
-fn a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history() {
-    let rom = calls_program();
-    let stopped_in_leaf = || {
-        let mut emu = loaded(&rom);
-        emu.debugger().add_breakpoint(execute_at(0x230));
-        run_to_a_stop(&mut emu, full_frame);
-        assert_eq!(calls(&emu), [(0x204, 0x20A), (0x240, 0x244)]);
-        emu
-    };
-    let state = stopped_in_leaf().save_state();
-
-    type Replace = fn(&mut GenesisEmulator, &[u8], &[u8]);
-    let replacements: [(&str, Replace); 3] = [
-        ("a reset", |emu, _, _| emu.reset()),
-        ("a ROM load", |emu, rom, _| {
-            emu.load_rom(rom).expect("the program loads again")
-        }),
-        ("a savestate load", |emu, _, state| {
-            emu.load_state(state).expect("the savestate loads")
-        }),
-    ];
-    for (what, replace) in replacements {
-        let mut emu = stopped_in_leaf();
-        let ran = history(&emu, MAIN_CPU, 3);
-        assert_eq!(ran, [0x240, 0x204, 0x200]);
-        replace(&mut emu, &rom, &state);
-        assert!(calls(&emu).is_empty(), "{what} empties the call stack");
-        assert_eq!(history(&emu, MAIN_CPU, 3), ran, "{what} keeps the history");
-    }
-}
-
-// ===== The traces =====
-
-#[test]
-fn a_trace_ring_holds_nothing_until_its_tracing_is_first_enabled() {
-    let mut emu = GenesisEmulator::new();
-    for cpu in [MAIN_CPU, SOUND_CPU] {
-        let stats = emu.debugger_ref().trace_stats(cpu).expect("a traced CPU");
-        assert_eq!(stats.buffer_capacity, 0, "cpu {cpu}");
-    }
-    emu.debugger().set_tracing_enabled(MAIN_CPU, true);
-    let stats = emu.debugger_ref().trace_stats(MAIN_CPU).unwrap();
-    assert_eq!(stats.buffer_capacity, 8 * 1024 * 1024);
-    assert_eq!(
-        emu.debugger_ref()
-            .trace_stats(SOUND_CPU)
-            .unwrap()
-            .buffer_capacity,
-        0
-    );
-}
-
-#[test]
-fn each_trace_asks_to_be_flushed_for_itself_and_any_one_for_the_debugger() {
-    let mut emu = GenesisEmulator::new();
-    emu.debugger().set_tracing_enabled(MAIN_CPU, true);
-    emu.debugger().set_tracing_enabled(SOUND_CPU, true);
-    assert!(!emu.debugger_ref().any_trace_needs_flush());
-
-    // Fill the Z80's ring, the 68000's holding one entry.
-    emu.debugger()
-        .record_trace(MAIN_CPU, &TraceEntryBinary::default());
-    let entry = TraceEntryBinaryZ80::default();
-    let mut recorded = 0;
-    while !emu.debugger_ref().needs_trace_flush(SOUND_CPU) {
-        emu.debugger().record_trace(SOUND_CPU, &entry);
-        recorded += 1;
-        assert!(recorded < 1_000_000, "the ring never asked to be flushed");
-    }
-    assert!(!emu.debugger_ref().needs_trace_flush(MAIN_CPU));
-    assert!(emu.debugger_ref().any_trace_needs_flush());
-
-    // Once the Z80's data is taken, nothing asks.
-    let data = emu
-        .debugger_ref()
-        .get_trace_flush_data(SOUND_CPU)
-        .expect("the Z80's entries");
-    assert_eq!(data.len() % TraceEntryBinaryZ80::SIZE, 0);
-    emu.debugger().clear_trace_flushed(SOUND_CPU);
-    assert!(!emu.debugger_ref().any_trace_needs_flush());
-}
-
-// ===== The debugger's own reads =====
-
 /// What a debugger read could change: the state hash, the cartridge's own
 /// saved state (its RAM and every coprocessor's state, which the hash
 /// leaves out) and the reads the cartridge's chip has counted.
@@ -369,7 +173,7 @@ fn machine(emu: &GenesisEmulator) -> (u64, Vec<u8>, u64) {
 }
 
 /// The counting program on a cartridge of `preset`, stopped by the light
-/// loop part of the way through its second frame, the first frame run in
+/// tier part of the way through its second frame, the first frame run in
 /// full.
 fn stopped_on(preset: &str) -> GenesisEmulator {
     let manifest = parse_manifest(&format!(
@@ -386,9 +190,9 @@ fn stopped_on(preset: &str) -> GenesisEmulator {
     emu.load_rom(&counting_program())
         .expect("the program loads");
     emu.debugger().set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_fast();
+    run_frame_on(&mut emu, ExecutionTier::Play);
     emu.debugger().add_breakpoint(execute_at(0x206));
-    run_to_a_stop(&mut emu, light_frame);
+    run_to_a_stop(&mut emu);
     emu
 }
 
@@ -447,85 +251,4 @@ fn a_live_read_of_the_svp_dram_runs_the_dsp_and_a_debugger_read_does_not() {
     let read = [emu.bus_mut().read(0x300000), emu.bus_mut().read(0x300001)];
     assert_eq!(peeked, read, "the peek reads the DRAM the 68000 reads");
     assert!(machine(&emu) != before, "the 68000's read ran the DSP");
-}
-
-// ===== A program waiting in STOP =====
-
-/// Turns the vertical interrupt on and waits for it in `STOP #$2300`,
-/// counting its wake-ups at `$FF0004`; the interrupt's handler counts its
-/// entries at `$FF0000`.
-fn stop_program() -> Vec<u8> {
-    let mut program = M68kProgram::new(0x1000, 0x200);
-    program.vector(30, 0x300);
-    #[rustfmt::skip]
-    program.org(0x200).words(&[
-        0x46FC, 0x2700,                 // $200: MOVE.W #$2700,SR
-        0x41F9, 0x00C0, 0x0004,         // $204: LEA $C00004,A0
-        0x30BC, 0x8164,                 // $20A: MOVE.W #$8164,(A0): display and vertical interrupt on
-    ]);
-    #[rustfmt::skip]
-    program.label("idle").words(&[
-        0x4E72, 0x2300,                 // $20E: STOP #$2300
-        0x5279, 0x00FF, 0x0004,         // $212: ADDQ.W #1,($FF0004).L
-    ]).branch(0x6000, "idle"); // $218: BRA.W $20E
-    #[rustfmt::skip]
-    program.org(0x300).words(&[
-        0x5279, 0x00FF, 0x0000,         // $300: ADDQ.W #1,($FF0000).L
-        0x4E73,                         // $306: RTE
-    ]);
-    program.build()
-}
-
-/// The handler's entries and the program's wake-ups, as `stop_program`
-/// counts them.
-fn wake_counts(emu: &GenesisEmulator) -> (u16, u16) {
-    let ram = emu.bus().memory().work_ram.as_slice();
-    (
-        u16::from_be_bytes([ram[0], ram[1]]),
-        u16::from_be_bytes([ram[4], ram[5]]),
-    )
-}
-
-#[test]
-fn a_program_waiting_in_stop_wakes_for_its_interrupt_on_both_debugger_loops() {
-    let mut play = loaded(&stop_program());
-    for _ in 0..60 {
-        play.run_frame_fast();
-    }
-    let on_play = wake_counts(&play);
-    assert!(
-        on_play.0 >= 50,
-        "play takes the interrupt each frame: {on_play:?}"
-    );
-
-    for (name, frame) in BOTH_LOOPS {
-        let mut emu = loaded(&stop_program());
-        // An execute breakpoint nothing reaches, which is what puts a host
-        // on a debugger loop.
-        emu.debugger().add_breakpoint(execute_at(0xFF_FFF0));
-        emu.debugger().set_execution_mode(ExecutionMode::Running);
-        for _ in 0..60 {
-            frame(&mut emu);
-        }
-        assert_eq!(wake_counts(&emu), on_play, "the {name} loop");
-    }
-}
-
-#[test]
-fn a_program_waiting_in_stop_wakes_for_its_interrupt_under_a_hosts_steps() {
-    let mut emu = loaded(&stop_program());
-    for _ in 0..3 {
-        emu.run_frame_fast();
-    }
-    assert!(emu.cpu().stopped, "the program waits in STOP");
-    let (entries_before, _) = wake_counts(&emu);
-    // A frame and a half of idle time: a stopped 68000 idles 4 cycles a step.
-    for _ in 0..48_000 {
-        emu.step_cpu(MAIN_CPU);
-    }
-    let (entries_after, _) = wake_counts(&emu);
-    assert!(
-        entries_after > entries_before,
-        "no vertical interrupt came: {entries_before} entries before the steps, {entries_after} after"
-    );
 }

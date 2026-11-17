@@ -14,7 +14,6 @@ mod step;
 
 pub use capture::GenesisSnapshotConsole;
 pub use debug::InstructionAccessLog;
-pub use frame::FrameProfile;
 
 use crate::bus::AddressBus;
 use crate::cartridge::composable::CartridgeManifest;
@@ -28,7 +27,7 @@ use crate::io::devices::genesis_6button::Genesis6ButtonDevice;
 use crate::timing::VideoRegion;
 use crate::z80::Z80;
 use descriptors::{genesis_button_layout, genesis_cpus};
-use frame::HeldFrame;
+use frame::LineRun;
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
 use retro_core::debug::{trace_to_text, AccessLog};
@@ -53,16 +52,10 @@ pub struct GenesisEmulator {
     region: VideoRegion,
     frame_count: u64,
     master_cycles: u64,
-    /// Accumulated master clocks for VDP scanline timing during step().
-    /// We track in master clocks (CPU cycles x 7) to avoid fractional drift.
-    /// 3420 master clocks = 1 scanline (exact), vs 488.57 CPU cycles (inexact).
+    /// The master clocks of 68000 time the line has run: zeroed at each
+    /// line's start, raised by each step (CPU cycles x 7). The savestate
+    /// keeps it.
     step_master_clocks_accumulated: u64,
-    /// When true, [`Self::step_68k_internal`] must not advance the VDP beam:
-    /// the outer `run_frame` loop owns scanline transitions. Without this, a
-    /// line whose 68K budget is 489 cycles (3423 mclks) crosses 3420 inside
-    /// `step()` and nudges the beam an extra line on top of the outer `+1`,
-    /// drifting EOF scanline by ~1/frame and eventually double-firing VINT.
-    frame_runner_owns_beam: bool,
     /// Fractional-cycle carry for the per-scanline 68K budget in the
     /// `run_frame*` tiers. A scanline is `3420 / 7 = 488.571...` 68K cycles, so
     /// each line spends 488 cycles plus a `4/7` remainder. This holds the
@@ -72,9 +65,11 @@ pub struct GenesisEmulator {
     scanline_cycle_carry: u32,
     /// 68K instruction overshoot (in 68K cycles) carried past a scanline
     /// boundary. The last instruction of a line usually runs a few cycles past
-    /// the budget; those cycles belong to the next line. Persisting this across
-    /// frames keeps one continuous cycle count, as the CPU has, instead of
-    /// resetting the sub-frame phase every frame.
+    /// the budget; those cycles belong to the next line, whose start reads
+    /// it. Written at every line's end; persisting it across frames keeps
+    /// one continuous cycle count, as the CPU has, instead of resetting the
+    /// sub-frame phase every frame. The savestate keeps the value a frame's
+    /// end leaves.
     frame_cycle_overshoot: u32,
     /// Absolute 68K-cycle target for the next DRAM-refresh bus-steal. On the
     /// Mega Drive the 68000 bus is stolen for DRAM refresh ~every `128` CPU
@@ -137,21 +132,12 @@ pub struct GenesisEmulator {
     /// status read does not clear it.
     z80_irq_pending: bool,
 
-    /// Accumulated Z80 cycle credit from 68K execution in step mode.
-    /// Each 68K cycle generates Z80 credit (68K_cycles * 7 / 15).
-    /// Absolute Z80 cycle target for the current scanline in step mode.
-    /// Monotonically increases as 68K instructions execute; reset at scanline boundary.
+    /// The Z80's and the YM2612's counters an earlier step of a host's kept
+    /// apart from the frame's lines. The savestate's layout holds them, so
+    /// they are written and read back with it; nothing else changes them.
     step_z80_target: u32,
-
-    /// Actual Z80 cycles executed in the current scanline in step mode.
-    /// May overshoot the target; reset at scanline boundary.
     step_z80_executed: u32,
-
-    /// Fractional numerator for Z80 cycle target in step mode (/15).
     step_z80_credit_numer: u32,
-
-    /// YM2612 cycles already clocked during step mode Z80 interleaving.
-    /// Reset each scanline.
     step_ym_cycles_clocked: u32,
 
     /// Staged cartridge manifest applied on the next [`Self::load_rom`],
@@ -174,11 +160,38 @@ pub struct GenesisEmulator {
     /// `instruction_access_logging` is on.
     instruction_access_log: InstructionAccessLog,
 
-    /// A frame left part of the way through, at a capture boundary or an
-    /// event breakpoint: the next frame call goes on from it instead of
-    /// starting a frame. Never part of a savestate; a reset, a savestate
-    /// load and a ROM load drop it.
-    held_frame: Option<HeldFrame>,
+    /// A frame is in progress: a frame call that stopped part of the way
+    /// through, or a host step, left it, and the next frame call or step
+    /// goes on with it. Never part of a savestate; a reset, a savestate load
+    /// and a ROM load drop it (`frame::GenesisEmulator::drop_frame`).
+    frame_open: bool,
+    /// The line the frame in progress is on, and whether that line's start
+    /// has run.
+    frame_line: u32,
+    line_started: bool,
+    /// The line's counters between runs of steps.
+    line: LineRun,
+    /// The frame stands in front of its first line of vertical blanking,
+    /// held there for a capture.
+    held_at_capture_boundary: bool,
+    /// A capture asked the frame to stop at that boundary.
+    capture_boundary_requested: bool,
+    /// Whether a frame's end presents (the host's picture and sound): off
+    /// for a headless frame.
+    present: bool,
+    /// An enabled breakpoint watches memory or an event: the watchpoints,
+    /// the access log and the event checks run. Read when the debugger is
+    /// armed for a frame call or a step.
+    debug_armed: bool,
+    /// The Z80 is traced, read when the debugger is armed.
+    z80_trace_armed: bool,
+    /// The first word of the instruction about to run, as the 68000 trace
+    /// entry read it, for the call stack's start to take rather than read
+    /// it again (one read through the cartridge a traced instruction).
+    opcode_read: std::cell::Cell<Option<(u32, u16)>>,
+    /// The cycles of the interrupt the step in progress took before its
+    /// instruction, which its total and its trace entry count.
+    interrupt_cycles: u32,
 
     /// What the host asked the video chip to record while frames run, for a
     /// capture ([`CaptureCore::set_capture_recording`]). A host setting,
@@ -239,7 +252,6 @@ impl GenesisEmulator {
             // Convert initial CPU cycles to master clocks: 34 * 7 = 238 master clocks
             // This ensures scanline tracking starts at the correct position within the scanline
             step_master_clocks_accumulated: 34 * 7,
-            frame_runner_owns_beam: false,
             scanline_cycle_carry: 0,
             frame_cycle_overshoot: 0,
             // First refresh bus-steal lands at the 128-cycle boundary after the
@@ -286,7 +298,17 @@ impl GenesisEmulator {
             last_rom: Vec::new(),
             instruction_access_logging: false,
             instruction_access_log: InstructionAccessLog::default(),
-            held_frame: None,
+            frame_open: false,
+            frame_line: 0,
+            line_started: false,
+            line: LineRun::default(),
+            held_at_capture_boundary: false,
+            capture_boundary_requested: false,
+            present: true,
+            debug_armed: false,
+            z80_trace_armed: false,
+            opcode_read: std::cell::Cell::new(None),
+            interrupt_cycles: 0,
             capture_recording: CaptureRecording::default(),
         }
     }
@@ -743,29 +765,24 @@ impl GenesisEmulator {
             return;
         }
 
-        // Copy framebuffer data, handling potential size difference
-        if display_width == vdp_internal_width {
-            // Same width (H40 mode): direct copy
-            let copy_size = self.cached_framebuffer.data.len().min(vdp_fb.len());
-            self.cached_framebuffer.data[..copy_size].copy_from_slice(&vdp_fb[..copy_size]);
-        } else {
-            // Different width (H32 mode): copy row by row, cropping the extra pixels
-            let src_stride = (vdp_internal_width * 4) as usize;
-            let dst_stride = (display_width * 4) as usize;
-            let rows = display_height as usize;
-
-            for y in 0..rows {
-                let src_start = y * src_stride;
-                let dst_start = y * dst_stride;
-
-                // Copy only the visible portion of each row
-                if src_start + dst_stride <= vdp_fb.len()
-                    && dst_start + dst_stride <= self.cached_framebuffer.data.len()
-                {
-                    self.cached_framebuffer.data[dst_start..dst_start + dst_stride]
-                        .copy_from_slice(&vdp_fb[src_start..src_start + dst_stride]);
-                }
-            }
+        // Copy each line's visible pixels: all 320 in the 40-cell mode, the
+        // first 256 in the 32-cell mode, down to the last line both hold.
+        // A line at a time in both modes: the C library hands a copy as
+        // long as the whole frame to the processor's string move (`rep
+        // movsb`), which an AMD Zen 4 runs about fifteen times slower when
+        // the destination sits 8 bytes past the source modulo 4 KiB, and
+        // where the allocator puts the two buffers changes with the build
+        // and the game. A copy as short as a line goes to a vector loop,
+        // as fast at any distance.
+        let src_stride = (vdp_internal_width * 4) as usize;
+        let dst_stride = (display_width * 4) as usize;
+        for (dst, src) in self
+            .cached_framebuffer
+            .data
+            .chunks_exact_mut(dst_stride)
+            .zip(vdp_fb.chunks_exact(src_stride))
+        {
+            dst.copy_from_slice(&src[..dst_stride]);
         }
     }
 }
@@ -787,9 +804,9 @@ impl EmulatorCore for GenesisEmulator {
         self.debugger.set_execution_mode(ExecutionMode::Paused);
         self.debugger.console_mut().clear_instruction_boundaries();
         self.debugger.machine_replaced();
-        // The machine starts over: a frame held part of the way through is
-        // dropped, not finished.
-        self.held_frame = None;
+        // The machine starts over: a frame in progress is dropped, not
+        // finished.
+        self.drop_frame();
 
         // Reset 68000 CPU
         self.cpu.reset(&mut self.bus);
@@ -824,7 +841,6 @@ impl EmulatorCore for GenesisEmulator {
         self.master_cycles = 34;
         // Convert initial CPU cycles to master clocks: 34 * 7 = 238 master clocks
         self.step_master_clocks_accumulated = 34 * 7;
-        self.frame_runner_owns_beam = false;
         self.scanline_cycle_carry = 0;
         self.frame_cycle_overshoot = 0;
         self.bus_refresh_target = 128;
@@ -849,7 +865,12 @@ impl EmulatorCore for GenesisEmulator {
 
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
         match cpu_id {
-            MAIN_CPU => self.step_68k_internal(),
+            // The step a host asks for on the 68000, one step of the frame
+            // loop: what is due before it handled, the step with its
+            // coverage, trace entry, call stack and history, what it made
+            // due handled and the frame closed at its end, then the cached
+            // register snapshots refreshed.
+            MAIN_CPU => retro_core::frame::host_step(self),
             SOUND_CPU => self.step_z80(),
             _ => StepResult {
                 cycles: 0,
@@ -875,17 +896,21 @@ impl EmulatorCore for GenesisEmulator {
         }
     }
 
-    /// The full debug loop (`GenesisEmulator::run_frame_full`): a frame,
-    /// or the rest of one held part of the way through.
+    /// A frame call on the loop the debugger's state selects: the play
+    /// tier when nothing is instrumented, the debugger's tier while it
+    /// runs with breakpoints or traces, and its paused or stepping tier
+    /// otherwise (`retro_core::frame::run_frame_on`). A frame in progress
+    /// goes on from where it stopped.
     fn run_frame(&mut self) {
-        self.run_frame_full(false);
+        let tier = self.debugger.execution_tier();
+        retro_core::frame::run_frame_on(self, tier);
     }
 
-    /// Run to the start of vertical blanking and stop there, on the full
-    /// debug loop [`EmulatorCore::run_frame`] runs: the capture boundary
-    /// ([`GenesisEmulator::run_to_capture_boundary_with`]).
+    /// Run to the start of vertical blanking and stop there: the capture
+    /// boundary ([`CaptureCore::run_to_capture_boundary`]), on the loop
+    /// [`EmulatorCore::run_frame`] picks.
     fn run_until_vblank(&mut self) {
-        self.run_to_capture_boundary_with(ExecutionTier::FullDebug);
+        self.run_to_capture_boundary();
     }
 
     fn load_rom(&mut self, data: &[u8]) -> Result<(), String> {
@@ -1083,19 +1108,20 @@ impl EmulatorCore for GenesisEmulator {
         &self.system_info.input
     }
 
-    /// The machine's state, where a frame ends. A frame held part of the
-    /// way through (a capture boundary, an event breakpoint) has no place
-    /// in a savestate, which cannot say where to resume it, and finishing
-    /// it needs `&mut self`: while one is held this returns nothing.
-    /// [`CaptureCore::save_state_at_frame_end`] finishes the frame first,
-    /// and is what every host calls.
+    /// The machine's state, where a frame ends. A frame in progress (a
+    /// frame call that stopped, a host step, a capture boundary) has no
+    /// place in a savestate, which cannot say where to resume it, and
+    /// finishing it needs `&mut self`: while one is in progress this returns
+    /// nothing. [`CaptureCore::save_state_at_frame_end`] finishes the frame
+    /// first, and is what every host calls.
     fn save_state(&self) -> Vec<u8> {
         use crate::savestate::*;
         use retro_core::savestate::{
             serialize_compressed, SaveStateEnvelope, RETRO_SAVESTATE_ENVELOPE_VERSION,
         };
 
-        if self.held_frame.is_some() {
+        // The savestate holds no frame part of the way through.
+        if self.frame_open {
             return Vec::new();
         }
 

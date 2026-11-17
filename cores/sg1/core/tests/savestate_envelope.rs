@@ -3,8 +3,8 @@
 //! Covers:
 //! - The envelope-wrapped format always carries the retro-core MAGIC
 //!   prefix.
-//! - `save_state` -> `load_state` roundtrip preserves the master cycle
-//!   count (the only state the roundtrip test compares).
+//! - `save_state_at_frame_end` -> `load_state` roundtrip preserves the
+//!   master cycle count (the only state the roundtrip test compares).
 //! - Legacy bincode+zstd savestates (no magic prefix) still load
 //!   through the fallback path in `load_state`.
 //! - ROM hash mismatch surfaces a clear error.
@@ -13,6 +13,7 @@
 mod helpers;
 
 use helpers::MiniCartridgeBuilder;
+use retro_core::capture::CaptureCore;
 use retro_core::EmulatorCore;
 use sg1_core::system::GenesisEmulator;
 
@@ -51,13 +52,21 @@ fn save_state_roundtrip_preserves_master_cycles() {
     for _ in 0..32 {
         a.step();
     }
-    let cycles_before = a.master_cycles();
     assert!(
-        cycles_before > 34,
-        "expected master_cycles > 34 (reset baseline) after stepping, got {cycles_before}"
+        a.master_cycles() > 34,
+        "expected master_cycles > 34 (reset baseline) after stepping, got {}",
+        a.master_cycles()
     );
 
-    let snapshot = a.save_state();
+    // A savestate is taken where a frame ends: the save runs the rest of
+    // the frame the steps opened, and the trait's `save_state` holds no
+    // frame in progress.
+    assert!(
+        a.save_state().is_empty(),
+        "no bytes while a frame is in progress"
+    );
+    let snapshot = a.save_state_at_frame_end();
+    let cycles_before = a.master_cycles();
 
     let mut b = GenesisEmulator::new();
     b.load_rom(&rom).unwrap();

@@ -1,8 +1,8 @@
 //! Event breakpoints on writes to video memory: a transfer finished (by the
 //! memory it wrote), a palette colour written, a transfer into the sprite
 //! table, a tile rewritten. Each stops after the instruction that made the
-//! write, on both debugger frame loops; with none set the frame runs on the
-//! loop a player runs.
+//! write, on the debugger's tier, and a step a host asks for counts it;
+//! with none set the frame runs on the play tier.
 //!
 //! The program below makes each kind of write once, in order, with the
 //! display off: a transfer from ROM into VRAM, a palette store, a transfer
@@ -14,6 +14,7 @@
 mod helpers;
 
 use helpers::M68kProgram;
+use retro_core::frame::run_frame_on;
 use retro_core::types::{Breakpoint, BreakpointType, BREAKPOINT_PARAM_ANY};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::genesis_events;
@@ -85,10 +86,10 @@ fn writes_program() -> M68kProgram {
     program
 }
 
-/// Run `rom` with an event breakpoint on `code` and `param`, on
-/// `frame_loop`, resuming after each stop, and return the program counter
-/// at each stop.
-fn stops(rom: &[u8], code: u32, param: u32, frame_loop: ExecutionTier) -> Vec<u32> {
+/// Run `rom` with an event breakpoint on `code` and `param`, on the
+/// debugger's tier, resuming after each stop, and return the program
+/// counter at each stop.
+fn stops(rom: &[u8], code: u32, param: u32) -> Vec<u32> {
     let mut emu = GenesisEmulator::new();
     emu.load_rom(rom).expect("the program loads");
     emu.set_execution_mode(ExecutionMode::Running);
@@ -102,10 +103,7 @@ fn stops(rom: &[u8], code: u32, param: u32, frame_loop: ExecutionTier) -> Vec<u3
     let mut pcs = Vec::new();
     for _ in 0..12 {
         emu.set_execution_mode(ExecutionMode::Running);
-        match frame_loop {
-            ExecutionTier::LightDebug => emu.run_frame_debug_light(),
-            _ => EmulatorCore::run_frame(&mut emu),
-        }
+        EmulatorCore::run_frame(&mut emu);
         if emu.debugger().get_execution_mode() == ExecutionMode::Paused {
             pcs.push(emu.cpu().pc);
         }
@@ -220,14 +218,8 @@ fn each_event_stops_after_the_instruction_that_made_its_write() {
             ],
         ),
     ];
-    for frame_loop in [ExecutionTier::LightDebug, ExecutionTier::FullDebug] {
-        for (what, code, param, expected) in &cases {
-            assert_eq!(
-                &stops(&rom, *code, *param, frame_loop),
-                expected,
-                "{what} on {frame_loop:?}"
-            );
-        }
+    for (what, code, param, expected) in &cases {
+        assert_eq!(&stops(&rom, *code, *param), expected, "{what}");
     }
 }
 
@@ -246,7 +238,7 @@ fn a_stop_is_counted_on_its_breakpoint_and_a_disabled_one_does_not_stop() {
         condition: None,
     });
     emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame_debug_light();
+    run_frame_on(&mut emu, ExecutionTier::LightDebug);
     assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
     let hits = |emu: &mut GenesisEmulator| {
         emu.debugger()
@@ -262,19 +254,19 @@ fn a_stop_is_counted_on_its_breakpoint_and_a_disabled_one_does_not_stop() {
     emu.debugger().enable_breakpoint(id, false);
     for _ in 0..4 {
         emu.set_execution_mode(ExecutionMode::Running);
-        emu.run_frame_debug_light();
+        run_frame_on(&mut emu, ExecutionTier::LightDebug);
         assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
     }
     assert_eq!(hits(&mut emu), 1);
 }
 
 #[test]
-fn with_no_breakpoint_the_frame_runs_on_the_fast_loop_and_raises_nothing() {
+fn the_play_tier_checks_no_event_and_raises_nothing() {
     let rom = writes_program().build();
     let mut emu = GenesisEmulator::new();
     emu.load_rom(&rom).expect("the program loads");
     emu.set_execution_mode(ExecutionMode::Running);
-    assert_eq!(emu.debugger().execution_tier(), ExecutionTier::Fast);
+    assert_eq!(emu.debugger().execution_tier(), ExecutionTier::Play);
     let id = emu.debugger().add_breakpoint(Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event {
@@ -286,10 +278,11 @@ fn with_no_breakpoint_the_frame_runs_on_the_fast_loop_and_raises_nothing() {
     });
     assert_eq!(emu.debugger().execution_tier(), ExecutionTier::LightDebug);
 
-    // The loop a player runs checks no event, even with one set: nothing
-    // stops it and the video chip raises nothing.
+    // The play tier checks no event, even with one set: it runs with the
+    // debugger disarmed, so nothing stops it and the video chip raises
+    // nothing.
     for _ in 0..3 {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
         assert!(emu
             .vdp_mut()
@@ -297,16 +290,16 @@ fn with_no_breakpoint_the_frame_runs_on_the_fast_loop_and_raises_nothing() {
             .is_none_or(|raised| raised.is_empty()));
     }
     emu.debugger().remove_breakpoint(id);
-    assert_eq!(emu.debugger().execution_tier(), ExecutionTier::Fast);
+    assert_eq!(emu.debugger().execution_tier(), ExecutionTier::Play);
 }
 
 #[test]
-fn a_step_the_host_asks_for_stops_on_the_write_it_makes() {
+fn a_step_the_host_asks_for_counts_the_write_it_makes() {
     let mut program = writes_program();
     let rom = program.build();
     let mut emu = GenesisEmulator::new();
     emu.load_rom(&rom).expect("the program loads");
-    emu.debugger().add_breakpoint(Breakpoint {
+    let id = emu.debugger().add_breakpoint(Breakpoint {
         address: 0,
         bp_type: BreakpointType::Event {
             code: genesis_events::PALETTE_WRITE,
@@ -315,11 +308,21 @@ fn a_step_the_host_asks_for_stops_on_the_write_it_makes() {
         cpu_id: None,
         condition: None,
     });
+    let hits = |emu: &mut GenesisEmulator| {
+        emu.debugger()
+            .list_breakpoints()
+            .into_iter()
+            .find(|bp| bp.id == id)
+            .unwrap()
+            .hit_count
+    };
+    // A host step counts what its checks find and stops on none of them:
+    // the count rises at the step that made the write.
     let target = program.address("after_palette_store");
     let mut hit_at = None;
     for _ in 0..200 {
-        let result = EmulatorCore::step(&mut emu);
-        if result.breakpoint_hit {
+        EmulatorCore::step(&mut emu);
+        if hits(&mut emu) > 0 {
             hit_at = Some(emu.cpu().pc);
             break;
         }

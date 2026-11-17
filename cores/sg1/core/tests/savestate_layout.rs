@@ -21,7 +21,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use retro_core::frame::run_frame_on;
 use retro_core::EmulatorCore;
+use retro_core::ExecutionTier;
 use sg1_core::savestate::SAVE_STATE_VERSION;
 use sg1_core::system::GenesisEmulator;
 
@@ -107,7 +109,7 @@ fn assert_holds_the_program_state(emu: &GenesisEmulator, file: &str) {
 fn the_program_reaches_its_loop_with_its_values() {
     let mut emu = emulator_with_program();
     for _ in 0..FRAMES {
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
     }
     assert_holds_the_program_state(&emu, "a fresh run");
 }
@@ -124,7 +126,7 @@ fn every_savestate_layout_written_keeps_loading() {
         );
         let mut emu = emulator_with_program();
         for _ in 0..FRAMES {
-            emu.run_frame_fast();
+            run_frame_on(&mut emu, ExecutionTier::Play);
         }
         fs::create_dir_all(&dir).expect("the fixture folder");
         fs::write(&path, emu.save_state()).expect("the fixture is written");

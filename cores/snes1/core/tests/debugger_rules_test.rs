@@ -1,11 +1,12 @@
 //! The debugger's rules on the SNES, each shown on a small program: what a
 //! watchpoint compares and how often it counts, what a condition reads, that
 //! the debugger's focus is no part of the machine, that no host steps the
-//! SPC700, where a state loaded at a stop is checked, what a reset or a load
+//! SPC700, where a state loaded at a stop is checked, what a power-on reset
 //! empties, what the cartridge's CPU traces, and that nothing the debugger
 //! reads for itself changes the machine, through any coprocessor's window.
-//! The rules of the frame loops and the host step are the frame driver's
-//! conformance suite (`frame_conformance_test.rs`).
+//! The rules of the frame loops and the host step, and what a reset or a
+//! load empties, are the frame driver's conformance suite
+//! (`frame_conformance_test.rs`).
 
 use retro_core::{
     Breakpoint, BreakpointAction, BreakpointType, EmulatorCore, ExecutionMode, ExecutionTier,
@@ -306,33 +307,12 @@ fn a_state_loaded_at_a_stop_is_checked_at_its_own_address() {
 }
 
 #[test]
-fn a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history() {
-    let rom = lorom(CALLS);
-    let mut emu = loaded(&rom);
-    let state = emu.save_state();
-    let into_call = |emu: &mut SnesEmulator| {
-        emu.step_cpu(MAIN_CPU);
-        emu.step_cpu(MAIN_CPU);
-        assert_eq!(call_stack(emu).len(), 2);
-        history(emu).len()
-    };
-
-    let kept = into_call(&mut emu);
-    emu.reset();
-    assert!(call_stack(&emu).is_empty(), "after a reset");
-    assert_eq!(history(&emu).len(), kept);
-
-    let kept = into_call(&mut emu);
-    emu.load_rom(&rom).expect("the program loads again");
-    assert!(call_stack(&emu).is_empty(), "after a ROM load");
-    assert_eq!(history(&emu).len(), kept);
-
-    let kept = into_call(&mut emu);
-    emu.load_state(&state).expect("the state loads");
-    assert!(call_stack(&emu).is_empty(), "after a state load");
-    assert_eq!(history(&emu).len(), kept);
-
-    let kept = into_call(&mut emu);
+fn a_power_on_reset_empties_the_call_stack_and_keeps_the_history() {
+    let mut emu = loaded(&lorom(CALLS));
+    emu.step_cpu(MAIN_CPU);
+    emu.step_cpu(MAIN_CPU);
+    assert_eq!(call_stack(&emu).len(), 2);
+    let kept = history(&emu).len();
     emu.power_on_reset();
     assert!(call_stack(&emu).is_empty(), "after a power-on reset");
     assert_eq!(history(&emu).len(), kept);
@@ -378,7 +358,7 @@ fn a_cartridge_without_a_cpu_that_traces_keeps_its_trace_off() {
     emu.run_frame();
     assert_eq!(
         emu.debugger_ref().execution_tier(),
-        ExecutionTier::Fast,
+        ExecutionTier::Play,
         "the frame ran on the fast loop"
     );
 }

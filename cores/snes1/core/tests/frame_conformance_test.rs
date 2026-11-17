@@ -61,6 +61,7 @@ fn build() -> SnesEmulator {
 fn snes() -> FrameCoreUnderTest<SnesEmulator> {
     FrameCoreUnderTest {
         build,
+        rom: program(),
         state_hash: SnesEmulator::state_hash,
         state_parts: SnesEmulator::state_hash_parts,
         frame_count: SnesEmulator::frame_count,

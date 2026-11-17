@@ -125,7 +125,9 @@ impl SnesEmulator {
         self.bus
             .set_next_irq_cycle(self.irq_cycles.front().copied());
         self.bus.begin_cpu_instruction();
+        hooks.chip_start("65C816");
         let cpu_cycles = self.cpu.step(&mut self.bus);
+        hooks.chip_finish(1);
         let (access_mclks, accesses) = self.bus.take_cpu_instruction_cost();
         if let Some(at) = self.bus.take_irq_read_early() {
             self.irq_read_early = Some(at);
@@ -139,7 +141,9 @@ impl SnesEmulator {
         // CPU stall.
         let dma_mask = self.bus.take_pending_general_dma();
         if dma_mask != 0 {
+            hooks.chip_start("DMA");
             delta += self.bus.run_general_dma(dma_mask);
+            hooks.chip_finish(0);
             // A general-DMA block just ran: match a `DmaStart` event
             // breakpoint for the whole `$420B` write, and a `DmaDone` for
             // each channel it ran, by the channel's B-bus port.
@@ -208,7 +212,9 @@ impl SnesEmulator {
         // current cadence. The chip's S-CPU-directed IRQ line is ORed into
         // `cpu.irq_pending` before the next step (see `mirror_irq_line`).
         if self.bus.cart_runs_burst_cpu() {
+            hooks.chip_start("cartridge");
             self.bus.catch_up_coprocessor(self.master_cycles);
+            hooks.chip_finish(0);
         }
         delta
     }

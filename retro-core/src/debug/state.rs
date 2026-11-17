@@ -405,7 +405,7 @@ impl<const N: usize, C: ConsoleDebug> DebuggerState<N, C> {
     }
 
     /// Record that CPU `cpu` ran an instruction at `address`, masked to its
-    /// space. The fast loops call it for every instruction: with a constant
+    /// space. Every tier calls it for every instruction: with a constant
     /// `cpu` it is the bitmap's store and the mask's load.
     #[inline(always)]
     pub fn record_coverage(&mut self, cpu: usize, address: u32) {
@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(state.trace_entry_size(9), None);
         assert_eq!(state.trace_entry_size(0), Some(4));
         assert_eq!(state.get_trace_flush_data(2), None);
-        assert_eq!(state.execution_tier(), ExecutionTier::Fast);
+        assert_eq!(state.execution_tier(), ExecutionTier::Play);
     }
 
     #[test]
@@ -1107,7 +1107,7 @@ mod tests {
     #[test]
     fn the_tier_follows_the_mode_the_breakpoints_and_the_traces() {
         let mut state = state();
-        assert_eq!(state.execution_tier(), ExecutionTier::Fast);
+        assert_eq!(state.execution_tier(), ExecutionTier::Play);
         state.set_tracing_enabled(1, true);
         assert_eq!(state.execution_tier(), ExecutionTier::LightDebug);
         state.set_tracing_enabled(1, false);
@@ -1116,7 +1116,7 @@ mod tests {
         state.remove_breakpoint(id);
         state.set_execution_mode(ExecutionMode::Paused);
         assert_eq!(state.execution_tier(), ExecutionTier::FullDebug);
-        assert_eq!(state.running_tier(), ExecutionTier::Fast);
+        assert_eq!(state.running_tier(), ExecutionTier::Play);
     }
 
     // -- History and calls ---------------------------------------------

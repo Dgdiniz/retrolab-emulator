@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use retro_core::EmulatorCore;
+use retro_core::frame::run_frame_on;
+use retro_core::{EmulatorCore, ExecutionTier};
 use sg1_core::GenesisEmulator;
 
 #[derive(Args, Debug)]
@@ -38,7 +39,7 @@ pub fn run(args: AudioInfoArgs) -> Result<()> {
         println!("Monitoring mode: printing state every {interval_frames} frames (total: {total})");
         println!();
         for frame in 0..total {
-            emu.run_frame_fast();
+            run_frame_on(&mut emu, ExecutionTier::Play);
             emu.clear_audio_buffer();
             if interval_frames > 0 && (frame + 1) % interval_frames == 0 {
                 println!("--- Frame {} ---", frame + 1);
@@ -49,7 +50,7 @@ pub fn run(args: AudioInfoArgs) -> Result<()> {
     } else {
         println!("Running {} frames...", args.frames);
         for _ in 0..args.frames {
-            emu.run_frame_fast();
+            run_frame_on(&mut emu, ExecutionTier::Play);
             emu.clear_audio_buffer();
         }
         println!();

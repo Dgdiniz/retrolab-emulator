@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_core::frame::run_frame_on;
+use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::psg::PsgWrite;
 use sg1_core::ym2612::FmWrite;
 
@@ -80,7 +81,7 @@ pub fn run(args: SoundTraceArgs) -> Result<()> {
     let mut total: u64 = 0;
     for frame in 0..args.frames {
         apply_press(&mut emu, schedule.as_ref(), frame);
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         // Drain the rendered audio so the chips' ring buffers don't back up;
         // each write was already timestamped at render time, so this does not
         // affect the captured offsets.

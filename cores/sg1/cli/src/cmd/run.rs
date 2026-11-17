@@ -89,8 +89,8 @@ pub fn run(args: RunArgs) -> Result<()> {
         }
         finish_bar(pb);
     } else if args.until_vblank {
-        // The full debug loop runs nothing while the debugger is paused, as
-        // it is after a load.
+        // A frame call runs nothing while the debugger is paused, as it is
+        // after a load.
         emu.debugger().set_execution_mode(ExecutionMode::Running);
         emu.run_until_vblank();
         println!("Stopped at the start of vertical blanking.");

@@ -32,9 +32,10 @@ sha2 = "0.10"  # Canonical ROM digest for cartridge manifests
 js-sys = "0.3"
 
 [dev-dependencies]
-# The capture conformance suite, which `tests/capture_conformance.rs` runs;
-# the core's own build leaves it out.
-retro-core = { path = "../../../retro-core", features = ["capture-conformance"] }
+# The capture and frame conformance suites, which
+# `tests/capture_conformance.rs` and `tests/frame_conformance.rs` run; the
+# core's own build leaves them out.
+retro-core = { path = "../../../retro-core", features = ["capture-conformance", "frame-conformance"] }
 serde_json = { workspace = true }
 flate2 = "1.0"
 criterion = "0.5"

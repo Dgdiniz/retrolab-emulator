@@ -11,6 +11,7 @@
 
 use retro_core::capture::{planes, CaptureCore};
 use retro_core::debug::DebugEvent;
+use retro_core::frame::{run_frame_on, run_to_capture_boundary_on, FrameMachine};
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -157,13 +158,14 @@ fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
     emu.get_audio_buffer().iter().map(|s| s.to_bits()).collect()
 }
 
-/// One whole frame on `frame_loop`.
-fn run_whole(emu: &mut GenesisEmulator, frame_loop: ExecutionTier) {
-    match frame_loop {
-        ExecutionTier::Fast => emu.run_frame_fast(),
-        ExecutionTier::LightDebug => emu.run_frame_debug_light(),
-        ExecutionTier::FullDebug => EmulatorCore::run_frame(emu),
-    }
+/// One whole frame on `tier` (a frame in progress goes on to its end).
+fn run_whole(emu: &mut GenesisEmulator, tier: ExecutionTier) {
+    run_frame_on(emu, tier);
+}
+
+/// One whole frame on the play tier.
+fn play(emu: &mut GenesisEmulator) {
+    run_frame_on(emu, ExecutionTier::Play);
 }
 
 /// The colour of pixel (0, 0) of the picture, and the colour tile 1's first
@@ -185,7 +187,7 @@ fn shown_and_held_colour(emu: &GenesisEmulator) -> ((u8, u8, u8), (u8, u8, u8)) 
 fn the_boundary_holds_the_memory_the_picture_was_drawn_from() {
     let mut emu = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        play(&mut emu);
     }
     for _ in 0..FRAMES {
         emu.run_to_capture_boundary();
@@ -209,7 +211,7 @@ fn the_boundary_holds_the_memory_the_picture_was_drawn_from() {
 
         // The frame run to its end: VRAM has the tile the vertical interrupt
         // put for the next frame, the picture the one just drawn.
-        emu.run_frame_fast();
+        play(&mut emu);
         assert!(!emu.capture_frame_snapshot().at_boundary);
         let (shown_after, held_after) = shown_and_held_colour(&emu);
         assert_eq!(shown_after, shown, "VBlank lines draw nothing");
@@ -233,7 +235,7 @@ fn each_call_moves_one_frame_and_lands_on_a_boundary() {
             "a held frame is counted when it ends"
         );
         // Held, the frame shows the picture it shows once it ends.
-        whole.run_frame_fast();
+        play(&mut whole);
         assert_eq!(
             emu.capture_frame_snapshot().framebuffer,
             whole.capture_frame_snapshot().framebuffer,
@@ -247,11 +249,7 @@ fn each_call_moves_one_frame_and_lands_on_a_boundary() {
 
 #[test]
 fn a_frame_split_at_its_boundary_sounds_and_ends_as_a_whole_frame() {
-    for frame_loop in [
-        ExecutionTier::Fast,
-        ExecutionTier::LightDebug,
-        ExecutionTier::FullDebug,
-    ] {
+    for frame_loop in [ExecutionTier::Play, ExecutionTier::LightDebug] {
         let mut whole = emulator();
         let mut split = emulator();
         for _ in 0..WARM_UP {
@@ -266,7 +264,7 @@ fn a_frame_split_at_its_boundary_sounds_and_ends_as_a_whole_frame() {
             run_whole(&mut whole, frame_loop);
             whole_audio.extend(take_audio(&mut whole));
 
-            split.run_to_capture_boundary_with(frame_loop);
+            run_to_capture_boundary_on(&mut split, frame_loop);
             assert!(split.at_capture_boundary());
             assert!(
                 take_audio(&mut split).is_empty(),
@@ -302,24 +300,27 @@ fn a_frame_split_at_its_boundary_sounds_and_ends_as_a_whole_frame() {
 #[test]
 fn every_frame_call_finishes_the_held_frame() {
     type FrameCall = fn(&mut GenesisEmulator);
-    // Each call, and the loop it runs. Headless is the fast loop with nothing
-    // shown, so it leaves the machine as the fast loop does.
+    // Each call, and the tier it runs. Headless is the play tier with
+    // nothing shown, and the trait's frame call is the play tier while
+    // nothing is armed, so both leave the machine as the play tier does.
     let calls: [(&str, FrameCall, ExecutionTier); 4] = [
-        ("fast", GenesisEmulator::run_frame_fast, ExecutionTier::Fast),
+        ("play", play, ExecutionTier::Play),
         (
             "headless",
             GenesisEmulator::run_frame_headless,
-            ExecutionTier::Fast,
+            ExecutionTier::Play,
         ),
         (
             "light",
-            GenesisEmulator::run_frame_debug_light,
+            |emu: &mut GenesisEmulator| {
+                run_frame_on(emu, ExecutionTier::LightDebug);
+            },
             ExecutionTier::LightDebug,
         ),
         (
-            "full",
+            "the trait's",
             |emu: &mut GenesisEmulator| EmulatorCore::run_frame(emu),
-            ExecutionTier::FullDebug,
+            ExecutionTier::Play,
         ),
     ];
     for (name, call, frame_loop) in calls {
@@ -330,7 +331,7 @@ fn every_frame_call_finishes_the_held_frame() {
             run_whole(&mut held, frame_loop);
         }
         run_whole(&mut whole, frame_loop);
-        held.run_to_capture_boundary_with(frame_loop);
+        run_to_capture_boundary_on(&mut held, frame_loop);
         let count = held.frame_count();
         call(&mut held);
         assert!(!held.at_capture_boundary(), "{name}");
@@ -344,7 +345,7 @@ fn every_frame_call_finishes_the_held_frame() {
 }
 
 #[test]
-fn run_until_vblank_stops_at_the_boundary_on_the_full_loop() {
+fn run_until_vblank_stops_at_the_boundary_on_the_debuggers_tier() {
     let mut emu = emulator();
     let mut whole = emulator();
     for _ in 0..WARM_UP {
@@ -367,10 +368,10 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
     let mut emu = emulator();
     let mut whole = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
-        whole.run_frame_fast();
+        play(&mut emu);
+        play(&mut whole);
     }
-    whole.run_frame_fast();
+    play(&mut whole);
     emu.run_to_capture_boundary();
 
     assert!(
@@ -387,8 +388,8 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
     let mut restored = emulator();
     restored.load_state(&state).expect("the savestate loads");
     assert_eq!(restored.state_hash(), whole.state_hash());
-    restored.run_frame_fast();
-    whole.run_frame_fast();
+    play(&mut restored);
+    play(&mut whole);
     assert_eq!(restored.state_hash(), whole.state_hash());
 
     // Taken where no frame is held, nothing runs first.
@@ -397,24 +398,78 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
     assert_eq!(emu.frame_count(), count);
 }
 
+/// Host steps open a frame, which no savestate can hold: the save runs the
+/// rest of it first, and the frame ends where it ends run whole.
+#[test]
+fn a_savestate_after_host_steps_finishes_the_frame_first() {
+    let mut emu = emulator();
+    let mut whole = emulator();
+    for _ in 0..WARM_UP {
+        play(&mut emu);
+        play(&mut whole);
+    }
+    play(&mut whole);
+    for _ in 0..40 {
+        emu.step_cpu(0);
+    }
+    assert!(
+        FrameMachine::frame_in_progress(&emu),
+        "the steps opened a frame"
+    );
+    assert!(
+        EmulatorCore::save_state(&emu).is_empty(),
+        "a frame in progress has no savestate: it needs finishing first"
+    );
+    let state = emu.save_state_at_frame_end();
+    assert!(!state.is_empty());
+    assert!(
+        !FrameMachine::frame_in_progress(&emu),
+        "the frame was finished"
+    );
+    assert_eq!(emu.frame_count(), whole.frame_count());
+    assert_eq!(emu.state_hash(), whole.state_hash());
+
+    let mut restored = emulator();
+    restored.load_state(&state).expect("the savestate loads");
+    assert_eq!(restored.state_hash(), whole.state_hash());
+}
+
 #[test]
 fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
     let mut emu = emulator();
-    emu.run_frame_fast();
+    play(&mut emu);
     let state = emu.save_state_at_frame_end();
 
     emu.run_to_capture_boundary();
     EmulatorCore::reset(&mut emu);
     assert!(!emu.at_capture_boundary());
+    assert!(!FrameMachine::frame_in_progress(&emu));
 
     emu.set_execution_mode(ExecutionMode::Running);
     emu.run_to_capture_boundary();
     emu.load_state(&state).expect("the savestate loads");
     assert!(!emu.at_capture_boundary());
+    assert!(!FrameMachine::frame_in_progress(&emu));
 
     emu.run_to_capture_boundary();
     emu.load_rom(&program_rom()).expect("the program loads");
     assert!(!emu.at_capture_boundary());
+    assert!(!FrameMachine::frame_in_progress(&emu));
+
+    // A frame host steps opened is dropped alike.
+    for (what, drop) in [("a reset", 0), ("a savestate load", 1), ("a ROM load", 2)] {
+        emu.step_cpu(0);
+        assert!(
+            FrameMachine::frame_in_progress(&emu),
+            "{what}: a step opens a frame"
+        );
+        match drop {
+            0 => EmulatorCore::reset(&mut emu),
+            1 => emu.load_state(&state).expect("the savestate loads"),
+            _ => emu.load_rom(&program_rom()).expect("the program loads"),
+        }
+        assert!(!FrameMachine::frame_in_progress(&emu), "{what} drops it");
+    }
 
     // A refused savestate changes nothing, the held frame included.
     emu.set_execution_mode(ExecutionMode::Running);
@@ -436,7 +491,7 @@ fn break_on(emu: &mut GenesisEmulator, event: GenesisEvent) -> u32 {
 
 #[test]
 fn an_event_breakpoint_stop_goes_on_where_it_stopped() {
-    for frame_loop in [ExecutionTier::LightDebug, ExecutionTier::FullDebug] {
+    for frame_loop in [ExecutionTier::LightDebug] {
         for event in [GenesisEvent::Scanline(100), GenesisEvent::VBlank] {
             let mut whole = emulator();
             let mut stopped = emulator();
@@ -493,7 +548,7 @@ fn rows(picture: &[u8], range: std::ops::Range<usize>) -> &[u8] {
 fn at_an_event_stop_the_snapshot_numbers_the_picture_the_host_holds() {
     // The program gives tile 1, at the top left, its other colour every
     // frame: rows 0 to 7 of two frames' pictures differ.
-    for frame_loop in [ExecutionTier::LightDebug, ExecutionTier::FullDebug] {
+    for frame_loop in [ExecutionTier::LightDebug] {
         for event in [
             GenesisEvent::Scanline(3),
             GenesisEvent::Scanline(100),
@@ -556,16 +611,59 @@ fn at_an_event_stop_the_snapshot_numbers_the_picture_the_host_holds() {
     }
 }
 
+/// An execute breakpoint at the vertical interrupt's handler stops in
+/// vertical blanking, the frame's picture finished: the host holds it,
+/// numbered as it is once the frame ran whole, `frame_count + 1`.
+#[test]
+fn at_an_execute_stop_in_vertical_blanking_the_snapshot_numbers_the_finished_picture() {
+    let mut whole = emulator();
+    let mut stopped = emulator();
+    for _ in 0..WARM_UP {
+        play(&mut whole);
+        play(&mut stopped);
+    }
+    play(&mut whole);
+    let after = whole.capture_frame_snapshot();
+
+    stopped.debugger().add_breakpoint(Breakpoint {
+        address: 0x300,
+        bp_type: BreakpointType::execute(),
+        cpu_id: Some(0),
+        condition: None,
+    });
+    run_whole(&mut stopped, ExecutionTier::LightDebug);
+    assert_eq!(
+        stopped.debugger().get_execution_mode(),
+        ExecutionMode::Paused,
+        "the breakpoint stops the frame"
+    );
+    assert_eq!(stopped.cpu().pc, 0x300, "in front of the handler");
+    let line = stopped.vdp().timing().scanline;
+    assert!(
+        line >= stopped.vdp().first_vblank_line(),
+        "in vertical blanking, line {line}"
+    );
+    let held = stopped.capture_frame_snapshot();
+    assert_eq!(held.framebuffer, stopped.get_framebuffer().data);
+    assert_eq!(held.framebuffer, after.framebuffer);
+    assert_eq!(held.frame, stopped.frame_count() + 1);
+    assert_eq!(held.frame, after.frame);
+    let sources = stopped.pixel_sources(planes::LAYER).expect("a game");
+    assert_eq!(sources.frame, held.frame);
+    let sprites = stopped.line_sprites().expect("a game");
+    assert_eq!(sprites.frame, held.frame);
+}
+
 #[test]
 fn a_boundary_call_goes_on_from_an_event_stop_to_the_frames_boundary() {
     let mut emu = emulator();
     let mut whole = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
-        whole.run_frame_fast();
+        play(&mut emu);
+        play(&mut whole);
     }
     let id = break_on(&mut emu, GenesisEvent::Scanline(100));
-    emu.run_frame_debug_light();
+    run_frame_on(&mut emu, ExecutionTier::LightDebug);
     emu.debugger().remove_breakpoint(id);
     emu.set_execution_mode(ExecutionMode::Running);
     let count = emu.frame_count();
@@ -577,51 +675,41 @@ fn a_boundary_call_goes_on_from_an_event_stop_to_the_frames_boundary() {
         count,
         "the same frame, held at its boundary"
     );
-    emu.run_frame_fast();
-    whole.run_frame_fast();
+    play(&mut emu);
+    play(&mut whole);
     assert_eq!(emu.state_hash(), whole.state_hash());
 }
 
 #[test]
-fn a_step_at_the_boundary_runs_where_the_frame_is_held() {
+fn a_step_at_the_boundary_goes_on_with_the_frame() {
     let mut emu = emulator();
     let mut whole = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
-        whole.run_frame_fast();
+        play(&mut emu);
+        play(&mut whole);
     }
-    whole.run_frame_fast();
+    play(&mut whole);
     emu.run_to_capture_boundary();
     let line = emu.vdp().timing().scanline;
+    assert!(!emu.vdp().in_vblank());
 
-    // A thousand instructions, more than a line's worth of 68000 time.
-    for _ in 0..1000 {
-        assert!(emu.step().instruction_executed);
+    // Host steps go on with the frame as a frame call goes on with it: the
+    // hold left, the lines started as their time comes, vertical blanking
+    // begun.
+    assert!(emu.step().instruction_executed);
+    assert!(!emu.at_capture_boundary(), "the step left the hold");
+    assert!(emu.vdp().in_vblank(), "vertical blanking began");
+    let mut steps = 0;
+    while emu.vdp().timing().scanline < line + 3 {
+        emu.step();
+        steps += 1;
+        assert!(steps < 10_000, "the beam moves on");
     }
-    assert!(emu.at_capture_boundary(), "the frame stays held");
-    assert_eq!(
-        emu.vdp().timing().scanline,
-        line,
-        "the beam stays where it stopped"
-    );
-    assert!(!emu.vdp().in_vblank(), "no VBlank before the frame goes on");
 
-    // The frame then ends where a whole frame ends: the stepped time came
-    // out of the rest of it.
-    emu.run_frame_fast();
+    // The frame then ends as the frame run whole: the same machine.
+    play(&mut emu);
     assert_eq!(emu.frame_count(), whole.frame_count());
-    assert_eq!(emu.vdp().timing().scanline, whole.vdp().timing().scanline);
-    let apart = emu.master_cycles().abs_diff(whole.master_cycles());
-    assert!(
-        apart < 200,
-        "68000 time differs by {apart} cycles: more than where the last instruction ends"
-    );
-    // And it took its VBlank as a whole frame does.
-    assert_eq!(
-        emu.bus().memory().work_ram.as_slice()[..2],
-        whole.bus().memory().work_ram.as_slice()[..2],
-        "the vertical interrupt counted the frame"
-    );
+    assert_eq!(emu.state_hash(), whole.state_hash());
 }
 
 #[test]
@@ -642,10 +730,10 @@ fn a_step_at_an_event_stop_runs_the_handler_where_the_frame_is_held() {
         "stopped on the VBlank line"
     );
 
-    // Stepped through the full loop's step mode, the 68000 runs on where
-    // the frame is held: the vertical interrupt lands part of the way into
-    // the line and its handler runs, while the beam stays on the line. A
-    // step that takes the interrupt runs the handler's first instruction.
+    // Stepped through the debugger's step mode, the 68000 goes on with the
+    // frame: the vertical interrupt lands part of the way into the line and
+    // its handler runs, the few steps staying on the line. A step that takes
+    // the interrupt runs the handler's first instruction.
     let in_handler = |emu: &GenesisEmulator| emu.cpu().sr & 0x0700 == 0x0600;
     let mut steps = 0;
     while !in_handler(&emu) {
@@ -678,7 +766,7 @@ fn a_step_at_an_event_stop_runs_the_handler_where_the_frame_is_held() {
     EmulatorCore::run_frame(&mut emu);
     assert_eq!(emu.state_hash(), hash);
 
-    // Going on finishes that frame.
+    // Going on finishes that frame, as the frame run whole.
     emu.set_execution_mode(ExecutionMode::Running);
     EmulatorCore::run_frame(&mut emu);
     EmulatorCore::run_frame(&mut whole);
@@ -688,13 +776,14 @@ fn a_step_at_an_event_stop_runs_the_handler_where_the_frame_is_held() {
         whole.bus().memory().work_ram.as_slice()[..2],
         "the vertical interrupt counted the frame once"
     );
+    assert_eq!(emu.state_hash(), whole.state_hash(), "the same machine");
 }
 
 #[test]
 fn a_layer_is_drawn_alone_and_changes_nothing() {
     let mut emu = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        play(&mut emu);
     }
     emu.run_to_capture_boundary();
     let hash = emu.state_hash();
@@ -737,9 +826,9 @@ fn a_layer_is_drawn_alone_and_changes_nothing() {
     // And the frame still ends as it would have.
     let mut whole = emulator();
     for _ in 0..=WARM_UP {
-        whole.run_frame_fast();
+        play(&mut whole);
     }
-    emu.run_frame_fast();
+    play(&mut emu);
     assert_eq!(emu.state_hash(), whole.state_hash());
 }
 
@@ -760,7 +849,7 @@ fn put_sprites_in_a_row(emu: &mut GenesisEmulator, count: u8) {
 fn a_repaint_and_a_layer_move_no_saved_state_on_a_frame_with_sprite_overflow() {
     let mut emu = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        play(&mut emu);
     }
     // 21 sprites on one line: one past the 40-cell mode's 20.
     put_sprites_in_a_row(&mut emu, 21);
@@ -803,7 +892,7 @@ fn a_repaint_and_a_layer_move_no_saved_state_on_a_frame_with_sprite_overflow() {
 fn the_display_info_gives_the_mode_s_width_and_the_lines_drawn() {
     let mut emu = emulator();
     for _ in 0..WARM_UP {
-        emu.run_frame_fast();
+        play(&mut emu);
     }
     let size = |emu: &GenesisEmulator| {
         let info = emu.get_display_info();
@@ -813,14 +902,14 @@ fn the_display_info_gives_the_mode_s_width_and_the_lines_drawn() {
 
     // 32 cells.
     emu.vdp_mut().write_word_port(0x04, 0x8C00);
-    emu.run_frame_fast();
+    play(&mut emu);
     assert_eq!(size(&emu), (256, 224));
     assert_eq!(emu.get_framebuffer().width, 256);
 
     // 30-cell lines: the framebuffer draws 224 of them, so the picture is 224
     // high whatever the mode asks.
     emu.vdp_mut().write_word_port(0x04, 0x816C);
-    emu.run_frame_fast();
+    play(&mut emu);
     assert_eq!(size(&emu), (256, 224));
     assert_eq!(
         emu.capture_frame_snapshot().framebuffer.len(),

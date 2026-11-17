@@ -1992,7 +1992,7 @@ impl SnesBus {
         }
     }
 
-    /// Fastest read tier (`ExecutionTier::Fast`): pure dispatch,
+    /// Fastest read tier (`ExecutionTier::Play`): pure dispatch,
     /// no instrumentation. Used when the CPU step loop runs free.
     #[inline(always)]
     pub fn read_fast(&mut self, addr: u32) -> u8 {

@@ -174,21 +174,17 @@ impl RetroEmulator {
         }
     }
 
-    /// Run one frame with automatic path selection:
-    /// - Fast path: no debug features active (highest performance)
-    /// - Light debug: breakpoints and/or trace active in Running mode (minimal overhead)
-    /// - Full debug: Paused/StepInto/StepOver modes (full disassembly, history, state updates)
+    /// Run one frame on the tier the debugger's state picks, the core's own
+    /// choice: the play tier with no debug feature active (highest
+    /// performance), the light debug tier with breakpoints or traces while
+    /// running, and the paused or stepping tier otherwise.
     #[wasm_bindgen(js_name = runFrame)]
     pub fn run_frame(&mut self) {
-        match self.genesis.debugger_ref().execution_tier() {
-            ExecutionTier::Fast => self.genesis.run_frame_fast(),
-            ExecutionTier::LightDebug => self.genesis.run_frame_debug_light(),
-            ExecutionTier::FullDebug => self.genesis.run_frame(),
-        }
+        self.genesis.run_frame();
     }
 
-    /// Run to the start of vertical blanking and stop there, on the full
-    /// debug loop: `runToCaptureBoundary` on that loop.
+    /// Run to the start of vertical blanking and stop there: the capture
+    /// boundary, as `runToCaptureBoundary`.
     #[wasm_bindgen(js_name = runUntilVBlank)]
     pub fn run_until_vblank(&mut self) {
         self.genesis.run_until_vblank();
@@ -3591,7 +3587,7 @@ mod tests {
 
         /// The Z80's state after the steps is the one its own last step wrote:
         /// each step a host asks for writes the states, the two Z80 steps, which
-        /// ran the NOPs at $24 and $25, as well as the 68000's.
+        /// ran the NOPs at $27 and $28, as well as the 68000's.
         #[wasm_bindgen_test]
         fn what_the_cpu_states_hold() {
             let mut stopped = stopped_at_count();
@@ -3613,11 +3609,11 @@ mod tests {
                          {name: \"A2\", value: 0}, {name: \"A3\", value: 0}, {name: \"A4\", \
                          value: 0}, {name: \"A5\", value: 0}, {name: \"A6\", value: 0}, \
                          {name: \"A7\", value: 4294967292}, {name: \"PC\", value: 1280}, \
-                         {name: \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 23, \
+                         {name: \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 26, \
                          registers: [{name: \"A\", value: 0}, {name: \"F\", value: 0}, {name: \
                          \"B\", value: 0}, {name: \"C\", value: 0}, {name: \"D\", value: 0}, \
                          {name: \"E\", value: 0}, {name: \"H\", value: 0}, {name: \"L\", \
-                         value: 0}, {name: \"PC\", value: 23}, {name: \"SP\", value: 65535}, \
+                         value: 0}, {name: \"PC\", value: 26}, {name: \"SP\", value: 65535}, \
                          {name: \"IX\", value: 0}, {name: \"IY\", value: 0}]}]",
                     ),
                     (
@@ -3630,11 +3626,11 @@ mod tests {
                          {name: \"A2\", value: 0}, {name: \"A3\", value: 0}, {name: \"A4\", \
                          value: 0}, {name: \"A5\", value: 0}, {name: \"A6\", value: 0}, \
                          {name: \"A7\", value: 0}, {name: \"PC\", value: 1094}, {name: \
-                         \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 38, registers: \
+                         \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 41, registers: \
                          [{name: \"A\", value: 0}, {name: \"F\", value: 0}, {name: \"B\", \
                          value: 0}, {name: \"C\", value: 0}, {name: \"D\", value: 0}, {name: \
                          \"E\", value: 0}, {name: \"H\", value: 0}, {name: \"L\", value: 0}, \
-                         {name: \"PC\", value: 38}, {name: \"SP\", value: 65535}, {name: \
+                         {name: \"PC\", value: 41}, {name: \"SP\", value: 65535}, {name: \
                          \"IX\", value: 0}, {name: \"IY\", value: 0}]}]",
                     ),
                 ],
@@ -3789,7 +3785,7 @@ mod tests {
             );
         }
 
-        /// The light loop that ran to the stop keeps no history; the steps' entries
+        /// The light tier that ran to the stop keeps no history; the steps' entries
         /// come back the newest first, and the Z80's carry no registers.
         #[wasm_bindgen_test]
         fn what_the_instruction_history_holds() {
@@ -3847,8 +3843,8 @@ mod tests {
                     ("68000 after the steps, 0", "[]"),
                     (
                         "Z80 after the steps",
-                        "[{address: 37, cycle_count: 4, instruction: \"NOP\", \
-                         registers_before: []}, {address: 36, cycle_count: 4, instruction: \
+                        "[{address: 40, cycle_count: 4, instruction: \"NOP\", \
+                         registers_before: []}, {address: 39, cycle_count: 4, instruction: \
                          \"NOP\", registers_before: []}]",
                     ),
                     ("CPU 2", "[]"),
@@ -3856,7 +3852,7 @@ mod tests {
             );
         }
 
-        /// At the light loop's stop the JSR's frame holds the address after the
+        /// At the light tier's stop the JSR's frame holds the address after the
         /// six-byte JSR at $43C, $442, as its return address; count's RTS takes
         /// the frame off, the BSR.W pushes colour's and colour's RTS takes it
         /// off. The Z80 has no call stack.
@@ -4208,7 +4204,7 @@ mod tests {
             );
         }
 
-        /// The first step stops on the write watch, the fifth on the palette write.
+        /// A host step reports no hit: the watch and the palette write are counted.
         #[wasm_bindgen_test]
         fn what_a_step_returns() {
             let (_, returned) = stepped();
@@ -4229,7 +4225,7 @@ mod tests {
                 &[
                     (
                         "step 1",
-                        "{breakpoint_hit: true, cycles: 20, instruction_executed: true}",
+                        "{breakpoint_hit: false, cycles: 20, instruction_executed: true}",
                     ),
                     (
                         "step 2",
@@ -4245,7 +4241,7 @@ mod tests {
                     ),
                     (
                         "step 5",
-                        "{breakpoint_hit: true, cycles: 22, instruction_executed: true}",
+                        "{breakpoint_hit: false, cycles: 22, instruction_executed: true}",
                     ),
                     (
                         "step 6",
@@ -4275,7 +4271,7 @@ mod tests {
                 &[
                     (
                         "stepCpu(0)",
-                        "{breakpoint_hit: true, cycles: 20, instruction_executed: true}",
+                        "{breakpoint_hit: false, cycles: 20, instruction_executed: true}",
                     ),
                     (
                         "stepCpu(1)",
@@ -4346,8 +4342,8 @@ mod tests {
             );
         }
 
-        /// One frame of the Z80 and the two Z80 steps: the Z80 instructions the six
-        /// 68000 steps ran are not in it.
+        /// The frames of the Z80, the Z80 instructions the six 68000 steps ran,
+        /// and the two Z80 steps.
         #[wasm_bindgen_test]
         fn what_the_z80_trace_flush_data_holds() {
             let (emu, _) = stepped();
@@ -4357,7 +4353,7 @@ mod tests {
                 &[
                     (
                         "length",
-                        "556700",
+                        "557308",
                     ),
                     (
                         "first entry",

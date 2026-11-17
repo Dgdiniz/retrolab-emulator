@@ -1,16 +1,20 @@
 //! The debugger's side of the machine: the CPUs' disassembly, register
-//! snapshots and trace entries, and the checks the debugger makes around a
-//! step (execute, watch, call stack, events).
+//! snapshots and trace entries, the checks the debugger makes around a
+//! step (execute, watch, call stack, events), and the 68000's adapter for
+//! the frame driver's tiers (`retro_core::frame::DebugMachine`).
 
 use super::GenesisEmulator;
 #[cfg(doc)]
 use crate::bus::AddressBus;
 use crate::cpu68k::calls::{call_step, CallStep};
-use crate::debugger::{video_event_watch, GenesisDebugger, GenesisEvent, MAIN_CPU, SOUND_CPU};
+use crate::debugger::{
+    video_event_watch, GenesisDebugger, GenesisEvent, TraceEntryBinary, MAIN_CPU, SOUND_CPU,
+};
 use crate::expr_ctx::m68k_register;
 use crate::vdp::dma::MemoryDma;
 use retro_core::cpu::Addressable;
 use retro_core::debug::{Access, ByteOrder, CpuExprContext};
+use retro_core::frame::DebugMachine;
 
 use retro_core::*;
 
@@ -93,8 +97,8 @@ impl GenesisEmulator {
     /// Keep (`true`) or stop keeping the bus accesses each 68000
     /// instruction makes, for [`Self::take_instruction_access_log`]. The
     /// paths that run one instruction at a time keep them
-    /// ([`EmulatorCore::step`], which the full debug frame loop runs too, and
-    /// the light debug loop); the fast frame loop never does. Only the
+    /// ([`EmulatorCore::step`], which the paused and stepping tier runs too,
+    /// and the light debug tier); the play tier never does. Only the
     /// instruction's own accesses are kept, not those of an interrupt entered
     /// before it nor the Z80's; a DMA from 68000 memory the instruction
     /// starts is kept beside them.
@@ -559,13 +563,13 @@ impl GenesisEmulator {
         vec![m68k_state, z80_state]
     }
 
-    /// Arm 68K bus-access recording when a memory watchpoint is active or the
+    /// Arm 68K bus-access recording when a memory watchpoint is armed or the
     /// instruction access log is on, so the just-stepped instruction's
     /// reads/writes are logged. Returns whether arming happened, which the
     /// caller passes to [`Self::drain_watchpoints`]. Otherwise the bus stays on
     /// its zero-overhead path.
     pub(super) fn arm_watchpoints(&mut self) -> bool {
-        let armed = self.debugger.has_watchpoints_or_events() || self.instruction_access_logging;
+        let armed = self.debug_armed || self.instruction_access_logging;
         if armed {
             self.bus.set_watch_armed(true);
         }
@@ -583,7 +587,7 @@ impl GenesisEmulator {
         }
         let events = self.bus.take_watch_events();
         let dmas = self.bus.take_watch_dmas();
-        let hit = self.debugger.has_watchpoints_or_events() && self.watchpoint_hit(&events);
+        let hit = self.debug_armed && self.watchpoint_hit(&events);
         self.bus.set_watch_armed(false);
         if self.instruction_access_logging {
             self.instruction_access_log = InstructionAccessLog {
@@ -644,21 +648,6 @@ impl GenesisEmulator {
             .check_execute(MAIN_CPU, pc, Some(&mut context))
     }
 
-    /// Check them after an instruction, at `next_pc`, for the instruction
-    /// that runs next ([`retro_core::debug::DebuggerState::check_execute_next`]:
-    /// the check before that instruction then passes, so each instruction
-    /// is checked once).
-    pub(super) fn check_next_execute_breakpoint(&mut self, next_pc: u32) -> bool {
-        let (cpu, bus) = (&self.cpu, &self.bus);
-        let mut context = CpuExprContext::new(
-            |name| m68k_register(cpu, name),
-            |address| bus.peek_byte(address),
-            ByteOrder::BigEndian,
-        );
-        self.debugger
-            .check_execute_next(MAIN_CPU, next_pc, Some(&mut context))
-    }
-
     /// Keep the 68000's call stack for the instruction at `pc`, whose first
     /// word is `opcode`, once it has run ([`call_step`]): a call pushes a
     /// frame whose return address is the address after the call, a return
@@ -678,31 +667,15 @@ impl GenesisEmulator {
         }
     }
 
-    /// The 68000 took an interrupt at `interrupted`, the address it was
-    /// about to run: keep a frame for it, its call and its return address
-    /// both that address, which the handler's `RTE` takes off.
-    pub(super) fn push_interrupt_frame(&mut self, interrupted: u32) {
-        self.debugger.push_call(
-            MAIN_CPU,
-            StackFrame {
-                call_address: interrupted,
-                return_address: interrupted,
-                function_name: None,
-            },
-        );
-    }
-
     /// Whether an event breakpoint stops on the interrupt of `level` the
-    /// 68000 has just taken: the vertical interrupt's at level 6, the
-    /// horizontal interrupt's at level 4. The stepping paths ask this when
-    /// they take an interrupt, so the event is the interrupt delivered, part
-    /// of the way into a line too; the stop then lands after the handler's
-    /// first instruction, as one on an execute breakpoint at its entry does.
-    /// Nothing is checked while no event or watch breakpoint is armed.
+    /// 68000 has just taken in a step: the vertical interrupt's at level 6,
+    /// the horizontal interrupt's at level 4. The step asks this when it
+    /// takes an interrupt, so the event is the interrupt delivered, part of
+    /// the way into a line too; the stop then lands after the step, which
+    /// ran the handler's first instruction. The debug tiers reach it only
+    /// while an event or watch breakpoint is armed
+    /// ([`retro_core::frame::StepHooks::raised`]).
     pub(super) fn interrupt_event_hit(&mut self, level: u8) -> bool {
-        if !self.debugger.has_watchpoints_or_events() {
-            return false;
-        }
         match level {
             6 => self.debugger.check_event(GenesisEvent::VInt),
             4 => self.debugger.check_event(GenesisEvent::HInt),
@@ -727,8 +700,8 @@ impl GenesisEmulator {
 
     /// Arm the VDP's watch on writes to video memory from the enabled event
     /// breakpoints ([`video_event_watch`]), or clear it when none asks. The
-    /// debugger loops do this as each pass begins, and a step the host asks
-    /// for before it runs.
+    /// debugger's tiers do this as each frame call begins, and a step the
+    /// host asks for before it runs ([`DebugMachine::arm`]).
     pub(super) fn arm_video_events(&mut self) {
         let watch = if self.debugger.has_watchpoints_or_events() {
             video_event_watch(self.debugger.breakpoints())
@@ -736,5 +709,131 @@ impl GenesisEmulator {
             None
         };
         self.bus.vdp_mut().set_event_watch(watch);
+    }
+}
+
+/// The 68000's adapter for the frame driver's tiers: the execute check in
+/// the 68000's register context, the call classifier of `cpu68k::calls`,
+/// the trace entry (which needs the instruction's cycles, so it is finished
+/// after it), the history entry with the instruction starts
+/// `disassemble_around_pc` reads, and the access log. The Z80's trace goes
+/// into the debugger as the Z80 runs, so nothing waits to be flushed.
+impl DebugMachine for GenesisEmulator {
+    type Debugger = GenesisDebugger;
+
+    fn debug_state(&self) -> &GenesisDebugger {
+        &self.debugger
+    }
+
+    fn debug_state_mut(&mut self) -> &mut GenesisDebugger {
+        &mut self.debugger
+    }
+
+    fn armed(&self) -> bool {
+        self.debug_armed
+    }
+
+    /// The watchpoints and events as the breakpoints ask, the Z80's trace
+    /// as the debugger traces it, and the VDP's watch on writes to video
+    /// memory.
+    fn arm(&mut self) {
+        self.debug_armed = self.debugger.has_watchpoints_or_events();
+        self.z80_trace_armed = self.debugger.tracing(SOUND_CPU);
+        self.arm_video_events();
+    }
+
+    /// The VDP's watch is cleared too, with what it raised.
+    fn disarm(&mut self) {
+        self.debug_armed = false;
+        self.z80_trace_armed = false;
+        self.bus.vdp_mut().set_event_watch(None);
+    }
+
+    fn check_execute(&mut self, pc: u32) -> bool {
+        self.check_execute_breakpoint(pc)
+    }
+
+    /// The instruction's address and its first word, read through the
+    /// bus's peek before it runs, or taken from the trace entry's read of
+    /// it when the 68000 is traced.
+    type CallStart = (u32, u16);
+
+    fn call_start(&self, pc: u32) -> (u32, u16) {
+        let opcode = match self.opcode_read.take() {
+            Some((at, opcode)) if at == pc => opcode,
+            _ => self.bus.peek_word(pc),
+        };
+        (pc, opcode)
+    }
+
+    fn call_finish(&mut self, (pc, opcode): (u32, u16)) {
+        self.maintain_call_stack(pc, opcode);
+    }
+
+    /// The entry read before the instruction, its cycles set after it. Its
+    /// total cycles count the interrupt the step took before it, and its
+    /// read of the opcode is kept for [`DebugMachine::call_start`].
+    type TraceStart = TraceEntryBinary;
+
+    fn trace_start(&mut self, pc: u32) -> TraceEntryBinary {
+        let opcode = self.bus.peek_word(pc);
+        self.opcode_read.set(Some((pc, opcode)));
+        TraceEntryBinary::new(
+            pc,
+            self.cpu.sr,
+            self.cpu.d,
+            self.cpu.a,
+            opcode,
+            0,
+            self.master_cycles + u64::from(self.interrupt_cycles),
+            self.bus.vdp().timing().scanline,
+        )
+    }
+
+    fn trace_finish(&mut self, mut entry: TraceEntryBinary, cycles: u32) {
+        entry.cycles = cycles as u16;
+        self.debugger.record_trace(MAIN_CPU, &entry);
+    }
+
+    /// The instruction disassembled through the bus's peek, and the PC and
+    /// SR before it.
+    type HistoryStart = InstructionTrace;
+
+    fn history_start(&self, pc: u32) -> InstructionTrace {
+        let (instruction, _) =
+            crate::cpu68k::disasm::disassemble_one(&mut self.bus.peek_view(), pc);
+        InstructionTrace {
+            address: pc,
+            instruction,
+            registers_before: vec![
+                RegisterValue {
+                    name: "PC".to_string(),
+                    value: u64::from(self.cpu.pc),
+                },
+                RegisterValue {
+                    name: "SR".to_string(),
+                    value: u64::from(self.cpu.sr),
+                },
+            ],
+            cycle_count: 0,
+        }
+    }
+
+    /// The instruction's start is kept for `disassemble_around_pc`, then the
+    /// entry recorded.
+    fn history_finish(&mut self, mut entry: InstructionTrace, cycles: u32) {
+        entry.cycle_count = cycles;
+        self.debugger
+            .console_mut()
+            .record_instruction_boundary(entry.address);
+        self.debugger.record_history(MAIN_CPU, entry);
+    }
+
+    fn arm_access_log(&mut self) -> bool {
+        self.arm_watchpoints()
+    }
+
+    fn check_access_log(&mut self, pc: u32) -> bool {
+        self.drain_watchpoints(true, pc)
     }
 }

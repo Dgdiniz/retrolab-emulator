@@ -18,7 +18,9 @@
 mod helpers;
 
 use helpers::{M68kRomBuilder, MiniCartridgeBuilder};
+use retro_core::frame::run_frame_on;
 use retro_core::EmulatorCore;
+use retro_core::ExecutionTier;
 use sg1_core::GenesisEmulator;
 
 /// A tiny valid Genesis ROM whose body is distinguishable per `tag`.
@@ -33,7 +35,7 @@ fn mini_rom(tag: u16) -> Vec<u8> {
 /// mimicking a game that has been playing for a while.
 fn dirty(emu: &mut GenesisEmulator) {
     for _ in 0..8 {
-        emu.run_frame_fast();
+        run_frame_on(emu, ExecutionTier::Play);
     }
     // Work RAM (0xFF0000-0xFFFFFF), never cleared by `reset()`.
     emu.write_memory_debug(0xFF0000, &[0xA5; 256]);
@@ -45,7 +47,7 @@ fn dirty(emu: &mut GenesisEmulator) {
             .write_word_port(0x00C00004, 0x8000 | (reg << 8) | value);
     }
     for _ in 0..8 {
-        emu.run_frame_fast();
+        run_frame_on(emu, ExecutionTier::Play);
     }
 }
 
@@ -72,8 +74,8 @@ fn loading_a_different_rom_power_cycles_the_console() {
 
     // And it stays converged once both run.
     for _ in 0..30 {
-        reused.run_frame_fast();
-        fresh.run_frame_fast();
+        run_frame_on(&mut reused, ExecutionTier::Play);
+        run_frame_on(&mut fresh, ExecutionTier::Play);
     }
     assert_eq!(reused.state_hash(), fresh.state_hash());
     assert_eq!(
@@ -142,7 +144,7 @@ fn only_power_on_reset_blanks_the_battery_save() {
         let mut emu = GenesisEmulator::new();
         emu.load_rom(&rom).expect("load");
         for _ in 0..4 {
-            emu.run_frame_fast();
+            run_frame_on(&mut emu, ExecutionTier::Play);
         }
 
         // Written exactly as the platform restores a stored save.

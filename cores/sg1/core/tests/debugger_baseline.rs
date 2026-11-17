@@ -1,16 +1,17 @@
 //! What the debugger reports today, held as literals: the event catalogue a
 //! host lists, each trace entry's bytes and text line, and the instruction
 //! history and the call stack of programs that call and return, on the
-//! light and the full debugger frame loops. A change to any of them fails
-//! here, and the message shows the value found beside the one recorded, so
-//! a change made on purpose shows exactly what moved.
+//! debugger's light tier and under the steps a host asks for. A change to
+//! any of them fails here, and the message shows the value found beside the
+//! one recorded, so a change made on purpose shows exactly what moved.
 
 mod helpers;
 
 use helpers::M68kProgram;
 use retro_core::debug::TraceEntry;
+use retro_core::frame::run_frame_on;
 use retro_core::types::{Breakpoint, BreakpointType, InstructionTrace, StackFrame};
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::{
     TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE,
     Z80_TRACE_ENTRY_SIZE,
@@ -456,14 +457,40 @@ fn stops_of(rom: &[u8], stops: &[u32], frame: fn(&mut GenesisEmulator)) -> Strin
     text
 }
 
-/// The light debugger loop, as a frame call.
+/// The light debugger tier, as a frame call.
 fn light_frame(emu: &mut GenesisEmulator) {
-    emu.run_frame_debug_light();
+    run_frame_on(emu, ExecutionTier::LightDebug);
 }
 
-/// The full debugger loop, as a frame call.
-fn full_frame(emu: &mut GenesisEmulator) {
-    <GenesisEmulator as EmulatorCore>::run_frame(emu);
+/// Host steps of the 68000 until its program counter is `address`, at
+/// least one.
+fn step_to(emu: &mut GenesisEmulator, address: u32) {
+    for _ in 0..1_000_000 {
+        emu.step_cpu(MAIN_CPU);
+        if emu.cpu().pc == address {
+            return;
+        }
+    }
+    panic!("the 68000 never reached ${address:06X}");
+}
+
+/// Load `rom` and step it with the host's steps to each of `stops` in
+/// turn, written as [`stops_of`] writes its stops.
+fn steps_to(rom: &[u8], stops: &[u32]) -> String {
+    let mut emu = GenesisEmulator::new();
+    emu.load_rom(rom).expect("the program loads");
+    let mut text = String::new();
+    for &address in stops {
+        step_to(&mut emu, address);
+        let stack = emu.debugger_ref().get_call_stack(0);
+        let history = emu.debugger_ref().get_instruction_history(0, 6);
+        text.push_str(&format!(
+            "stopped at ${address:06X}\n  call stack {}\n  history:{}",
+            describe_stack(&stack),
+            describe_history(&history)
+        ));
+    }
+    text
 }
 
 /// Where the calls program puts its code.
@@ -504,7 +531,7 @@ fn calls_program() -> Vec<u8> {
 /// outer, in leaf called from main, idle.
 const CALLS_STOPS: [u32; 4] = [LEAF, 0x244, LEAF, 0x20C];
 
-/// The calls program on the light loop. Each call, the JSR and both BSRs,
+/// The calls program on the light tier. Each call, the JSR and both BSRs,
 /// pushes a frame whose return address is the address after the call, and
 /// each RTS takes its own call's frame off. The loop keeps no instruction
 /// history.
@@ -522,9 +549,10 @@ stopped at $00020C
   history: none
 "#;
 
-/// The calls program on the full loop: the frames of the light loop, and
-/// the history, which lists the instructions run, the newest first.
-const CALLS_ON_THE_FULL_LOOP: &str = r#"stopped at $000230
+/// The calls program stepped by the host to the same places: the frames of
+/// the light tier, and the history, which lists the instructions run, the
+/// newest first.
+const CALLS_UNDER_HOST_STEPS: &str = r#"stopped at $000230
   call stack [{call $000204, return $00020A, name None}, {call $000240, return $000244, name None}]
   history:
     $000240 "BSR     $00000230" 18 cycles, registers PC=$240 SR=$2700
@@ -562,16 +590,16 @@ stopped at $00020C
 fn the_history_and_call_stack_through_calls_on_the_light_loop() {
     let found = stops_of(&calls_program(), &CALLS_STOPS, light_frame);
     assert_literal(
-        "the calls on the light loop",
+        "the calls on the light tier",
         &found,
         CALLS_ON_THE_LIGHT_LOOP,
     );
 }
 
 #[test]
-fn the_history_and_call_stack_through_calls_on_the_full_loop() {
-    let found = stops_of(&calls_program(), &CALLS_STOPS, full_frame);
-    assert_literal("the calls on the full loop", &found, CALLS_ON_THE_FULL_LOOP);
+fn the_history_and_call_stack_through_calls_under_host_steps() {
+    let found = steps_to(&calls_program(), &CALLS_STOPS);
+    assert_literal("the calls under host steps", &found, CALLS_UNDER_HOST_STEPS);
 }
 
 /// Where the interrupt program puts its code.
@@ -614,15 +642,21 @@ fn interrupt_program() -> Vec<u8> {
     rom
 }
 
-/// Where the interrupt program is stopped: in the handler (a stop on its
-/// first instruction lands after that instruction), at wait's RTS, idle.
+/// Where the interrupt program is stopped: in front of the handler's first
+/// instruction, at wait's RTS, idle.
 const INTERRUPT_STOPS: [u32; 3] = [HANDLER, 0x24E, 0x214];
 
-/// The interrupt program on the light loop: taking the interrupt pushes a
+/// Where host steps stop in it: after the handler's first instruction (the
+/// step that takes the interrupt runs it), at wait's RTS, idle.
+const INTERRUPT_STEPS: [u32; 3] = [HANDLER + 6, 0x24E, 0x214];
+
+/// The interrupt program on the light tier: taking the interrupt pushes a
 /// frame whose call and return address are both the address the interrupt
 /// came at (the BEQ the handler returns to), the handler's RTE takes that
-/// frame off, and wait's RTS takes main's call of wait off.
-const INTERRUPT_ON_THE_LIGHT_LOOP: &str = r#"stopped at $000286
+/// frame off, and wait's RTS takes main's call of wait off. The stop at the
+/// handler comes in front of its first instruction: the step took the
+/// interrupt, and the breakpoint stopped it before the instruction.
+const INTERRUPT_ON_THE_LIGHT_LOOP: &str = r#"stopped at $000280
   call stack [{call $00020E, return $000214, name None}, {call $00024A, return $00024A, name None}]
   history: none
 stopped at $00024E
@@ -633,11 +667,11 @@ stopped at $000214
   history: none
 "#;
 
-/// The interrupt program on the full loop: the frames of the light loop,
+/// The interrupt program stepped by the host: the frames of the light tier,
 /// and the history. The history has no entry for taking the interrupt: the
 /// handler's first instruction is listed with the status register the
 /// interrupt set.
-const INTERRUPT_ON_THE_FULL_LOOP: &str = r#"stopped at $000286
+const INTERRUPT_UNDER_HOST_STEPS: &str = r#"stopped at $000286
   call stack [{call $00020E, return $000214, name None}, {call $00024A, return $00024A, name None}]
   history:
     $000280 "ADDQ.W #1, $00FF0000" 20 cycles, registers PC=$280 SR=$2604
@@ -670,27 +704,27 @@ stopped at $000214
 fn the_call_stack_through_an_interrupt_on_the_light_loop() {
     let found = stops_of(&interrupt_program(), &INTERRUPT_STOPS, light_frame);
     assert_literal(
-        "the interrupt on the light loop",
+        "the interrupt on the light tier",
         &found,
         INTERRUPT_ON_THE_LIGHT_LOOP,
     );
 }
 
 #[test]
-fn the_call_stack_through_an_interrupt_on_the_full_loop() {
-    let found = stops_of(&interrupt_program(), &INTERRUPT_STOPS, full_frame);
+fn the_call_stack_through_an_interrupt_under_host_steps() {
+    let found = steps_to(&interrupt_program(), &INTERRUPT_STEPS);
     assert_literal(
-        "the interrupt on the full loop",
+        "the interrupt under host steps",
         &found,
-        INTERRUPT_ON_THE_FULL_LOOP,
+        INTERRUPT_UNDER_HOST_STEPS,
     );
 }
 
-/// The calls program stopped in leaf on the full loop, a savestate taken
-/// there, then a reset, the same ROM loaded again, the savestate loaded and
-/// another ROM loaded. Each of them empties the call stack, whose frames
-/// belonged to the machine it replaced; the history stays, since it records
-/// what ran.
+/// The calls program stepped by the host into leaf, then a reset, the same
+/// ROM loaded again, a savestate loaded (one a twin took at its first
+/// frame's end: a frame in progress has none) and another ROM loaded. Each
+/// of them empties the call stack, whose frames belonged to the machine it
+/// replaced; the history stays, since it records what ran.
 const ACROSS_A_RESET_AND_A_LOAD: &str = r#"stopped in leaf
   call stack [{call $000204, return $00020A, name None}, {call $000240, return $000244, name None}]
   history:
@@ -723,15 +757,16 @@ fn the_call_stack_and_history_across_a_reset_and_a_load() {
     let rom = calls_program();
     let mut emu = GenesisEmulator::new();
     emu.load_rom(&rom).expect("the program loads");
-    emu.debugger().add_breakpoint(Breakpoint {
-        address: LEAF,
-        bp_type: BreakpointType::execute(),
-        cpu_id: Some(0),
-        condition: None,
-    });
-    run_to_a_stop(&mut emu, full_frame);
-    let state = emu.save_state();
-    assert!(!state.is_empty(), "a stop at a breakpoint holds no frame");
+    step_to(&mut emu, LEAF);
+    assert!(
+        emu.save_state().is_empty(),
+        "a frame in progress has no savestate"
+    );
+    let mut twin = GenesisEmulator::new();
+    twin.load_rom(&rom).expect("the program loads");
+    run_frame_on(&mut twin, ExecutionTier::Play);
+    let state = twin.save_state();
+    assert!(!state.is_empty(), "a frame's end has one");
 
     let describe = |what: &str, emu: &GenesisEmulator| {
         format!(

@@ -1,6 +1,6 @@
 //! `audio-dump`: run a ROM with audio enabled and write the mixed
 //! output as a 16-bit PCM stereo WAV, reporting peak level and clipping.
-//! Uses `run_frame_fast()` so capture runs at full speed with no debug
+//! Runs the play tier by name, so capture runs at full speed with no debug
 //! overhead; `get_audio_buffer()` drains the ring each frame.
 
 use std::fs::File;
@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
-use retro_core::EmulatorCore;
+use retro_core::frame::run_frame_on;
+use retro_core::{EmulatorCore, ExecutionTier};
 
 #[derive(Args, Debug)]
 pub struct AudioDumpArgs {
@@ -63,7 +64,7 @@ pub fn run(args: AudioDumpArgs) -> Result<()> {
 
     for frame in 0..args.frames {
         super::apply_press(&mut emu, schedule.as_ref(), frame);
-        emu.run_frame_fast();
+        run_frame_on(&mut emu, ExecutionTier::Play);
         let audio = emu.get_audio_buffer();
         all_samples.extend_from_slice(&audio);
         progress.set_position(frame + 1);

@@ -219,7 +219,7 @@ fn genesis() -> CoreUnderTest<GenesisEmulator> {
     CoreUnderTest {
         build,
         rom: program(),
-        run_frame: GenesisEmulator::run_frame_fast,
+        run_frame: |emu| EmulatorCore::run_frame(emu),
         state_hash: GenesisEmulator::state_hash,
         frame_count: GenesisEmulator::frame_count,
         sprite_order: |emu| emu.vdp_mut().resolved_sprite_render_order(),

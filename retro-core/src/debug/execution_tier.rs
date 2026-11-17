@@ -1,19 +1,19 @@
 //! Execution-tier selector shared across console cores.
 //!
-//! Cores typically expose three variants of the per-frame loop, each
+//! The frame driver runs a core's frames on one of three tiers, each
 //! trading runtime cost against debug instrumentation:
 //!
-//! - **Fast**: no breakpoint checks, no tracing, no per-instruction
-//!   bookkeeping. The hot path when the user is just playing the game
-//!   with the debugger panel idle.
-//! - **LightDebug**: keeps breakpoint checks and trace recording
-//!   active but skips disassembly snapshots, register history, and
-//!   call-stack updates. Used when the user has a breakpoint or
-//!   tracing on but is still in `Running` mode.
-//! - **FullDebug**: every step also updates the `DebuggerCore`
-//!   surface (registers, disassembly, history, call stack). This is
-//!   the only tier appropriate for `Paused` / `StepInto` / `StepOver`
-//!   / `StepOut`.
+//! - **Play** ([`crate::frame::Play`]): no breakpoint checks, no tracing,
+//!   no per-instruction bookkeeping but the main CPU's coverage. The hot
+//!   path when the user is just playing the game with the debugger panel
+//!   idle.
+//! - **LightDebug** ([`crate::frame::LightDebug`]): breakpoint checks,
+//!   watchpoints, events, traces and the call stack, while the user has a
+//!   breakpoint or tracing on but is still in `Running` mode.
+//! - **FullDebug** ([`crate::frame::run_full`]): the debugger paused or
+//!   stepping; a step also records the instruction history. This is the
+//!   only tier appropriate for `Paused` / `StepInto` / `StepOver` /
+//!   `StepOut`.
 //!
 //! Picking the right tier for a given snapshot of execution state is
 //! pure logic, independent of which console is being emulated, so
@@ -24,8 +24,9 @@ use crate::types::ExecutionMode;
 /// Tier of the per-frame execution loop that a core should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionTier {
-    /// No debug instrumentation. Fastest path.
-    Fast,
+    /// What a player runs ([`crate::frame::Play`]): no debug
+    /// instrumentation but the main CPU's coverage. Fastest path.
+    Play,
     /// Breakpoint checks + trace recording, but no disassembly /
     /// register history / call-stack work per instruction.
     LightDebug,
@@ -54,7 +55,7 @@ pub struct TierSelectorInputs<'a> {
 /// - Any non-`Running` mode -> [`ExecutionTier::FullDebug`] (the user
 ///   is actively stepping or paused; debugger state must be live).
 /// - `Running` + no breakpoints + no tracing on any CPU ->
-///   [`ExecutionTier::Fast`].
+///   [`ExecutionTier::Play`].
 /// - `Running` with breakpoints or tracing -> [`ExecutionTier::LightDebug`].
 pub fn select_tier(inputs: TierSelectorInputs<'_>) -> ExecutionTier {
     if inputs.execution_mode != ExecutionMode::Running {
@@ -62,7 +63,7 @@ pub fn select_tier(inputs: TierSelectorInputs<'_>) -> ExecutionTier {
     }
     let any_trace = inputs.tracing_enabled_per_cpu.iter().any(|&t| t);
     if !inputs.has_breakpoints && !any_trace {
-        ExecutionTier::Fast
+        ExecutionTier::Play
     } else {
         ExecutionTier::LightDebug
     }
@@ -103,10 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn running_clean_is_fast() {
+    fn running_clean_is_play() {
         assert_eq!(
             select_tier(inputs(ExecutionMode::Running, false, &[false, false])),
-            ExecutionTier::Fast
+            ExecutionTier::Play
         );
     }
 
@@ -134,7 +135,7 @@ mod tests {
     fn empty_cpu_list_is_treated_as_no_tracing() {
         assert_eq!(
             select_tier(inputs(ExecutionMode::Running, false, &[])),
-            ExecutionTier::Fast
+            ExecutionTier::Play
         );
     }
 

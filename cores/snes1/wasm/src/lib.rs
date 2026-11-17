@@ -4329,7 +4329,7 @@ mod tests {
             assert!(!emu.is_hg51b_tracing_enabled());
             emu.run_frame();
             let tier = emu.snes.debugger_ref().execution_tier();
-            assert_eq!(tier, retro_core::ExecutionTier::Fast);
+            assert_eq!(tier, retro_core::ExecutionTier::Play);
         }
 
         /// On a Super FX cartridge the switch is on.
