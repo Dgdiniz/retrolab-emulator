@@ -13,6 +13,7 @@ pub mod cpu;
 pub mod debug;
 pub mod debugger;
 pub mod emulator;
+pub mod frame;
 pub mod golden;
 pub mod hash;
 pub mod input;

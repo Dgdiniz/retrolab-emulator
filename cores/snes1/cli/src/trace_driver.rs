@@ -41,8 +41,10 @@ use crate::trace_ref::TraceCpu;
 pub enum RunLimit {
     /// Run exactly this many frames (`run_frame`).
     Frames(u64),
-    /// Step exactly this many 65C816 instructions (`step_cpu(0)`).
-    /// Only valid for [`TraceCpu::Snes`].
+    /// Step the 65C816 (`step_cpu(0)`) until exactly this many
+    /// instructions have run: a step that only waits or only takes an
+    /// interrupt runs none and traces no line. Only valid for
+    /// [`TraceCpu::Snes`].
     Instructions(u64),
     /// Run frames until the callback breaks (used by `compare-trace`,
     /// which stops at reference EOF or the divergence cap). A safety
@@ -63,6 +65,11 @@ pub struct RunStats {
 /// can't loop indefinitely. Reaching it is reported by the caller via
 /// the frame count vs. the reference position.
 const SAFETY_FRAME_CAP: u64 = 200_000;
+
+/// Upper bound on steps for [`RunLimit::Instructions`], so a 65C816 that
+/// stopped, or waits for an interrupt that never comes, cannot spin
+/// forever.
+const SAFETY_STEP_CAP: u64 = 2_000_000_000;
 
 /// Drive the emulator while tracing `cpu`, feeding each formatted line
 /// to `on_line`. The callback returns [`ControlFlow::Break`] to stop
@@ -103,15 +110,24 @@ where
 
     match limit {
         RunLimit::Instructions(n) => {
-            let mut stepped = 0u64;
-            while stepped < n && !stop {
-                emu.step_cpu(0);
-                stepped += 1;
+            let mut ran = 0u64;
+            let mut steps = 0u64;
+            while ran < n && !stop {
+                if emu.step_cpu(0).instruction_executed {
+                    ran += 1;
+                }
+                steps += 1;
+                if steps >= SAFETY_STEP_CAP {
+                    anyhow::bail!(
+                        "{steps} steps ran only {ran} of {n} instructions: the 65C816 stopped, \
+                         or waits for an interrupt that never comes"
+                    );
+                }
                 if emu.debugger().any_trace_needs_flush() {
                     stop = drain_and_feed(emu, cpu, &mut on_line, &mut stats)?;
                 }
                 if let Some(pb) = progress {
-                    pb.set_position(stepped);
+                    pb.set_position(ran);
                 }
             }
         }

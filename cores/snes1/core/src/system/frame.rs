@@ -1,12 +1,12 @@
-//! The frame: the raster events armed each frame and what each does, the
-//! frame loops that run them, and a frame held part of the way through.
+//! The frame: the raster events armed each frame and what each does, and
+//! this core's side of the frame driver (`retro_core::frame`): what falls
+//! due, where a frame ends, and the hold at the capture boundary.
 
-use retro_core::*;
+use retro_core::frame::{Due, FrameMachine, StepHooks, Stepped};
 use wdc65816::instructions::FLAG_I;
 
-use super::debug::expr_context;
 use super::{SnesEmulator, NMI_DELIVERY_MAX_INSNS};
-use crate::debugger::{SnesEvent, MAIN_CPU};
+use crate::debugger::SnesEvent;
 use crate::irq::schedule_irq_events;
 use crate::scheduler::{schedule_frame_events, EventKind};
 
@@ -51,12 +51,13 @@ impl SnesEmulator {
     }
 
     /// Test-only convenience wrapper that dispatches an event at the live
-    /// `master_cycles`. The frame loops call [`Self::handle_event_at`]
-    /// directly with each event's true scheduled `at_cycle`; unit tests use
-    /// this shorthand when the scheduled cycle is irrelevant to the case.
+    /// `master_cycles`, with no debugger hooks. The frame calls
+    /// [`Self::handle_event_at`] directly with each event's true scheduled
+    /// `at_cycle`; unit tests use this shorthand when the scheduled cycle
+    /// is irrelevant to the case.
     #[cfg(test)]
     pub(super) fn handle_event(&mut self, kind: EventKind) {
-        self.handle_event_at(self.master_cycles, kind);
+        self.handle_event_at(self.master_cycles, kind, &mut ());
     }
 
     /// Per-event dispatcher. Each variant drives the subsystem that
@@ -97,7 +98,15 @@ impl SnesEmulator {
     /// many scanlines into one jump, deferring a batch of events. Cycle
     /// *accounting* (HDMA stolen cycles, APU/IRQ bookkeeping) still uses
     /// `master_cycles`: only the raster attribution reads `at_cycle`.
-    pub(super) fn handle_event_at(&mut self, at_cycle: u64, kind: EventKind) {
+    ///
+    /// An event a breakpoint can stop on is handed to the debugger through
+    /// `hooks.raised`; the play tier's hooks drop it unchecked.
+    pub(super) fn handle_event_at<H: StepHooks<Self>>(
+        &mut self,
+        at_cycle: u64,
+        kind: EventKind,
+        hooks: &mut H,
+    ) {
         match kind {
             EventKind::RenderPos => {
                 // The line that owns this RenderPos, decoded against
@@ -116,9 +125,9 @@ impl SnesEmulator {
                 self.bus
                     .ppu_mut()
                     .render_scanline(scanline, &mut self.framebuffer);
-                if self.debug_armed && self.debugger.check_event(SnesEvent::Scanline(scanline)) {
-                    self.pending_break = true;
-                }
+                hooks.raised(self, |m| {
+                    m.debugger.check_event(SnesEvent::Scanline(scanline))
+                });
             }
             EventKind::HBlankStart => {
                 // Dot 274: raise the HVBJOY HBlank flag ($4212 bit 6).
@@ -152,12 +161,9 @@ impl SnesEmulator {
                 self.bus
                     .system_regs_mut()
                     .tick(stolen.min(u32::MAX as u64) as u32);
-                if self.debug_armed
-                    && (self.debugger.check_event(SnesEvent::HdmaStart)
-                        | self.drain_ppu_debug_events())
-                {
-                    self.pending_break = true;
-                }
+                hooks.raised(self, |m| {
+                    m.debugger.check_event(SnesEvent::HdmaStart) | m.drain_ppu_debug_events()
+                });
             }
             EventKind::HdmaTrigger => {
                 // Re-anchor the raster snapshot to this trigger's own
@@ -178,9 +184,7 @@ impl SnesEmulator {
                     .tick(stolen.min(u32::MAX as u64) as u32);
                 // A palette colour or a tile the line's HDMA wrote: the
                 // break waits for the rest of the batch.
-                if self.debug_armed && self.drain_ppu_debug_events() {
-                    self.pending_break = true;
-                }
+                hooks.raised(self, Self::drain_ppu_debug_events);
             }
             EventKind::VBlankStart => {
                 // A frame held at the capture boundary finished its
@@ -215,15 +219,11 @@ impl SnesEmulator {
                     self.nmi_deliver_armed = true;
                     self.nmi_deliver_countdown = NMI_DELIVERY_MAX_INSNS;
                 }
-                // Event breakpoints: entering V-blank, and the NMI when
-                // it's actually delivered. Only checked when armed.
-                if self.debug_armed {
-                    if self.debugger.check_event(SnesEvent::VBlank) {
-                        self.pending_break = true;
-                    }
-                    if nmi_enabled && self.debugger.check_event(SnesEvent::Nmi) {
-                        self.pending_break = true;
-                    }
+                // Event breakpoints: entering V-blank, and the NMI when its
+                // delivery is armed.
+                hooks.raised(self, |m| m.debugger.check_event(SnesEvent::VBlank));
+                if nmi_enabled {
+                    hooks.raised(self, |m| m.debugger.check_event(SnesEvent::Nmi));
                 }
                 // Sample the controllers into the pads here, at the
                 // start of VBlank, where the hardware's auto-read does.
@@ -261,9 +261,9 @@ impl SnesEmulator {
                 while self.irq_cycles.front().is_some_and(|&at| at <= at_cycle) {
                     self.irq_cycles.pop_front();
                 }
-                // Raise the level-triggered IRQ line. `step_cpu_internal`
-                // mirrors it into the CPU each step; the handler acks by
-                // reading $4211 (TIMEUP), which lowers the line again.
+                // Raise the level-triggered IRQ line. `mirror_irq_line`
+                // copies it into the CPU before each step; the handler acks
+                // by reading $4211 (TIMEUP), which lowers the line again.
                 //
                 // A `$4211` read inside the instruction during which this
                 // IRQ rose has seen and acknowledged it already. The 5A22
@@ -279,9 +279,7 @@ impl SnesEmulator {
                 if !seen_early || (self.cpu.p & FLAG_I) == 0 {
                     self.bus.system_regs_mut().set_irq_flag(true);
                 }
-                if self.debug_armed && self.debugger.check_event(SnesEvent::Irq) {
-                    self.pending_break = true;
-                }
+                hooks.raised(self, |m| m.debugger.check_event(SnesEvent::Irq));
             }
             EventKind::AutoJoypadDone => {
                 // The auto-joypad read window elapsed: drop the HVBJOY
@@ -383,8 +381,168 @@ impl SnesEmulator {
     /// can carry it past both the frame's `VBlankStart` and its end, and a
     /// frame stopped at its capture boundary there is still in progress.
     pub fn frame_in_progress(&self) -> bool {
-        self.scheduler.earliest(&EventKind::FrameEnd)
+        self.scheduler.earliest(|kind| *kind == EventKind::FrameEnd)
             == Some(self.frame_base_cycle + self.timing.cycles_per_frame())
+    }
+
+    /// Handle the scheduler events due by the present cycle, in order.
+    ///
+    /// For a capture run the drain stops in front of the frame's
+    /// `VBlankStart`, which stays queued with every event after it: the
+    /// picture is finished there and the core is held at the capture
+    /// boundary, which the `true` return reports. The events left queued
+    /// are the ones the same drain would have handled after
+    /// `VBlankStart`; the first drain once the frame goes on handles them
+    /// (see [`Self::release_capture_boundary`]). No event a handler
+    /// schedules can fall due before them, since a handler only ever
+    /// schedules ahead of the present cycle.
+    #[inline]
+    fn handle_due_events<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> bool {
+        if self.capture_boundary_requested | self.held_at_capture_boundary {
+            return self.handle_capture_events(hooks);
+        }
+        let events = self.scheduler.take_due(self.master_cycles);
+        for (at_cycle, ev) in events.iter() {
+            self.handle_event_at(at_cycle, ev, hooks);
+        }
+        self.scheduler.give_back(events);
+        false
+    }
+
+    /// The drain while a capture is under way (see
+    /// [`Self::handle_due_events`]): the rest of a split batch when the
+    /// core is held at the boundary, else a drain that stops in front of
+    /// the frame's `VBlankStart`.
+    fn handle_capture_events<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> bool {
+        if self.held_at_capture_boundary {
+            self.release_capture_boundary(hooks);
+            return false;
+        }
+        let bound = self.master_cycles;
+        let (events, at_vblank) = self
+            .scheduler
+            .take_due_before(bound, |kind| matches!(kind, EventKind::VBlankStart));
+        for (at_cycle, ev) in events.iter() {
+            self.handle_event_at(at_cycle, ev, hooks);
+        }
+        self.scheduler.give_back(events);
+        if at_vblank {
+            self.finish_picture();
+            self.held_at_capture_boundary = true;
+            self.capture_boundary_cycle = bound;
+        }
+        at_vblank
+    }
+
+    /// Handle the rest of the batch the capture boundary split: the
+    /// events that were due when the stopping drain ran, up to its own
+    /// cycle, the frame's `VBlankStart` first (whose handler ends the
+    /// hold). Events that came due since, which an HDMA transfer's cycles
+    /// can bring, wait for the next drain, as they would in a frame run
+    /// whole: the queue then sees the same pops and pushes in the same
+    /// order, and a savestate, which writes the queue in its stored order,
+    /// comes out byte for byte the same.
+    fn release_capture_boundary<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
+        let events = self.scheduler.take_due(self.capture_boundary_cycle);
+        for (at_cycle, ev) in events.iter() {
+            self.handle_event_at(at_cycle, ev, hooks);
+        }
+        self.scheduler.give_back(events);
+    }
+
+    /// Before an instruction runs from the capture boundary, handle what
+    /// the frame loop handles first there: the rest of the split batch
+    /// (the start of the vertical blank first), then every event due by
+    /// now, draining again, as the loop does, while the cycles an HDMA
+    /// transfer takes bring more events due; then, if the clock is already
+    /// past the frame's end (a long general DMA crossed both), close the
+    /// frame as the loop would. A step from the boundary is therefore the
+    /// step the frame loop would take: the same instruction against the
+    /// same state.
+    pub(super) fn leave_capture_boundary<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
+        if !self.held_at_capture_boundary {
+            return;
+        }
+        self.release_capture_boundary(hooks);
+        while self
+            .scheduler
+            .peek_cycle()
+            .is_some_and(|at| at <= self.master_cycles)
+        {
+            let events = self.scheduler.take_due(self.master_cycles);
+            for (at_cycle, ev) in events.iter() {
+                self.handle_event_at(at_cycle, ev, hooks);
+            }
+            self.scheduler.give_back(events);
+        }
+        if self.master_cycles >= self.frame_base_cycle + self.timing.cycles_per_frame() {
+            self.end_of_frame_bookkeeping();
+            self.frame_base_cycle = self.master_cycles;
+        }
+    }
+
+    /// Headless frame for netplay rollback / catch-up: the full
+    /// deterministic simulation with the host-facing presentation steps
+    /// (framebuffer post-process + 32 kHz -> 44.1 kHz audio drain)
+    /// suppressed, on the play tier with the debugger disarmed for its
+    /// length (`retro_core::frame::run_frame_headless`). Every
+    /// state-changing step still runs (the per-scanline PPU render, which
+    /// updates the serialized sprite range/time-over flags, the interlace
+    /// field toggle, the OAM re-anchor, and the APU + coprocessor
+    /// catch-up), so it produces the exact same machine state (and
+    /// `frame_count`) as a presented frame. Re-simulating a mispredicted
+    /// span therefore leaves the emulator byte-identical to a live run,
+    /// which [`Self::state_hash`] verifies.
+    pub fn run_frame_headless(&mut self) {
+        retro_core::frame::run_frame_headless(self);
+    }
+
+    /// Finish the frame held at the capture boundary on the loop a player
+    /// runs, whatever the debugger is doing: the play tier, with nothing of
+    /// the debugger armed, so no breakpoint, watchpoint or event can stop
+    /// it before the frame's end, and nothing of it is traced or counted
+    /// (`retro_core::frame::finish_held_frame`). The debugger's hooks are
+    /// armed again after, as its breakpoints and traces ask, and its cached
+    /// CPU states show where the frame ended. Returns whether there was a
+    /// frame to finish.
+    pub fn finish_held_frame(&mut self) -> bool {
+        retro_core::frame::finish_held_frame(self)
+    }
+
+    /// Per-frame tail shared by every tier: advance the frame counter,
+    /// pre-schedule the next frame's events, and re-arm the H/V IRQ
+    /// triggers anchored at the current master cycle (which carries the
+    /// small overshoot from this frame's last instruction).
+    fn end_of_frame_bookkeeping(&mut self) {
+        self.frame_count += 1;
+        // The lines drawn next belong to the next frame: one store, made
+        // whether or not anything records them.
+        self.bus.ppu_mut().set_recording_frame(self.frame_count + 1);
+        // Read the live overscan bit so the upcoming frame's VBlank/NMI
+        // and HDMA range land on the right scanline (240 when overscan
+        // is on, else the region default). Games set overscan during
+        // VBlank and leave it stable, so the value is settled here.
+        let overscan = self.bus.ppu().overscan();
+        schedule_frame_events(
+            &mut self.scheduler,
+            self.timing,
+            self.master_cycles,
+            overscan,
+        );
+        self.arm_irq_events(self.master_cycles, self.master_cycles);
+    }
+}
+
+/// The SNES on the frame driver: a queue of timed events is its timetable,
+/// a pass runs the 65C816 to the next event or the frame's end, and the
+/// frame is anchored on a floating start (the frame's end the previous
+/// frame armed).
+impl FrameMachine for SnesEmulator {
+    type Run = ();
+
+    #[inline(always)]
+    fn now(&self) -> u64 {
+        self.master_cycles
     }
 
     /// Go on with the frame in progress, or open the next one, and return
@@ -403,7 +561,7 @@ impl SnesEmulator {
     /// cycles already run) and give it a whole frame's budget again, so a
     /// frame stopped at a breakpoint would run long and draw at the wrong
     /// rows; going on with it keeps the frame exactly as one run whole.
-    pub(super) fn enter_frame(&mut self) -> u64 {
+    fn enter_frame(&mut self) -> u64 {
         let frame_cycles = self.timing.cycles_per_frame();
         let frame_end = self.frame_base_cycle + frame_cycles;
         // Short of the frame's end the frame is in progress: its
@@ -413,7 +571,7 @@ impl SnesEmulator {
         if self.master_cycles < frame_end {
             return frame_end;
         }
-        match self.scheduler.earliest(&EventKind::FrameEnd) {
+        match self.scheduler.earliest(|kind| *kind == EventKind::FrameEnd) {
             Some(end) if end == frame_end => {}
             Some(end) => self.frame_base_cycle = end.saturating_sub(frame_cycles),
             None => self.frame_base_cycle = self.master_cycles,
@@ -421,345 +579,84 @@ impl SnesEmulator {
         self.frame_base_cycle + frame_cycles
     }
 
-    /// Handle the scheduler events due by the present cycle, in order.
-    ///
-    /// For a capture run the drain stops in front of the frame's
-    /// `VBlankStart`, which stays queued with every event after it: the
-    /// picture is finished there and the core is held at the capture
-    /// boundary, which the `true` return reports. The events left queued
-    /// are the ones the same drain would have handled after
-    /// `VBlankStart`; the first drain once the frame goes on handles them
-    /// (see [`Self::release_capture_boundary`]). No event a handler
-    /// schedules can fall due before them, since a handler only ever
-    /// schedules ahead of the present cycle.
+    /// The events due by the present cycle (stopping in front of the
+    /// frame's `VBlankStart` for a capture), then the S-DSP register
+    /// writes the `FrameEnd` catch-up made, checked as the batch drains;
+    /// the frame ends once the clock reaches `frame_end`.
     #[inline]
-    fn handle_due_events(&mut self) -> bool {
-        if self.capture_boundary_requested | self.held_at_capture_boundary {
-            return self.handle_capture_events();
+    fn handle_due<H: StepHooks<Self>>(&mut self, frame_end: u64, hooks: &mut H) -> Due {
+        if self.handle_due_events(hooks) {
+            return Due::Held;
         }
-        let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
-        for (at_cycle, ev) in events {
-            self.handle_event_at(at_cycle, ev);
-        }
-        false
-    }
-
-    /// The drain while a capture is under way (see
-    /// [`Self::handle_due_events`]): the rest of a split batch when the
-    /// core is held at the boundary, else a drain that stops in front of
-    /// the frame's `VBlankStart`.
-    fn handle_capture_events(&mut self) -> bool {
-        if self.held_at_capture_boundary {
-            self.release_capture_boundary();
-            return false;
-        }
-        let bound = self.master_cycles;
-        let (events, at_vblank) = self
-            .scheduler
-            .drain_up_to_before(bound, |kind| matches!(kind, EventKind::VBlankStart));
-        for (at_cycle, ev) in events {
-            self.handle_event_at(at_cycle, ev);
-        }
-        if at_vblank {
-            self.finish_picture();
-            self.held_at_capture_boundary = true;
-            self.capture_boundary_cycle = bound;
-        }
-        at_vblank
-    }
-
-    /// Handle the rest of the batch the capture boundary split: the
-    /// events that were due when the stopping drain ran, up to its own
-    /// cycle, the frame's `VBlankStart` first (whose handler ends the
-    /// hold). Events that came due since, which an HDMA transfer's cycles
-    /// can bring, wait for the next drain, as they would in a frame run
-    /// whole: the queue then sees the same pops and pushes in the same
-    /// order, and a savestate, which writes the queue in its stored order,
-    /// comes out byte for byte the same.
-    fn release_capture_boundary(&mut self) {
-        let events = self
-            .scheduler
-            .drain_up_to_with_cycles(self.capture_boundary_cycle);
-        for (at_cycle, ev) in events {
-            self.handle_event_at(at_cycle, ev);
+        hooks.raised(self, Self::drain_apu_dsp_events);
+        if self.master_cycles >= frame_end {
+            Due::FrameEnd
+        } else {
+            Due::Continue
         }
     }
 
-    /// Before an instruction runs from the capture boundary, handle what
-    /// the frame loop handles first there: the rest of the split batch
-    /// (the start of the vertical blank first), then every event due by
-    /// now, draining again, as the loop does, while the cycles an HDMA
-    /// transfer takes bring more events due; then, if the clock is already
-    /// past the frame's end (a long general DMA crossed both), close the
-    /// frame as the loop would. A step from the boundary is therefore the
-    /// step the frame loop would take: the same instruction against the
-    /// same state.
-    pub(super) fn leave_capture_boundary(&mut self) {
-        if !self.held_at_capture_boundary {
-            return;
-        }
-        self.release_capture_boundary();
-        while self
-            .scheduler
-            .peek_cycle()
-            .is_some_and(|at| at <= self.master_cycles)
-        {
-            let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
-            for (at_cycle, ev) in events {
-                self.handle_event_at(at_cycle, ev);
-            }
-        }
-        if self.master_cycles >= self.frame_base_cycle + self.timing.cycles_per_frame() {
-            self.end_of_frame_bookkeeping();
-            self.frame_base_cycle = self.master_cycles;
-        }
+    /// The next queued event, or the frame's end if that comes first.
+    #[inline(always)]
+    fn next_deadline(&self, frame_end: u64) -> Option<u64> {
+        Some(
+            self.scheduler
+                .peek_cycle()
+                .unwrap_or(frame_end)
+                .min(frame_end),
+        )
     }
 
-    /// Run one frame with no debug instrumentation (the `Fast` tier).
-    /// This is the hot path when the debugger panel is idle.
-    ///
-    /// Each pass handles the events due first, then runs CPU instructions
-    /// up to the next event or the frame's end. A frame picked up where an
-    /// earlier call stopped may have events due from before the stop, the
-    /// clock even past the frame's end, so they are handled before the
-    /// frame's end is checked.
-    pub(super) fn run_frame_fast(&mut self) {
-        let frame_end = self.enter_frame();
+    #[inline(always)]
+    fn begin_run(&mut self) {}
 
-        loop {
-            if self.handle_due_events() {
-                return;
-            }
-            if self.master_cycles >= frame_end {
-                break;
-            }
-            // Run CPU instructions until either (a) the next
-            // scheduler event fires or (b) we've used the whole
-            // frame budget. `target` is the lesser of the two.
-            let next_event = self.scheduler.peek_cycle().unwrap_or(frame_end);
-            let target = next_event.min(frame_end);
+    #[inline(always)]
+    fn end_run(&mut self, _run: ()) {}
 
-            while self.master_cycles < target {
-                self.step_cpu_internal();
-            }
-        }
+    #[inline(always)]
+    fn machine_step<H: StepHooks<Self>>(
+        &mut self,
+        _run: &mut (),
+        hooks: &mut H,
+    ) -> Option<Stepped> {
+        self.step_main_cpu(hooks)
+    }
 
+    fn close_frame(&mut self) {
         self.end_of_frame_bookkeeping();
     }
 
-    /// Headless frame for netplay rollback / catch-up: the full
-    /// deterministic simulation with the host-facing presentation steps
-    /// (framebuffer post-process + 32 kHz -> 44.1 kHz audio drain)
-    /// suppressed. Runs the same `Fast`-tier loop as
-    /// [`Self::run_frame_fast`], including the per-scanline PPU render
-    /// (which updates the serialized sprite range/time-over flags), the
-    /// interlace field toggle, the OAM re-anchor, and the APU + coprocessor
-    /// catch-up, so it produces the exact same machine state (and
-    /// `frame_count`) as a presented frame. Re-simulating a mispredicted
-    /// span therefore leaves the emulator byte-identical to a live run,
-    /// which [`Self::state_hash`] verifies.
-    pub fn run_frame_headless(&mut self) {
-        self.present = false;
-        self.run_frame_fast();
-        self.present = true;
+    /// Before a host step: leave the capture boundary if the core is held
+    /// there (see [`SnesEmulator::leave_capture_boundary`]), then go on
+    /// with the frame in progress or open the next one, as a frame call
+    /// does. Opening the next frame here matters after a frame call that
+    /// ran its frame to the end: the frame base would otherwise still be
+    /// that frame's, so the first step would close a frame at once and
+    /// arm a second set of events over the ones already armed.
+    fn enter_step<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> u64 {
+        self.leave_capture_boundary(hooks);
+        FrameMachine::enter_frame(self)
     }
 
-    /// Whether the frame call just made stopped before its frame's end, at
-    /// the capture boundary or at a breakpoint (which pauses the debugger,
-    /// even one that hit in the batch that ended the frame).
-    pub(super) fn frame_call_stopped(&self) -> bool {
-        self.frame_in_progress() || self.debugger.get_execution_mode() != ExecutionMode::Running
+    fn frame_in_progress(&self) -> bool {
+        SnesEmulator::frame_in_progress(self)
     }
 
-    /// Finish the frame held at the capture boundary on the loop a player
-    /// runs, whatever the debugger is doing: the fast loop, with nothing of
-    /// the debugger armed, as a frame call with no breakpoint and no trace
-    /// runs it. No breakpoint, watchpoint or event can stop it before the
-    /// frame's end, and nothing of it is traced or counted. The debugger's
-    /// hooks are armed again after, as its breakpoints and traces ask, and
-    /// its cached CPU states show where the frame ended. Returns whether
-    /// there was a frame to finish.
-    pub fn finish_held_frame(&mut self) -> bool {
-        if !self.held_at_capture_boundary {
-            return false;
-        }
-        self.disarm_debugger_hooks();
-        self.run_frame_fast();
-        self.sync_spc_trace_enable();
-        self.sync_cartridge_trace_enable();
-        self.sync_debug_arm();
-        self.refresh_debugger_state();
-        true
+    /// Only the hold at the capture boundary: a savestate holds any other
+    /// frame in progress, its queue and its base with it.
+    fn frame_held(&self) -> bool {
+        self.held_at_capture_boundary
     }
 
-    /// Run the frame in progress, or the next one, on the fast or the
-    /// instrumented loop; the tier names which.
-    pub(super) fn run_frame_on_tier(&mut self, tier: ExecutionTier) {
-        match tier {
-            ExecutionTier::Fast => self.run_frame_fast(),
-            ExecutionTier::LightDebug => self.run_frame_instrumented(),
-            ExecutionTier::FullDebug => self.run_frame_full(),
-        }
+    fn held_at_capture_boundary(&self) -> bool {
+        self.held_at_capture_boundary
     }
 
-    /// Run one frame with per-instruction debug hooks (the `LightDebug`
-    /// tier). Before each 65C816 instruction we check execute breakpoints,
-    /// record coverage, and, when 65C816 tracing is enabled, capture a
-    /// binary trace entry; after it, keep the call stack and check the
-    /// watchpoints and the events. Everything the debugger reads for
-    /// itself goes through the bus's side-effect-free peek, so a frame run
-    /// here leaves the machine as the fast loop leaves it.
-    ///
-    /// A breakpoint hit pauses the debugger (refreshing its CPU states) and
-    /// returns mid-frame; the next frame call goes on with the same frame
-    /// (see [`Self::enter_frame`]), so a frame broken into pieces ends where
-    /// one run whole ends, with the same state. After a stop at an execute
-    /// breakpoint, the instruction there runs first, unchecked, so running
-    /// on goes on from the stop. Each pass handles the events due first, as
-    /// [`Self::run_frame_fast`] does, then runs instructions up to the next
-    /// event.
-    pub(super) fn run_frame_instrumented(&mut self) {
-        // An event in the batch that reached the capture boundary may have
-        // matched an event breakpoint. The frame loop honours a match once
-        // the whole batch is handled, and the events after the boundary
-        // are the rest of that batch, so the match waits for them.
-        if !self.held_at_capture_boundary {
-            self.pending_break = false;
-        }
-        let frame_end = self.enter_frame();
-
-        loop {
-            if self.handle_due_events() {
-                // Held at the capture boundary. The traces the APU and the
-                // coprocessor captured so far are flushed as at a frame's
-                // end; a breakpoint match waits for the rest of the batch.
-                self.drain_spc_trace();
-                self.drain_cartridge_trace();
-                return;
-            }
-            // Inline events (VBlank/NMI/IRQ/HDMA/scanline set `pending_break`)
-            // and the FrameEnd APU catch-up's DSP-register writes are checked
-            // after the event batch drains.
-            let hit = self.debug_armed && (self.pending_break | self.drain_apu_dsp_events());
-            if self.master_cycles >= frame_end {
-                // The batch held the frame's end: the frame closes before a
-                // pause, so the next call opens the next frame.
-                self.end_of_frame_bookkeeping();
-                if hit {
-                    self.finish_paused_frame();
-                    return;
-                }
-                break;
-            }
-            if hit {
-                self.finish_paused_frame();
-                return;
-            }
-
-            let next_event = self.scheduler.peek_cycle().unwrap_or(frame_end);
-            let target = next_event.min(frame_end);
-
-            while self.master_cycles < target {
-                let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
-                let stop = {
-                    let mut context = expr_context(&self.cpu, &self.bus);
-                    self.debugger
-                        .check_execute(MAIN_CPU, pc24, Some(&mut context))
-                };
-                if stop {
-                    self.finish_paused_frame();
-                    return;
-                }
-                self.debugger.record_coverage(MAIN_CPU, pc24);
-                if self.debugger.tracing(MAIN_CPU) {
-                    let entry = self.capture_trace_65816();
-                    self.debugger.record_trace(MAIN_CPU, &entry);
-                }
-                // Drop what was recorded between two instructions (a
-                // host's write while the frame was stopped) so the
-                // watchpoints see only this instruction's own accesses.
-                if self.debug_armed {
-                    self.bus.clear_debug_events();
-                }
-                let start = self.step_start_65816(pc24);
-                self.step_cpu_internal();
-                self.maintain_call_stack_65816(start);
-                // Watchpoints + PPU/APU write events (recorded by the bus),
-                // DSP-register events (recorded by the APU during a mailbox
-                // catch-up), and the inline DMA-start event all funnel into
-                // a single pause check. Bitwise-or so every match bumps its
-                // hit count before we bail.
-                if self.debug_armed
-                    && (self.drain_bus_debug_events()
-                        | self.drain_apu_dsp_events()
-                        | self.pending_break)
-                {
-                    self.finish_paused_frame();
-                    return;
-                }
-            }
-        }
-
-        self.drain_spc_trace();
-        self.drain_cartridge_trace();
+    fn request_capture_boundary(&mut self, on: bool) {
+        self.capture_boundary_requested = on;
     }
 
-    /// The `FullDebug` tier. Reached only when the execution mode is not
-    /// `Running` (paused or stepping). `Paused` just refreshes the cached
-    /// state; the step modes advance one 65C816 instruction and pause.
-    /// Step-over and step-out are not call-stack-aware: all three step
-    /// modes single-step.
-    pub(super) fn run_frame_full(&mut self) {
-        if self.debugger.get_execution_mode() == ExecutionMode::Paused {
-            self.refresh_debugger_state();
-            return;
-        }
-        self.debug_single_step_65816();
-        self.debugger.set_execution_mode(ExecutionMode::Paused);
-    }
-
-    /// Drain every scheduler event due at the current master cycle and,
-    /// when the instruction just executed carried the clock past the frame
-    /// boundary, run the end-of-frame tail and re-anchor the frame base.
-    ///
-    /// Single-stepping shares this with the frame loop so that one stepped
-    /// instruction stays event-consistent: the PPU renders, the HVBJOY
-    /// flags toggle, NMI/IRQ/HDMA fire. The frame-boundary close is the
-    /// load-bearing part, `schedule_frame_events` only arms the *current*
-    /// frame, so without re-running it at the boundary a stepped timeline
-    /// would fall silent after frame 0 (no further VBlank/NMI) and an
-    /// instruction-bounded trace would drift away from a
-    /// continuously-running reference.
-    pub(super) fn drain_events_and_maybe_close_frame(&mut self) {
-        let events = self.scheduler.drain_up_to_with_cycles(self.master_cycles);
-        for (at_cycle, ev) in events {
-            self.handle_event_at(at_cycle, ev);
-        }
-        // A general-DMA stall can fold many master cycles into a single
-        // instruction. Like `run_frame`, close at most one frame per step
-        // and re-anchor the base at the overshoot; the next step absorbs
-        // any remaining slack.
-        if self.master_cycles >= self.frame_base_cycle + self.timing.cycles_per_frame() {
-            self.end_of_frame_bookkeeping();
-            self.frame_base_cycle = self.master_cycles;
-        }
-    }
-
-    /// Per-frame tail shared by every tier: advance the frame counter,
-    /// pre-schedule the next frame's events, and re-arm the H/V IRQ
-    /// triggers anchored at the current master cycle (which carries the
-    /// small overshoot from this frame's last instruction).
-    fn end_of_frame_bookkeeping(&mut self) {
-        self.frame_count += 1;
-        // The lines drawn next belong to the next frame: one store, made
-        // whether or not anything records them.
-        self.bus.ppu_mut().set_recording_frame(self.frame_count + 1);
-        // Read the live overscan bit so the upcoming frame's VBlank/NMI
-        // and HDMA range land on the right scanline (240 when overscan
-        // is on, else the region default). Games set overscan during
-        // VBlank and leave it stable, so the value is settled here.
-        let overscan = self.bus.ppu().overscan();
-        schedule_frame_events(&mut self.scheduler, self.master_cycles, overscan);
-        self.arm_irq_events(self.master_cycles, self.master_cycles);
+    fn set_presenting(&mut self, on: bool) {
+        self.present = on;
     }
 }

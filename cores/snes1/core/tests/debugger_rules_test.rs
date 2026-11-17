@@ -1,13 +1,15 @@
 //! The debugger's rules on the SNES, each shown on a small program: what a
 //! watchpoint compares and how often it counts, what a condition reads, that
-//! the debugger's focus is no part of the machine, what a step records, how
-//! a run goes on from a stop, what a reset or a load empties, what the
-//! cartridge's CPU traces, and that nothing the debugger reads for itself
-//! changes the machine, through any coprocessor's window.
+//! the debugger's focus is no part of the machine, that no host steps the
+//! SPC700, where a state loaded at a stop is checked, what a reset or a load
+//! empties, what the cartridge's CPU traces, and that nothing the debugger
+//! reads for itself changes the machine, through any coprocessor's window.
+//! The rules of the frame loops and the host step are the frame driver's
+//! conformance suite (`frame_conformance_test.rs`).
 
 use retro_core::{
-    Breakpoint, BreakpointAction, BreakpointType, EmulatorCore, ExecutionMode, MatchSpec,
-    BREAKPOINT_PARAM_ANY,
+    Breakpoint, BreakpointAction, BreakpointType, EmulatorCore, ExecutionMode, ExecutionTier,
+    MatchSpec, BREAKPOINT_PARAM_ANY,
 };
 use snes1_core::{MapTarget, SnesEmulator, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU};
 
@@ -266,86 +268,13 @@ const CALLS: &[(u16, &[u8])] = &[
 const LOOP: &[(u16, &[u8])] = &[(0x8000, &[0xEA, 0x80, 0xFD])];
 
 #[test]
-fn a_step_of_the_focused_cpu_is_the_step_the_trait_makes() {
-    let mut by_trait = loaded(&lorom(CALLS));
-    let mut by_cpu = loaded(&lorom(CALLS));
-    for _ in 0..6 {
-        let a = EmulatorCore::step(&mut by_trait);
-        let focused = by_cpu.focused_cpu();
-        let b = by_cpu.step_cpu(focused);
-        assert_eq!(a.cycles, b.cycles);
-        assert_eq!(a.instruction_executed, b.instruction_executed);
-    }
-    assert_eq!(by_trait.state_hash(), by_cpu.state_hash());
-    assert_eq!(call_stack(&by_trait), call_stack(&by_cpu));
-    assert_eq!(history(&by_trait), history(&by_cpu));
-    // Focused on the SPC700, which no host steps, a step runs nothing.
-    by_trait.set_focused_cpu(SOUND_CPU);
-    let before = by_trait.state_hash();
-    assert!(!EmulatorCore::step(&mut by_trait).instruction_executed);
-    assert_eq!(by_trait.state_hash(), before);
-}
-
-#[test]
-fn a_host_step_over_a_call_and_its_return_records_each_instruction() {
+fn a_step_focused_on_the_spc700_runs_nothing() {
+    // No host steps the SPC700: focused on it, a step runs nothing.
     let mut emu = loaded(&lorom(CALLS));
-    let mut stacks = Vec::new();
-    for _ in 0..6 {
-        emu.step_cpu(MAIN_CPU);
-        stacks.push(call_stack(&emu));
-    }
-    assert_eq!(
-        stacks,
-        [
-            vec![(0x00_8000, 0x00_8003)],
-            vec![(0x00_8000, 0x00_8003), (0x00_8010, 0x00_8014)],
-            vec![(0x00_8000, 0x00_8003), (0x00_8010, 0x00_8014)],
-            vec![(0x00_8000, 0x00_8003)],
-            vec![],
-            vec![],
-        ]
-    );
-    assert_eq!(
-        history(&emu),
-        [0x00_8003, 0x00_8014, 0x00_8021, 0x00_8020, 0x00_8010, 0x00_8000],
-        "one record a step, the newest first"
-    );
-}
-
-#[test]
-fn a_run_goes_on_from_an_execute_breakpoint_and_stops_at_its_next_hit() {
-    let mut emu = loaded(&lorom(LOOP));
-    let id = add(
-        &mut emu,
-        0x00_8000,
-        BreakpointType::execute(),
-        MatchSpec::default(),
-    );
-    emu.run_frame();
-    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
-    assert_eq!(pc24(&emu), 0x00_8000);
-    assert_eq!(hits(&emu, id), 1);
-    let cycles = emu.cpu().cycles_executed;
-
-    emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame();
-    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
-    assert_eq!(pc24(&emu), 0x00_8000, "it stops at the next pass");
-    assert_eq!(hits(&emu, id), 2);
-    assert_eq!(
-        emu.cpu().cycles_executed - cycles,
-        5,
-        "the NOP at the breakpoint and the BRA ran in between"
-    );
-
-    // A host's step from the stop runs the instruction there; the run
-    // after it stops at the next pass again.
-    emu.step_cpu(MAIN_CPU);
-    assert_eq!(pc24(&emu), 0x00_8001);
-    emu.set_execution_mode(ExecutionMode::Running);
-    emu.run_frame();
-    assert_eq!(pc24(&emu), 0x00_8000);
-    assert_eq!(hits(&emu, id), 3);
+    emu.set_focused_cpu(SOUND_CPU);
+    let before = emu.state_hash();
+    assert!(!EmulatorCore::step(&mut emu).instruction_executed);
+    assert_eq!(emu.state_hash(), before);
 }
 
 #[test]
@@ -374,21 +303,6 @@ fn a_state_loaded_at_a_stop_is_checked_at_its_own_address() {
         cycles,
         "the loaded machine stops before running anything"
     );
-}
-
-#[test]
-fn a_stop_refreshes_the_cpu_states() {
-    let mut emu = loaded(&lorom(CALLS));
-    add(
-        &mut emu,
-        0x00_8020,
-        BreakpointType::execute(),
-        MatchSpec::default(),
-    );
-    emu.run_frame();
-    let states = emu.debugger_ref().get_cpu_states();
-    assert_eq!(states[MAIN_CPU].pc, 0x00_8020);
-    assert_eq!(states[MAIN_CPU].pc, pc24(&emu));
 }
 
 #[test]
@@ -424,60 +338,23 @@ fn a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history() {
     assert_eq!(history(&emu).len(), kept);
 }
 
-/// NMI enabled, then a loop; the NMI handler at `$8030` is an `RTI`.
-const NMI_LOOP: &[(u16, &[u8])] = &[(
-    0x8000,
-    &[
-        0xA9, 0x80, // $8000 LDA #$80
-        0x8D, 0x00, 0x42, // $8002 STA $4200
-        0xEA, // $8005 NOP
-        0x80, 0xFD, // $8006 BRA $8005
-    ],
-)];
-
-#[test]
-fn an_interrupt_pushes_a_frame_its_return_pops_on_every_loop() {
-    // The instrumented loop, stopped at the handler.
-    let mut running = loaded(&lorom(NMI_LOOP));
-    add(
-        &mut running,
-        0x00_8030,
-        BreakpointType::execute(),
-        MatchSpec::default(),
-    );
-    running.run_frame();
-    assert_eq!(pc24(&running), 0x00_8030);
-    let interrupted = call_stack(&running);
-    assert_eq!(interrupted.len(), 1);
-    assert_eq!(
-        interrupted[0].0, interrupted[0].1,
-        "an interrupt's frame names the interrupted address twice"
-    );
-
-    // The same machine stepped by a host to the handler keeps the same stack.
-    let mut stepped = loaded(&lorom(NMI_LOOP));
-    while pc24(&stepped) != 0x00_8030 {
-        stepped.step_cpu(MAIN_CPU);
-    }
-    assert_eq!(
-        call_stack(&stepped),
-        interrupted,
-        "the light and the full loops keep one stack"
-    );
-    // The RTI pops it.
-    stepped.step_cpu(MAIN_CPU);
-    assert!(call_stack(&stepped).is_empty());
+/// A loop of 124 `NOP`s, then `BRA $8000`: about 25,000 instructions a
+/// frame.
+fn nop_loop() -> Vec<u8> {
+    let mut code = vec![0xEA; 124];
+    code.extend_from_slice(&[0x80, 0x82]);
+    code
 }
 
 #[test]
 fn the_main_cpu_trace_flushes_alone_and_any_cpu_names_it() {
-    // A program that waits in WAI with the main CPU traced: each waiting
-    // step is traced, and four frames fill the ring's first eight MiB.
-    let mut emu = loaded(&lorom(&[(0x8000, &[0xCB, 0x80, 0xFD])]));
+    // A loop of NOPs with the main CPU traced: each instruction is traced,
+    // and ten frames pass the ring's first eight MiB.
+    let mut emu = loaded(&lorom(&[(0x8000, &nop_loop())]));
     emu.debugger().set_tracing_enabled(MAIN_CPU, true);
     emu.debugger().set_tracing_enabled(SOUND_CPU, true);
     assert!(!emu.debugger_ref().any_trace_needs_flush());
-    for _ in 0..4 {
+    for _ in 0..10 {
         emu.run_frame();
         emu.debugger().clear_trace_flushed(SOUND_CPU);
     }
@@ -487,8 +364,7 @@ fn the_main_cpu_trace_flushes_alone_and_any_cpu_names_it() {
     assert!(debugger.any_trace_needs_flush());
 }
 
-/// How many addresses the main CPU ran instructions from: the instrumented
-/// loop records them, the fast loop does not.
+/// How many addresses the main CPU ran instructions from.
 fn covered(emu: &SnesEmulator) -> u32 {
     emu.debugger_ref().coverage_stats(MAIN_CPU).1
 }
@@ -500,7 +376,11 @@ fn a_cartridge_without_a_cpu_that_traces_keeps_its_trace_off() {
     assert!(!emu.debugger_ref().is_tracing_enabled(CARTRIDGE_CPU));
     assert_eq!(emu.debugger_ref().trace_entry_size(CARTRIDGE_CPU), None);
     emu.run_frame();
-    assert_eq!(covered(&emu), 0, "the frame ran on the fast loop");
+    assert_eq!(
+        emu.debugger_ref().execution_tier(),
+        ExecutionTier::Fast,
+        "the frame ran on the fast loop"
+    );
 }
 
 #[test]
@@ -773,8 +653,9 @@ fn every_chip_cartridge_runs_on_the_instrumented_loop_as_on_the_fast_loop() {
                     instrumented.debugger().clear_trace_flushed(cpu);
                 }
             }
-            assert!(
-                covered(&instrumented) > 0,
+            assert_eq!(
+                instrumented.debugger_ref().execution_tier(),
+                ExecutionTier::LightDebug,
                 "{} {config}: the frames ran on the instrumented loop",
                 cart.chip
             );

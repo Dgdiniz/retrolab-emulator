@@ -3667,24 +3667,24 @@ mod tests {
         }
 
         /// The flag after the program's four traced instructions, then on a
-        /// program that waits in `WAI` with the main CPU's trace on: each
-        /// waiting step is traced, and four frames fill the trace's first
+        /// program that loops on `NOP`s with the main CPU's trace on: each
+        /// instruction is traced, and ten frames pass the trace's first
         /// eight MiB.
         #[wasm_bindgen_test]
         fn the_trace_flush_flag_reads_as_before() {
             let emu = debugging_the_program();
             let mut flags = vec![JsValue::from_bool(emu.needs_trace_flush())];
-            let mut waiting = RetroEmulator::new("snes").unwrap();
-            waiting
-                .load_rom(&lorom_running("WAITING", &[0xCB, 0x80, 0xFD], &[])) // WAI, BRA $8000
-                .unwrap();
-            waiting.set_tracing_enabled(true);
-            for _ in 0..4 {
-                waiting.run_frame();
+            let nops: Vec<u8> = [0xEA; 124].into_iter().chain([0x80, 0x82]).collect();
+            let mut looping = RetroEmulator::new("snes").unwrap();
+            let rom = lorom_running("LOOPING", &nops, &[]); // 124 NOPs, BRA $8000
+            looping.load_rom(&rom).unwrap();
+            looping.set_tracing_enabled(true);
+            for _ in 0..10 {
+                looping.run_frame();
             }
-            flags.push(JsValue::from_bool(waiting.needs_trace_flush()));
-            waiting.clear_trace_flushed();
-            flags.push(JsValue::from_bool(waiting.needs_trace_flush()));
+            flags.push(JsValue::from_bool(looping.needs_trace_flush()));
+            looping.clear_trace_flushed();
+            flags.push(JsValue::from_bool(looping.needs_trace_flush()));
             let expected = ["false", "true", "false"];
             assert_eq!(shapes(&flags), expected);
         }
@@ -4318,7 +4318,7 @@ mod tests {
 
         /// On the program, which has no cartridge CPU, the cartridge CPU's
         /// trace switches stay off under both names, and a frame runs on
-        /// the fast loop: it records no coverage.
+        /// the fast loop.
         #[wasm_bindgen_test]
         fn a_cartridge_without_a_cpu_that_traces_keeps_its_switches_off() {
             let mut emu = RetroEmulator::new("snes").unwrap();
@@ -4328,8 +4328,8 @@ mod tests {
             assert!(!emu.is_superfx_tracing_enabled());
             assert!(!emu.is_hg51b_tracing_enabled());
             emu.run_frame();
-            let covered = property(&emu.get_coverage_stats(0), "coveredBytes");
-            assert_eq!(covered.as_f64(), Some(0.0));
+            let tier = emu.snes.debugger_ref().execution_tier();
+            assert_eq!(tier, retro_core::ExecutionTier::Fast);
         }
 
         /// On a Super FX cartridge the switch is on.

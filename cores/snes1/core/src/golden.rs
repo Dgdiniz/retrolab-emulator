@@ -12,7 +12,7 @@ pub use retro_core::golden::{
     GoldenSpec,
 };
 
-use retro_core::EmulatorCore;
+use retro_core::{EmulatorCore, ExecutionTier};
 
 use crate::cartridge::{fixed_unix_time, set_fixed_unix_time};
 use crate::input_schedule::BUTTONS;
@@ -47,6 +47,30 @@ pub fn run_golden(
         emu,
         spec,
         <SnesEmulator as EmulatorCore>::run_frame,
+        SnesEmulator::state_hash,
+        on_shot,
+        on_audio,
+    );
+    set_fixed_unix_time(previous_time);
+    records
+}
+
+/// [`run_golden`] with every frame on `tier` through the frame driver
+/// (`retro_core::golden::run_golden_on`), the clock pinned the same way:
+/// held to the records, it shows the tier runs the play tier's machine.
+pub fn run_golden_on(
+    emu: &mut SnesEmulator,
+    spec: &GoldenSpec,
+    tier: ExecutionTier,
+    on_shot: impl FnMut(u64, u32, u32, &[u8]),
+    on_audio: impl FnMut(&[f32]),
+) -> Vec<FrameRecord> {
+    let previous_time = fixed_unix_time();
+    set_fixed_unix_time(Some(GOLDEN_UNIX_TIME));
+    let records = retro_core::golden::run_golden_on(
+        emu,
+        spec,
+        tier,
         SnesEmulator::state_hash,
         on_shot,
         on_audio,

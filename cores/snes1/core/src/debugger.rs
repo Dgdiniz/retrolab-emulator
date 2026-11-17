@@ -45,8 +45,8 @@ use crate::cartridge::cx4::hg51b::Hg51b;
 use crate::ppu::PpuDebugEvent;
 use wdc65816::Wdc65816;
 
-/// The 65C816, the 5A22's CPU.
-pub const MAIN_CPU: usize = 0;
+/// The 65C816, the 5A22's CPU: the CPU the frame loop steps.
+pub use retro_core::debug::MAIN_CPU;
 
 /// The SPC700, the sound CPU.
 pub const SOUND_CPU: usize = 1;

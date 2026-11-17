@@ -2,6 +2,7 @@
 
 use crate::debug::state::BreakpointChecks;
 use crate::debug::trace::TraceStats;
+use crate::debug::ExecutionTier;
 use crate::types::*;
 
 /// What a host reads and changes of a core's debugger. One implementation
@@ -51,6 +52,12 @@ pub trait DebuggerCore {
 
     /// Set execution mode.
     fn set_execution_mode(&mut self, mode: ExecutionMode);
+
+    /// The frame loop the debugger's state selects for the next frame
+    /// call: the play tier while it runs with nothing instrumented, its
+    /// light tier while it runs with breakpoints or traces, its full tier
+    /// while it is paused or stepping.
+    fn execution_tier(&self) -> ExecutionTier;
 
     /// Get available memory regions.
     fn get_memory_regions(&self) -> Vec<MemoryRegionInfo>;

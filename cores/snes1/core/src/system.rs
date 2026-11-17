@@ -43,7 +43,11 @@ use retro_core::audio::{AudioRingBuffer, LinearResampler};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::debugger::DebuggerCore;
 use retro_core::input::{GenericInputManager, KeyboardInputProvider};
-use retro_core::*;
+use retro_core::{
+    AudioInfo, CpuArchitecture, DisplayInfo, EmulatorCore, Framebuffer, InputInfo, InputState,
+    Instruction, PixelFormat, RomInfo, StepResult, SystemInfo,
+};
+
 use wdc65816::Wdc65816;
 
 use retro_core::debug::trace_to_text;
@@ -62,7 +66,8 @@ use crate::cartridge::{
 use crate::controller::{
     default_gamepad_mapping, default_keyboard_mapping, input_state_to_snes_pad,
 };
-use crate::scheduler::{schedule_frame_events, HEventScheduler, TimingProfile};
+use crate::scheduler::{schedule_frame_events, EventKind, TimingProfile};
+use retro_core::frame::EventQueue;
 
 use debug::SpcPeekBus;
 use descriptors::{preset_kind_name, secondary_cpu_info, snes_base_cpus, snes_button_layout};
@@ -112,7 +117,7 @@ pub struct SnesEmulator {
 
     cpu: Wdc65816,
     bus: SnesBus,
-    scheduler: HEventScheduler,
+    scheduler: EventQueue<EventKind>,
     timing: TimingProfile,
 
     frame_count: u64,
@@ -201,13 +206,10 @@ pub struct SnesEmulator {
     debugger: SnesDebugger,
 
     /// Mirror of `debugger.has_watchpoints_or_events()`, refreshed each
-    /// debug entry. Gates the inline event checks in `handle_event_at` and
-    /// `step_cpu_internal` so the fast path stays branch-free.
+    /// debug entry: whether the bus records the CPU's accesses, the APU
+    /// its S-DSP register writes and the PPU its palette and tile events,
+    /// and whether the debugger's tiers check them.
     debug_armed: bool,
-    /// Set by an armed event/watchpoint hit mid-frame; the instrumented
-    /// frame loop honours it by pausing and returning. Reset at the top
-    /// of every instrumented frame.
-    pending_break: bool,
 
     /// VBlank NMI *delivery* state, modelling the 5A22's NMI latency in a
     /// phase-independent way. The `$4210` NMI flag is latched the instant
@@ -330,7 +332,7 @@ impl SnesEmulator {
             framebuffer,
             cpu: Wdc65816::new(),
             bus: SnesBus::new(),
-            scheduler: HEventScheduler::new(timing),
+            scheduler: EventQueue::new(),
             timing,
             frame_count: 0,
             master_cycles: 0,
@@ -355,7 +357,6 @@ impl SnesEmulator {
             capture_recording: CaptureRecording::default(),
             debugger,
             debug_armed: false,
-            pending_break: false,
             nmi_deliver_armed: false,
             nmi_deliver_countdown: 0,
             irq_cycles: VecDeque::new(),
@@ -577,9 +578,8 @@ impl SnesEmulator {
         &mut self.input_manager
     }
 
-    /// Borrow the scheduler. Tests use this to check pending events
-    /// and the current scanline position.
-    pub fn scheduler(&self) -> &HEventScheduler {
+    /// Borrow the event queue. Tests use this to check pending events.
+    pub fn scheduler(&self) -> &EventQueue<EventKind> {
         &self.scheduler
     }
 
@@ -610,17 +610,13 @@ impl SnesEmulator {
             }
         };
         self.timing = profile;
-        // `reset()` re-anchors the scheduler cursor but keeps whatever
-        // timing the scheduler was built with, so rebuild it on the new
-        // profile here; the per-frame event cycles are then computed
-        // against the new scanline count.
-        self.scheduler = HEventScheduler::new(profile);
         // STAT78 (`$213F` bit 4) must report the new region.
         self.bus
             .system_regs_mut()
             .set_timing_is_pal(profile.scanlines_per_frame == 312);
-        // reset() re-arms frame-0 events and rebinds the APU +
-        // coprocessor rate converters to `self.timing.master_clock_hz`.
+        // reset() empties the event queue, arms frame 0's events on the
+        // new scanline count and rebinds the APU + coprocessor rate
+        // converters to `self.timing.master_clock_hz`.
         self.reset();
         Ok(())
     }
@@ -776,7 +772,12 @@ impl EmulatorCore for SnesEmulator {
         // Frame 0 schedules off the live overscan bit (off at the
         // reset/power-on state); subsequent frames re-read it in
         // `end_of_frame_bookkeeping`.
-        schedule_frame_events(&mut self.scheduler, 0, self.bus.ppu().overscan());
+        schedule_frame_events(
+            &mut self.scheduler,
+            self.timing,
+            0,
+            self.bus.ppu().overscan(),
+        );
         self.arm_irq_events(0, 0);
         self.audio_ring.clear();
         self.resampler.reset();
@@ -831,18 +832,12 @@ impl EmulatorCore for SnesEmulator {
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
         match cpu_id {
             MAIN_CPU => {
-                // The step a host asks for on the 5A22: coverage, a trace
-                // entry (when enabled), the call stack and the history,
-                // the events the instruction reached (RenderPos, VBlank,
-                // HBlank, NMI, IRQ, HDMA) handled and the frame closed at
-                // its boundary, as in the frame loop, then the cached
-                // register snapshots refreshed. Without the events a
-                // stepped run executes against a dead timeline that never
-                // advances past frame 0.
-                self.sync_spc_trace_enable();
-                self.sync_cartridge_trace_enable();
-                self.sync_debug_arm();
-                self.debug_single_step_65816()
+                // The step a host asks for on the 5A22, one step of the
+                // frame loop: what is due before it handled, the step with
+                // its coverage, trace entry, call stack and history, what
+                // it made due handled and the frame closed at its
+                // boundary, then the cached register snapshots refreshed.
+                retro_core::frame::host_step(self)
             }
             CARTRIDGE_CPU => {
                 // The slot-2 CPU: the SA-1's second 65816, the GSU or the Cx4.
@@ -885,25 +880,14 @@ impl EmulatorCore for SnesEmulator {
         self.debugger.set_focused_cpu(cpu_id);
     }
 
+    /// A frame call on the loop the debugger's state selects: the play
+    /// tier when nothing is instrumented, the debugger's tier while it
+    /// runs with breakpoints or traces, and its paused or stepping tier
+    /// otherwise (`retro_core::frame::run_frame_on`, which arms the
+    /// debugger's recorders and the second CPUs' trace capture first).
     fn run_frame(&mut self) {
-        // Keep the APU's SPC700 trace capture in lock-step with the
-        // debugger's SPC700 tracing flag before any catch-up runs this
-        // frame.
-        self.sync_spc_trace_enable();
-        // Same for the cartridge CPU's trace capture, the Super FX's GSU
-        // or the Cx4 (no-op otherwise).
-        self.sync_cartridge_trace_enable();
-        // Arm (or disarm) bus + APU debug-event recording to match the
-        // current watch/event-breakpoint set before the loop runs.
-        self.sync_debug_arm();
-        // Dispatch on the current debug state: the fast path when nothing
-        // is instrumented, a per-instruction light path when breakpoints
-        // or tracing are active, and the full path while paused / stepping.
-        match self.debugger.execution_tier() {
-            ExecutionTier::Fast => self.run_frame_fast(),
-            ExecutionTier::LightDebug => self.run_frame_instrumented(),
-            ExecutionTier::FullDebug => self.run_frame_full(),
-        }
+        let tier = self.debugger.execution_tier();
+        retro_core::frame::run_frame_on(self, tier);
     }
 
     /// Run to the start of vertical blanking and stop there: the capture
@@ -982,7 +966,6 @@ impl EmulatorCore for SnesEmulator {
             .map(|h| TimingProfile::from_destination(h.destination))
             .unwrap_or(TimingProfile::NTSC);
         self.timing = timing;
-        self.scheduler = HEventScheduler::new(timing);
         // The host resampler runs at a fixed 32 kHz -> 44.1 kHz ratio that
         // is independent of the console region, so it needs no rebuild
         // here; the APU's own region-dependent 32 kHz clock is rebound in

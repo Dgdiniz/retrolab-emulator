@@ -54,9 +54,7 @@ pub use ppu::{
     PpuSettings, SpriteDescriptor, TileSetSource, ViewerImage, WindowEnable, WindowMasks,
 };
 pub use savestate::{SnesSaveState, SNES_SAVESTATE_VERSION};
-pub use scheduler::{
-    schedule_frame_events, EventKind, HEventScheduler, ScheduledEvent, TimingProfile,
-};
+pub use scheduler::{schedule_frame_events, EventKind, TimingProfile};
 pub use system::{SnesEmulator, SnesSnapshotConsole};
 pub use system_regs::{SystemRegWriteFx, SystemRegs};
 #[cfg(feature = "chip-cx4")]

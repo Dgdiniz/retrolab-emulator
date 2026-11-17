@@ -3,6 +3,7 @@
 use super::*;
 use crate::scheduler::EventKind;
 use retro_core::cpu::Addressable;
+use retro_core::{CpuArchitecture, ExecutionMode, InputState};
 
 #[test]
 fn system_info_lists_both_cpus() {
@@ -130,7 +131,7 @@ fn a_pause_reports_where_the_fast_loop_stopped() {
     let at_load = emu.debugger.get_cpu_states()[0].pc;
     emu.set_execution_mode(ExecutionMode::Running);
     for _ in 0..3 {
-        emu.run_frame_fast();
+        retro_core::frame::run_frame(&mut emu, &mut retro_core::frame::Play);
     }
     // The fast loop refreshes no snapshot: the debugger still holds the
     // one the reset took.
@@ -793,7 +794,7 @@ fn deferred_hdma_event_re_anchors_raster_snapshot_to_scheduled_hblank_dot() {
         "the trigger's scheduled cycle decodes to line 100, dot 276"
     );
 
-    emu.handle_event_at(trigger_cycle, EventKind::HdmaTrigger);
+    emu.handle_event_at(trigger_cycle, EventKind::HdmaTrigger, &mut ());
 
     // The snapshot now reflects the trigger's own H-blank dot, not the
     // poisoned mid-active cursor: dot 276 is >= the active-scan gate's
@@ -808,7 +809,7 @@ fn deferred_hdma_event_re_anchors_raster_snapshot_to_scheduled_hblank_dot() {
     // HdmaInit (top-of-frame, dot 6) re-anchors the same way.
     emu.bus.set_raster_snapshot(150, 120);
     let init_cycle = emu.frame_base_cycle + 6 * 4;
-    emu.handle_event_at(init_cycle, EventKind::HdmaInit);
+    emu.handle_event_at(init_cycle, EventKind::HdmaInit, &mut ());
     assert_eq!(
         (emu.bus.cached_h_dot(), emu.bus.cached_v_scanline()),
         (6, 0),
@@ -949,7 +950,7 @@ fn nmi_delivery_releases_after_poll_observes_flag_lda_in_flight() {
         "NMI must not be vectored at the boundary"
     );
 
-    emu.step_cpu_internal();
+    emu.step_without_events();
     assert_eq!(emu.cpu.c & 0xFF, 0x80, "the poll read the latched NMI flag");
     assert!(
         emu.cpu.nmi_pending,
@@ -977,7 +978,7 @@ fn nmi_delivery_holds_off_until_poll_reads_flag_bpl_in_flight() {
     emu.handle_event(EventKind::VBlankStart);
 
     // The BPL reads no register: the NMI must stay armed, not fire.
-    emu.step_cpu_internal();
+    emu.step_without_events();
     assert_eq!(emu.cpu.pc, 0x0200, "BPL branched back to the LDA");
     assert!(
         !emu.cpu.nmi_pending,
@@ -989,7 +990,7 @@ fn nmi_delivery_holds_off_until_poll_reads_flag_bpl_in_flight() {
     );
 
     // The LDA now observes the flag -> NMI released.
-    emu.step_cpu_internal();
+    emu.step_without_events();
     assert_eq!(emu.cpu.c & 0xFF, 0x80, "the poll read the latched NMI flag");
     assert!(
         emu.cpu.nmi_pending,
@@ -1014,14 +1015,14 @@ fn nmi_delivery_falls_back_to_window_when_main_thread_does_not_poll() {
 
     emu.handle_event(EventKind::VBlankStart);
     for n in 1..NMI_DELIVERY_MAX_INSNS {
-        emu.step_cpu_internal();
+        emu.step_without_events();
         assert!(
             !emu.cpu.nmi_pending,
             "not delivered before the window elapses (step {n})"
         );
         assert!(emu.nmi_deliver_armed);
     }
-    emu.step_cpu_internal();
+    emu.step_without_events();
     assert!(
         emu.cpu.nmi_pending,
         "NMI delivered when the fallback window expires"

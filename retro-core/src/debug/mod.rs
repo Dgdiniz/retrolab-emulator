@@ -39,7 +39,7 @@ pub use execution_tier::{select_tier, ExecutionTier, TierSelectorInputs};
 pub use expr::{eval_str, ByteOrder, CpuExprContext, Expr, ExprContext, ExprError};
 pub use state::{
     BreakpointChecks, CallStack, ConsoleDebug, CpuDebug, CpuDebugSpec, DebuggerState, HistoryRing,
-    CALL_STACK_DEPTH, HISTORY_CAPACITY,
+    CALL_STACK_DEPTH, HISTORY_CAPACITY, MAIN_CPU,
 };
 pub use trace::{
     trace_to_text, TraceEntry, TraceStats, TraceText, TracingState, MAX_TRACE_BUFFER_SIZE,

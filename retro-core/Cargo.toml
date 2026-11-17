@@ -11,6 +11,9 @@ description = "Common traits and types for retro console emulators"
 # The capture conformance suite (`capture::conformance`), which each core's
 # tests run against its own emulator.
 capture-conformance = []
+# The frame driver's conformance suite (`frame::conformance`), which each
+# core's tests run against its own emulator.
+frame-conformance = []
 
 [dependencies]
 serde = { workspace = true }

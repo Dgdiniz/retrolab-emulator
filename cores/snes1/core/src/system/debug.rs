@@ -5,8 +5,10 @@
 use retro_core::audio::AudioDebugger;
 use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
+use retro_core::frame::DebugMachine;
 use retro_core::video::VideoDebugger;
-use retro_core::*;
+use retro_core::{DisasmRow, DisasmRowKind, InstructionTrace, StackFrame};
+
 use wdc65816::Wdc65816;
 
 use retro_core::debug::{ByteOrder, CpuExprContext};
@@ -395,59 +397,27 @@ impl SnesEmulator {
         hit
     }
 
-    /// Pause the debugger on a mid-frame break (an execute breakpoint, a
-    /// watchpoint or an event hit), refreshing its CPU states, and flush
-    /// the traces. Shared by every early-return site in the instrumented
-    /// frame loop.
-    pub(super) fn finish_paused_frame(&mut self) {
-        // The SPC700 / GSU may have run (via mailbox catch-up) before the break
-        // paused us mid-frame; flush their trace entries chronologically.
-        self.drain_spc_trace();
-        self.drain_cartridge_trace();
-        EmulatorCore::set_execution_mode(self, ExecutionMode::Paused);
-    }
-
-    /// What the call stack needs to know of a 65C816 step before it runs:
-    /// the instruction's address and opcode (read through the peek), the
-    /// CPU's count of executed cycles and whether it was stopped.
+    /// What the call stack needs to know of a 65C816 instruction before it
+    /// runs: its address and opcode (read through the peek).
     pub(super) fn step_start_65816(&self, pc24: u32) -> StepStart {
         StepStart {
             pc24,
             opcode: self.bus.peek(pc24),
-            cycles: self.cpu.cycles_executed,
-            stopped: self.cpu.stopped,
         }
     }
 
-    /// Keep the 65C816 call stack after a step that began as `start`. An
-    /// instruction the step ran pushes a frame on a
-    /// subroutine or software-interrupt call (JSR `$20` / JSR(abs,x) `$FC`
-    /// / JSL `$22` / BRK `$00` / COP `$02`) and pops one on a return (RTS
-    /// `$60` / RTL `$6B` / RTI `$40`). A step that takes an interrupt
-    /// instead runs no instruction and pushes a frame whose call and return
-    /// addresses are both the interrupted address, which the handler's RTI
-    /// pops; so a call an interrupt preempts is pushed once, when it runs.
-    /// A step that finds the CPU stopped, or still waiting, does nothing.
-    /// The return address is the next instruction, wrapped inside the
+    /// Keep the 65C816 call stack after the instruction that began as
+    /// `start`: push a frame on a subroutine or software-interrupt call
+    /// (JSR `$20` / JSR(abs,x) `$FC` / JSL `$22` / BRK `$00` / COP `$02`)
+    /// and pop one on a return (RTS `$60` / RTL `$6B` / RTI `$40`). An
+    /// interrupt the CPU takes instead of an instruction pushes its frame
+    /// through the frame driver's `interrupt_taken`, the interrupted
+    /// address as both the call and the return, which the handler's RTI
+    /// pops. The return address is the next instruction, wrapped inside the
     /// program bank like the CPU's own PC; the `function_name` stays `None`
     /// (the core resolves no symbols).
     pub(super) fn maintain_call_stack_65816(&mut self, start: StepStart) {
         let pc24 = start.pc24;
-        if self.cpu.cycles_executed == start.cycles {
-            // No instruction ran: the CPU was stopped or still waits, or it
-            // took an interrupt.
-            if !start.stopped && !self.cpu.waiting {
-                self.debugger.push_call(
-                    MAIN_CPU,
-                    StackFrame {
-                        call_address: pc24,
-                        return_address: pc24,
-                        function_name: None,
-                    },
-                );
-            }
-            return;
-        }
         let bank = pc24 & 0x00FF_0000;
         let call = |size: u16| StackFrame {
             call_address: pc24,
@@ -509,18 +479,13 @@ impl SnesEmulator {
 }
 
 /// What [`SnesEmulator::maintain_call_stack_65816`] needs to know of a
-/// 65C816 step before it runs.
+/// 65C816 instruction before it runs.
 #[derive(Clone, Copy)]
-pub(super) struct StepStart {
-    /// The address of the instruction the step would run.
+pub struct StepStart {
+    /// The address of the instruction.
     pc24: u32,
     /// Its opcode, read through the peek.
     opcode: u8,
-    /// The CPU's count of executed cycles: it moves only when the step
-    /// runs an instruction.
-    cycles: u64,
-    /// The CPU was stopped (STP), so the step runs nothing.
-    stopped: bool,
 }
 
 /// The context a breakpoint's condition and a watch's value are read in on
@@ -654,5 +619,95 @@ impl retro_core::DisasmDriver for SnesDisasmDriver<'_> {
 
     fn decode_at(&mut self, addr: u32) -> DisasmRow {
         decode_one_snes(self.emu, self.cpu_id, addr)
+    }
+}
+
+/// The 65C816's side of the debugger's tiers: the frame driver runs the
+/// debugger's work around a step, and these are the pieces this console
+/// does its own way.
+impl DebugMachine for SnesEmulator {
+    type Debugger = crate::debugger::SnesDebugger;
+
+    fn debug_state(&self) -> &Self::Debugger {
+        &self.debugger
+    }
+
+    fn debug_state_mut(&mut self) -> &mut Self::Debugger {
+        &mut self.debugger
+    }
+
+    fn armed(&self) -> bool {
+        self.debug_armed
+    }
+
+    /// The SPC700's and the cartridge CPU's trace capture as the
+    /// debugger traces them, and the event and access recorders as its
+    /// breakpoints watch.
+    fn arm(&mut self) {
+        self.sync_spc_trace_enable();
+        self.sync_cartridge_trace_enable();
+        self.sync_debug_arm();
+    }
+
+    fn disarm(&mut self) {
+        self.disarm_debugger_hooks();
+    }
+
+    /// The registers before the instruction, and memory through the peek.
+    fn check_execute(&mut self, pc: u32) -> bool {
+        let mut context = expr_context(&self.cpu, &self.bus);
+        self.debugger
+            .check_execute(MAIN_CPU, pc, Some(&mut context))
+    }
+
+    type CallStart = StepStart;
+
+    fn call_start(&self, pc: u32) -> StepStart {
+        self.step_start_65816(pc)
+    }
+
+    fn call_finish(&mut self, start: StepStart) {
+        self.maintain_call_stack_65816(start);
+    }
+
+    /// The 65C816's entry is whole before its instruction runs, so it is
+    /// recorded there.
+    type TraceStart = ();
+
+    fn trace_start(&mut self, _pc: u32) {
+        let entry = self.capture_trace_65816();
+        self.debugger.record_trace(MAIN_CPU, &entry);
+    }
+
+    fn trace_finish(&mut self, _start: (), _cycles: u32) {}
+
+    type HistoryStart = InstructionTrace;
+
+    fn history_start(&self, pc: u32) -> InstructionTrace {
+        self.history_entry_65816(pc)
+    }
+
+    fn history_finish(&mut self, entry: InstructionTrace, _cycles: u32) {
+        self.debugger.record_history(MAIN_CPU, entry);
+    }
+
+    /// Drop what was recorded between two instructions (a host's write
+    /// while the frame was stopped, an interrupt's stack pushes) so the
+    /// watchpoints see only this instruction's own accesses.
+    fn arm_access_log(&mut self) -> bool {
+        if self.debug_armed {
+            self.bus.clear_debug_events();
+        }
+        self.debug_armed
+    }
+
+    fn check_access_log(&mut self, _pc: u32) -> bool {
+        self.drain_bus_debug_events()
+    }
+
+    /// What the SPC700 and the cartridge's CPU traced, in their order.
+    fn flush_traces(&mut self) {
+        self.drain_spc_trace();
+        self.drain_cartridge_trace();
     }
 }

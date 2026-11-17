@@ -324,11 +324,11 @@ fn irq_reschedule_cancels_stale_event() {
     emu.bus_mut().write(0x4209, 0x64); // VTIMEL = 100
     emu.bus_mut().write(0x420A, 0x00);
     emu.step_without_events(); // drain reschedule -> one IrqV armed
-    let before = emu.scheduler().pending_count();
+    let before = emu.scheduler().len();
 
     emu.bus_mut().write(0x4209, 0x96); // VTIMEL = 150
     emu.step_without_events(); // reschedule: cancel old IrqV, arm new one
-    let after = emu.scheduler().pending_count();
+    let after = emu.scheduler().len();
 
     assert_eq!(
         after, before,

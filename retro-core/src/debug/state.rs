@@ -266,6 +266,9 @@ impl ConsoleDebug for () {
     }
 }
 
+/// The slot of the CPU a frame loop steps: CPU 0 in every core.
+pub const MAIN_CPU: usize = 0;
+
 /// A console's debugger: `N` CPU slots and the console's own part `C`.
 ///
 /// It starts running (`ExecutionMode::Running`) with CPU 0 focused. The
@@ -283,6 +286,10 @@ pub struct DebuggerState<const N: usize, C: ConsoleDebug> {
     /// For each CPU, the address its last execute check covered, when the
     /// next check there is to be skipped ([`Self::check_execute`]).
     checked_at: [Option<u32>; N],
+    /// A check asked the frame call to stop: an event, or a watchpoint the
+    /// instruction's accesses matched. The frame loop pauses after the step
+    /// or the events that asked ([`crate::frame`]).
+    stop_requested: bool,
     console: C,
 }
 
@@ -297,6 +304,7 @@ impl<const N: usize, C: ConsoleDebug> DebuggerState<N, C> {
             system_info,
             cpus: cpus.map(CpuDebug::new),
             checked_at: [None; N],
+            stop_requested: false,
             console,
         }
     }
@@ -523,6 +531,21 @@ impl<const N: usize, C: ConsoleDebug> DebuggerState<N, C> {
         self.breakpoints.check_execute(cpu, next_pc, ctx)
     }
 
+    /// A check asks the frame call to stop.
+    pub fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    /// Whether a check asked the frame call to stop.
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
+    /// Forget a request to stop.
+    pub fn clear_stop(&mut self) {
+        self.stop_requested = false;
+    }
+
     /// Forget CPU `cpu`'s mark: its next execute check checks.
     pub fn forget_checked(&mut self, cpu: usize) {
         if let Some(mark) = self.checked_at.get_mut(cpu) {
@@ -618,6 +641,10 @@ impl<const N: usize, C: ConsoleDebug> DebuggerCore for DebuggerState<N, C> {
 
     fn set_execution_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
+    }
+
+    fn execution_tier(&self) -> ExecutionTier {
+        DebuggerState::execution_tier(self)
     }
 
     fn get_memory_regions(&self) -> Vec<MemoryRegionInfo> {

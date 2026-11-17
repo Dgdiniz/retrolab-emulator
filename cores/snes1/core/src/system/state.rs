@@ -20,7 +20,7 @@ impl SnesEmulator {
             version: SNES_SAVESTATE_VERSION,
             cpu: Cpu65816State::capture(&self.cpu),
             bus: self.bus.to_savestate(),
-            scheduler: self.scheduler.to_savestate(),
+            scheduler: crate::scheduler::queue_to_state(&self.scheduler, &self.timing),
             master_cycles: self.master_cycles,
             frame_base_cycle: self.frame_base_cycle,
             frame_count: self.frame_count,
@@ -71,7 +71,7 @@ impl SnesEmulator {
         self.timing = crate::scheduler::timing_from_state(&payload.timing);
         self.bus
             .from_savestate(&payload.bus, self.timing.master_clock_hz as u64);
-        self.scheduler.from_savestate(&payload.scheduler);
+        crate::scheduler::queue_from_state(&mut self.scheduler, &payload.scheduler);
         self.collect_irq_cycles();
         self.irq_read_early = None;
         self.master_cycles = payload.master_cycles;

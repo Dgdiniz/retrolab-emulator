@@ -20,7 +20,10 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::debug::ExecutionTier;
+use crate::frame::{run_frame_on, DebugMachine, FrameCall};
 use crate::input_schedule::{parse_press_schedule, parse_reset_frames, PressSchedule};
+use crate::types::{Breakpoint, BreakpointAction, BreakpointType, MatchSpec, BREAKPOINT_PARAM_ANY};
 use crate::{fnv1a64, EmulatorCore, InputState};
 
 /// What a golden run does: how long, when to take pictures, what to press
@@ -112,6 +115,89 @@ pub fn run_golden<E: EmulatorCore>(
         });
     }
     records
+}
+
+/// [`run_golden`] with every frame on `tier` through the frame driver
+/// ([`run_frame_on`]), what each CPU's trace holds dropped after each
+/// frame. Held to a golden manifest's records, it shows a tier runs the
+/// play tier's machine: a run on a debug tier arms only breakpoints that
+/// log ([`arm_everything`]), so a frame call that does not end its frame
+/// is the defect such a run looks for, and it panics naming the frame.
+/// `FullDebug` steps rather than running frames and is refused.
+pub fn run_golden_on<E: DebugMachine>(
+    emu: &mut E,
+    spec: &GoldenSpec,
+    tier: ExecutionTier,
+    state_hash: impl Fn(&E) -> u64,
+    on_shot: impl FnMut(u64, u32, u32, &[u8]),
+    on_audio: impl FnMut(&[f32]),
+) -> Vec<FrameRecord> {
+    assert!(
+        tier != ExecutionTier::FullDebug,
+        "the full debug tier steps one instruction a call; a golden run needs frames"
+    );
+    let cpus = emu.system_info().cpus.len();
+    let mut frame = 0u64;
+    let run_frame = |e: &mut E| {
+        frame += 1;
+        let call = run_frame_on(e, tier);
+        assert_eq!(
+            call,
+            FrameCall::Ended,
+            "frame {frame} on the {tier:?} tier did not end"
+        );
+        for cpu in 0..cpus {
+            e.debugger().clear_trace_flushed(cpu);
+        }
+    };
+    run_golden(emu, spec, run_frame, state_hash, on_shot, on_audio)
+}
+
+/// Arm every check the debugger has, each set to log rather than stop: an
+/// execute breakpoint and a read and write watchpoint over the whole
+/// address space, every event the console's catalogue lists with any
+/// parameter, and tracing on every CPU. Every check then runs on every
+/// instruction, and nothing stops.
+pub fn arm_everything<E: EmulatorCore>(emu: &mut E) {
+    let log = MatchSpec {
+        address_end: Some(u32::MAX),
+        action: BreakpointAction::Log,
+        ..Default::default()
+    };
+    let codes: Vec<u32> = emu
+        .debugger_ref()
+        .available_events()
+        .iter()
+        .map(|event| event.code)
+        .collect();
+    let mut breakpoints = vec![
+        (0, BreakpointType::execute(), log.clone()),
+        (0, BreakpointType::read_write(), log.clone()),
+    ];
+    for code in codes {
+        let event = BreakpointType::Event {
+            code,
+            param: BREAKPOINT_PARAM_ANY,
+        };
+        let spec = MatchSpec {
+            address_end: None,
+            ..log.clone()
+        };
+        breakpoints.push((0, event, spec));
+    }
+    for (address, bp_type, spec) in breakpoints {
+        let id = emu.debugger().add_breakpoint(Breakpoint {
+            address,
+            bp_type,
+            cpu_id: None,
+            condition: None,
+        });
+        emu.debugger().set_breakpoint_match_spec(id, spec);
+    }
+    let cpus = emu.system_info().cpus.len();
+    for cpu in 0..cpus {
+        emu.debugger().set_tracing_enabled(cpu, true);
+    }
 }
 
 /// Hash interleaved `f32` samples by their exact bit patterns, so a change

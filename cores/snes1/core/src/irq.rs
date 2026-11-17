@@ -23,7 +23,9 @@
 //! than a per-cycle compare (what bsnes-plus does) but is sufficient
 //! for the scanline-window HUD effects that drive the IRQ feature.
 
-use crate::scheduler::{EventKind, HEventScheduler, TimingProfile};
+use retro_core::frame::EventQueue;
+
+use crate::scheduler::{EventKind, TimingProfile};
 
 /// Which raster IRQ source is armed, decoded from NMITIMEN
 /// (`$4200`) bit 5 (V) and bit 4 (H).
@@ -70,7 +72,7 @@ pub fn h_irq_cycle(base_cycle: u64, line: u16, htime: u16, cycles_per_scanline: 
 /// the still-future triggers rather than re-firing one for a scanline
 /// the beam already crossed).
 pub fn schedule_irq_events(
-    scheduler: &mut HEventScheduler,
+    scheduler: &mut EventQueue<EventKind>,
     base_cycle: u64,
     nmitimen: u8,
     htime: u16,
@@ -122,8 +124,16 @@ mod tests {
     const NTSC: TimingProfile = TimingProfile::NTSC;
     const CPS: u64 = 1364;
 
-    fn fresh() -> HEventScheduler {
-        HEventScheduler::new(NTSC)
+    fn fresh() -> EventQueue<EventKind> {
+        EventQueue::new()
+    }
+
+    /// The kinds of the events due by `cycle`, taken off the queue.
+    fn drain_kinds(q: &mut EventQueue<EventKind>, cycle: u64) -> Vec<EventKind> {
+        let batch = q.take_due(cycle);
+        let kinds = batch.iter().map(|(_, kind)| kind).collect();
+        q.give_back(batch);
+        kinds
     }
 
     #[test]
@@ -140,7 +150,7 @@ mod tests {
     fn disabled_schedules_nothing() {
         let mut s = fresh();
         schedule_irq_events(&mut s, 0, 0x00, 0x10, 0x20, NTSC, 0);
-        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]
@@ -148,10 +158,13 @@ mod tests {
         let mut s = fresh();
         // V-IRQ, vtime = 0x50 (80).
         schedule_irq_events(&mut s, 0, 0x20, 0x00, 0x50, NTSC, 0);
-        assert_eq!(s.pending_count(), 1);
+        assert_eq!(s.len(), 1);
         let at = 0x50 * CPS;
         assert_eq!(s.peek_cycle(), Some(at));
-        assert_eq!(s.drain_up_to(at), vec![EventKind::IrqV { v_target: 0x50 }]);
+        assert_eq!(
+            drain_kinds(&mut s, at),
+            vec![EventKind::IrqV { v_target: 0x50 }]
+        );
     }
 
     #[test]
@@ -159,7 +172,7 @@ mod tests {
         let mut s = fresh();
         // vtime past the 262-line frame never fires.
         schedule_irq_events(&mut s, 0, 0x20, 0x00, 300, NTSC, 0);
-        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]
@@ -167,7 +180,7 @@ mod tests {
         let mut s = fresh();
         // H-IRQ, htime = 0x20 (32 dots).
         schedule_irq_events(&mut s, 0, 0x10, 0x20, 0x00, NTSC, 0);
-        assert_eq!(s.pending_count(), NTSC.scanlines_per_frame as usize);
+        assert_eq!(s.len(), NTSC.scanlines_per_frame as usize);
         // First trigger is on line 0 at dot 32 = 128 master clocks.
         assert_eq!(s.peek_cycle(), Some(0x20 * 4));
     }
@@ -177,7 +190,7 @@ mod tests {
         let mut s = fresh();
         // htime * 4 >= cps (1364) -> 341 dots is past the line length.
         schedule_irq_events(&mut s, 0, 0x10, 341, 0x00, NTSC, 0);
-        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]
@@ -185,11 +198,11 @@ mod tests {
         let mut s = fresh();
         // HV: vtime = 100, htime = 0x40 (64 dots).
         schedule_irq_events(&mut s, 0, 0x30, 0x40, 100, NTSC, 0);
-        assert_eq!(s.pending_count(), 1);
+        assert_eq!(s.len(), 1);
         let at = 100 * CPS + 0x40 * 4;
         assert_eq!(s.peek_cycle(), Some(at));
         assert_eq!(
-            s.drain_up_to(at),
+            drain_kinds(&mut s, at),
             vec![EventKind::IrqHV { v: 100, h: 0x40 }]
         );
     }
@@ -201,7 +214,7 @@ mod tests {
         // only the future lines (10..262) are armed.
         let min = 10 * CPS;
         schedule_irq_events(&mut s, 0, 0x10, 0x00, 0x00, NTSC, min);
-        assert_eq!(s.pending_count(), (NTSC.scanlines_per_frame as usize) - 10);
+        assert_eq!(s.len(), (NTSC.scanlines_per_frame as usize) - 10);
         // The earliest armed trigger is line 10.
         assert_eq!(s.peek_cycle(), Some(min));
     }

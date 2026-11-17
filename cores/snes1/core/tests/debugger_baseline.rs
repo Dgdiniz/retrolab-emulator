@@ -668,8 +668,9 @@ fn a_call_stepped_one_instruction_at_a_time_reads_as_recorded() {
 /// call and return addresses are both the interrupted address, which the
 /// handler's `RTI` pops. The call it preempted runs after the `RTI`, and
 /// only then pushes its frame, once. Every return pops its own call's frame.
-/// The history records the instruction at the PC as each step starts, so a
-/// call the NMI preempted is in it twice.
+/// The history records the instructions that ran, so a call the NMI
+/// preempted is in it once, and the step that took the NMI is in it not at
+/// all.
 #[test]
 fn a_call_an_interrupt_meets_reads_as_recorded() {
     let mut emu = calls_loaded(Some(0x8030));
@@ -707,13 +708,10 @@ fn a_call_an_interrupt_meets_reads_as_recorded() {
             "008021 rtl",
             "008020 nop",
             "008030 rti",
-            "008020 nop",
             "008010 jsl $008020",
             "008030 rti",
-            "008010 jsl $008020",
             "008000 jsr $8010",
             "008030 rti",
-            "008000 jsr $8010",
         ]
     );
 }

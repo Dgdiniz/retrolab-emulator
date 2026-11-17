@@ -1,7 +1,7 @@
 //! What the host is told about the console: its CPUs (a cartridge's own
 //! CPU among them) and the pad's buttons.
 
-use retro_core::*;
+use retro_core::{ButtonInfo, CpuArchitecture, CpuInfo, CpuLocation};
 
 use crate::cartridge::PresetKind;
 

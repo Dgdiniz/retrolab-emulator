@@ -22,7 +22,8 @@ pub struct RunArgs {
     /// Run for exactly N frames.
     #[arg(long)]
     pub frames: Option<u64>,
-    /// Step exactly N 65C816 instructions.
+    /// Run exactly N 65C816 instructions; a step that only waits or only
+    /// takes an interrupt is not one.
     #[arg(long)]
     pub instructions: Option<u64>,
     /// Run the first frame to the start of its vertical blanking and stop
@@ -91,13 +92,24 @@ pub fn run(args: RunArgs) -> Result<()> {
         finish_bar(pb);
     } else if let Some(n) = args.instructions {
         let pb = make_bar(args.progress, n, "instructions");
+        let mut steps = 0u64;
         while instructions_executed < n {
+            // A step that only waits, or only takes an interrupt, runs no
+            // instruction.
             let r = emu.step_cpu(0);
+            steps += 1;
             if r.instruction_executed {
                 instructions_executed += 1;
                 if let Some(pb) = &pb {
                     pb.inc(1);
                 }
+            }
+            if steps >= MAX_STEPS {
+                anyhow::bail!(
+                    "reached {MAX_STEPS} steps with {instructions_executed} of {n} instructions \
+                     run (last PC ${:06x})",
+                    current_pc(&emu)
+                );
             }
         }
         finish_bar(pb);

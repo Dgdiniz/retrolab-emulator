@@ -1,11 +1,11 @@
-//! H-event scheduler and console timing profile.
+//! The SNES's timetable: the console's timing profile and the events a
+//! frame arms.
 //!
-//! Drives the SNES system loop around a min-heap of pre-scheduled
-//! events keyed on absolute master-clock cycles. Every cycle in the
-//! scheduler (`current_cycle`, `at_cycle`, `peek_cycle`,
-//! `drain_up_to`) is expressed in **master clocks** (NTSC
-//! `21_477_270` Hz, PAL `21_281_370` Hz), the same unit the rest of
-//! the emulator counts in `master_cycles`.
+//! The frame runs on a queue of events keyed on absolute master-clock
+//! cycles, retro-core's [`EventQueue`] over this core's [`EventKind`].
+//! Every cycle in it is expressed in **master clocks** (NTSC
+//! `21_477_270` Hz, PAL `21_281_370` Hz), the same unit the rest of the
+//! emulator counts in `master_cycles`.
 //!
 //! The intent is to model events that are known in advance (per
 //! scanline H-blank, HDMA and render position, V-blank entry/exit,
@@ -14,11 +14,11 @@
 //! during the frame (the H/V IRQ events, re-armed after an
 //! `NMITIMEN` / `HTIME` / `VTIME` write, and `AutoJoypadDone`, armed
 //! when an auto-joypad read starts) get added on demand via
-//! [`HEventScheduler::schedule`].
+//! [`EventQueue::schedule`].
 //!
 //! ## Frame skeleton
 //!
-//! [`schedule_frame_events`] populates the scheduler for an entire
+//! [`schedule_frame_events`] populates the queue for an entire
 //! NTSC/PAL frame at `base_cycle`:
 //!
 //! - one [`EventKind::HBlankStart`] per scanline at dot 274 (= 1096
@@ -36,10 +36,9 @@
 //!   alone).
 //!
 //! The event handlers themselves live in
-//! `SnesEmulator::handle_event_at` (`system.rs`).
+//! `SnesEmulator::handle_event_at` (`system/frame.rs`).
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use retro_core::frame::EventQueue;
 
 /// Region-specific timing constants (master-clock rate, scanline
 /// length, frame layout).
@@ -142,7 +141,7 @@ impl TimingProfile {
 /// (begin/end of blank periods, frame boundary, APU resync hook).
 ///
 /// Event semantics live in `handle_event_at` inside the SnesEmulator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// Start of horizontal blank for the current scanline.
     HBlankStart,
@@ -199,37 +198,6 @@ impl EventKind {
             self,
             EventKind::IrqV { .. } | EventKind::IrqH { .. } | EventKind::IrqHV { .. }
         )
-    }
-}
-
-/// One scheduled event. Ordered by `(at_cycle, seq)` so the
-/// scheduler can use `BinaryHeap<Reverse<_>>` as a min-heap with
-/// stable FIFO order on cycle ties.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduledEvent {
-    /// Absolute master-clock cycle at which the event fires.
-    pub at_cycle: u64,
-    /// Sequence number assigned at schedule time. Breaks ties on
-    /// `at_cycle` so events scheduled first fire first.
-    pub seq: u64,
-    /// The event itself.
-    pub kind: EventKind,
-}
-
-impl Ord for ScheduledEvent {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Sort by (at_cycle, seq) ascending so that wrapped in
-        // `Reverse` the BinaryHeap pops the lowest cycle first, and
-        // ties are broken by insertion order.
-        self.at_cycle
-            .cmp(&other.at_cycle)
-            .then(self.seq.cmp(&other.seq))
-    }
-}
-
-impl PartialOrd for ScheduledEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -292,250 +260,46 @@ fn event_kind_from_state(s: &crate::savestate::EventKindState) -> EventKind {
     }
 }
 
-/// Min-heap scheduler of [`ScheduledEvent`]s keyed on master cycles.
-///
-/// See module docs for the unit contract and the typical event
-/// catalog. The scheduler owns nothing the rest of the system
-/// doesn't already own, it's a pure data structure with a small
-/// helper API around `BinaryHeap`.
-pub struct HEventScheduler {
-    events: BinaryHeap<Reverse<ScheduledEvent>>,
-    current_cycle: u64,
-    timing: TimingProfile,
-    next_seq: u64,
+/// The queue as the savestate writes it: its cursor, its sequence, the
+/// timing profile, and its events in the heap's storage order, which the
+/// state hash covers. `timing` is the emulator's own profile, the one the
+/// queue's events were armed with: the two were always set together.
+pub(crate) fn queue_to_state(
+    queue: &EventQueue<EventKind>,
+    timing: &TimingProfile,
+) -> crate::savestate::SchedulerState {
+    crate::savestate::SchedulerState {
+        current_cycle: queue.cursor(),
+        next_seq: queue.next_seq(),
+        timing: timing_to_state(timing),
+        events: queue
+            .stored()
+            .map(
+                |(at_cycle, seq, kind)| crate::savestate::ScheduledEventState {
+                    at_cycle,
+                    seq,
+                    kind: event_kind_to_state(kind),
+                },
+            )
+            .collect(),
+    }
 }
 
-impl HEventScheduler {
-    /// Build a fresh scheduler for the given timing profile. The
-    /// heap is empty and `current_cycle` is zero.
-    pub fn new(timing: TimingProfile) -> Self {
-        Self {
-            events: BinaryHeap::new(),
-            current_cycle: 0,
-            timing,
-            next_seq: 0,
-        }
-    }
-
-    /// Clear every queued event and re-anchor `current_cycle` to
-    /// `base_cycle`. Used at console reset and at savestate restore.
-    pub fn reset(&mut self, base_cycle: u64) {
-        self.events.clear();
-        self.current_cycle = base_cycle;
-        self.next_seq = 0;
-    }
-
-    /// Capture the cursor, the sequence counter, the active timing
-    /// profile, and the pending events (the heap flattened to an
-    /// order-independent `Vec`) into a snapshot.
-    pub fn to_savestate(&self) -> crate::savestate::SchedulerState {
-        crate::savestate::SchedulerState {
-            current_cycle: self.current_cycle,
-            next_seq: self.next_seq,
-            timing: timing_to_state(&self.timing),
-            events: self
-                .events
-                .iter()
-                .map(|Reverse(ev)| crate::savestate::ScheduledEventState {
-                    at_cycle: ev.at_cycle,
-                    seq: ev.seq,
-                    kind: event_kind_to_state(&ev.kind),
-                })
-                .collect(),
-        }
-    }
-
-    /// Restore the scheduler from a snapshot, rebuilding the heap from
-    /// the flattened event list (order is irrelevant, the heap re-sorts
-    /// by `(at_cycle, seq)`).
-    pub fn from_savestate(&mut self, s: &crate::savestate::SchedulerState) {
-        self.current_cycle = s.current_cycle;
-        self.next_seq = s.next_seq;
-        self.timing = timing_from_state(&s.timing);
-        self.events.clear();
-        for ev in &s.events {
-            self.events.push(Reverse(ScheduledEvent {
-                at_cycle: ev.at_cycle,
-                seq: ev.seq,
-                kind: event_kind_from_state(&ev.kind),
-            }));
-        }
-    }
-
-    /// Schedule `kind` to fire at absolute master cycle `at_cycle`.
-    /// Multiple events at the same cycle fire in schedule order.
-    pub fn schedule(&mut self, at_cycle: u64, kind: EventKind) {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.events.push(Reverse(ScheduledEvent {
-            at_cycle,
-            seq,
-            kind,
-        }));
-    }
-
-    /// Cycles of the queued events `pred` accepts, earliest first.
-    pub fn cycles_of(&self, pred: impl Fn(&EventKind) -> bool) -> Vec<u64> {
-        let mut cycles: Vec<u64> = self
+/// The queue back from a savestate, its events pushed in the stored order
+/// they were written in, which rebuilds the same storage. The timing
+/// profile the state carries is the emulator's, restored with it.
+pub(crate) fn queue_from_state(
+    queue: &mut EventQueue<EventKind>,
+    state: &crate::savestate::SchedulerState,
+) {
+    queue.restore(
+        state.current_cycle,
+        state.next_seq,
+        state
             .events
             .iter()
-            .filter(|Reverse(ev)| pred(&ev.kind))
-            .map(|Reverse(ev)| ev.at_cycle)
-            .collect();
-        cycles.sort_unstable();
-        cycles
-    }
-
-    /// The earliest cycle at which an event of `kind` is queued, if any. A
-    /// walk over the queue, for the once-a-frame question of where the
-    /// armed frame's `FrameEnd` falls.
-    pub fn earliest(&self, kind: &EventKind) -> Option<u64> {
-        self.events
-            .iter()
-            .filter(|Reverse(ev)| ev.kind == *kind)
-            .map(|Reverse(ev)| ev.at_cycle)
-            .min()
-    }
-
-    /// Cycle of the earliest queued event, or `None` if no events
-    /// are pending.
-    pub fn peek_cycle(&self) -> Option<u64> {
-        self.events.peek().map(|Reverse(ev)| ev.at_cycle)
-    }
-
-    /// Pop every event whose `at_cycle <= cycle`, in `(at_cycle,
-    /// seq)` order, and return the kinds. Updates `current_cycle`
-    /// to `cycle`.
-    ///
-    /// `cycle` must not go backward across calls; the scheduler is
-    /// monotonically advancing.
-    pub fn drain_up_to(&mut self, cycle: u64) -> Vec<EventKind> {
-        debug_assert!(
-            cycle >= self.current_cycle,
-            "drain_up_to ({cycle}) must not go backward below current_cycle ({})",
-            self.current_cycle
-        );
-        let mut out = Vec::new();
-        while let Some(Reverse(top)) = self.events.peek() {
-            if top.at_cycle > cycle {
-                break;
-            }
-            let Reverse(ev) = self.events.pop().expect("peek above guaranteed an element");
-            out.push(ev.kind);
-        }
-        self.current_cycle = cycle;
-        out
-    }
-
-    /// Like [`Self::drain_up_to`] but pairs each drained event with its
-    /// scheduled `at_cycle`, in `(at_cycle, seq)` order.
-    ///
-    /// The scheduled cycle is the raster point the event was armed for.
-    /// When a single instruction or DMA overshoots the cursor by many
-    /// scanlines (a general DMA folds its whole transfer into one step),
-    /// draining against the post-jump `master_cycles` would attribute
-    /// every deferred event to the same late raster position, misrendering
-    /// the deferred `RenderPos` scanlines and pushing per-line HDMA CGRAM/OAM
-    /// writes into active display (where the active-scan gate redirects them
-    /// to colour 0). Callers that care about the raster position of each
-    /// event use this so a deferred batch replays in cycle order at the
-    /// dot each event was scheduled for.
-    pub fn drain_up_to_with_cycles(&mut self, cycle: u64) -> Vec<(u64, EventKind)> {
-        debug_assert!(
-            cycle >= self.current_cycle,
-            "drain_up_to_with_cycles ({cycle}) must not go backward below current_cycle ({})",
-            self.current_cycle
-        );
-        let mut out = Vec::new();
-        while let Some(Reverse(top)) = self.events.peek() {
-            if top.at_cycle > cycle {
-                break;
-            }
-            let Reverse(ev) = self.events.pop().expect("peek above guaranteed an element");
-            out.push((ev.at_cycle, ev.kind));
-        }
-        self.current_cycle = cycle;
-        out
-    }
-
-    /// Like [`Self::drain_up_to_with_cycles`], but stop in front of the
-    /// first due event `stop` accepts: that event and every event after
-    /// it stay queued for a later drain. The `bool` is `true` when the
-    /// drain stopped there.
-    ///
-    /// The capture boundary uses it to hold a frame in front of its
-    /// `VBlankStart`. A later drain picks the held events up in the same
-    /// order, at their own cycles, so splitting a batch here changes
-    /// neither which events fire nor their order.
-    pub fn drain_up_to_before(
-        &mut self,
-        cycle: u64,
-        stop: impl Fn(&EventKind) -> bool,
-    ) -> (Vec<(u64, EventKind)>, bool) {
-        debug_assert!(
-            cycle >= self.current_cycle,
-            "drain_up_to_before ({cycle}) must not go backward below current_cycle ({})",
-            self.current_cycle
-        );
-        let mut out = Vec::new();
-        let mut stopped = false;
-        while let Some(Reverse(top)) = self.events.peek() {
-            if top.at_cycle > cycle {
-                break;
-            }
-            if stop(&top.kind) {
-                stopped = true;
-                break;
-            }
-            let Reverse(ev) = self.events.pop().expect("peek above guaranteed an element");
-            out.push((ev.at_cycle, ev.kind));
-        }
-        self.current_cycle = cycle;
-        (out, stopped)
-    }
-
-    /// Drop every queued event for which `pred(&kind)` returns
-    /// `true`. Used to cancel IRQs when the corresponding timer
-    /// disables. O(n log n) because `BinaryHeap` has no efficient
-    /// in-place removal, fine because the call rate is bounded by
-    /// register writes, not by per-cycle traffic.
-    pub fn cancel_matching(&mut self, pred: impl Fn(&EventKind) -> bool) {
-        let kept: Vec<_> = self
-            .events
-            .drain()
-            .filter(|Reverse(ev)| !pred(&ev.kind))
-            .collect();
-        self.events = BinaryHeap::from(kept);
-    }
-
-    /// Decompose `current_cycle` into `(scanline, h_dot)`.
-    ///
-    /// `scanline` is taken modulo `scanlines_per_frame` so the
-    /// position rolls over at frame boundary even if the caller
-    /// never resets the scheduler. `h_dot` is in PPU dot units (4
-    /// master clocks per dot).
-    pub fn current_position(&self) -> (u16, u16) {
-        let cps = self.timing.cycles_per_scanline as u64;
-        let line = (self.current_cycle / cps) % self.timing.scanlines_per_frame as u64;
-        let dot = (self.current_cycle % cps) / 4;
-        (line as u16, dot as u16)
-    }
-
-    /// Timing profile this scheduler was built with.
-    pub fn timing(&self) -> TimingProfile {
-        self.timing
-    }
-
-    /// Current absolute master cycle (last value passed to
-    /// `drain_up_to`, or `reset` baseline).
-    pub fn current_cycle(&self) -> u64 {
-        self.current_cycle
-    }
-
-    /// Number of events currently queued. Diagnostics-only.
-    pub fn pending_count(&self) -> usize {
-        self.events.len()
-    }
+            .map(|ev| (ev.at_cycle, ev.seq, event_kind_from_state(&ev.kind))),
+    );
 }
 
 /// Pre-schedule the per-frame skeleton: HBlank starts, RenderPos
@@ -574,8 +338,12 @@ impl HEventScheduler {
 /// silently drops it, freezing per-frame VRAM uploads (e.g. the text
 /// of the Color Test in Nintendo's SNES Test Program) while ungated
 /// register writes keep animating.
-pub fn schedule_frame_events(scheduler: &mut HEventScheduler, base_cycle: u64, overscan: bool) {
-    let timing = scheduler.timing();
+pub fn schedule_frame_events(
+    scheduler: &mut EventQueue<EventKind>,
+    timing: TimingProfile,
+    base_cycle: u64,
+    overscan: bool,
+) {
     let cps = timing.cycles_per_scanline as u64;
     let lines = timing.scanlines_per_frame;
     // Overscan moves the first VBlank scanline to 240, matching the
@@ -644,6 +412,14 @@ pub fn schedule_frame_events(scheduler: &mut HEventScheduler, base_cycle: u64, o
 mod tests {
     use super::*;
 
+    /// The kinds of the events due by `cycle`, taken off the queue.
+    fn drain_kinds(q: &mut EventQueue<EventKind>, cycle: u64) -> Vec<EventKind> {
+        let batch = q.take_due(cycle);
+        let kinds = batch.iter().map(|(_, kind)| kind).collect();
+        q.give_back(batch);
+        kinds
+    }
+
     #[test]
     fn timing_ntsc_constants_match_spec() {
         let t = TimingProfile::NTSC;
@@ -702,154 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_then_peek_returns_earliest_cycle() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(500, EventKind::HBlankStart);
-        s.schedule(100, EventKind::RenderPos);
-        s.schedule(900, EventKind::FrameEnd);
-        assert_eq!(s.peek_cycle(), Some(100));
-        assert_eq!(s.pending_count(), 3);
-    }
-
-    #[test]
-    fn peek_cycle_none_when_empty() {
-        let s = HEventScheduler::new(TimingProfile::NTSC);
-        assert_eq!(s.peek_cycle(), None);
-    }
-
-    #[test]
-    fn drain_up_to_returns_events_in_order_and_removes_them() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(500, EventKind::HBlankStart);
-        s.schedule(100, EventKind::RenderPos);
-        s.schedule(900, EventKind::FrameEnd);
-
-        let drained = s.drain_up_to(600);
-        assert_eq!(drained, vec![EventKind::RenderPos, EventKind::HBlankStart]);
-        assert_eq!(s.pending_count(), 1);
-        assert_eq!(s.peek_cycle(), Some(900));
-        assert_eq!(s.current_cycle(), 600);
-
-        let drained2 = s.drain_up_to(1000);
-        assert_eq!(drained2, vec![EventKind::FrameEnd]);
-        assert_eq!(s.pending_count(), 0);
-    }
-
-    #[test]
-    fn drain_up_to_preserves_fifo_on_tie() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(1000, EventKind::HBlankStart);
-        s.schedule(1000, EventKind::RenderPos);
-        s.schedule(1000, EventKind::HdmaTrigger);
-        let drained = s.drain_up_to(2000);
-        assert_eq!(
-            drained,
-            vec![
-                EventKind::HBlankStart,
-                EventKind::RenderPos,
-                EventKind::HdmaTrigger
-            ],
-            "tied events must fire in insertion order"
-        );
-    }
-
-    #[test]
-    fn drain_up_to_with_cycles_pairs_each_event_with_its_scheduled_cycle() {
-        // Placing each event at its own raster point (Yoshi's Island's HDMA
-        // water gradient) needs each drained event tagged with the cycle it
-        // was armed for, not the post-drain cursor: a batch deferred behind
-        // a long general DMA must replay at each event's own scanline/dot.
-        // This is the only difference from `drain_up_to`, which discards
-        // the cycle.
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(100, EventKind::HBlankStart);
-        s.schedule(300, EventKind::RenderPos);
-        s.schedule(300, EventKind::HdmaTrigger);
-        let drained = s.drain_up_to_with_cycles(1000);
-        assert_eq!(
-            drained,
-            vec![
-                (100, EventKind::HBlankStart),
-                (300, EventKind::RenderPos),
-                (300, EventKind::HdmaTrigger),
-            ],
-            "each event carries its own scheduled cycle, FIFO on tie"
-        );
-        // The cursor advanced to the drain point, so a re-drain is empty.
-        assert!(s.drain_up_to_with_cycles(1000).is_empty());
-    }
-
-    #[test]
-    fn drain_up_to_before_leaves_the_stop_event_and_what_follows_queued() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(100, EventKind::HdmaTrigger);
-        s.schedule(200, EventKind::VBlankStart);
-        s.schedule(200, EventKind::IrqV { v_target: 225 });
-        s.schedule(300, EventKind::RenderPos);
-        s.schedule(900, EventKind::FrameEnd);
-        let (drained, stopped) =
-            s.drain_up_to_before(400, |kind| matches!(kind, EventKind::VBlankStart));
-        assert!(stopped, "the drain stopped in front of VBlankStart");
-        assert_eq!(drained, vec![(100, EventKind::HdmaTrigger)]);
-        // A later drain takes the held events up in their own order, the
-        // event tied with VBlankStart on its cycle still after it.
-        assert_eq!(
-            s.drain_up_to_with_cycles(400),
-            vec![
-                (200, EventKind::VBlankStart),
-                (200, EventKind::IrqV { v_target: 225 }),
-                (300, EventKind::RenderPos),
-            ]
-        );
-        // With no stop event due, it drains like `drain_up_to_with_cycles`.
-        let (drained, stopped) =
-            s.drain_up_to_before(1000, |kind| matches!(kind, EventKind::VBlankStart));
-        assert!(!stopped);
-        assert_eq!(drained, vec![(900, EventKind::FrameEnd)]);
-    }
-
-    #[test]
-    fn drain_up_to_excludes_events_strictly_after_cycle() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(100, EventKind::HBlankStart);
-        s.schedule(101, EventKind::RenderPos);
-        let drained = s.drain_up_to(100);
-        assert_eq!(drained, vec![EventKind::HBlankStart]);
-        assert_eq!(s.pending_count(), 1);
-    }
-
-    #[test]
-    fn cancel_matching_drops_only_matching_kinds() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(100, EventKind::IrqV { v_target: 10 });
-        s.schedule(200, EventKind::HBlankStart);
-        s.schedule(300, EventKind::IrqV { v_target: 20 });
-        s.schedule(400, EventKind::VBlankStart);
-
-        s.cancel_matching(|kind| matches!(kind, EventKind::IrqV { .. }));
-
-        assert_eq!(s.pending_count(), 2);
-        let drained = s.drain_up_to(1000);
-        assert_eq!(
-            drained,
-            vec![EventKind::HBlankStart, EventKind::VBlankStart]
-        );
-    }
-
-    #[test]
-    fn cycles_of_lists_matching_events_earliest_first() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(300, EventKind::IrqH { h_target: 5 });
-        s.schedule(100, EventKind::IrqV { v_target: 10 });
-        s.schedule(50, EventKind::HBlankStart);
-        s.schedule(200, EventKind::IrqHV { v: 1, h: 2 });
-        assert_eq!(s.cycles_of(EventKind::is_irq), vec![100, 200, 300]);
-        assert!(s.cycles_of(|k| matches!(k, EventKind::FrameEnd)).is_empty());
-        // Listing leaves the queue as it was.
-        assert_eq!(s.pending_count(), 4);
-    }
-
-    #[test]
     fn is_irq_names_the_three_irq_triggers() {
         assert!(EventKind::IrqV { v_target: 0 }.is_irq());
         assert!(EventKind::IrqH { h_target: 0 }.is_irq());
@@ -859,54 +487,10 @@ mod tests {
     }
 
     #[test]
-    fn current_position_computes_scanline_and_hdot() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        // Move into scanline 3, dot 22 (= 22*4 = 88 master clocks into line)
-        s.drain_up_to(3 * 1364 + 88);
-        assert_eq!(s.current_position(), (3, 22));
-
-        // Move into scanline 225 (VBlank start), dot 0
-        s.drain_up_to(225 * 1364);
-        assert_eq!(s.current_position(), (225, 0));
-    }
-
-    #[test]
-    fn current_position_wraps_at_frame_boundary() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        // 1.5 frames forward, scanline must wrap modulo 262.
-        let frames = TimingProfile::NTSC.cycles_per_frame();
-        s.drain_up_to(frames + 5 * 1364);
-        assert_eq!(s.current_position(), (5, 0));
-    }
-
-    #[test]
-    fn reset_clears_events_and_anchors_cycle() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(500, EventKind::HBlankStart);
-        s.schedule(700, EventKind::VBlankStart);
-        s.drain_up_to(100); // advance current_cycle, leaves events queued
-
-        s.reset(0);
-        assert_eq!(s.pending_count(), 0);
-        assert_eq!(s.peek_cycle(), None);
-        assert_eq!(s.current_cycle(), 0);
-    }
-
-    #[test]
-    fn reset_to_nonzero_anchor() {
-        let mut s = HEventScheduler::new(TimingProfile::PAL);
-        s.reset(12_345);
-        assert_eq!(s.current_cycle(), 12_345);
-        let (line, dot) = s.current_position();
-        // 12345 / 1364 = 9, 12345 % 1364 = 69 -> dot 17
-        assert_eq!(line, 9);
-        assert_eq!(dot, 17);
-    }
-
-    #[test]
     fn schedule_frame_events_ntsc_counts_match_spec() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, false);
 
         // RenderPos always covers lines 1..=240 (overscan-aware
         // gate lives inside the PPU): 240 RenderPos events
@@ -914,9 +498,9 @@ mod tests {
         // 262 HBlankStart + 240 RenderPos + 1 VBlankStart + 1
         // VBlankEnd + 1 FrameEnd + 1 HdmaInit + 225 HdmaTrigger
         // (one per visible line 0..225).
-        assert_eq!(s.pending_count(), 262 + 240 + 1 + 1 + 1 + 1 + 225);
+        assert_eq!(s.len(), 262 + 240 + 1 + 1 + 1 + 1 + 225);
 
-        let drained = s.drain_up_to(u64::MAX);
+        let drained = drain_kinds(&mut s, u64::MAX);
         let count = |needle: &EventKind| drained.iter().filter(|e| *e == needle).count();
         assert_eq!(count(&EventKind::HBlankStart), 262);
         assert_eq!(count(&EventKind::RenderPos), 240);
@@ -929,15 +513,16 @@ mod tests {
 
     #[test]
     fn schedule_frame_events_pal_counts_match_spec() {
-        let mut s = HEventScheduler::new(TimingProfile::PAL);
-        schedule_frame_events(&mut s, 0, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::PAL;
+        schedule_frame_events(&mut s, timing, 0, false);
         // RenderPos always covers lines 1..=240, same as NTSC.
         // 312 HBlankStart + 240 RenderPos + 1 VBlankStart +
         // 1 VBlankEnd + 1 FrameEnd + 1 HdmaInit + 240 HdmaTrigger
         // (one per visible line 0..240).
-        assert_eq!(s.pending_count(), 312 + 240 + 1 + 1 + 1 + 1 + 240);
+        assert_eq!(s.len(), 312 + 240 + 1 + 1 + 1 + 1 + 240);
 
-        let drained = s.drain_up_to(u64::MAX);
+        let drained = drain_kinds(&mut s, u64::MAX);
         let count = |needle: &EventKind| drained.iter().filter(|e| *e == needle).count();
         assert_eq!(count(&EventKind::HdmaInit), 1);
         assert_eq!(count(&EventKind::HdmaTrigger), 240);
@@ -950,16 +535,17 @@ mod tests {
         // triggers extend to line 239 (240 triggers, one per line
         // 0..=239). RenderPos/HBlank/VBlankEnd/FrameEnd are unchanged.
         let cps = TimingProfile::NTSC.cycles_per_scanline as u64;
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, true);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, true);
         // 262 HBlank + 240 RenderPos + 1 VBlankStart + 1 VBlankEnd +
         // 1 FrameEnd + 1 HdmaInit + 240 HdmaTrigger.
-        assert_eq!(s.pending_count(), 262 + 240 + 1 + 1 + 1 + 1 + 240);
+        assert_eq!(s.len(), 262 + 240 + 1 + 1 + 1 + 1 + 240);
 
         let mut vbl_start_cycle = None;
         let mut hdma_triggers = 0usize;
         while let Some(cyc) = s.peek_cycle() {
-            for ev in s.drain_up_to(cyc) {
+            for ev in drain_kinds(&mut s, cyc) {
                 match ev {
                     EventKind::VBlankStart => vbl_start_cycle = Some(cyc),
                     EventKind::HdmaTrigger => hdma_triggers += 1,
@@ -978,13 +564,14 @@ mod tests {
         // the PPU gate can decide at runtime whether to render
         // (overscan on) or skip (overscan off).
         let cps = TimingProfile::NTSC.cycles_per_scanline as u64;
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, false);
         // Collect (cycle, kind) tuples by repeatedly peeking +
         // draining.
         let mut render_pos_cycles: Vec<u64> = Vec::new();
         while let Some(cyc) = s.peek_cycle() {
-            for ev in s.drain_up_to(cyc) {
+            for ev in drain_kinds(&mut s, cyc) {
                 if matches!(ev, EventKind::RenderPos) {
                     render_pos_cycles.push(cyc);
                 }
@@ -999,12 +586,13 @@ mod tests {
     #[test]
     fn schedule_frame_events_hdma_positions() {
         let cps = TimingProfile::NTSC.cycles_per_scanline as u64;
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, false);
         let mut init_cycles: Vec<u64> = Vec::new();
         let mut trigger_cycles: Vec<u64> = Vec::new();
         while let Some(cyc) = s.peek_cycle() {
-            for ev in s.drain_up_to(cyc) {
+            for ev in drain_kinds(&mut s, cyc) {
                 match ev {
                     EventKind::HdmaInit => init_cycles.push(cyc),
                     EventKind::HdmaTrigger => trigger_cycles.push(cyc),
@@ -1022,19 +610,21 @@ mod tests {
 
     #[test]
     fn schedule_frame_events_vblank_start_lands_on_correct_cycle() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, false);
-        let drained = s.drain_up_to(u64::MAX);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, false);
+        let drained = drain_kinds(&mut s, u64::MAX);
         // First VBlankStart event must be at cycle 225 * 1364, the
         // pre-schedule loop placed it on the line_base of vbl_start.
         // Since drain_up_to flattens to kinds, we can't easily
         // re-derive the cycle. So instead, schedule into an empty
         // scheduler, then peek before drain:
-        let mut s2 = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s2, 1_000_000, false);
+        let mut s2 = EventQueue::new();
+        let timing_s2 = TimingProfile::NTSC;
+        schedule_frame_events(&mut s2, timing_s2, 1_000_000, false);
         let mut found_vbl = None;
         while let Some(cyc) = s2.peek_cycle() {
-            let evs = s2.drain_up_to(cyc);
+            let evs = drain_kinds(&mut s2, cyc);
             for ev in evs {
                 if let EventKind::VBlankStart = ev {
                     found_vbl = Some(cyc);
@@ -1060,11 +650,12 @@ mod tests {
         // $4212 VBlank flag one line early and fail the H/V-latch sub-test
         // of the Electronics Test in Nintendo's SNES Test Program.
         let base = 1_000_000u64;
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, base, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, base, false);
         let mut vbl_end = None;
         while let Some(cyc) = s.peek_cycle() {
-            for ev in s.drain_up_to(cyc) {
+            for ev in drain_kinds(&mut s, cyc) {
                 if let EventKind::VBlankEnd = ev {
                     vbl_end = Some(cyc);
                 }
@@ -1079,14 +670,15 @@ mod tests {
 
     #[test]
     fn schedule_frame_events_frame_end_is_strictly_after_vblank_end() {
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        schedule_frame_events(&mut s, 0, false);
+        let mut s = EventQueue::new();
+        let timing = TimingProfile::NTSC;
+        schedule_frame_events(&mut s, timing, 0, false);
         // Pull all events into an order list, tagged with their cycle
         // by interleaving peek + drain_up_to(peek_cycle).
         let mut sequence: Vec<(u64, EventKind)> = Vec::new();
         while let Some(cyc) = s.peek_cycle() {
-            for ev in s.drain_up_to(cyc) {
-                sequence.push((cyc, ev.clone()));
+            for ev in drain_kinds(&mut s, cyc) {
+                sequence.push((cyc, ev));
             }
         }
         let vbl_end_cycle = sequence
@@ -1111,31 +703,6 @@ mod tests {
         assert_eq!(
             TimingProfile::NTSC.refresh_rate(),
             (21_477_270f64 / 357_368f64) as f32
-        );
-    }
-
-    #[test]
-    fn timing_getter_round_trips() {
-        let s = HEventScheduler::new(TimingProfile::PAL);
-        assert_eq!(s.timing(), TimingProfile::PAL);
-    }
-
-    #[test]
-    fn schedule_after_drain_keeps_unique_sequence_numbers() {
-        // Regression: if next_seq wasn't preserved across schedules
-        // that come after a drain, two new events at the same cycle
-        // could collide on their ScheduledEvent Ord. This test guards
-        // that drains never reset next_seq mid-frame.
-        let mut s = HEventScheduler::new(TimingProfile::NTSC);
-        s.schedule(100, EventKind::HBlankStart);
-        s.drain_up_to(100);
-        s.schedule(200, EventKind::RenderPos);
-        s.schedule(200, EventKind::HdmaTrigger);
-        let drained = s.drain_up_to(300);
-        assert_eq!(
-            drained,
-            vec![EventKind::RenderPos, EventKind::HdmaTrigger],
-            "post-drain schedules must keep FIFO order on tie"
         );
     }
 }

@@ -1,30 +1,100 @@
-//! The machine step: one 65C816 instruction and what its time does to the
+//! The machine step: one step of the 65C816 and what its time does to the
 //! rest of the machine (its bus costs, DMA, NMI and IRQ delivery, the
-//! cartridge chips' catch-up), and the step a host asks for.
+//! cartridge chips' catch-up), and the bare step register-level tests
+//! take.
 
-use retro_core::*;
+use retro_core::frame::{Flow, StepHooks, Stepped};
+use retro_core::StepResult;
+use wdc65816::instructions::FLAG_I;
 
 use super::SnesEmulator;
-use crate::debugger::{SnesEvent, MAIN_CPU};
+use crate::debugger::SnesEvent;
 
 impl SnesEmulator {
-    /// Run one 65C816 instruction, returning the master clocks it
-    /// consumed (the sum of each memory access's 6/8/12 mclk cost plus
-    /// internal cycles at the 6 mclk fast rate, plus any general-DMA
-    /// stall).
-    pub(super) fn step_cpu_internal(&mut self) -> u64 {
-        // Mirror the level-triggered IRQ line into the CPU before the
-        // instruction. The scheduler's `Irq*` handlers raise the line;
-        // a `$4211` (TIMEUP) read inside the previous instruction
-        // lowered it again. The CPU's own `I` flag decides whether a
-        // raised line is actually serviced. A burst-CPU coprocessor (the
-        // SA-1, the Super FX or the Cx4) ORs its own S-CPU-directed IRQ
-        // line in on top, gated so only such a cart pays for the call.
+    /// Mirror the level-triggered IRQ line into the CPU before a step. The
+    /// scheduler's `Irq*` handlers raise the line; a `$4211` (TIMEUP) read
+    /// inside the previous instruction lowered it again. The CPU's own `I`
+    /// flag decides whether a raised line is actually serviced. A
+    /// burst-CPU coprocessor (the SA-1, the Super FX or the Cx4) ORs its
+    /// own S-CPU-directed IRQ line in on top, gated so only such a cart
+    /// pays for the call. Both reads are of state the chips hold: nothing
+    /// is caught up.
+    #[inline(always)]
+    pub(super) fn mirror_irq_line(&mut self) {
         self.cpu.irq_pending = self.bus.system_regs().irq_line();
         if self.bus.cart_runs_burst_cpu() {
             self.cpu.irq_pending |= self.bus.cart_has_irq();
         }
+    }
 
+    /// One step of the 65C816, the machine step of the frame driver
+    /// (`FrameMachine::machine_step`). What the step does is read from the
+    /// CPU before it runs, the IRQ line mirrored once: nothing between
+    /// the read and the CPU's step can change the line or `nmi_pending`.
+    ///
+    /// - A stopped CPU (STP), or one waiting in WAI with no interrupt line
+    ///   up, runs nothing: an idle step, with no hook.
+    /// - With an NMI pending, or the IRQ line up and the `I` flag clear,
+    ///   the CPU vectors to the handler instead of running the
+    ///   instruction at its PC, which it runs when the handler returns:
+    ///   the step reports the interrupt (`interrupt_taken`) and calls no
+    ///   instruction hook.
+    /// - Otherwise it runs that instruction, between `before_instruction`
+    ///   and `after_instruction`. A CPU woken from WAI by an IRQ the `I`
+    ///   flag masks runs it in the same step.
+    ///
+    /// The S-DSP register writes a mailbox catch-up made during the step
+    /// are checked after it, whatever it did.
+    #[inline(always)]
+    pub(super) fn step_main_cpu<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> Option<Stepped> {
+        self.mirror_irq_line();
+        let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
+        let start = if self.cpu_idles() {
+            None
+        } else if self.cpu_takes_interrupt() {
+            hooks.interrupt_taken(self, pc24);
+            None
+        } else {
+            match hooks.before_instruction(self, pc24) {
+                Flow::Run(start) => Some(start),
+                Flow::StopBefore => return None,
+            }
+        };
+        let instruction = start.is_some();
+        let delta = self.step_cpu_internal(hooks);
+        if let Some(start) = start {
+            hooks.after_instruction(self, start, delta.min(u32::MAX as u64) as u32);
+        }
+        hooks.raised(self, Self::drain_apu_dsp_events);
+        Some(Stepped {
+            elapsed: delta,
+            instruction,
+        })
+    }
+
+    /// Whether the step about to run is idle: the CPU stopped (STP), or
+    /// waiting in WAI with no interrupt line up. The IRQ line is mirrored.
+    #[inline(always)]
+    fn cpu_idles(&self) -> bool {
+        let cpu = &self.cpu;
+        cpu.stopped || (cpu.waiting && !cpu.nmi_pending && !cpu.irq_pending)
+    }
+
+    /// Whether the step about to run takes an interrupt instead of the
+    /// instruction at the PC: an NMI pending, or the IRQ line up with the
+    /// `I` flag clear. Read after [`Self::cpu_idles`].
+    #[inline(always)]
+    fn cpu_takes_interrupt(&self) -> bool {
+        let cpu = &self.cpu;
+        cpu.nmi_pending || (cpu.irq_pending && cpu.p & FLAG_I == 0)
+    }
+
+    /// Run one step of the 65C816 and what its time does to the rest of
+    /// the machine, the IRQ line already mirrored, returning the master
+    /// clocks it consumed (the sum of each memory access's 6/8/12 mclk
+    /// cost plus internal cycles at the 6 mclk fast rate, plus any
+    /// general-DMA stall).
+    pub(super) fn step_cpu_internal<H: StepHooks<Self>>(&mut self, hooks: &mut H) -> u64 {
         // VBlank NMI delivery is decided *after* the instruction runs (see
         // below), so a `$4210` poll the instruction performs is observed
         // before the NMI is vectored.
@@ -72,19 +142,15 @@ impl SnesEmulator {
             delta += self.bus.run_general_dma(dma_mask);
             // A general-DMA block just ran: match a `DmaStart` event
             // breakpoint for the whole `$420B` write, and a `DmaDone` for
-            // each channel it ran, by the channel's B-bus port (only armed
-            // when one exists).
-            if self.debug_armed {
-                if self.debugger.check_event(SnesEvent::DmaStart) {
-                    self.pending_break = true;
-                }
+            // each channel it ran, by the channel's B-bus port.
+            hooks.raised(self, |m| {
+                let mut hit = m.debugger.check_event(SnesEvent::DmaStart);
                 for channel in (0..8).filter(|c| dma_mask & (1 << c) != 0) {
-                    let port = self.bus.dma().channels[channel].b_bus_port;
-                    if self.debugger.check_event(SnesEvent::DmaDone(port)) {
-                        self.pending_break = true;
-                    }
+                    let port = m.bus.dma().channels[channel].b_bus_port;
+                    hit |= m.debugger.check_event(SnesEvent::DmaDone(port));
                 }
-            }
+                hit
+            });
         }
         // A `$4200` NMI-enable 0->1 edge while the `$4210` flag is still
         // latched re-triggers NMI. The bus flagged it because it cannot
@@ -140,88 +206,32 @@ impl SnesEmulator {
         // so it keeps step with the S-CPU across code that never touches shared
         // memory. Gated so plain / DSP-1 / S-DD1 / SPC7110 carts keep their exact
         // current cadence. The chip's S-CPU-directed IRQ line is ORed into
-        // `cpu.irq_pending` at the head of the next instruction (see
-        // `step_cpu_internal`).
+        // `cpu.irq_pending` before the next step (see `mirror_irq_line`).
         if self.bus.cart_runs_burst_cpu() {
             self.bus.catch_up_coprocessor(self.master_cycles);
         }
         delta
     }
 
-    /// Run one 65C816 instruction and nothing else: no scheduler event is
-    /// handled, no frame closed, and the debugger records nothing. For
-    /// looking at one instruction in isolation (register-level tests); a
-    /// host steps through [`EmulatorCore::step_cpu`], which the trait's
-    /// `step` calls for the focused CPU. From a capture boundary, the
-    /// events the frame loop handles before the next instruction come
-    /// first, so the instruction runs against the state it would in the
-    /// loop.
+    /// Run one 65C816 step and nothing else: no scheduler event is
+    /// handled, no frame closed, and the debugger records and checks
+    /// nothing. For looking at one instruction in isolation
+    /// (register-level tests); a host steps through
+    /// [`retro_core::EmulatorCore::step_cpu`], which the trait's `step`
+    /// calls for the focused CPU. From a capture boundary, the events the
+    /// frame loop handles before the next instruction come first, so the
+    /// instruction runs against the state it would in the loop. As the host
+    /// step does, it reports no instruction for an idle step or an
+    /// interrupt's entry.
     pub fn step_without_events(&mut self) -> StepResult {
-        self.leave_capture_boundary();
-        let delta = self.step_cpu_internal();
+        self.leave_capture_boundary(&mut ());
+        self.mirror_irq_line();
+        let instruction = !self.cpu_idles() && !self.cpu_takes_interrupt();
+        let delta = self.step_cpu_internal(&mut ());
         StepResult {
             cycles: delta.min(u32::MAX as u64) as u32,
             breakpoint_hit: false,
-            instruction_executed: true,
+            instruction_executed: instruction,
         }
-    }
-
-    /// Advance exactly one 65C816 instruction with full instrumentation
-    /// (coverage, trace, call stack, history, state refresh), draining any
-    /// scheduler events that fall at the new master-cycle boundary so the
-    /// PPU stays consistent. The step a host asks for
-    /// ([`EmulatorCore::step_cpu`] on the 65C816) and the step modes both
-    /// run it. The history records the instruction at the PC as the step
-    /// starts. The step runs the instruction whatever execute breakpoint
-    /// sits at it, so the next execute check is made afresh.
-    pub(super) fn debug_single_step_65816(&mut self) -> StepResult {
-        self.enter_frame_for_step();
-        let pc24 = ((self.cpu.pbr as u32) << 16) | self.cpu.pc as u32;
-        self.debugger.record_coverage(MAIN_CPU, pc24);
-        if self.debugger.tracing(MAIN_CPU) {
-            let entry = self.capture_trace_65816();
-            self.debugger.record_trace(MAIN_CPU, &entry);
-        }
-        let history = self.history_entry_65816(pc24);
-        self.debugger.record_history(MAIN_CPU, history);
-        // Drop what was recorded between two instructions so the
-        // watchpoint scan sees only this instruction.
-        if self.debug_armed {
-            self.bus.clear_debug_events();
-        }
-        let start = self.step_start_65816(pc24);
-        let delta = self.step_cpu_internal();
-        self.maintain_call_stack_65816(start);
-        self.debugger.forget_checked(MAIN_CPU);
-        self.drain_events_and_maybe_close_frame();
-        // A single step always pauses, so the hit result isn't acted on,
-        // but the recorders are still drained to keep watchpoint/event hit
-        // counts accurate and to clear the buffers for the next step.
-        if self.debug_armed {
-            let _ = self.drain_bus_debug_events();
-            let _ = self.drain_apu_dsp_events();
-            self.pending_break = false;
-        }
-        self.drain_spc_trace();
-        self.drain_cartridge_trace();
-        self.refresh_debugger_state();
-        StepResult {
-            cycles: delta.min(u32::MAX as u64) as u32,
-            breakpoint_hit: false,
-            instruction_executed: true,
-        }
-    }
-
-    /// Before a debugger step: leave the capture boundary if the core is
-    /// held there (see [`Self::leave_capture_boundary`]), then go on with
-    /// the frame in progress or open the next one, as a frame call does.
-    ///
-    /// Opening the next frame here matters after a frame call that ran its
-    /// frame to the end: the frame base would otherwise still be that
-    /// frame's, so the first step would close a frame at once and arm a
-    /// second set of events over the ones already armed.
-    fn enter_frame_for_step(&mut self) {
-        self.leave_capture_boundary();
-        self.enter_frame();
     }
 }

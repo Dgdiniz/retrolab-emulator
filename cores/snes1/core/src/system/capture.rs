@@ -9,7 +9,7 @@ use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN};
 use retro_core::video::{
     crop_rgba, equals_cropped_rgba, LineStateTable, PixelImage, VideoDebugger,
 };
-use retro_core::*;
+use retro_core::EmulatorCore;
 
 use super::SnesEmulator;
 #[cfg(doc)]
@@ -58,7 +58,10 @@ impl SnesEmulator {
     fn picture_finished_in_frame(&self) -> bool {
         self.held_at_capture_boundary
             || (self.frame_in_progress()
-                && self.scheduler.earliest(&EventKind::VBlankStart).is_none())
+                && self
+                    .scheduler
+                    .earliest(|kind| *kind == EventKind::VBlankStart)
+                    .is_none())
     }
 
     /// The picture the host holds, as
@@ -151,31 +154,7 @@ impl CaptureCore for SnesEmulator {
     /// or on the save path ([`Self::save_state_at_frame_end`]). A reset, a
     /// ROM load or a state load drops it.
     fn run_to_capture_boundary(&mut self) {
-        self.sync_spc_trace_enable();
-        self.sync_cartridge_trace_enable();
-        self.sync_debug_arm();
-        let tier = self.debugger.execution_tier();
-        if tier == ExecutionTier::FullDebug {
-            self.run_frame_full();
-            return;
-        }
-        if self.held_at_capture_boundary {
-            self.run_frame_on_tier(tier);
-            if self.frame_call_stopped() {
-                // A breakpoint stopped the rest of the held frame.
-                return;
-            }
-        }
-        self.capture_boundary_requested = true;
-        // At most two frames: the rest of a frame already past its
-        // `VBlankStart`, then the next frame up to its own.
-        for _ in 0..2 {
-            self.run_frame_on_tier(tier);
-            if self.frame_call_stopped() {
-                break;
-            }
-        }
-        self.capture_boundary_requested = false;
+        retro_core::frame::run_to_capture_boundary(self);
     }
 
     fn at_capture_boundary(&self) -> bool {
@@ -188,7 +167,7 @@ impl CaptureCore for SnesEmulator {
     /// frame's end, the state a player's run of that frame reaches.
     /// Anywhere else it is [`EmulatorCore::save_state`].
     fn save_state_at_frame_end(&mut self) -> Vec<u8> {
-        self.finish_held_frame();
+        retro_core::frame::finish_held_frame(self);
         EmulatorCore::save_state(self)
     }
 
