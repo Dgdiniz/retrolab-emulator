@@ -7,10 +7,12 @@
 //! - Bank register for the 68K window (0x6000-0x60FF)
 //! - 68K address space via bank window (0x8000-0xFFFF)
 
-use crate::cartridge::composable::GenesisCartridge;
+use crate::bus::OPEN_BUS;
+use crate::cartridge::GenesisCartridge;
 use crate::memory::GenesisMemory;
 use crate::psg::Psg;
 use crate::ym2612::Ym2612;
+use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
 
 /// Z80 Address Bus
@@ -26,7 +28,7 @@ pub struct Z80Bus<'a> {
     /// Bit counter for serial bank register writes (0-8)
     bank_bit_count: &'a mut u8,
     /// Cartridge ROM for bank reads
-    cartridge: Option<&'a mut (dyn GenesisCartridge + 'static)>,
+    cartridge: Option<&'a mut GenesisCartridge>,
     /// Genesis memory (includes Z80 RAM and 68K work RAM for bank reads)
     memory: &'a mut GenesisMemory,
 }
@@ -37,7 +39,7 @@ impl<'a> Z80Bus<'a> {
         ym2612: &'a mut Ym2612,
         bank_register: &'a mut u32,
         bank_bit_count: &'a mut u8,
-        cartridge: Option<&'a mut (dyn GenesisCartridge + 'static)>,
+        cartridge: Option<&'a mut GenesisCartridge>,
         memory: &'a mut GenesisMemory,
     ) -> Self {
         Self {
@@ -75,9 +77,9 @@ impl<'a> Z80Bus<'a> {
                 if let Some(cart) = &mut self.cartridge {
                     // The Z80 bank window reads ROM/mapped-ROM only; chips do
                     // not use the master-cycle here, so pass 0.
-                    cart.read_bus(addr_68k, 0)
+                    cart.read_bus(addr_68k, 0, OPEN_BUS)
                 } else {
-                    0xFF
+                    OPEN_BUS
                 }
             }
             // Work RAM (0xE00000-0xFFFFFF, mirrored)
@@ -105,8 +107,8 @@ impl<'a> Z80Bus<'a> {
     /// The byte a Z80 read of `addr` would give, read without a side effect,
     /// for the debugger: Z80 RAM, the YM2612's status, and the 68000's space
     /// through the bank window as the cartridge's peek gives it
-    /// ([`GenesisCartridge::peek_bus`]: a coprocessor is neither caught up
-    /// nor counted). The write-only ports read `0xFF`, as they do for the
+    /// ([`Cartridge::peek_bus`]: a coprocessor is neither caught up nor
+    /// counted). The write-only ports read `0xFF`, as they do for the
     /// Z80.
     pub fn peek(&self, addr: u32) -> u8 {
         match addr & 0xFFFF {
@@ -118,7 +120,7 @@ impl<'a> Z80Bus<'a> {
                     0x000000..=0x3FFFFF => self
                         .cartridge
                         .as_deref()
-                        .map_or(0xFF, |cart| cart.peek_bus(addr_68k)),
+                        .map_or(OPEN_BUS, |cart| cart.peek_bus(addr_68k, OPEN_BUS)),
                     0xE00000..=0xFFFFFF => {
                         self.memory.work_ram.as_slice()[(addr_68k & 0xFFFF) as usize]
                     }

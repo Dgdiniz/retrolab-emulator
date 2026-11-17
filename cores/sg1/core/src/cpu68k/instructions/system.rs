@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn test_reset_user_mode() {
         use crate::bus::AddressBus;
-        use crate::cartridge::composable::build_genesis_cartridge;
+        use crate::cartridge::build_genesis_cartridge;
         use crate::cpu68k::make_test_rom_with_header;
 
         let mut cpu = M68k::new();

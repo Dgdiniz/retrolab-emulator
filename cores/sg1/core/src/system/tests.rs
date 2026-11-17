@@ -1058,9 +1058,8 @@ fn power_on_reset_keeps_an_explicit_region_over_the_header() {
 }
 
 #[test]
-fn test_cartridge_audio_mixing() {
-    // No Genesis cartridge provides audio (`audio()` is `None`), so this
-    // checks the console mix alone: non-empty and in range.
+fn the_console_mix_is_in_range() {
+    // The PSG and the YM2612 mixed: non-empty and in range.
     use retro_core::DebuggerCore;
 
     let mut genesis = GenesisEmulator::new();
@@ -1089,8 +1088,48 @@ fn test_cartridge_audio_mixing() {
             sample
         );
     }
+}
 
-    // TODO: check the mix with a cartridge that has audio of its own.
+#[test]
+fn the_cartridge_hash_is_the_file_the_last_load_received() {
+    let mut genesis = GenesisEmulator::new();
+    assert_eq!(genesis.get_cartridge_hash(), None, "no load yet");
+    let rom = create_test_rom();
+    genesis.load_rom(&rom).unwrap();
+    let hash = retro_core::cartridge::rom_sha256(&rom);
+    assert_eq!(genesis.get_cartridge_hash().as_deref(), Some(hash.as_str()));
+    assert!(genesis.load_rom(&[0u8; 0x100]).is_err());
+    assert_eq!(
+        genesis.get_cartridge_hash().as_deref(),
+        Some(hash.as_str()),
+        "a load that fails keeps the last"
+    );
+    genesis.hard_reset();
+    assert_eq!(
+        genesis.get_cartridge_hash().as_deref(),
+        Some(hash.as_str()),
+        "a hard reset keeps the cartridge"
+    );
+    genesis.power_on_reset();
+    assert_eq!(
+        genesis.get_cartridge_hash().as_deref(),
+        Some(hash.as_str()),
+        "a power cycle loads the same file again"
+    );
+}
+
+#[test]
+fn the_coprocessor_label_names_the_primary_chip() {
+    let mut genesis = GenesisEmulator::new();
+    assert_eq!(genesis.coprocessor_label(), None, "no cartridge");
+    let mut rom = create_test_rom();
+    genesis.load_rom(&rom).unwrap();
+    assert_eq!(genesis.coprocessor_label(), None, "a plain cartridge");
+    rom[0x1C8] = b'S';
+    rom[0x1C9] = b'V';
+    genesis.load_rom(&rom).unwrap();
+    assert_eq!(genesis.coprocessor_label(), Some("SVP"));
+    assert_eq!(genesis.coprocessor_labels(), [(0, "SVP".to_string())]);
 }
 
 #[test]

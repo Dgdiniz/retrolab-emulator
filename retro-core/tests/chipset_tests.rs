@@ -553,3 +553,232 @@ fn factory_built_chip_installs_into_chipset() {
     set.write(id, 0, 0x09, 0);
     assert_eq!(set.read(id, 0, 0), Some(0x09));
 }
+
+// ---------------------------------------------------------------------------
+// What a chip does by default, and what the set does with it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_chip_with_no_answer_of_its_own_takes_the_defaults() {
+    let mut chip = OpaqueChip(ExpansionChipInfo {
+        name: "opaque".into(),
+        chip_type: ExpansionChipType::Custom(1),
+        description: String::new(),
+        features: Vec::new(),
+    });
+    assert_eq!(chip.read_with_open_bus(0, 0, 0x77), 0x5A, "the read itself");
+    assert_eq!(chip.source_place(0x1234), SourcePlace::Coprocessor);
+    assert!(!chip.needs_tick());
+    chip.tick(5);
+    assert!(!chip.produces_audio());
+    assert_eq!(chip.audio_level(), 0.0);
+    assert!(chip.audio_debugger().is_none());
+}
+
+/// A chip that drives only some data bits, answers where its bytes come
+/// from, ticks, makes sound and holds a battery: every new hook overridden.
+struct BusyChip {
+    info: ExpansionChipInfo,
+    ticks: u64,
+    level: f32,
+    battery: Option<Vec<u8>>,
+}
+
+impl BusyChip {
+    fn boxed(level: f32, battery: bool) -> Box<dyn Coprocessor> {
+        Box::new(Self {
+            info: ExpansionChipInfo {
+                name: "busy".into(),
+                chip_type: ExpansionChipType::Custom(2),
+                description: String::new(),
+                features: Vec::new(),
+            },
+            ticks: 0,
+            level,
+            battery: battery.then(|| vec![0xAB; 4]),
+        })
+    }
+}
+
+impl Coprocessor for BusyChip {
+    fn info(&self) -> &ExpansionChipInfo {
+        &self.info
+    }
+    fn read(&mut self, _offset: u32, _master_cycle: u64) -> u8 {
+        0x0F
+    }
+    fn read_with_open_bus(&mut self, _offset: u32, _master_cycle: u64, open_bus: u8) -> u8 {
+        (open_bus & 0xF0) | 0x0F
+    }
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        SourcePlace::Rom(offset)
+    }
+    fn needs_tick(&self) -> bool {
+        true
+    }
+    fn tick(&mut self, _master_cycle: u64) {
+        self.ticks += 1;
+    }
+    fn produces_audio(&self) -> bool {
+        true
+    }
+    fn audio_level(&self) -> f32 {
+        self.level
+    }
+    fn write(&mut self, _offset: u32, _value: u8, _master_cycle: u64) {}
+    fn reset(&mut self, _master_clock_hz: u64) {}
+    fn serialize(&self) -> Vec<u8> {
+        self.ticks.to_le_bytes().to_vec()
+    }
+    fn restore(&mut self, _data: &[u8], _master_clock_hz: u64) {}
+    fn debug_state(&self) -> ExpansionChipState {
+        ExpansionChipState {
+            chip_type: self.info.chip_type,
+            registers: Vec::new(),
+            internal_ram: None,
+            program_counter: None,
+            cycle_count: self.ticks,
+        }
+    }
+    fn label(&self) -> &str {
+        "busy"
+    }
+    fn battery(&self) -> Option<&[u8]> {
+        self.battery.as_deref()
+    }
+}
+
+#[test]
+fn the_set_reads_with_the_open_bus_and_asks_a_chip_where_its_bytes_come_from() {
+    let mut set = ChipSet::default();
+    set.insert(2, BusyChip::boxed(0.0, false));
+    set.insert(4, FakeChip::boxed(ExpansionChipType::DSP1, "plain"));
+    assert_eq!(set.read_with_open_bus(2, 0, 0, 0xA0), Some(0xAF));
+    assert_eq!(
+        set.read_with_open_bus(4, 3, 0, 0xA0),
+        set.read(4, 3, 0),
+        "a chip that ignores the open bus reads as a plain read"
+    );
+    assert_eq!(set.read_with_open_bus(3, 0, 0, 0xA0), None);
+    assert_eq!(set.source_place(2, 0x40), Some(SourcePlace::Rom(0x40)));
+    assert_eq!(set.source_place(4, 0x40), Some(SourcePlace::Coprocessor));
+    assert_eq!(set.source_place(3, 0x40), None);
+}
+
+#[test]
+fn a_cycle_visits_only_the_chips_that_tick_and_the_mix_sums_those_that_sound() {
+    let mut set = ChipSet::default();
+    assert!(!set.needs_tick() && !set.produces_audio());
+    set.insert(0, FakeChip::boxed(ExpansionChipType::DSP1, "quiet"));
+    assert!(!set.needs_tick() && !set.produces_audio());
+    set.insert(3, BusyChip::boxed(0.25, false));
+    set.push(BusyChip::boxed(0.5, false));
+    assert!(set.needs_tick() && set.produces_audio());
+    assert_eq!(set.audio_level(), 0.75);
+    set.tick(1);
+    set.tick(2);
+    assert_eq!(debug_of(&set, 3).cycle_count, 2);
+    assert_eq!(debug_of(&set, 4).cycle_count, 2);
+
+    // A chip put over a ticking one leaves the caches with it.
+    set.insert(3, FakeChip::boxed(ExpansionChipType::DSP1, "quiet again"));
+    assert_eq!(set.audio_level(), 0.5);
+    set.tick(3);
+    assert_eq!(debug_of(&set, 4).cycle_count, 3);
+    set.insert(4, FakeChip::boxed(ExpansionChipType::DSP1, "quiet too"));
+    assert!(!set.needs_tick() && !set.produces_audio());
+}
+
+#[test]
+fn the_battery_chip_is_the_lowest_id_with_a_battery() {
+    let mut set = ChipSet::default();
+    assert_eq!(set.battery_id(), None);
+    set.insert(1, FakeChip::boxed(ExpansionChipType::DSP1, "none"));
+    assert_eq!(set.battery_id(), None);
+    set.insert(5, BusyChip::boxed(0.0, true));
+    set.insert(3, BusyChip::boxed(0.0, true));
+    assert_eq!(set.battery_id(), Some(3));
+    assert_eq!(set.battery(), Some(&[0xAB; 4][..]));
+}
+
+/// A console's own subtrait of the chip trait, for a set that reads more
+/// of its chips than the trait gives.
+trait Mapper: Coprocessor {
+    fn bank(&self) -> u8;
+}
+
+struct BankChip(OpaqueChip, u8);
+
+impl Coprocessor for BankChip {
+    fn info(&self) -> &ExpansionChipInfo {
+        self.0.info()
+    }
+    fn read(&mut self, offset: u32, master_cycle: u64) -> u8 {
+        self.0.read(offset, master_cycle)
+    }
+    fn write(&mut self, _offset: u32, value: u8, _master_cycle: u64) {
+        self.1 = value;
+    }
+    fn reset(&mut self, _master_clock_hz: u64) {}
+    fn serialize(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn restore(&mut self, _data: &[u8], _master_clock_hz: u64) {}
+    fn debug_state(&self) -> ExpansionChipState {
+        self.0.debug_state()
+    }
+    fn label(&self) -> &str {
+        "bank"
+    }
+}
+
+impl Mapper for BankChip {
+    fn bank(&self) -> u8 {
+        self.1
+    }
+}
+
+struct MapperFactory;
+
+impl ChipFactory<dyn Mapper> for MapperFactory {
+    fn build(
+        &self,
+        kind: &str,
+        _chip_id: u8,
+        _rom: Arc<[u8]>,
+        _master_clock_hz: u64,
+    ) -> Option<Box<dyn Mapper>> {
+        (kind == "bank").then(|| {
+            Box::new(BankChip(
+                OpaqueChip(ExpansionChipInfo {
+                    name: "bank".into(),
+                    chip_type: ExpansionChipType::Custom(3),
+                    description: String::new(),
+                    features: Vec::new(),
+                }),
+                0,
+            )) as Box<dyn Mapper>
+        })
+    }
+}
+
+#[test]
+fn a_set_of_a_console_subtrait_reaches_its_chips_with_no_downcast() {
+    let rom: Arc<[u8]> = Arc::from(vec![0u8; 16].into_boxed_slice());
+    let mut set: ChipSetOf<dyn Mapper> = ChipSetOf::default();
+    install_chips(
+        &MapperFactory,
+        [ChipDecl {
+            id: 2,
+            kind: "bank".into(),
+            observes: Vec::new(),
+        }],
+        &rom,
+        HZ,
+        &mut set,
+    )
+    .unwrap();
+    set.write(2, 0, 7, 0);
+    assert_eq!(set.get(2).map(|chip| chip.bank()), Some(7));
+    assert_eq!(set.read(2, 0, 0), Some(0x5A), "and as a plain chip");
+}

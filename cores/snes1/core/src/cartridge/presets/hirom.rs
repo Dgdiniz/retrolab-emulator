@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn hirom_size_check_through_both_halves() {
-        use crate::cartridge::{PlainCartridge, SnesCartridge};
+        use retro_core::cartridge::Cartridge;
         // A RAM-size check of the shape games run: three different bytes
         // written through banks $21-$23 must all read back through
         // $A5-$A7. A 32 KiB chip keeps them apart; an 8 KiB one folds the
@@ -248,7 +248,7 @@ mod tests {
 
         let check = |sram_size: usize| -> Vec<u8> {
             let plan = hirom_preset(&rom, sram_size, false);
-            let mut cart = PlainCartridge::new(rom.clone(), sram_size, plan);
+            let mut cart = crate::cartridge::test_cartridge(rom.clone(), sram_size, plan);
             for (addr, value) in written {
                 let offset = cart.map_plan().resolve(addr).unwrap().target_offset;
                 cart.write_sram(offset, value);
@@ -257,7 +257,7 @@ mod tests {
                 .iter()
                 .map(|&addr| {
                     let offset = cart.map_plan().resolve(addr).unwrap().target_offset;
-                    cart.read_sram(offset)
+                    cart.read_sram(offset, 0)
                 })
                 .collect()
         };
@@ -345,17 +345,17 @@ mod tests {
 
     #[test]
     fn hirom_dkc_style_mirror_read_through_cartridge() {
-        use crate::cartridge::{PlainCartridge, SnesCartridge};
+        use retro_core::cartridge::Cartridge;
         // End-to-end DKC anti-piracy shape: write a marker at the
         // base SRAM address, read it back from a mirrored address
         // 0x800 higher; without the mask the mirror read would be 0.
         let rom = vec![0u8; 0x40_0000];
         let plan = hirom_preset(&rom, 2048, false);
-        let mut cart = PlainCartridge::new(rom, 2048, plan);
+        let mut cart = crate::cartridge::test_cartridge(rom, 2048, plan);
 
         let base = cart.map_plan().resolve(0x20_6000).unwrap().target_offset;
         let mirror = cart.map_plan().resolve(0x20_6800).unwrap().target_offset;
         cart.write_sram(base, 0x5A);
-        assert_eq!(cart.read_sram(mirror), 0x5A, "2 KiB SRAM must mirror");
+        assert_eq!(cart.read_sram(mirror, 0), 0x5A, "2 KiB SRAM must mirror");
     }
 }

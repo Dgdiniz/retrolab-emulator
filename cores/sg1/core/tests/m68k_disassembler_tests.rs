@@ -3,7 +3,7 @@
 //! Sample tests for each instruction group to validate disassembly output.
 
 use sg1_core::bus::AddressBus;
-use sg1_core::cartridge::composable::build_genesis_cartridge;
+use sg1_core::cartridge::build_genesis_cartridge;
 use sg1_core::cpu68k::disasm;
 
 /// Helper to setup a bus with test opcodes

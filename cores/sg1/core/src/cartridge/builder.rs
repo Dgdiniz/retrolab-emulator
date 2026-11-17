@@ -3,12 +3,13 @@
 //!
 //! Two entry points mirror the SNES builder:
 //! - [`build_genesis_cartridge`] runs heuristic detection (header hints +
-//!   ROM size), then assembles the matching composable cartridge.
+//!   ROM size), then assembles the matching cartridge.
 //! - [`build_with_manifest`] takes a parsed [`CartridgeManifest`] and builds
 //!   exactly what it describes, resolving chips through [`Sg1ChipFactory`].
 //!
-//! Both share the concrete assembly helpers so a `plain` cartridge built by
-//! detection and one built from a `"preset": "plain"` manifest are identical.
+//! Both put the cartridge together the same way (`assemble`), so a
+//! `plain` cartridge built by detection and one built from a
+//! `"preset": "plain"` manifest are identical.
 //!
 //! ## Detection ordering
 //!
@@ -16,26 +17,28 @@
 //! (Virtua Racing) are <= 4 MiB and would otherwise fall through to the plain
 //! path and never build their coprocessor.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use retro_core::cartridge::detection::{calculate_rom_hash, HeaderInfo, HeaderParser};
+use retro_core::cartridge::detection::{HeaderInfo, HeaderParser};
+use retro_core::cartridge::manifest::{NoFields, MANIFEST_SCHEMA};
 use retro_core::cartridge::{
-    CartridgeInfo, ChipFactory, ChipSet, ConsoleSystem, DetectionSource, ExpansionChipInfo,
-    ExpansionChipType, MapperId, MapperInfo, Region,
+    install_chips, rom_sha256, CartridgeInfo, ChipDecl, ChipSet, ConsoleSystem, DetectionSource,
+    ExpansionChipInfo, ExpansionChipType, MapperId, MapperInfo, Region,
 };
-use sha2::{Digest, Sha256};
 
 use crate::cartridge::detection::{calculate_genesis_checksum, detect_genesis_mapper};
 use crate::cartridge::parsers::{GenesisHeaderParser, SRAM_SIZE_LIMIT};
 
+use super::board::{GenesisBoard, GenesisCartridge};
 use super::factory::{Sg1ChipFactory, DEFAULT_EEPROM_SIZE};
 use super::manifest::{
-    manifest_sram_window, manifest_to_map_plan, parse_addr_range, parse_preset, CartridgeManifest,
-    ManifestMapping, ManifestRom, SUPPORTED_MANIFEST_VERSION,
+    manifest_sram_window, manifest_to_map_plan, parse_preset, CartridgeManifest, ManifestMapping,
+    ManifestRom, SUPPORTED_MANIFEST_VERSION,
 };
+use super::map_plan::MapPlan;
 use super::presets::{self, PresetKind};
 use super::savestate::BankMapperKind;
-use super::{ComposableCartridge, GenesisCartridge, PlainCartridge};
 
 /// Genesis NTSC master clock. The composable chips are re-anchored to the
 /// real region clock by `reset_chip` once the system is up; this is only the
@@ -43,11 +46,11 @@ use super::{ComposableCartridge, GenesisCartridge, PlainCartridge};
 pub const DEFAULT_MASTER_CLOCK_HZ: u64 = 53_693_175;
 
 /// The `0xA130Fx` bank-register window a SEGA / SSF2 mapper observes.
-const SEGA_BANK_OBSERVE: std::ops::RangeInclusive<u32> = 0xA130F0..=0xA130FF;
+const SEGA_BANK_OBSERVE: RangeInclusive<u32> = 0xA130F0..=0xA130FF;
 
 /// Detect the cartridge kind from the ROM and assemble the matching
-/// composable cartridge.
-pub fn build_genesis_cartridge(rom_data: Vec<u8>) -> Result<Box<dyn GenesisCartridge>, String> {
+/// cartridge.
+pub fn build_genesis_cartridge(rom_data: Vec<u8>) -> Result<Box<GenesisCartridge>, String> {
     if rom_data.len() < 0x200 {
         return Err("ROM too small (must be at least 512 bytes)".to_string());
     }
@@ -64,7 +67,7 @@ pub fn build_genesis_cartridge(rom_data: Vec<u8>) -> Result<Box<dyn GenesisCartr
         .clone()
         .unwrap_or_else(|| detect_genesis_mapper(rom_data.len(), &header_info));
 
-    let cart: Box<dyn GenesisCartridge> = match mapper_id {
+    let cart = match mapper_id {
         MapperId::GenesisSEGA => build_bank_mapper(rom_data, &header_info, BankMapperKind::Sega),
         MapperId::GenesisSSF2 => build_bank_mapper(rom_data, &header_info, BankMapperKind::Ssf2),
         MapperId::GenesisCodemasters => {
@@ -89,14 +92,30 @@ pub fn build_genesis_cartridge(rom_data: Vec<u8>) -> Result<Box<dyn GenesisCartr
 pub fn build_with_manifest(
     rom_data: Vec<u8>,
     manifest: &CartridgeManifest,
-) -> Result<Box<dyn GenesisCartridge>, String> {
+) -> Result<Box<GenesisCartridge>, String> {
     let header_info = GenesisHeaderParser::new().parse(&rom_data).ok();
     let preset = parse_preset(&manifest.mapping.preset).map_err(|e| e.to_string())?;
     let plan = manifest_to_map_plan(manifest, &rom_data).map_err(|e| e.to_string())?;
     let sram = manifest_sram_window(manifest);
     // The preset seeds its MMIO windows at the first declared chip's id (or
     // 0 when none is declared), the same id `manifest_to_map_plan` uses.
-    let preset_chip_id = manifest.chips.first().map(|c| c.id).unwrap_or(0);
+    let preset_chip_id = manifest.chips.first().map_or(0, |c| c.id);
+
+    // The chips the manifest declares, then the preset's implied chip when
+    // the manifest left the preset's `chip_id` empty (the common
+    // `detected_manifest` case).
+    let mut decls = manifest
+        .chips
+        .iter()
+        .enumerate()
+        .map(|(i, chip)| ChipDecl::from_manifest(chip, i))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if let Some(kind) = preset_chip_kind(preset) {
+        if decls.iter().all(|decl| decl.id != preset_chip_id) {
+            decls.push(preset_chip(preset_chip_id, kind));
+        }
+    }
 
     let info = make_info(
         &rom_data,
@@ -106,64 +125,16 @@ pub fn build_with_manifest(
         DetectionSource::Manifest,
     );
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-
-    let factory = Sg1ChipFactory::default();
     let mut chips = ChipSet::default();
-    let mut battery_chip = None;
-
-    // Explicit chips the manifest declares.
-    for chip in &manifest.chips {
-        let built = factory
-            .build(
-                &chip.kind,
-                chip.id,
-                Arc::clone(&rom),
-                DEFAULT_MASTER_CLOCK_HZ,
-            )
-            .ok_or_else(|| format!("unknown chip kind: {}", chip.kind))?;
-        // A chip with a battery and no stock SRAM owns the cartridge save.
-        if built.battery().is_some() && sram.is_none() {
-            battery_chip = Some(chip.id);
-        }
-        chips.insert(chip.id, built);
-        for obs in &chip.observes {
-            let range = parse_addr_range(obs, "observes").map_err(|e| e.to_string())?;
-            chips.add_observer(range, chip.id);
-        }
-    }
-
-    // Auto-instantiate the preset's implied chip when the manifest left the
-    // preset's `chip_id` slot empty (the common `detected_manifest` case).
-    if let Some(kind) = preset_chip_kind(preset) {
-        if chips.get(preset_chip_id).is_none() {
-            let built = factory
-                .build(
-                    kind,
-                    preset_chip_id,
-                    Arc::clone(&rom),
-                    DEFAULT_MASTER_CLOCK_HZ,
-                )
-                .ok_or_else(|| format!("unknown preset chip kind: {kind}"))?;
-            if built.battery().is_some() && sram.is_none() {
-                battery_chip = Some(preset_chip_id);
-            }
-            chips.insert(preset_chip_id, built);
-            // SEGA / SSF2 program their banks through the 0xA130Fx window,
-            // outside the ROM slot the plan carries, register the observer.
-            if matches!(preset, PresetKind::Sega | PresetKind::Ssf2) {
-                chips.add_observer(SEGA_BANK_OBSERVE, preset_chip_id);
-            }
-        }
-    }
-
-    let mut cart = ComposableCartridge::new(rom, plan, chips, info);
-    if let Some((start, len)) = sram {
-        cart = cart.with_sram(vec![0xFF; len as usize], start);
-    }
-    if let Some(id) = battery_chip {
-        cart = cart.with_battery_chip(id);
-    }
-    Ok(Box::new(cart))
+    install_chips(
+        &Sg1ChipFactory::default(),
+        decls,
+        &rom,
+        DEFAULT_MASTER_CLOCK_HZ,
+        &mut chips,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(assemble(rom, plan, chips, info, sram))
 }
 
 /// Build the `cartridge-manifest-v1` that [`build_genesis_cartridge`]'s
@@ -212,7 +183,7 @@ pub fn detected_manifest(rom: &[u8]) -> CartridgeManifest {
         .map(region_label);
 
     CartridgeManifest {
-        schema: Some("cartridge-manifest-v1".to_string()),
+        schema: Some(MANIFEST_SCHEMA.to_string()),
         core: "sg1".to_string(),
         version: SUPPORTED_MANIFEST_VERSION.to_string(),
         rom: ManifestRom {
@@ -223,29 +194,73 @@ pub fn detected_manifest(rom: &[u8]) -> CartridgeManifest {
         },
         mapping: ManifestMapping {
             preset: preset_to_str(preset).to_string(),
+            knobs: NoFields {},
             sram_size,
             slots: Vec::new(),
         },
         chips: Vec::new(),
+        console: NoFields {},
         metadata: None,
     }
 }
 
-/// Lowercase hex SHA-256 of a ROM image, the manifest's `rom.sha256`.
-pub fn rom_sha256(rom: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(rom);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+// --- assembly ----------------------------------------------------------------
+
+/// Put a cartridge together: its plan and chips over `rom`, the SRAM
+/// window `sram` filled with `0xFF` when it has one, and, when it has none,
+/// the chip with a battery as the save (the EEPROM).
+fn assemble(
+    rom: Arc<[u8]>,
+    plan: MapPlan,
+    chips: ChipSet,
+    info: CartridgeInfo,
+    sram: Option<(u32, u32)>,
+) -> Box<GenesisCartridge> {
+    let board = GenesisBoard::new(rom.len(), sram);
+    let battery_chip = if sram.is_none() {
+        chips.battery_id()
+    } else {
+        None
+    };
+    let mut cart = GenesisCartridge::new(rom, plan, chips, info, board);
+    if let Some((_, len)) = sram {
+        cart = cart.with_sram(vec![0xFF; len as usize]);
     }
-    out
+    if let Some(id) = battery_chip {
+        cart = cart.with_battery_chip(id);
+    }
+    Box::new(cart)
 }
 
-// --- concrete assembly helpers --------------------------------------------
+/// The chip a preset implies, at `id`: a SEGA or SSF2 mapper watches its
+/// `0xA130Fx` bank registers, outside the ROM window its slot covers.
+fn preset_chip(id: u8, kind: &str) -> ChipDecl {
+    let observes = match kind {
+        "sega" | "ssf2" => vec![SEGA_BANK_OBSERVE],
+        _ => Vec::new(),
+    };
+    ChipDecl {
+        id,
+        kind: kind.to_string(),
+        observes,
+    }
+}
 
-fn build_plain(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCartridge> {
+/// The chips of a cartridge whose one chip is `kind`, at id 0.
+fn one_chip(factory: &Sg1ChipFactory, kind: &str, rom: &Arc<[u8]>) -> ChipSet {
+    let mut chips = ChipSet::default();
+    install_chips(
+        factory,
+        [preset_chip(0, kind)],
+        rom,
+        DEFAULT_MASTER_CLOCK_HZ,
+        &mut chips,
+    )
+    .expect("the factory builds every preset's chip");
+    chips
+}
+
+fn build_plain(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<GenesisCartridge> {
     let mapper_info = header_info.mapper_hint.clone().map(|id| MapperInfo {
         mapper_id: id,
         name: "None".to_string(),
@@ -261,17 +276,15 @@ fn build_plain(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCa
     );
     let sram = sram_window(&rom_data, header_info);
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-    match sram {
-        Some((start, len)) => Box::new(PlainCartridge::with_sram(rom, info, start, len)),
-        None => Box::new(PlainCartridge::new(rom, info)),
-    }
+    let plan = presets::plain_plan(rom.len(), sram);
+    assemble(rom, plan, ChipSet::default(), info, sram)
 }
 
 fn build_bank_mapper(
     rom_data: Vec<u8>,
     header_info: &HeaderInfo,
     kind: BankMapperKind,
-) -> Box<dyn GenesisCartridge> {
+) -> Box<GenesisCartridge> {
     let info = make_info(
         &rom_data,
         Some(header_info),
@@ -281,34 +294,15 @@ fn build_bank_mapper(
     );
     let sram = sram_window(&rom_data, header_info);
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-
-    let factory = Sg1ChipFactory::default();
-    let mut chips = ChipSet::default();
-    let chip = factory
-        .build(
-            bank_mapper_kind_str(kind),
-            0,
-            Arc::clone(&rom),
-            DEFAULT_MASTER_CLOCK_HZ,
-        )
-        .expect("bank mapper kind is known to the factory");
-    let chip_id = chips.push(chip);
     // SEGA and SSF2 program their banks through 0xA130Fx (outside the ROM
-    // window), so the cartridge must forward those writes to the chip.
+    // window), so the cartridge forwards those writes to the chip.
     // Codemasters uses ROM-window writes and needs no observer.
-    if matches!(kind, BankMapperKind::Sega | BankMapperKind::Ssf2) {
-        chips.add_observer(SEGA_BANK_OBSERVE, chip_id);
-    }
-
-    let plan = presets::bank_mapper_plan(kind, chip_id, sram);
-    let mut cart = ComposableCartridge::new(rom, plan, chips, info);
-    if let Some((start, len)) = sram {
-        cart = cart.with_sram(vec![0xFF; len as usize], start);
-    }
-    Box::new(cart)
+    let chips = one_chip(&Sg1ChipFactory::default(), bank_mapper_kind_str(kind), &rom);
+    let plan = presets::bank_mapper_plan(kind, 0, sram);
+    assemble(rom, plan, chips, info, sram)
 }
 
-fn build_eeprom(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCartridge> {
+fn build_eeprom(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<GenesisCartridge> {
     let info = make_info(
         &rom_data,
         Some(header_info),
@@ -322,23 +316,16 @@ fn build_eeprom(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisC
         DetectionSource::Header,
     );
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-
     let factory = Sg1ChipFactory {
         eeprom_size: DEFAULT_EEPROM_SIZE,
     };
-    let mut chips = ChipSet::default();
-    let chip_id = chips.push(
-        factory
-            .build("eeprom", 0, Arc::clone(&rom), DEFAULT_MASTER_CLOCK_HZ)
-            .expect("eeprom kind is known"),
-    );
-
-    let plan = presets::eeprom_plan(chip_id, rom.len(), presets::EEPROM_CONTROL_ADDR);
-    // The save lives inside the EEPROM chip; route `.srm` traffic to it.
-    Box::new(ComposableCartridge::new(rom, plan, chips, info).with_battery_chip(chip_id))
+    let chips = one_chip(&factory, "eeprom", &rom);
+    let plan = presets::eeprom_plan(0, rom.len(), presets::EEPROM_CONTROL_ADDR);
+    // The save lives inside the EEPROM chip ([`assemble`] names it).
+    assemble(rom, plan, chips, info, None)
 }
 
-fn build_jcart(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCartridge> {
+fn build_jcart(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<GenesisCartridge> {
     let info = make_info(
         &rom_data,
         Some(header_info),
@@ -353,24 +340,12 @@ fn build_jcart(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCa
     );
     let sram = sram_window(&rom_data, header_info);
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-
-    let factory = Sg1ChipFactory::default();
-    let mut chips = ChipSet::default();
-    let chip_id = chips.push(
-        factory
-            .build("jcart", 0, Arc::clone(&rom), DEFAULT_MASTER_CLOCK_HZ)
-            .expect("jcart kind is known"),
-    );
-
-    let plan = presets::jcart_plan(chip_id, rom.len(), sram);
-    let mut cart = ComposableCartridge::new(rom, plan, chips, info);
-    if let Some((start, len)) = sram {
-        cart = cart.with_sram(vec![0xFF; len as usize], start);
-    }
-    Box::new(cart)
+    let chips = one_chip(&Sg1ChipFactory::default(), "jcart", &rom);
+    let plan = presets::jcart_plan(0, rom.len(), sram);
+    assemble(rom, plan, chips, info, sram)
 }
 
-fn build_svp(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCartridge> {
+fn build_svp(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<GenesisCartridge> {
     let info = make_info(
         &rom_data,
         Some(header_info),
@@ -384,17 +359,9 @@ fn build_svp(rom_data: Vec<u8>, header_info: &HeaderInfo) -> Box<dyn GenesisCart
         DetectionSource::Header,
     );
     let rom: Arc<[u8]> = Arc::from(rom_data.into_boxed_slice());
-
-    let factory = Sg1ChipFactory::default();
-    let mut chips = ChipSet::default();
-    let chip_id = chips.push(
-        factory
-            .build("svp", 0, Arc::clone(&rom), DEFAULT_MASTER_CLOCK_HZ)
-            .expect("svp kind is known"),
-    );
-
-    let plan = presets::svp_plan(chip_id, rom.len());
-    Box::new(ComposableCartridge::new(rom, plan, chips, info))
+    let chips = one_chip(&Sg1ChipFactory::default(), "svp", &rom);
+    let plan = presets::svp_plan(0, rom.len());
+    assemble(rom, plan, chips, info, None)
 }
 
 // --- metadata helpers ------------------------------------------------------
@@ -545,6 +512,8 @@ fn sram_window(rom_data: &[u8], header_info: &HeaderInfo) -> Option<(u32, u32)> 
     (len > 0).then_some((start, len as u32))
 }
 
+/// What the cartridge is: the image's size and hash, the header's fields
+/// when there is a header, the mapper and chip the builder chose.
 fn make_info(
     rom_data: &[u8],
     header_info: Option<&HeaderInfo>,
@@ -552,8 +521,6 @@ fn make_info(
     expansion_chip_info: Option<ExpansionChipInfo>,
     detection_source: DetectionSource,
 ) -> CartridgeInfo {
-    let calculated_checksum = calculate_genesis_checksum(rom_data);
-    let rom_hash = calculate_rom_hash(rom_data);
     let (title, serial, regions, sram_size, sram_type, header_checksum) = match header_info {
         Some(h) => (
             h.title.clone(),
@@ -573,26 +540,26 @@ fn make_info(
         ),
     };
     CartridgeInfo {
-        system: ConsoleSystem::Genesis,
         title,
         serial,
         regions,
-        rom_size: rom_data.len(),
         sram_size,
         sram_type,
         mapper_info,
         expansion_chip_info,
         header_checksum,
-        calculated_checksum: Some(calculated_checksum),
-        rom_hash,
+        calculated_checksum: Some(calculate_genesis_checksum(rom_data)),
         detection_source,
+        ..CartridgeInfo::new(ConsoleSystem::Genesis, rom_data)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use retro_core::cartridge::Cartridge;
+
     use super::*;
-    use crate::cartridge::composable::manifest::parse_manifest;
+    use crate::cartridge::manifest::parse_manifest;
 
     /// Every byte a NOP, the header included: its RAM field reads as an SRAM
     /// range of $4E000001 bytes, which the cartridge must not allocate whole.
@@ -645,7 +612,7 @@ mod tests {
         let mut cart = build_genesis_cartridge(rom).unwrap();
         assert_eq!(cart.map_plan().name, "plain");
         assert_eq!(cart.info().title, "PLAIN GAME");
-        assert_eq!(cart.read_addr(0x000200), 0xA5);
+        assert_eq!(cart.read_bus(0x000200, 0, 0xFF), 0xA5);
         assert!(cart.coprocessor_label().is_none());
     }
 
@@ -660,8 +627,8 @@ mod tests {
         assert_eq!(cart.coprocessor_label(), Some("SEGA mapper"));
         // Bank-switch slot 0 to bank 9 via 0xA130F0 (through the observer),
         // then a ROM-window read at 0x000000 comes from physical bank 9.
-        cart.write_addr(0xA130F0, 9);
-        assert_eq!(cart.read_addr(0x000000), 0x9B);
+        cart.write_bus(0xA130F0, 9, 0);
+        assert_eq!(cart.read_bus(0x000000, 0, 0xFF), 0x9B);
         assert!(cart.coprocessor_accesses() > 0);
     }
 
@@ -688,8 +655,8 @@ mod tests {
         let mut cart = build_genesis_cartridge(rom).unwrap();
         assert_eq!(cart.map_plan().name, "plain");
         // SRAM at 0x200000 is beyond the 2 MiB image -> permanent, writable.
-        cart.write_addr(0x200000, 0x5A);
-        assert_eq!(cart.read_addr(0x200000), 0x5A);
+        cart.write_bus(0x200000, 0x5A, 0);
+        assert_eq!(cart.read_bus(0x200000, 0, 0xFF), 0x5A);
         assert!(cart.is_sram_dirty());
     }
 
@@ -768,19 +735,13 @@ mod tests {
             ]
         }"#;
         let manifest = parse_manifest(json).unwrap();
-        assert!(build_with_manifest(rom, &manifest).is_err());
+        assert_eq!(
+            build_with_manifest(rom, &manifest).err().as_deref(),
+            Some("unknown coprocessor chip kind: supervChipZZZ")
+        );
     }
 
     // -- detected_manifest exporter -----------------------------------------
-
-    #[test]
-    fn rom_sha256_known_vector() {
-        // SHA-256 of the empty input is the standard test vector.
-        assert_eq!(
-            rom_sha256(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
 
     #[test]
     fn detected_manifest_plain_round_trips() {
@@ -797,7 +758,7 @@ mod tests {
         // Fed back, it reproduces the same cartridge shape.
         let mut cart = build_with_manifest(rom.clone(), &manifest).unwrap();
         assert_eq!(cart.map_plan().name, "plain");
-        assert_eq!(cart.read_addr(0x000200), 0xA5);
+        assert_eq!(cart.read_bus(0x000200, 0, 0xFF), 0xA5);
         assert_eq!(cart.info().detection_source, DetectionSource::Manifest);
     }
 
@@ -834,8 +795,8 @@ mod tests {
         let mut cart = build_with_manifest(rom, &manifest).unwrap();
         assert_eq!(cart.map_plan().name, "sega");
         assert_eq!(cart.coprocessor_label(), Some("SEGA mapper"));
-        cart.write_addr(0xA130F0, 9);
-        assert_eq!(cart.read_addr(0x000000), 0x9B);
+        cart.write_bus(0xA130F0, 9, 0);
+        assert_eq!(cart.read_bus(0x000000, 0, 0xFF), 0x9B);
     }
 
     #[test]
@@ -846,8 +807,8 @@ mod tests {
         assert!(manifest.mapping.sram_size > 0);
 
         let mut cart = build_with_manifest(rom, &manifest).unwrap();
-        cart.write_addr(0x200000, 0x5A);
-        assert_eq!(cart.read_addr(0x200000), 0x5A);
+        cart.write_bus(0x200000, 0x5A, 0);
+        assert_eq!(cart.read_bus(0x200000, 0, 0xFF), 0x5A);
         assert!(cart.is_sram_dirty());
     }
 

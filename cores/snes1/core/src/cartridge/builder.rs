@@ -3,7 +3,7 @@
 //! [`CartridgeBuilder`] is what every client (the CLI, the WASM
 //! bindings, the platform shell) goes through to turn a raw ROM
 //! file, and an optional manifest, into a
-//! [`Box<dyn SnesCartridge>`] that
+//! [`Box<SnesCartridge>`](SnesCartridge) that
 //! [`crate::bus::SnesBus::install_cartridge`] can install
 //! verbatim. The bus knows nothing about detection, manifests, or
 //! SMC headers; that logic all lives here.
@@ -24,9 +24,10 @@
 //!     |     manifest > detected header > default (0 / false)
 //!     |-> build base MapPlan via preset generator
 //!     |-> append manifest slots + chip windows (if manifest present)
-//!     |-> resolve chip instances (manifest chips[] + header DSP-1)
-//!     `-> no chips => PlainCartridge; else re-home ROM/SRAM/plan behind
-//!         a ChipSet built by the console factory => ComposableCartridge
+//!     |-> declare the chips (manifest chips[] + header DSP-1 + the
+//!     |   preset's chip), each built by the console factory
+//!     `-> one cartridge: the ROM, the plan, the chip set (empty for a
+//!         plain cartridge) and the SRAM
 //! ```
 //!
 //! ## Design notes
@@ -61,13 +62,13 @@
 //!   `EmulatorCore::get_save_ram` / `set_save_ram` once the
 //!   cartridge is installed.
 
-use std::fmt::Write as _;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
-use retro_core::cartridge::{ChipFactory, ChipSet};
+use retro_core::cartridge::manifest::MANIFEST_SCHEMA;
+use retro_core::cartridge::{
+    install_chips, rom_sha256, CartridgeInfo, ChipDecl, ChipSet, ConsoleSystem, DetectionSource,
+    MapperInfo, SRAMType,
+};
 
 use crate::cartridge::chip_support::{unsupported_chip, unsupported_preset};
 use crate::cartridge::detect::{detect_preset_with_threshold, DEFAULT_DETECT_THRESHOLD};
@@ -80,28 +81,18 @@ use crate::cartridge::factory::{
 };
 use crate::cartridge::header::SnesHeader;
 use crate::cartridge::manifest::{
-    append_manifest_extras, parse_addr_range, parse_preset, CartridgeManifest, ManifestError,
-    ManifestMapping, ManifestRom, SUPPORTED_MANIFEST_VERSION,
+    append_manifest_extras, parse_preset, CartridgeManifest, ManifestError, ManifestMapping,
+    ManifestRom, SnesManifestExtras, SnesMappingKnobs, SUPPORTED_MANIFEST_VERSION,
 };
 use crate::cartridge::map_plan::MapPlan;
-use crate::cartridge::plain::PlainCartridge;
 use crate::cartridge::presets::{
     cx4_preset, exhirom_preset, hirom_preset, lorom_preset, sa1_preset, sdd1_preset,
     spc7110_preset, superfx_preset, PresetKind,
 };
 use crate::cartridge::{
-    ComposableCartridge, SnesCartridge, CX4_CHIP_ID, SA1_CHIP_ID, SDD1_CHIP_ID, SPC7110_CHIP_ID,
+    SnesBoard, SnesCartridge, CX4_CHIP_ID, SA1_CHIP_ID, SDD1_CHIP_ID, SPC7110_CHIP_ID,
     SUPERFX_CHIP_ID,
 };
-
-/// One chip to instantiate into the cartridge's [`ChipSet`]: its `chip_id`,
-/// the manifest `kind` the factory resolves, and the already-parsed bus
-/// ranges it passively observes (empty for chips that observe nothing).
-struct ChipInstance {
-    id: u8,
-    kind: String,
-    observes: Vec<RangeInclusive<u32>>,
-}
 
 /// Fluent builder for [`SnesCartridge`] instances. See module docs
 /// for the pipeline and design rationale.
@@ -213,7 +204,7 @@ impl<'a> CartridgeBuilder<'a> {
 
     /// Consume the builder and produce a boxed cartridge. See
     /// [`BuildError`] for failure modes.
-    pub fn build(self) -> Result<Box<dyn SnesCartridge>, BuildError> {
+    pub fn build(self) -> Result<Box<SnesCartridge>, BuildError> {
         // Move the consumed buffers out of `self` up front so the DSP
         // and plain-cartridge construction paths below can each take
         // ownership without partial-move headaches.
@@ -243,7 +234,7 @@ impl<'a> CartridgeBuilder<'a> {
             if let Some(ref manifest) = self.manifest {
                 let expected = manifest.rom.sha256.to_lowercase();
                 if !expected.is_empty() {
-                    let actual = sha256_lowercase(stripped);
+                    let actual = rom_sha256(stripped);
                     if actual != expected {
                         return Err(BuildError::Sha256Mismatch { expected, actual });
                     }
@@ -289,7 +280,7 @@ impl<'a> CartridgeBuilder<'a> {
         let fastrom = self
             .manifest
             .as_ref()
-            .map(|m| m.mapping.fastrom)
+            .map(|m| m.mapping.knobs.fastrom)
             .or_else(|| detected.as_ref().map(|d| d.fastrom))
             .unwrap_or(false);
 
@@ -373,21 +364,10 @@ impl<'a> CartridgeBuilder<'a> {
         // The header DSP-1 also front-inserts its two mirror windows so they
         // beat the overlapping ROM mirror, the delicate ordering the manifest
         // path can't express (see `detected_manifest`).
-        let mut instances: Vec<ChipInstance> = Vec::new();
+        let mut instances: Vec<ChipDecl> = Vec::new();
         if let Some(ref manifest) = self.manifest {
             for (i, chip) in manifest.chips.iter().enumerate() {
-                let mut observes = Vec::with_capacity(chip.observes.len());
-                for (j, range) in chip.observes.iter().enumerate() {
-                    observes.push(parse_addr_range(
-                        range,
-                        &format!("chips[{i}].observes[{j}]"),
-                    )?);
-                }
-                instances.push(ChipInstance {
-                    id: chip.id,
-                    kind: chip.kind.clone(),
-                    observes,
-                });
+                instances.push(ChipDecl::from_manifest(chip, i)?);
             }
         }
         if !manifest_dsp1 {
@@ -395,7 +375,7 @@ impl<'a> CartridgeBuilder<'a> {
                 let [low, high] = layout.register_slots(DSP1_CHIP_ID);
                 plan.slots.insert(0, high);
                 plan.slots.insert(0, low);
-                instances.push(ChipInstance {
+                instances.push(ChipDecl {
                     id: DSP1_CHIP_ID,
                     kind: "dsp1".to_string(),
                     observes: Vec::new(),
@@ -418,7 +398,7 @@ impl<'a> CartridgeBuilder<'a> {
             // A one-window observe list really is a Vec of one range, the
             // chip model takes N windows; the S-DD1 needs exactly one.
             #[allow(clippy::single_range_in_vec_init)]
-            instances.push(ChipInstance {
+            instances.push(ChipDecl {
                 id: SDD1_CHIP_ID,
                 kind: "sdd1".to_string(),
                 observes: vec![0x4300..=0x437F],
@@ -441,7 +421,7 @@ impl<'a> CartridgeBuilder<'a> {
             })
             .unwrap_or(false);
         if effective_kind == PresetKind::Spc7110 && !manifest_spc7110 {
-            instances.push(ChipInstance {
+            instances.push(ChipDecl {
                 id: SPC7110_CHIP_ID,
                 kind: "spc7110".to_string(),
                 observes: Vec::new(),
@@ -460,7 +440,7 @@ impl<'a> CartridgeBuilder<'a> {
             .map(|m| m.chips.iter().any(|c| c.kind.eq_ignore_ascii_case("sa1")))
             .unwrap_or(false);
         if effective_kind == PresetKind::Sa1 && !manifest_sa1 {
-            instances.push(ChipInstance {
+            instances.push(ChipDecl {
                 id: SA1_CHIP_ID,
                 kind: "sa1".to_string(),
                 observes: Vec::new(),
@@ -482,7 +462,7 @@ impl<'a> CartridgeBuilder<'a> {
             })
             .unwrap_or(false);
         if effective_kind == PresetKind::SuperFx && !manifest_superfx {
-            instances.push(ChipInstance {
+            instances.push(ChipDecl {
                 id: SUPERFX_CHIP_ID,
                 kind: "superfx".to_string(),
                 observes: Vec::new(),
@@ -501,7 +481,7 @@ impl<'a> CartridgeBuilder<'a> {
             .map(|m| m.chips.iter().any(|c| c.kind.eq_ignore_ascii_case("cx4")))
             .unwrap_or(false);
         if effective_kind == PresetKind::Cx4 && !manifest_cx4 {
-            instances.push(ChipInstance {
+            instances.push(ChipDecl {
                 id: CX4_CHIP_ID,
                 kind: "cx4".to_string(),
                 observes: Vec::new(),
@@ -509,35 +489,24 @@ impl<'a> CartridgeBuilder<'a> {
         }
 
         // The Super FX and Cx4 own all cart RAM inside the chip (mapped via
-        // ChipMmio slots), so the inner cartridge needs no SRAM buffer of its
-        // own. Leaving it 0 keeps a non-battery cart (Star Fox, the real
-        // MMX2/X3) from exposing a phantom all-zero `.srm`; a battery cart
-        // (Yoshi's Island, a manifest-declared Cx4 SRAM) persists through the
-        // chip's `battery()` instead.
+        // ChipMmio slots), so the cartridge needs no SRAM buffer of its own.
+        // Leaving it 0 keeps a non-battery cart (Star Fox, the real MMX2/X3)
+        // from exposing a phantom all-zero `.srm`; a battery cart (Yoshi's
+        // Island, a manifest-declared Cx4 SRAM) persists through the chip's
+        // `battery()` instead.
         let inner_sram_size = if matches!(effective_kind, PresetKind::SuperFx | PresetKind::Cx4) {
             0
         } else {
             sram_size
         };
-        let inner = match sram_override {
-            Some(sram_bytes) => PlainCartridge::with_sram(rom, sram_bytes, plan),
-            None => PlainCartridge::new(rom, inner_sram_size, plan),
-        };
+        let sram = sram_override.unwrap_or_else(|| vec![0u8; inner_sram_size]);
 
-        // No chips => the plain cartridge is the whole story (zero overhead,
-        // the common case).
-        if instances.is_empty() {
-            return Ok(Box::new(inner));
-        }
-
-        // At least one chip => re-home the ROM/SRAM/plan behind a `ChipSet`
-        // and instantiate each chip through the console factory. Threading the
-        // storage through `PlainCartridge::into_parts` keeps SRAM
-        // initialisation byte-identical to the plain path; the ROM moves into
-        // an `Arc<[u8]>` so a ROM-consuming chip (MMC / decompressor) can share
-        // the image the bus reads.
-        let (rom_bytes, sram, plan) = inner.into_parts();
-        let rom_arc: Arc<[u8]> = Arc::from(rom_bytes.into_boxed_slice());
+        // Each chip built through the console factory, in the order it was
+        // declared; a chip this build has no module for is refused as it is
+        // reached, as is a kind the factory does not know. The ROM is an
+        // `Arc<[u8]>` so a ROM-consuming chip (MMC / decompressor) shares the
+        // image the bus reads.
+        let rom_arc: Arc<[u8]> = Arc::from(rom.into_boxed_slice());
         let factory = Snes1ChipFactory {
             firmware: coprocessor_firmware,
             mode: coprocessor_mode,
@@ -561,37 +530,86 @@ impl<'a> CartridgeBuilder<'a> {
             },
         };
         let mut chips = ChipSet::default();
-        for inst in instances {
+        for decl in instances {
             // A manifest can name a chip the detector did not: the same refusal.
-            if let Some(chip) = unsupported_chip(&inst.kind) {
+            if let Some(chip) = unsupported_chip(&decl.kind) {
                 return Err(BuildError::UnsupportedChip { chip });
             }
-            let chip = factory
-                .build(
-                    &inst.kind,
-                    inst.id,
-                    rom_arc.clone(),
-                    DEFAULT_MASTER_CLOCK_HZ,
-                )
-                .ok_or_else(|| BuildError::UnknownChip {
-                    kind: inst.kind.clone(),
-                })?;
-            chips.insert(inst.id, chip);
-            for range in inst.observes {
-                chips.add_observer(range, inst.id);
-            }
+            install_chips(
+                &factory,
+                [decl],
+                &rom_arc,
+                DEFAULT_MASTER_CLOCK_HZ,
+                &mut chips,
+            )
+            .map_err(|unknown| BuildError::UnknownChip { kind: unknown.kind })?;
         }
 
         // A chip that owns the battery (the SPC7110's game SRAM) takes the
         // initial SRAM contents, the `with_sram` override or the zeroed
-        // buffer, so the chip, not the cartridge's now-dead SRAM buffer,
-        // holds the persistent save that the bus routes through it.
+        // buffer, and is the cartridge's save: the chip, not the cartridge's
+        // own buffer, holds what the bus routes through it.
+        let battery_chip = chips.battery_id();
         if chips.has_battery() && !sram.is_empty() {
             chips.restore_battery(&sram);
         }
 
-        let cart = ComposableCartridge::new(rom_arc, sram, plan, chips);
+        let info = cartridge_info(
+            stripped,
+            detected.as_ref().map(|d| &d.header),
+            effective_kind,
+            &plan,
+            &chips,
+            sram_size,
+            self.manifest.is_some(),
+        );
+        let mut cart = SnesCartridge::new(rom_arc, plan, chips, info, SnesBoard).with_sram(sram);
+        if let Some(id) = battery_chip {
+            cart = cart.with_battery_chip(id);
+        }
         Ok(Box::new(cart))
+    }
+}
+
+/// What the cartridge is: the image's size and hash (the file less its
+/// copier header, before padding), the header's title and checksum, its
+/// SRAM, the mapper its preset names, its primary chip, and whether a
+/// manifest described it.
+fn cartridge_info(
+    image: &[u8],
+    header: Option<&SnesHeader>,
+    kind: PresetKind,
+    plan: &MapPlan,
+    chips: &ChipSet,
+    sram_size: usize,
+    from_manifest: bool,
+) -> CartridgeInfo {
+    let primary_chip = chips
+        .first_id()
+        .and_then(|id| chips.get(id))
+        .map(|chip| chip.info().clone());
+    CartridgeInfo {
+        title: header.map_or_else(String::new, |h| h.title.trim_end().to_string()),
+        sram_size,
+        sram_type: if sram_size > 0 {
+            SRAMType::Battery
+        } else {
+            SRAMType::None
+        },
+        mapper_info: Some(MapperInfo {
+            mapper_id: kind.mapper_id(&plan.name),
+            name: kind.name().to_string(),
+            description: String::new(),
+            features: Vec::new(),
+        }),
+        expansion_chip_info: primary_chip,
+        header_checksum: header.map(|h| h.checksum),
+        detection_source: if from_manifest {
+            DetectionSource::Manifest
+        } else {
+            DetectionSource::Header
+        },
+        ..CartridgeInfo::new(ConsoleSystem::SNES, image)
     }
 }
 
@@ -649,23 +667,23 @@ pub fn detected_manifest(rom: &[u8]) -> CartridgeManifest {
         .map(dsp1_metadata);
 
     CartridgeManifest {
-        schema: Some("cartridge-manifest-v1".to_string()),
+        schema: Some(MANIFEST_SCHEMA.to_string()),
         core: "snes1".to_string(),
         version: SUPPORTED_MANIFEST_VERSION.to_string(),
         rom: ManifestRom {
-            sha256: sha256_lowercase(stripped),
+            sha256: rom_sha256(stripped),
             size: stripped.len() as u64,
             title,
             region,
         },
         mapping: ManifestMapping {
             preset: preset_to_str(preset).to_string(),
-            fastrom,
+            knobs: SnesMappingKnobs { fastrom },
             sram_size,
             slots: Vec::new(),
         },
         chips: Vec::new(),
-        controllers: None,
+        console: SnesManifestExtras { controllers: None },
         metadata: coprocessor,
     }
 }
@@ -818,10 +836,10 @@ pub fn copier_header_length(file_length: usize) -> usize {
 /// The LoROM / HiROM preset generators use a `mask = rom.len() - 1`
 /// to fold over-large slot offsets back into the chip image; that
 /// trick only works when `rom.len()` is a power of two. Padding
-/// also makes `PlainCartridge::read_rom` return well-defined zero
-/// bytes for the mirrored region of non-power-of-two ROMs like the
-/// 6 MiB ExHiROM dumps (Tales of Phantasia among them) instead of
-/// indexing past the end of the buffer.
+/// also makes a ROM read give well-defined zero bytes for the
+/// mirrored region of non-power-of-two ROMs like the 6 MiB ExHiROM
+/// dumps (Tales of Phantasia among them) instead of reaching past
+/// the end of the image.
 fn pad_to_power_of_two(mut rom: Vec<u8>) -> Vec<u8> {
     if rom.is_empty() {
         return rom;
@@ -835,31 +853,10 @@ fn pad_to_power_of_two(mut rom: Vec<u8>) -> Vec<u8> {
     rom
 }
 
-/// SHA-256 (lowercase hex) of a ROM after the SMC copier prelude is
-/// stripped, the exact digest the manifest convention checks against
-/// (see [`CartridgeBuilder::build`]). Savestates key on this so a state
-/// is only loadable against the ROM it was captured from, regardless of
-/// whether the on-disk image carried a 512-byte SMC header.
-pub fn rom_sha256(rom: &[u8]) -> String {
-    sha256_lowercase(strip_smc_if_present(rom))
-}
-
-/// SHA-256 of `bytes`, hex-encoded in lowercase. Centralized here
-/// so [`BuildError::Sha256Mismatch`] only ever shows one canonical
-/// format.
-fn sha256_lowercase(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        write!(&mut out, "{:02x}", b).expect("writing to String never fails");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use retro_core::cartridge::Cartridge;
+
     use super::*;
     use crate::cartridge::header::{MAP_MODE_HIROM, MAP_MODE_LOROM};
     use crate::cartridge::parse_manifest;
@@ -952,15 +949,6 @@ mod tests {
     }
 
     #[test]
-    fn sha256_lowercase_known_vector() {
-        // RFC 6234 / NIST CAVS test vector for SHA-256 of "abc".
-        assert_eq!(
-            sha256_lowercase(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
     fn build_lorom_with_detection_only() {
         let rom = lorom_rom(0x10_0000);
         let cart = CartridgeBuilder::new(&rom).build().expect("LoROM builds");
@@ -996,11 +984,11 @@ mod tests {
         assert_eq!(cart.map_plan().name, "lorom");
     }
 
-    /// `Box<dyn SnesCartridge>` does not impl `Debug`, so the
-    /// usual `Result::unwrap_err` chain blows up on the `T:
-    /// Debug` bound. Local helper unwraps the `Err` arm without
-    /// needing the `Ok` arm to be printable.
-    fn expect_err(result: Result<Box<dyn SnesCartridge>, BuildError>) -> BuildError {
+    /// `SnesCartridge` does not impl `Debug`, so the usual
+    /// `Result::unwrap_err` chain blows up on the `T: Debug` bound.
+    /// Local helper unwraps the `Err` arm without needing the `Ok`
+    /// arm to be printable.
+    fn expect_err(result: Result<Box<SnesCartridge>, BuildError>) -> BuildError {
         match result {
             Ok(_) => panic!("expected BuildError, got Ok"),
             Err(e) => e,
@@ -1096,7 +1084,7 @@ mod tests {
         // round-trip; an 8 KiB buffer (the header value) would
         // silently drop the write and read back 0.
         cart.write_sram(0x7FFF, 0xCC);
-        assert_eq!(cart.read_sram(0x7FFF), 0xCC);
+        assert_eq!(cart.read_sram(0x7FFF, 0), 0xCC);
     }
 
     #[test]
@@ -1106,10 +1094,10 @@ mod tests {
             .with_sram(vec![0xAB; 2048])
             .build()
             .expect("with_sram builds");
-        assert_eq!(cart.read_sram(0), 0xAB);
-        assert_eq!(cart.read_sram(2047), 0xAB);
+        assert_eq!(cart.read_sram(0, 0), 0xAB);
+        assert_eq!(cart.read_sram(2047, 0), 0xAB);
         // One byte past the buffer end -> out-of-bounds -> 0.
-        assert_eq!(cart.read_sram(2048), 0);
+        assert_eq!(cart.read_sram(2048, 0), 0);
     }
 
     #[test]
@@ -1462,8 +1450,8 @@ mod tests {
         srm[0x40] = 0x5A;
         srm[0x7FFE] = 0x42;
         cart.restore_sram(&srm);
-        assert_eq!(cart.read_chip(SA1_CHIP_ID, base + 0x40, 0), 0x5A);
-        assert_eq!(cart.read_chip(SA1_CHIP_ID, base + 0x7FFE, 0), 0x42);
+        assert_eq!(cart.read_chip(SA1_CHIP_ID, base + 0x40, 0, 0), 0x5A);
+        assert_eq!(cart.read_chip(SA1_CHIP_ID, base + 0x7FFE, 0, 0), 0x42);
         assert_eq!(cart.sram()[0x40], 0x5A, "restored bytes surface in `.srm`");
     }
 
@@ -1480,7 +1468,7 @@ mod tests {
         let base = crate::cartridge::SA1_BWRAM_LINEAR_BASE;
         cart.write_chip(SA1_CHIP_ID, base, 0x99, 0);
         // The BW-RAM still works as RAM...
-        assert_eq!(cart.read_chip(SA1_CHIP_ID, base, 0), 0x99);
+        assert_eq!(cart.read_chip(SA1_CHIP_ID, base, 0, 0), 0x99);
         // ...but the write does not surface in `.srm` (no battery to persist it).
         assert_eq!(
             cart.sram().first().copied(),
@@ -1515,7 +1503,7 @@ mod tests {
     /// `(chip_id, chip_address)` pair the bus would hand `read_chip`/`write_chip`,
     /// i.e. exercise the real S-CPU window, not a hand-computed base.
     #[cfg(feature = "chip-cx4")]
-    fn scpu_chip_addr(cart: &dyn SnesCartridge, addr24: u32) -> (u8, u32) {
+    fn scpu_chip_addr(cart: &SnesCartridge, addr24: u32) -> (u8, u32) {
         let r = cart.map_plan().resolve(addr24).expect("address maps");
         match cart.map_plan().slots[r.slot_index as usize].target {
             crate::cartridge::MapTarget::ChipMmio { chip_id, base } => {
@@ -1593,10 +1581,10 @@ mod tests {
         // A write through the $70:0000 S-CPU window round-trips and reaches
         // `.srm`; $71:0000 (8 KiB into the linear window, past the 8 KiB buffer)
         // folds back to offset 0 inside the chip.
-        let (id, a) = scpu_chip_addr(&*cart, 0x70_0000);
+        let (id, a) = scpu_chip_addr(&cart, 0x70_0000);
         cart.write_chip(id, a, 0xAB, 0);
-        let (id, a) = scpu_chip_addr(&*cart, 0x70_0000);
-        assert_eq!(cart.read_chip(id, a, 0), 0xAB);
+        let (id, a) = scpu_chip_addr(&cart, 0x70_0000);
+        assert_eq!(cart.read_chip(id, a, 0, 0), 0xAB);
         assert_eq!(cart.sram()[0], 0xAB, "S-CPU write reaches `.srm`");
 
         // A loaded `.srm` routes back into the chip's SRAM, readable again.
@@ -1604,10 +1592,10 @@ mod tests {
         srm[0x40] = 0x5A;
         srm[0x1FFF] = 0x42;
         cart.restore_sram(&srm);
-        let (id, a) = scpu_chip_addr(&*cart, 0x70_0040);
-        assert_eq!(cart.read_chip(id, a, 0), 0x5A);
-        let (id, a) = scpu_chip_addr(&*cart, 0x70_1FFF);
-        assert_eq!(cart.read_chip(id, a, 0), 0x42);
+        let (id, a) = scpu_chip_addr(&cart, 0x70_0040);
+        assert_eq!(cart.read_chip(id, a, 0, 0), 0x5A);
+        let (id, a) = scpu_chip_addr(&cart, 0x70_1FFF);
+        assert_eq!(cart.read_chip(id, a, 0, 0), 0x42);
     }
 
     // -- manifest chips[] instantiation via the factory ------------------
@@ -1717,7 +1705,7 @@ mod tests {
         assert_eq!(manifest.core, "snes1");
         assert_eq!(manifest.version, SUPPORTED_MANIFEST_VERSION);
         assert_eq!(manifest.mapping.preset, "hirom");
-        assert!(manifest.mapping.fastrom);
+        assert!(manifest.mapping.knobs.fastrom);
         assert_eq!(manifest.mapping.sram_size, 2048);
         assert!(manifest.chips.is_empty());
         // Canonical post-strip digest + size.
@@ -1783,7 +1771,7 @@ mod tests {
         let manifest = detected_manifest(&rom);
         assert_eq!(manifest.mapping.preset, "lorom");
         assert_eq!(manifest.mapping.sram_size, 0);
-        assert!(!manifest.mapping.fastrom);
+        assert!(!manifest.mapping.knobs.fastrom);
         assert!(manifest.rom.title.is_none());
         assert!(manifest.rom.region.is_none());
         assert!(manifest.metadata.is_none());

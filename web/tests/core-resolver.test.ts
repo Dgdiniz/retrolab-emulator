@@ -186,7 +186,8 @@ describe('deriveRomIdentity', () => {
   it('hashes bytes + reads getRomInfo().title for snes1', () => {
     const emu: RomIdentitySource = {
       getRomInfo: () => ({ title: 'SUPER MARIOKART' }),
-      // snes1 must NOT consult these even if a stray method exists.
+      // snes1 must NOT consult its cartridge hash: its stores are keyed
+      // by the byte hash.
       getCartridgeHash: () => 'should-be-ignored',
     }
     const id = deriveRomIdentity(emu, data, 'smk.sfc', 'snes1')

@@ -1,13 +1,12 @@
 //! DSP-1 coprocessor cartridge: the register window and its backends.
 //!
-//! Wraps a [`PlainCartridge`] (the ROM + battery SRAM) with the DSP-1's
-//! DR/SR register window. Behind it runs either the firmware-free HLE
-//! or, with the `nec-lle` feature, an emulated NEC uPD7725 (the
-//! `upd7725` crate) running a real DSP-1 firmware dump. The
-//! cartridge owns its combined [`MapPlan`], the stock ROM/SRAM slots
-//! *plus* the DSP register window, so the bus dispatches ROM reads to
-//! the inner cartridge and the DSP register window here, via
-//! [`SnesCartridge::read_chip`] / [`SnesCartridge::write_chip`].
+//! The DSP-1 is a chip of the cartridge's chip set at [`DSP1_CHIP_ID`],
+//! behind its DR/SR register window. Behind it runs either the
+//! firmware-free HLE or, with the `nec-lle` feature, an emulated NEC
+//! uPD7725 (the `upd7725` crate) running a real DSP-1 firmware dump. The
+//! cartridge's combined [`MapPlan`](super::MapPlan) holds the stock
+//! ROM/SRAM slots *plus* the DSP register window, so the bus dispatches
+//! ROM reads to the ROM and the DSP register window to the chip.
 //!
 //! **Timing.** The uPD7725 runs at 8 MHz, asynchronous to the 21.477 MHz
 //! SNES master clock. Rather than co-scheduling, the chip is driven by
@@ -36,7 +35,7 @@
 //!
 //! **Backend selection.** The DSP-1 ships as a [`Dsp1Chip`] implementing
 //! the generic [`Coprocessor`] trait, placed at [`DSP1_CHIP_ID`] in a
-//! [`ComposableCartridge`]'s chip set. Three backends sit behind the same
+//! [`SnesCartridge`](super::SnesCartridge)'s chip set. Three backends sit behind the same
 //! register window:
 //!
 //! - **LLE**: a real uPD7725 (the `upd7725` crate, built only with the
@@ -48,14 +47,12 @@
 //!   `SR` always reports ready and `DR` reads back `0`, so a status-poll
 //!   loop never hard-hangs (the game still misbehaves).
 
-use std::sync::Arc;
-
 #[cfg(feature = "nec-lle")]
 use retro_core::audio::IntegerRateConverter;
 #[cfg(feature = "nec-lle")]
 use retro_core::cartridge::ChipRegister;
 use retro_core::cartridge::{
-    ChipSet, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 #[cfg(feature = "nec-lle")]
 use retro_core::cpu::Resettable;
@@ -69,7 +66,7 @@ use crate::savestate::Dsp1State;
 #[cfg(feature = "nec-lle")]
 use super::firmware::{ByteOrder, Dsp1Firmware, Dsp1Revision};
 use super::header::SnesHeader;
-use super::{BusSpeed, ComposableCartridge, MapSlot, MapTarget, PlainCartridge};
+use super::{BusSpeed, MapSlot, MapTarget};
 
 /// `chip_id` the bus dispatch carries for the DSP-1. Matches the
 /// manifest convention (`chips[].id = 1`). A second NEC chip (ST010, ...)
@@ -236,7 +233,7 @@ enum Backend {
 /// The DSP-1 coprocessor as a [`Coprocessor`].
 ///
 /// Holds *only* the coprocessor state behind the DR/SR window, the
-/// ROM/SRAM live in the [`ComposableCartridge`] whose chip set hosts this
+/// ROM/SRAM live in the [`SnesCartridge`](super::SnesCartridge) whose chip set hosts this
 /// chip. The backend is either a firmware-running uPD7725 (LLE) or the idle
 /// stub; the firmware-free HLE backend lives in
 /// [`Dsp1Hle`](super::dsp1_hle::Dsp1Hle) and is selected by the builder.
@@ -614,59 +611,6 @@ impl Coprocessor for Dsp1Chip {
     }
 }
 
-/// Assemble a single-coprocessor cartridge: place `chip` at
-/// [`DSP1_CHIP_ID`] in a fresh [`ChipSet`] and re-home the plain
-/// cartridge's ROM / SRAM / combined map plan behind it. The ROM moves
-/// into an `Arc<[u8]>` so a future ROM-consuming chip can share the image.
-fn compose_single(inner: PlainCartridge, chip: impl Coprocessor + 'static) -> ComposableCartridge {
-    let (rom, sram, plan) = inner.into_parts();
-    let mut chips = ChipSet::default();
-    chips.insert(DSP1_CHIP_ID, Box::new(chip));
-    ComposableCartridge::new(Arc::from(rom.into_boxed_slice()), sram, plan, chips)
-}
-
-/// DSP-1 entry point into the composable-cartridge machinery.
-///
-/// `Dsp1Cartridge` is not a cartridge type of its own, it's a thin
-/// constructor namespace that pairs a [`PlainCartridge`] (ROM + battery
-/// SRAM + the combined map plan, including the DSP register window) with
-/// a DSP-1 backend placed at [`DSP1_CHIP_ID`] inside a
-/// [`ComposableCartridge`]: a [`Dsp1Chip`] for `new_lle(...)` and
-/// `new_idle(...)`, the [`Dsp1Hle`](super::dsp1_hle::Dsp1Hle) for
-/// `new_hle(...)`. The constructors build a one-chip DSP-1 cartridge
-/// without the caller assembling the [`ChipSet`] itself.
-pub struct Dsp1Cartridge;
-
-impl Dsp1Cartridge {
-    /// Build a DSP-1 LLE cartridge. `inner` must carry the *combined* map
-    /// plan (ROM + SRAM + the DSP register window); `sr_select_bit` comes
-    /// from the resolved [`Dsp1Layout`].
-    #[cfg(feature = "nec-lle")]
-    pub fn new_lle(
-        inner: PlainCartridge,
-        firmware: &Dsp1Firmware,
-        master_clock_hz: u64,
-        sr_select_bit: u32,
-    ) -> ComposableCartridge {
-        compose_single(
-            inner,
-            Dsp1Chip::new_lle(firmware, master_clock_hz, sr_select_bit),
-        )
-    }
-
-    /// Build a DSP-1 HLE cartridge (no firmware required).
-    /// `sr_select_bit` comes from the resolved [`Dsp1Layout`] so the
-    /// DR/SR decode matches the mapping the LLE backend would have used.
-    pub fn new_hle(inner: PlainCartridge, sr_select_bit: u32) -> ComposableCartridge {
-        compose_single(inner, super::dsp1_hle::Dsp1Hle::new(sr_select_bit))
-    }
-
-    /// Build a DSP-1 idle-stub cartridge (no firmware available).
-    pub fn new_idle(inner: PlainCartridge, sr_select_bit: u32) -> ComposableCartridge {
-        compose_single(inner, Dsp1Chip::new_idle(sr_select_bit))
-    }
-}
-
 /// `true` for the chip-kind strings that denote a DSP-1 (the only NEC-DSP
 /// coprocessor wired today). DSP-2/3/4 share the silicon but need their own
 /// firmware + mapping, so they are not matched here. Shared by the cartridge
@@ -758,7 +702,9 @@ mod tests {
     use crate::cartridge::firmware::ByteOrder;
     use crate::cartridge::MapTarget;
     #[cfg(feature = "nec-lle")]
-    use crate::cartridge::{BusSpeed, MapPlan, MapSlot, SnesCartridge};
+    use crate::cartridge::{BusSpeed, MapPlan, MapSlot};
+    #[cfg(feature = "nec-lle")]
+    use retro_core::cartridge::Cartridge;
 
     // Local opcode builders (mirror the upd7725 crate's test helpers).
     #[cfg(feature = "nec-lle")]
@@ -923,18 +869,26 @@ mod tests {
 
     #[cfg(feature = "nec-lle")]
     #[test]
-    fn rom_reads_delegate_to_inner_cartridge() {
+    fn a_dsp1_cartridge_reads_its_rom_through_the_plan() {
         let mut rom = vec![0u8; 0x8000];
         rom[0x10] = 0x42;
-        let inner = PlainCartridge::new(rom, 0, plan());
-        let cart = Dsp1Cartridge::new_lle(
-            inner,
-            &firmware(vec![0u32; 2048]),
-            DEFAULT_MASTER_CLOCK_HZ,
-            0x4000,
+        let mut chips = retro_core::cartridge::ChipSet::default();
+        chips.insert(
+            DSP1_CHIP_ID,
+            Box::new(Dsp1Chip::new_lle(
+                &firmware(vec![0u32; 2048]),
+                DEFAULT_MASTER_CLOCK_HZ,
+                0x4000,
+            )),
         );
-        assert_eq!(cart.read_rom(0x10), 0x42);
+        let mut cart = crate::cartridge::test_cartridge_with_chips(rom, plan(), chips);
+        assert_eq!(cart.read_bus(0x80_8010, 0, 0), 0x42);
         assert_eq!(cart.map_plan().name, "dsp1-test");
+        assert_eq!(
+            cart.coprocessor_labels().len(),
+            1,
+            "the DSP-1 is the one chip"
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
-//! Stock map-plan generators for the composable Genesis cartridges.
+//! Stock map-plan generators for the Genesis cartridges.
 //!
 //! A preset builds the [`MapPlan`] for one class of cartridge; the
 //! [`builder`](super::builder) then attaches the matching chips,
 //! observers, and SRAM configuration to a
-//! [`ComposableCartridge`](super::ComposableCartridge). A plain cartridge
-//! built by detection needs no preset: [`PlainCartridge`](super::PlainCartridge)
-//! builds its own plan ([`plain_plan`] serves a manifest's `plain` preset).
+//! [`GenesisCartridge`](super::GenesisCartridge). A plain cartridge, built
+//! by detection or from a manifest's `plain` preset, is [`plain_plan`] with
+//! no chip.
 //!
 //! Slot ordering matters: [`MapPlan::resolve`] is first-wins, so a preset
 //! pushes the *specific* windows (chip MMIO, SRAM) ahead of the broad ROM
@@ -82,10 +82,8 @@ fn sram_slot(start: u32, len: u32) -> MapSlot {
     )
 }
 
-/// Plan for a plain cartridge (ROM + optional stock SRAM, no coprocessor).
-/// [`PlainCartridge`](super::PlainCartridge) builds this same shape
-/// internally; this free function exists so the manifest path can request a
-/// plain plan without going through the concrete cartridge.
+/// Plan for a plain cartridge (ROM + optional stock SRAM, no coprocessor):
+/// the SRAM window ahead of the mirrored ROM window it overlaps.
 pub fn plain_plan(rom_len: usize, sram: Option<(u32, u32)>) -> MapPlan {
     let mut plan = MapPlan::new("plain");
     if let Some((start, len)) = sram {

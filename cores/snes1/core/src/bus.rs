@@ -22,7 +22,7 @@
 //!   which skip the A-bus decoder, are stubs nothing calls: a read
 //!   returns 0 and a write is dropped.
 //!
-//! Cartridge mapping is delegated to a `Box<dyn SnesCartridge>`
+//! Cartridge mapping is delegated to a [`SnesCartridge`]
 //! installed once via [`SnesBus::install_cartridge`]. The bus walks
 //! the cartridge's [`MapPlan`] at install time and rewrites the
 //! covered pages to [`PageHandler::Cartridge`] under a *first-wins*
@@ -82,7 +82,7 @@ mod wmdata;
 use std::sync::Arc;
 
 use retro_core::capture::{CaptureRecording, WriteOrigin};
-use retro_core::cartridge::SourcePlace;
+use retro_core::cartridge::{Cartridge, SlotShape, SourcePlace};
 use retro_core::cpu::Addressable;
 use retro_core::debug::{Access, AccessLog};
 
@@ -220,7 +220,7 @@ pub struct SnesBus {
     /// rewritten by [`SnesBus::apply_memsel`] whenever MEMSEL
     /// flips. Pages outside this list are unaffected by MEMSEL.
     fastrom_pages: Vec<u16>,
-    cartridge: Option<Box<dyn SnesCartridge>>,
+    cartridge: Option<Box<SnesCartridge>>,
     /// Cached pointer to the cartridge's map plan. `Arc` keeps the
     /// plan alive even if the cartridge swaps out its own internal
     /// state, and lets the bus borrow slot metadata without locking
@@ -1146,7 +1146,7 @@ impl SnesBus {
     /// borrow slot metadata during dispatch without locking down the
     /// cartridge for write access, important because chip reads
     /// take `&mut self`.
-    pub fn install_cartridge(&mut self, cartridge: Box<dyn SnesCartridge>) {
+    pub fn install_cartridge(&mut self, cartridge: Box<SnesCartridge>) {
         let plan = Arc::new(cartridge.map_plan().clone());
         for (slot_index, slot) in plan.slots.iter().enumerate() {
             let slot_index = slot_index as u16;
@@ -1293,12 +1293,12 @@ impl SnesBus {
     }
 
     /// Borrow the installed cartridge, if any.
-    pub fn cartridge_ref(&self) -> Option<&dyn SnesCartridge> {
+    pub fn cartridge(&self) -> Option<&SnesCartridge> {
         self.cartridge.as_deref()
     }
 
     /// Mutable borrow of the installed cartridge, if any.
-    pub fn cartridge_mut(&mut self) -> Option<&mut (dyn SnesCartridge + 'static)> {
+    pub fn cartridge_mut(&mut self) -> Option<&mut SnesCartridge> {
         self.cartridge.as_deref_mut()
     }
 
@@ -1313,37 +1313,42 @@ impl SnesBus {
     /// cartridge's map plan as they stand, the way a read of it is routed:
     /// work RAM (`$7E-$7F`, and the low 8 KiB of a system bank), a byte of
     /// the cartridge's ROM image (the image the cartridge holds: the copier
-    /// header stripped, padded to a power of two), the cartridge's RAM, a
-    /// coprocessor's window, or nothing it can name. Pure: it reads the
-    /// mapping and changes nothing.
+    /// header stripped, padded to a power of two; nothing past it), the
+    /// cartridge's RAM, a coprocessor's window, or nothing it can name.
+    /// Pure: it reads the mapping and changes nothing.
     ///
-    /// The Super FX's and the Cx4's ROM windows reach the image through the
-    /// chip with the plain ROM geometry, so they name the image's byte; the
-    /// SA-1's, the S-DD1's and the SPC7110's ROM windows go through the
-    /// chip's own banks, so they name the coprocessor. The Super FX's and
-    /// the Cx4's cartridge RAM, the SA-1's BW-RAM and the SPC7110's SRAM
-    /// name the cartridge's RAM.
+    /// A coprocessor's window answers as its chip says
+    /// ([`Coprocessor::source_place`](retro_core::cartridge::Coprocessor::source_place)):
+    /// the Super FX's and the Cx4's ROM windows reach the image with the
+    /// plain ROM geometry, so they name the image's byte; the SA-1's, the
+    /// S-DD1's and the SPC7110's ROM windows go through the chip's own
+    /// banks, so they name the coprocessor. The Super FX's and the Cx4's
+    /// cartridge RAM, the SA-1's BW-RAM and the SPC7110's SRAM name the
+    /// cartridge's RAM.
     pub fn source_place(&self, address: u32) -> SourcePlace {
         let addr24 = address & 0x00FF_FFFF;
         let low = addr24 & 0xFFFF;
-        let plan_place = || match self.cartridge_plan.as_deref() {
-            Some(plan) => plan
-                .resolve(addr24)
-                .map_or(SourcePlace::Unknown, |resolved| {
-                    let slot = &plan.slots[resolved.slot_index as usize];
-                    target_place(slot.target, resolved.target_offset)
-                }),
-            None => SourcePlace::Unknown,
+        let plan_place = || match (self.cartridge_plan.as_deref(), self.cartridge.as_deref()) {
+            (Some(plan), Some(cart)) => {
+                plan.resolve(addr24)
+                    .map_or(SourcePlace::Unknown, |resolved| {
+                        let slot = &plan.slots[resolved.slot_index as usize];
+                        cart.target_source_place(slot.target, resolved.target_offset)
+                    })
+            }
+            _ => SourcePlace::Unknown,
         };
         match self.page_table[(addr24 >> 12) as usize] {
             PageHandler::Wram | PageHandler::WramMirror => SourcePlace::WorkRam,
             PageHandler::Cartridge { slot_index } => {
-                let Some(plan) = self.cartridge_plan.as_deref() else {
+                let (Some(plan), Some(cart)) =
+                    (self.cartridge_plan.as_deref(), self.cartridge.as_deref())
+                else {
                     return SourcePlace::Unknown;
                 };
                 match plan.slots.get(usize::from(slot_index)) {
                     Some(slot) if slot.contains(addr24) => {
-                        target_place(slot.target, slot.compute_target_offset(addr24))
+                        cart.target_source_place(slot.target, slot.compute_target_offset(addr24))
                     }
                     _ => SourcePlace::Unknown,
                 }
@@ -1368,7 +1373,7 @@ impl SnesBus {
     /// Work RAM and its mirror give their bytes, and the cartridge's ROM
     /// and RAM theirs, routed through the page table and the map plan as a
     /// read is. A coprocessor's window answers through the chip's own peek
-    /// ([`SnesCartridge::peek_chip`]), which gives the ROM or RAM behind it
+    /// ([`Cartridge::peek_chip`]), which gives the ROM or RAM behind it
     /// and nothing for a register; where the chip cannot answer, and on an
     /// unmapped page, the peek gives the open-bus value, as a read of
     /// nothing would. The B-bus and CPU register pages read 0, because a
@@ -1421,15 +1426,7 @@ impl SnesBus {
         if !slot.contains(addr24) {
             return self.mdr;
         }
-        let offset = slot.compute_target_offset(addr24);
-        match slot.target {
-            MapTarget::Rom { base_offset } => cart.read_rom(base_offset + offset),
-            MapTarget::Sram { base_offset } => cart.read_sram(base_offset + offset),
-            MapTarget::ChipMmio { chip_id, base } => {
-                cart.peek_chip(chip_id, base + offset).unwrap_or(self.mdr)
-            }
-            MapTarget::OpenBus => self.mdr,
-        }
+        cart.peek_target(slot.target, slot.compute_target_offset(addr24), self.mdr)
     }
 
     /// Battery SRAM bytes of the installed cartridge, or `None` when no
@@ -1879,19 +1876,9 @@ impl SnesBus {
         let mdr = self.mdr;
         let chip_cycle = self.chip_access_cycle();
         let target = slot.target;
-        let value = {
-            let cart = match self.cartridge.as_mut() {
-                Some(c) => c,
-                None => return mdr,
-            };
-            match target {
-                MapTarget::Rom { base_offset } => cart.read_rom(base_offset + target_offset),
-                MapTarget::Sram { base_offset } => cart.read_sram(base_offset + target_offset),
-                MapTarget::ChipMmio { chip_id, base } => {
-                    cart.read_chip(chip_id, base + target_offset, chip_cycle)
-                }
-                MapTarget::OpenBus => mdr,
-            }
+        let value = match self.cartridge.as_mut() {
+            Some(cart) => cart.read_target(target, target_offset, chip_cycle, mdr),
+            None => return mdr,
         };
         if self.coprocessor_trace.is_some() {
             if let MapTarget::ChipMmio { base, .. } = target {
@@ -1916,24 +1903,12 @@ impl SnesBus {
         let target_offset = slot.compute_target_offset(addr24);
         let chip_cycle = self.chip_access_cycle();
         let target = slot.target;
-        {
-            let cart = match self.cartridge.as_mut() {
-                Some(c) => c,
-                None => return,
-            };
-            match target {
-                // Cartridge ROM is read-only; SNES ROM "writes" are how
-                // some chips (SA-1, SuperFX) signal their MMIO via the
-                // ChipMmio target rather than a Rom write.
-                MapTarget::Rom { .. } => {}
-                MapTarget::Sram { base_offset } => {
-                    cart.write_sram(base_offset + target_offset, value)
-                }
-                MapTarget::ChipMmio { chip_id, base } => {
-                    cart.write_chip(chip_id, base + target_offset, value, chip_cycle)
-                }
-                MapTarget::OpenBus => {}
-            }
+        // Cartridge ROM is read-only; SNES ROM "writes" are how some chips
+        // (SA-1, SuperFX) signal their MMIO via the ChipMmio target rather
+        // than a Rom write.
+        match self.cartridge.as_mut() {
+            Some(cart) => cart.write_target(target, target_offset, value, chip_cycle),
+            None => return,
         }
         if self.coprocessor_trace.is_some() {
             if let MapTarget::ChipMmio { base, .. } = target {
@@ -2056,31 +2031,6 @@ impl Addressable for SnesPeekBus<'_> {
     }
 
     fn write(&mut self, _addr: u32, _value: u8) {}
-}
-
-/// What a map-plan target holds at `offset` into its slot.
-fn target_place(target: MapTarget, offset: u32) -> SourcePlace {
-    use crate::cartridge::{
-        CX4_RAM_BASE, CX4_ROM_BASE, SA1_BWRAM_BASE, SA1_BWRAM_LINEAR_BASE, SA1_CHIP_ID,
-        SPC7110_CHIP_ID, SPC7110_SRAM_BASE, SUPERFX_CHIP_ID, SUPERFX_RAM_BASE, SUPERFX_ROM_BASE,
-    };
-    match target {
-        MapTarget::Rom { base_offset } => SourcePlace::Rom(base_offset.wrapping_add(offset)),
-        MapTarget::Sram { .. } => SourcePlace::CartridgeRam,
-        MapTarget::ChipMmio { chip_id, base } => match (chip_id, base) {
-            // The chip address is the base plus the slot offset; these two
-            // chips keep the plain ROM geometry, so the offset is the image's.
-            (SUPERFX_CHIP_ID, SUPERFX_ROM_BASE) | (CX4_CHIP_ID, CX4_ROM_BASE) => {
-                SourcePlace::Rom(offset)
-            }
-            (SUPERFX_CHIP_ID, SUPERFX_RAM_BASE)
-            | (CX4_CHIP_ID, CX4_RAM_BASE)
-            | (SA1_CHIP_ID, SA1_BWRAM_BASE | SA1_BWRAM_LINEAR_BASE)
-            | (SPC7110_CHIP_ID, SPC7110_SRAM_BASE) => SourcePlace::CartridgeRam,
-            _ => SourcePlace::Coprocessor,
-        },
-        MapTarget::OpenBus => SourcePlace::Unknown,
-    }
 }
 
 /// Build the default page table: WRAM (`$7E-$7F`), WRAM mirror in
@@ -2479,7 +2429,7 @@ mod tests {
 
     // -- Walker / cartridge / speed-table tests -------------
 
-    use crate::cartridge::{BusSpeed, MapPlan, MapSlot, MapTarget, PlainCartridge};
+    use crate::cartridge::{test_cartridge, BusSpeed, MapPlan, MapSlot, MapTarget};
 
     fn lorom_like_plan(speed: BusSpeed) -> MapPlan {
         let mut plan = MapPlan::new("lorom-like");
@@ -2499,7 +2449,7 @@ mod tests {
     #[test]
     fn walker_promotes_open_bus_to_cartridge() {
         let plan = lorom_like_plan(BusSpeed::Fast);
-        let cart = PlainCartridge::new(ramp_rom(0x8000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x8000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
 
@@ -2529,7 +2479,7 @@ mod tests {
             MapTarget::Rom { base_offset: 0 },
             BusSpeed::Fast,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x100), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x100), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
 
@@ -2576,7 +2526,7 @@ mod tests {
             },
             BusSpeed::Slow,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x10000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x10000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
 
@@ -2622,7 +2572,7 @@ mod tests {
 
     #[test]
     fn speed_table_after_install_uses_slot_speed() {
-        let cart = PlainCartridge::new(ramp_rom(0x8000), 0, lorom_like_plan(BusSpeed::XSlow));
+        let cart = test_cartridge(ramp_rom(0x8000), 0, lorom_like_plan(BusSpeed::XSlow));
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         // Every promoted page takes the slot's declared speed, XSlow
@@ -2640,7 +2590,7 @@ mod tests {
         // The slot's `compute_target_offset` returns
         // (addr - $8000) & 0xFFFF, which is what we want when the
         // ROM is exactly 32 KiB and the slot is a single bank.
-        let cart = PlainCartridge::new(ramp_rom(0x8000), 0, lorom_like_plan(BusSpeed::Fast));
+        let cart = test_cartridge(ramp_rom(0x8000), 0, lorom_like_plan(BusSpeed::Fast));
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         // ROM[0] = 0x00 at $80:8000.
@@ -2661,7 +2611,7 @@ mod tests {
             MapTarget::Sram { base_offset: 0 },
             BusSpeed::Slow,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0), 0x8000, plan);
+        let cart = test_cartridge(ramp_rom(0), 0x8000, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         bus.write(0x70_0000, 0xAB);
@@ -2679,7 +2629,7 @@ mod tests {
             MapTarget::OpenBus,
             BusSpeed::Fast,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x8000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x8000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         // The page IS promoted (handler became Cartridge), but the
@@ -2741,7 +2691,7 @@ mod tests {
     }
 
     fn install_fastrom_lorom(bus: &mut SnesBus) {
-        let cart = PlainCartridge::new(ramp_rom(0x40 * 0x8000), 0, fastrom_lorom_like_plan());
+        let cart = test_cartridge(ramp_rom(0x40 * 0x8000), 0, fastrom_lorom_like_plan());
         bus.install_cartridge(Box::new(cart));
     }
 
@@ -2788,7 +2738,7 @@ mod tests {
             MapTarget::Rom { base_offset: 0 },
             BusSpeed::Fast,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x40_0000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x40_0000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         // Boot: MEMSEL=0 -> pinned to Slow (8).
@@ -2814,7 +2764,7 @@ mod tests {
             // hardware, so MEMSEL must be a no-op here.
             BusSpeed::Slow,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x40 * 0x8000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x40 * 0x8000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         assert_eq!(bus.cycles_for(0x80_8000), 8);
@@ -2834,7 +2784,7 @@ mod tests {
             MapTarget::Rom { base_offset: 0 },
             BusSpeed::Fast,
         ));
-        let cart = PlainCartridge::new(ramp_rom(0x20 * 0x8000), 0, plan);
+        let cart = test_cartridge(ramp_rom(0x20 * 0x8000), 0, plan);
         let mut bus = SnesBus::new();
         bus.install_cartridge(Box::new(cart));
         // The slot's declared Fast speed is honoured at install
@@ -3161,7 +3111,8 @@ mod tests {
     mod expansion {
         use crate::bus::SnesBus;
         use crate::cartridge::{
-            BusSpeed, ComposableCartridge, MapPlan, MapSlot, MapTarget, PlainCartridge,
+            test_cartridge, test_cartridge_with_chips, BusSpeed, MapPlan, MapSlot, MapTarget,
+            SnesCartridge,
         };
         use retro_core::cartridge::{
             ChipSet, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
@@ -3235,7 +3186,7 @@ mod tests {
         /// expansion-MMIO window `$00-$3F`/`$80-$BF : $4800-$480F` (a chip
         /// window inside the CpuMmio page the walker can't promote) and
         /// *observes* the DMA registers `$4300-$437F`.
-        fn cart_with_expansion_chip(log: Arc<Mutex<Log>>) -> Box<ComposableCartridge> {
+        fn cart_with_expansion_chip(log: Arc<Mutex<Log>>) -> Box<SnesCartridge> {
             let mut plan = MapPlan::new("expansion-test");
             // Stock ROM window so the cartridge dispatches normally elsewhere.
             plan.push(MapSlot::new(
@@ -3269,12 +3220,7 @@ mod tests {
             let mut chips = ChipSet::default();
             chips.insert(1, spy_chip(log));
             chips.add_observer(0x4300..=0x437F, 1);
-            Box::new(ComposableCartridge::new(
-                Arc::from(vec![0u8; 0x8000].into_boxed_slice()),
-                Vec::new(),
-                plan,
-                chips,
-            ))
+            Box::new(test_cartridge_with_chips(vec![0u8; 0x8000], plan, chips))
         }
 
         #[test]
@@ -3334,7 +3280,7 @@ mod tests {
                 MapTarget::Rom { base_offset: 0 },
                 BusSpeed::Fast,
             ));
-            let cart = PlainCartridge::new(vec![0x11u8; 0x8000], 0, plan);
+            let cart = test_cartridge(vec![0x11u8; 0x8000], 0, plan);
             let mut bus = SnesBus::new();
             bus.install_cartridge(Box::new(cart));
 
@@ -3363,7 +3309,7 @@ mod tests {
         /// window `$00-$3F`/`$80-$BF : $2200-$220F`, a chip window inside the
         /// B-bus page ($2000-$2FFF) the page-table walker can't promote. This
         /// is the SA-1 register-file seam.
-        fn cart_with_bbus_chip(log: Arc<Mutex<Log>>) -> Box<ComposableCartridge> {
+        fn cart_with_bbus_chip(log: Arc<Mutex<Log>>) -> Box<SnesCartridge> {
             let mut plan = MapPlan::new("bbus-test");
             plan.push(MapSlot::new(
                 0x80..=0xFF,
@@ -3387,12 +3333,7 @@ mod tests {
             }
             let mut chips = ChipSet::default();
             chips.insert(1, spy_chip(log));
-            Box::new(ComposableCartridge::new(
-                Arc::from(vec![0u8; 0x8000].into_boxed_slice()),
-                Vec::new(),
-                plan,
-                chips,
-            ))
+            Box::new(test_cartridge_with_chips(vec![0u8; 0x8000], plan, chips))
         }
 
         #[test]
@@ -3460,7 +3401,7 @@ mod tests {
                 BusSpeed::Fast,
             ));
             let mut plain_bus = SnesBus::new();
-            plain_bus.install_cartridge(Box::new(PlainCartridge::new(vec![0u8; 0x8000], 0, plan)));
+            plain_bus.install_cartridge(Box::new(test_cartridge(vec![0u8; 0x8000], 0, plan)));
             assert!(
                 !plain_bus.cart_runs_burst_cpu(),
                 "a plain cart keeps its current cadence"
@@ -3480,11 +3421,7 @@ mod tests {
                 BusSpeed::Slow,
             ));
             let mut sfx_bus = SnesBus::new();
-            sfx_bus.install_cartridge(Box::new(PlainCartridge::new(
-                vec![0u8; 0x8000],
-                0,
-                sfx_plan,
-            )));
+            sfx_bus.install_cartridge(Box::new(test_cartridge(vec![0u8; 0x8000], 0, sfx_plan)));
             assert!(
                 sfx_bus.cart_runs_burst_cpu(),
                 "a $3000-$34FF MMIO claimer (Super FX) runs a burst CPU"
@@ -3503,11 +3440,7 @@ mod tests {
                 BusSpeed::Slow,
             ));
             let mut cx4_bus = SnesBus::new();
-            cx4_bus.install_cartridge(Box::new(PlainCartridge::new(
-                vec![0u8; 0x8000],
-                0,
-                cx4_plan,
-            )));
+            cx4_bus.install_cartridge(Box::new(test_cartridge(vec![0u8; 0x8000], 0, cx4_plan)));
             assert!(
                 cx4_bus.cart_runs_burst_cpu(),
                 "a $6000-$7FFF MMIO claimer with the Cx4 chip_id runs a burst CPU"
@@ -3527,11 +3460,7 @@ mod tests {
                 BusSpeed::Slow,
             ));
             let mut spc_bus = SnesBus::new();
-            spc_bus.install_cartridge(Box::new(PlainCartridge::new(
-                vec![0u8; 0x8000],
-                0,
-                spc_plan,
-            )));
+            spc_bus.install_cartridge(Box::new(test_cartridge(vec![0u8; 0x8000], 0, spc_plan)));
             assert!(
                 !spc_bus.cart_runs_burst_cpu(),
                 "an SPC7110 SRAM window ($6000-$7FFF, other chip_id) is not a burst CPU"
@@ -3539,7 +3468,7 @@ mod tests {
         }
 
         /// A coprocessor whose S-CPU IRQ line is always asserted, to prove the
-        /// `has_irq()` chain (`Coprocessor` -> `ChipSet` -> `ComposableCartridge`
+        /// `has_irq()` chain (`Coprocessor` -> `ChipSet` -> `SnesCartridge`
         /// -> `SnesBus::cart_has_irq`) propagates end to end.
         struct AlwaysIrqChip {
             info: ExpansionChipInfo,
@@ -3598,9 +3527,8 @@ mod tests {
                 }),
             );
             let mut bus = SnesBus::new();
-            bus.install_cartridge(Box::new(ComposableCartridge::new(
-                Arc::from(vec![0u8; 0x8000].into_boxed_slice()),
-                Vec::new(),
+            bus.install_cartridge(Box::new(test_cartridge_with_chips(
+                vec![0u8; 0x8000],
                 plan,
                 chips,
             )));
@@ -3615,11 +3543,7 @@ mod tests {
                 BusSpeed::Fast,
             ));
             let mut plain_bus = SnesBus::new();
-            plain_bus.install_cartridge(Box::new(PlainCartridge::new(
-                vec![0u8; 0x8000],
-                0,
-                plain_plan,
-            )));
+            plain_bus.install_cartridge(Box::new(test_cartridge(vec![0u8; 0x8000], 0, plain_plan)));
             assert!(!plain_bus.cart_has_irq(), "a plain cart never asserts IRQ");
         }
     }

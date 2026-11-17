@@ -1,11 +1,16 @@
 //! Cartridge Performance Benchmarks
 //!
 //! Benchmarks for cartridge operations to ensure acceptable performance.
-//! Exercises the composable cartridge (`GenesisCartridge`) surface: bus
-//! reads/writes and the SRAM + coprocessor savestate path.
+//! Exercises the cartridge (`GenesisCartridge`) surface: bus reads/writes
+//! and the SRAM + coprocessor savestate path, and the 68000's own path to
+//! the cartridge through `AddressBus` (`Addressable::read`, `read_word` and
+//! `write`), which every instruction fetch takes.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use sg1_core::cartridge::composable::build_genesis_cartridge;
+use retro_core::cartridge::Cartridge;
+use retro_core::cpu::Addressable;
+use sg1_core::bus::AddressBus;
+use sg1_core::cartridge::build_genesis_cartridge;
 
 /// Genesis NTSC master clock, for rebinding coprocessor clocks on restore.
 const MASTER_CLOCK_HZ: u64 = 53_693_175;
@@ -57,7 +62,7 @@ fn bench_rom_read(c: &mut Criterion) {
                 b.iter(|| {
                     // Read from various addresses
                     for addr in (0..10000).step_by(100) {
-                        black_box(cart.read_addr(addr));
+                        black_box(cart.read_bus(addr, 0, 0xFF));
                     }
                 })
             },
@@ -76,7 +81,7 @@ fn bench_sram_write(c: &mut Criterion) {
             // Write 512 bytes to SRAM, one at each odd address of 1 KB
             for i in 0..512 {
                 let addr = 0x200001 + (i * 2); // Odd-byte addressing
-                cart.write_addr(addr, black_box((i & 0xFF) as u8));
+                cart.write_bus(addr, black_box((i & 0xFF) as u8), 0);
             }
         })
     });
@@ -89,7 +94,7 @@ fn bench_sram_read(c: &mut Criterion) {
     // Pre-fill SRAM
     for i in 0..512 {
         let addr = 0x200001 + (i * 2);
-        cart.write_addr(addr, (i & 0xFF) as u8);
+        cart.write_bus(addr, (i & 0xFF) as u8, 0);
     }
 
     c.bench_function("cartridge_sram_read", |b| {
@@ -97,7 +102,7 @@ fn bench_sram_read(c: &mut Criterion) {
             // Read 512 bytes from SRAM, one at each odd address of 1 KB
             for i in 0..512 {
                 let addr = 0x200001 + (i * 2);
-                black_box(cart.read_addr(addr));
+                black_box(cart.read_bus(addr, 0, 0xFF));
             }
         })
     });
@@ -110,7 +115,7 @@ fn bench_save_state(c: &mut Criterion) {
     // Write some data to SRAM
     for i in 0..100 {
         let addr = 0x200001 + (i * 2);
-        cart.write_addr(addr, (i & 0xFF) as u8);
+        cart.write_bus(addr, (i & 0xFF) as u8, 0);
     }
 
     c.bench_function("cartridge_save_state", |b| {
@@ -128,7 +133,7 @@ fn bench_load_state(c: &mut Criterion) {
     // Populate then snapshot the state we will restore each iteration.
     for i in 0..100 {
         let addr = 0x200001 + (i * 2);
-        cart.write_addr(addr, (i & 0xFF) as u8);
+        cart.write_bus(addr, (i & 0xFF) as u8, 0);
     }
     let sram = cart.sram().to_vec();
     let coprocessors = cart.coprocessors_savestate();
@@ -166,8 +171,70 @@ fn bench_set_save_ram(c: &mut Criterion) {
     });
 }
 
+/// A bus with the cartridge `rom` builds plugged in.
+fn bus_with(rom: Vec<u8>) -> AddressBus {
+    let mut bus = AddressBus::new();
+    bus.set_cartridge(build_genesis_cartridge(rom).unwrap());
+    bus
+}
+
+/// The 68000's reads of the cartridge window: a word and a byte at each of
+/// 256 addresses spread over `span` bytes from `base`.
+fn read_through_the_bus(bus: &mut AddressBus, base: u32, span: u32) -> u32 {
+    let step = (span / 256) & !1;
+    let mut sum = 0u32;
+    for i in 0..256 {
+        let addr = base + i * step;
+        sum = sum.wrapping_add(u32::from(bus.read_word(addr)));
+        sum = sum.wrapping_add(u32::from(bus.read(addr + 1)));
+    }
+    sum
+}
+
+fn bench_bus_cartridge(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bus_cartridge");
+
+    // A plain 2 MiB ROM: one ROM slot, the plan resolved on every access.
+    let mut plain = bus_with(create_test_rom_simple(0x200000, false));
+    group.bench_function("plain_2mib_rom", |b| {
+        b.iter(|| black_box(read_through_the_bus(&mut plain, 0, 0x200000)))
+    });
+
+    // A 5 MiB ROM: the SEGA mapper answers the whole window through its banks.
+    let mut sega = bus_with(create_test_rom_simple(0x500000, false));
+    sega.write(0xA130F7, 9);
+    group.bench_function("sega_mapper_5mib_rom", |b| {
+        b.iter(|| black_box(read_through_the_bus(&mut sega, 0, 0x400000)))
+    });
+
+    // An SVP cartridge: its DRAM window, a chip window ahead of the ROM slot.
+    let mut svp_rom = create_test_rom_simple(0x200000, false);
+    svp_rom[0x1C8] = b'S';
+    svp_rom[0x1C9] = b'V';
+    let mut svp = bus_with(svp_rom);
+    group.bench_function("svp_dram", |b| {
+        b.iter(|| black_box(read_through_the_bus(&mut svp, 0x300000, 0x20000)))
+    });
+
+    // A 4 MiB ROM with SRAM inside its window, switched on through $A130F1:
+    // reads and writes of the SRAM slot ahead of the ROM slot.
+    let mut sram = bus_with(create_test_rom_simple(0x400000, true));
+    sram.write(0xA130F1, 1);
+    group.bench_function("sram_switched_on", |b| {
+        b.iter(|| {
+            for i in 0..256u32 {
+                sram.write(0x200001 + i * 2, black_box(i as u8));
+            }
+            black_box(read_through_the_bus(&mut sram, 0x200000, 0x400))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_bus_cartridge,
     bench_rom_read,
     bench_sram_write,
     bench_sram_read,

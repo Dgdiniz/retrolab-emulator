@@ -6,7 +6,7 @@
 //! Uses a 256-entry page table for O(1) address region dispatch,
 //! indexed by the top 8 bits of the 24-bit address.
 
-use crate::cartridge::composable::GenesisCartridge;
+use crate::cartridge::GenesisCartridge;
 use crate::io::GenesisIo;
 use crate::memory::GenesisMemory;
 use crate::psg::Psg;
@@ -14,7 +14,7 @@ use crate::timing::VideoRegion;
 use crate::vdp::dma::{DmaTarget, MemoryDma};
 use crate::vdp::Vdp;
 use crate::ym2612::Ym2612;
-use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
+use retro_core::cartridge::{Cartridge, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
 use retro_core::cpu::{Addressable, CyclesTrackable};
 
 /// 68K cycles the BUSACK ($A11100) read keeps reporting "busy" after BUSREQ is
@@ -26,6 +26,12 @@ use retro_core::cpu::{Addressable, CyclesTrackable};
 /// (only the BUSACK status bit is delayed), so games that skip the poll are
 /// unaffected.
 const Z80_BUS_GRANT_DELAY_68K: u64 = 11;
+
+/// What a read gives where nothing drives the 68000's data bus: an address
+/// no cartridge slot covers, a slot with nothing behind it, and no
+/// cartridge at all. The cartridge is told it with every read, as the
+/// value an access that reaches nothing reads.
+pub(crate) const OPEN_BUS: u8 = 0xFF;
 
 /// Memory region identifiers for the page table.
 /// Each 64KB page maps to one of these regions.
@@ -84,7 +90,7 @@ static PAGE_TABLE: [MemRegion; 256] = build_page_table();
 /// - I/O ports
 /// - Z80 memory space
 pub struct AddressBus {
-    cartridge: Option<Box<dyn GenesisCartridge>>,
+    cartridge: Option<Box<GenesisCartridge>>,
     memory: GenesisMemory,
     vdp: Vdp,
     psg: Psg,
@@ -233,8 +239,8 @@ impl AddressBus {
         match a {
             0x000000..=0x7FFFFF => {
                 if let Some(ref mut cart) = self.cartridge {
-                    ((cart.read_bus(a, mc) as u16) << 8)
-                        | (cart.read_bus(a.wrapping_add(1), mc) as u16)
+                    ((cart.read_bus(a, mc, OPEN_BUS) as u16) << 8)
+                        | (cart.read_bus(a.wrapping_add(1), mc, OPEN_BUS) as u16)
                 } else {
                     0
                 }
@@ -254,9 +260,9 @@ impl AddressBus {
     /// call stack classifies and the disassembly. Unlike
     /// [`Addressable::read`] it charges no bus cycles, logs no watch event,
     /// moves no open-bus latch and changes no port's state. Reads the
-    /// cartridge through its peek ([`GenesisCartridge::peek_bus`]: a
-    /// coprocessor's window is neither caught up nor counted, and one whose
-    /// read would act reads `0xFF`), work RAM and Z80 RAM
+    /// cartridge through its peek ([`Cartridge::peek_bus`]: a coprocessor's
+    /// window is neither caught up nor counted, and one whose read would act
+    /// reads `0xFF`), work RAM and Z80 RAM
     /// (`$A00000-$A01FFF`, repeated at `$A02000`, whoever holds the Z80's
     /// bus); every other address returns 0, since a read of the I/O or VDP
     /// ports would change them. The VDP's memories have calls of their own.
@@ -266,8 +272,7 @@ impl AddressBus {
             0x000000..=0x7FFFFF => self
                 .cartridge
                 .as_ref()
-                .map(|cart| cart.peek_bus(a))
-                .unwrap_or(0xFF),
+                .map_or(OPEN_BUS, |cart| cart.peek_bus(a, OPEN_BUS)),
             0xA00000..=0xA03FFF => {
                 let ram = self.memory.z80_ram.as_slice();
                 ram[(a & 0x1FFF) as usize & (ram.len() - 1)]
@@ -297,8 +302,8 @@ impl AddressBus {
     /// a read of it comes from now. In the cartridge window
     /// (`0x000000-0x7FFFFF`), the offset into the ROM file the read
     /// reaches, through the cartridge's mapping as it stands
-    /// ([`GenesisCartridge::byte_sources`]: a bank mapper's banks as they
-    /// are set, the SRAM switch), else
+    /// ([`Cartridge::source_place`]: a bank mapper's banks as they are set,
+    /// the SRAM switch), else
     /// [`SOURCE_CARTRIDGE_RAM`](retro_core::cartridge::SOURCE_CARTRIDGE_RAM)
     /// or [`SOURCE_COPROCESSOR`](retro_core::cartridge::SOURCE_COPROCESSOR);
     /// [`SOURCE_WORK_RAM`] for work RAM (`0xE00000-0xFFFFFF`, where a
@@ -306,22 +311,13 @@ impl AddressBus {
     /// other address, an empty slot and a read past the end of the ROM.
     /// Reads the mapping and changes nothing.
     pub fn resolve_sources(&self, addresses: &[u32]) -> Vec<i32> {
-        let window: Vec<u32> = addresses
-            .iter()
-            .map(|&address| address & 0x00FF_FFFF)
-            .filter(|&address| address <= 0x7F_FFFF)
-            .collect();
-        let from_cartridge = match &self.cartridge {
-            Some(cartridge) => cartridge.byte_sources(&window),
-            None => vec![SourcePlace::Unknown; window.len()],
-        };
-        let mut from_cartridge = from_cartridge.into_iter();
         addresses
             .iter()
             .map(|&address| match address & 0x00FF_FFFF {
-                0x00_0000..=0x7F_FFFF => from_cartridge
-                    .next()
-                    .map_or(SOURCE_UNKNOWN, SourcePlace::code),
+                window @ 0x00_0000..=0x7F_FFFF => self
+                    .cartridge
+                    .as_ref()
+                    .map_or(SOURCE_UNKNOWN, |cart| cart.source_place(window).code()),
                 0xE0_0000..=0xFF_FFFF => SOURCE_WORK_RAM,
                 _ => SOURCE_UNKNOWN,
             })
@@ -329,7 +325,7 @@ impl AddressBus {
     }
 
     /// Set the cartridge.
-    pub fn set_cartridge(&mut self, cartridge: Box<dyn GenesisCartridge>) {
+    pub fn set_cartridge(&mut self, cartridge: Box<GenesisCartridge>) {
         self.cartridge = Some(cartridge);
     }
 
@@ -340,28 +336,25 @@ impl AddressBus {
     /// return to their power-on state) but must keep the cartridge:
     /// battery-backed SRAM survives a power cycle on real hardware, and
     /// silently blanking it would destroy the player's save.
-    pub fn take_cartridge(&mut self) -> Option<Box<dyn GenesisCartridge>> {
+    pub fn take_cartridge(&mut self) -> Option<Box<GenesisCartridge>> {
         self.cartridge.take()
     }
 
     /// Get a reference to the cartridge.
-    pub fn cartridge(&self) -> Option<&dyn GenesisCartridge> {
-        self.cartridge.as_ref().map(|c| c.as_ref())
+    pub fn cartridge(&self) -> Option<&GenesisCartridge> {
+        self.cartridge.as_deref()
     }
 
     /// Get a mutable reference to the cartridge.
-    pub fn cartridge_mut(&mut self) -> Option<&mut (dyn GenesisCartridge + '_)> {
-        match &mut self.cartridge {
-            Some(cart) => Some(&mut **cart),
-            None => None,
-        }
+    pub fn cartridge_mut(&mut self) -> Option<&mut GenesisCartridge> {
+        self.cartridge.as_deref_mut()
     }
 
     /// Load ROM - Legacy compatibility method (use set_cartridge for new code)
     #[deprecated(note = "Use set_cartridge with build_genesis_cartridge instead")]
     #[allow(dead_code)]
     pub fn load_rom(&mut self, mut rom: Vec<u8>) {
-        use crate::cartridge::composable::build_genesis_cartridge;
+        use crate::cartridge::build_genesis_cartridge;
 
         // Ensure minimum size for header
         if rom.len() < 512 {
@@ -494,9 +487,9 @@ impl AddressBus {
         match PAGE_TABLE[page] {
             MemRegion::Cartridge => {
                 if let Some(ref mut cart) = self.cartridge {
-                    cart.read_bus(addr, mc)
+                    cart.read_bus(addr, mc, OPEN_BUS)
                 } else {
-                    0xFF
+                    OPEN_BUS
                 }
             }
             MemRegion::WorkRam => {
@@ -539,21 +532,21 @@ impl AddressBus {
                     }
                     // SRAM-enable / /TIME control registers ($A130xx). These
                     // live outside the cartridge map plan (page 0xA1), so the
-                    // cartridge reports the enable bit via a dedicated hook;
-                    // everything else on this window is open bus.
+                    // cartridge reports the enable bit as a register of its
+                    // board; everything else on this window is open bus.
                     0xA13000..=0xA130FF => self
                         .cartridge
                         .as_ref()
-                        .and_then(|cart| cart.read_time_register(addr))
-                        .unwrap_or(0xFF),
+                        .and_then(|cart| cart.read_register(addr))
+                        .unwrap_or(OPEN_BUS),
                     // SVP (and future I/O-page coprocessor) mailbox: the
                     // $A15000-$A1500B window is dispatched to the cartridge,
                     // which routes it to the owning chip via its map plan.
                     0xA15000..=0xA1500B => {
                         if let Some(ref mut cart) = self.cartridge {
-                            cart.read_bus(addr, mc)
+                            cart.read_bus(addr, mc, OPEN_BUS)
                         } else {
-                            0xFF
+                            OPEN_BUS
                         }
                     }
                     _ => 0xFF,
@@ -625,9 +618,9 @@ impl AddressBus {
                             let byte = match PAGE_TABLE[(src_addr >> 16) as usize] {
                                 MemRegion::Cartridge => {
                                     if let Some(ref mut cart) = self.cartridge {
-                                        cart.read_bus(src_addr, mc)
+                                        cart.read_bus(src_addr, mc, OPEN_BUS)
                                     } else {
-                                        0xFF
+                                        OPEN_BUS
                                     }
                                 }
                                 MemRegion::WorkRam => {
@@ -884,8 +877,8 @@ impl Addressable for AddressBus {
                 self.open_bus_pc = addr.wrapping_add(2);
                 let mc = self.m68k_cycle;
                 if let Some(ref mut cart) = self.cartridge {
-                    let hi = cart.read_bus(addr, mc) as u16;
-                    let lo = cart.read_bus(addr.wrapping_add(1), mc) as u16;
+                    let hi = cart.read_bus(addr, mc, OPEN_BUS) as u16;
+                    let lo = cart.read_bus(addr.wrapping_add(1), mc, OPEN_BUS) as u16;
                     (hi << 8) | lo
                 } else {
                     0xFFFF
@@ -1004,9 +997,9 @@ impl Addressable for AddressBus {
                             let byte = match src_addr {
                                 0x000000..=0x7FFFFF => {
                                     if let Some(ref mut cart) = self.cartridge {
-                                        cart.read_bus(src_addr, mc)
+                                        cart.read_bus(src_addr, mc, OPEN_BUS)
                                     } else {
-                                        0xFF
+                                        OPEN_BUS
                                     }
                                 }
                                 0xE00000..=0xFFFFFF => {
@@ -1056,7 +1049,7 @@ impl CyclesTrackable for AddressBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cartridge::composable::build_genesis_cartridge;
+    use crate::cartridge::build_genesis_cartridge;
 
     #[test]
     fn test_bus_creation() {

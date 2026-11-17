@@ -136,13 +136,14 @@ impl GenesisEmulator {
 
     /// A [`CartridgeDebugger`](retro_core::cartridge::CartridgeDebugger) over
     /// the installed cartridge: memory-map / ROM / SRAM regions, the mapper
-    /// state, the per-chip coprocessor snapshots, and ROM/SRAM breakpoints
-    /// (which append to the emulator's shared breakpoint list). Mirrors
-    /// `SnesEmulator::cartridge_debugger()`. With no cartridge loaded it
+    /// state (every Genesis shape a custom mapper named by its plan), the
+    /// per-chip coprocessor snapshots, and ROM/SRAM breakpoints (which
+    /// append to the emulator's shared breakpoint list). The same surface
+    /// as `SnesEmulator::cartridge_debugger()`. With no cartridge loaded it
     /// binds an empty plan so the surface stays non-`Option`.
     pub fn cartridge_debugger(
         &mut self,
-    ) -> crate::cartridge::composable::GenesisCartridgeDebugger<'_> {
+    ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
         let (plan, rom_size, sram_size, chip_states) = match self.bus.cartridge() {
             Some(cart) => (
                 cart.map_plan().clone(),
@@ -150,20 +151,32 @@ impl GenesisEmulator {
                 cart.sram().len() as u32,
                 cart.coprocessors_debug_state(),
             ),
-            None => (
-                crate::cartridge::composable::MapPlan::default(),
-                0,
-                0,
-                Vec::new(),
-            ),
+            None => (crate::cartridge::MapPlan::default(), 0, 0, Vec::new()),
         };
-        crate::cartridge::composable::GenesisCartridgeDebugger::new(
+        let mapper_id = MapperId::Custom(plan.name.clone());
+        retro_core::cartridge::MapPlanDebugger::new(
             plan,
             rom_size,
             sram_size,
+            Some(mapper_id),
             chip_states,
             self.debugger.breakpoints_mut(),
         )
+    }
+
+    /// Human-readable label of the primary (lowest-id) coprocessor (e.g.
+    /// `"SVP"`), or `None` on a plain cartridge.
+    pub fn coprocessor_label(&self) -> Option<&str> {
+        self.bus.cartridge()?.coprocessor_label()
+    }
+
+    /// MMIO access count of the primary coprocessor (proves the game is
+    /// driving it). Zero when there is no coprocessor.
+    pub fn coprocessor_accesses(&self) -> u64 {
+        self.bus
+            .cartridge()
+            .map(|cart| cart.coprocessor_accesses())
+            .unwrap_or(0)
     }
 
     /// Live debug snapshot of the primary (lowest-id) coprocessor (the SVP's
@@ -190,15 +203,6 @@ impl GenesisEmulator {
             .cartridge()
             .map(|cart| cart.coprocessor_labels())
             .unwrap_or_default()
-    }
-
-    /// MMIO access count of the primary coprocessor (proves the game is
-    /// driving it). Zero when there is no coprocessor.
-    pub fn coprocessor_accesses(&self) -> u64 {
-        self.bus
-            .cartridge()
-            .map(|cart| cart.coprocessor_accesses())
-            .unwrap_or(0)
     }
 
     /// Get mutable reference to the debugger.

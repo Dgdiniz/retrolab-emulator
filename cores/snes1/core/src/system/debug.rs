@@ -3,6 +3,7 @@
 //! step (execute, watch, call stack, events).
 
 use retro_core::audio::AudioDebugger;
+use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
 use retro_core::frame::DebugMachine;
@@ -121,31 +122,84 @@ impl SnesEmulator {
         self.bus.ppu().settings()
     }
 
-    /// A [`crate::cartridge::SnesCartridgeDebugger`] bound to the live
-    /// breakpoint list: memory-map / ROM / SRAM / mapper inspection from
-    /// the installed [`crate::cartridge::MapPlan`], with ROM/SRAM
-    /// breakpoints delegating into the emulator's own breakpoint list.
-    pub fn cartridge_debugger(&mut self) -> crate::cartridge::SnesCartridgeDebugger<'_> {
+    /// A [`CartridgeDebugger`](retro_core::cartridge::CartridgeDebugger) over
+    /// the installed cartridge, bound to the live breakpoint list:
+    /// memory-map / ROM / SRAM regions from the installed
+    /// [`crate::cartridge::MapPlan`], the mapper state (the preset's
+    /// [`crate::cartridge::PresetKind::mapper_id`]), the per-chip coprocessor
+    /// snapshots, and ROM/SRAM breakpoints delegating into the emulator's
+    /// own breakpoint list. The same surface as
+    /// `GenesisEmulator::cartridge_debugger()`.
+    pub fn cartridge_debugger(
+        &mut self,
+    ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
         let plan = self.bus.cartridge_plan().cloned().unwrap_or_default();
         let rom_size = self.rom_size as u32;
         let sram_size = self.bus.cartridge_sram().map(<[u8]>::len).unwrap_or(0) as u32;
-        let preset_kind = self.preset_kind;
+        let mapper_id = self.preset_kind.map(|kind| kind.mapper_id(&plan.name));
         // Snapshot every coprocessor's state up front (owned), so the
         // immutable cartridge borrow ends before we borrow the breakpoint
         // list mutably below.
         let chip_states = self
             .bus
-            .cartridge_ref()
+            .cartridge()
             .map(|c| c.coprocessors_debug_state())
             .unwrap_or_default();
-        crate::cartridge::SnesCartridgeDebugger::new(
+        retro_core::cartridge::MapPlanDebugger::new(
             plan,
             rom_size,
             sram_size,
-            preset_kind,
+            mapper_id,
             chip_states,
             self.debugger.breakpoints_mut(),
         )
+    }
+
+    /// Human-readable label of the primary (lowest-id) coprocessor (e.g.
+    /// `"DSP-1B (LLE)"`), or `None` for a plain cartridge. Used by the
+    /// CLI `info` command.
+    pub fn coprocessor_label(&self) -> Option<&str> {
+        self.bus.cartridge()?.coprocessor_label()
+    }
+
+    /// Count of CPU accesses to the coprocessor's register window since
+    /// the last reset (`0` when no coprocessor is installed or the game has
+    /// not touched it yet). A positive value proves the running game is
+    /// actively driving the chip.
+    pub fn coprocessor_accesses(&self) -> u64 {
+        self.bus
+            .cartridge()
+            .map(|c| c.coprocessor_accesses())
+            .unwrap_or(0)
+    }
+
+    /// Live state of the primary (lowest-id) coprocessor (the DSP-1's
+    /// uPD7725 registers + data RAM), or `None` for a plain cartridge.
+    /// Read-only path for the CLI `info` command and the WASM debugger; it
+    /// does not borrow the breakpoint list like
+    /// [`Self::cartridge_debugger`] does. See
+    /// [`Self::coprocessors_debug_state`] for the full set.
+    pub fn coprocessor_debug_state(&self) -> Option<retro_core::cartridge::ExpansionChipState> {
+        self.bus.cartridge()?.coprocessor_debug_state()
+    }
+
+    /// Live state of every installed coprocessor, keyed by `chip_id`. Empty
+    /// for a plain cartridge.
+    pub fn coprocessors_debug_state(&self) -> Vec<(u8, retro_core::cartridge::ExpansionChipState)> {
+        self.bus
+            .cartridge()
+            .map(|c| c.coprocessors_debug_state())
+            .unwrap_or_default()
+    }
+
+    /// Human-readable label of every installed coprocessor, keyed by
+    /// `chip_id` (e.g. `[(1, "DSP-1B (LLE)")]`). Empty for a plain
+    /// cartridge. Used by the CLI `info` command to enumerate the chips.
+    pub fn coprocessor_labels(&self) -> Vec<(u8, String)> {
+        self.bus
+            .cartridge()
+            .map(|c| c.coprocessor_labels())
+            .unwrap_or_default()
     }
 
     /// Write `data` to the 65C816 address space starting at `addr` for
@@ -530,7 +584,7 @@ fn decode_one_snes(emu: &mut SnesEmulator, cpu_id: usize, addr: u32) -> DisasmRo
         let addr24 = addr & 0x00FF_FFFF;
         return match emu
             .bus
-            .cartridge_ref()
+            .cartridge()
             .and_then(|c| c.disassemble_secondary(addr24, 1).into_iter().next())
         {
             Some(instr) => DisasmRow {

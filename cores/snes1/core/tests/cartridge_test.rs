@@ -1,13 +1,14 @@
 //! End-to-end cartridge pipeline tests.
 //!
 //! These exercise the full ROM-bytes -> `CartridgeBuilder` ->
-//! `Box<dyn SnesCartridge>` -> `SnesBus::install_cartridge` ->
+//! `Box<SnesCartridge>` -> `SnesBus::install_cartridge` ->
 //! `bus.read_full(addr)` path. Unit-level coverage for individual
 //! pieces (header parsing, presets, scoring, manifest parsing,
 //! builder helpers) lives in the `snes1-core` `--lib` test suite;
 //! this file proves the pieces fit together and that a built
 //! cartridge dispatches correctly through the bus.
 
+use retro_core::cartridge::Cartridge;
 use sha2::{Digest, Sha256};
 use snes1_core::{
     parse_manifest, BuildError, CartridgeBuilder, MapTarget, SnesBus, SnesCartridge,
@@ -83,8 +84,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Install the boxed cartridge in a fresh bus and hand the bus
-/// back so the test can drive `read_full` / `cartridge_ref`.
-fn install_in_bus(cart: Box<dyn SnesCartridge>) -> SnesBus {
+/// back so the test can drive `read_full` / `cartridge`.
+fn install_in_bus(cart: Box<SnesCartridge>) -> SnesBus {
     let mut bus = SnesBus::new();
     bus.install_cartridge(cart);
     bus
@@ -303,7 +304,7 @@ fn manifest_custom_chip_dispatches_via_chip_id() {
     let label = cart.coprocessor_label().expect("manifest DSP-1 is live");
     assert!(label.contains("HLE"), "label = {label}");
     assert_eq!(cart.coprocessor_accesses(), 0);
-    assert_eq!(cart.read_chip(1, 0x4000, 0), 0x80);
+    assert_eq!(cart.read_chip(1, 0x4000, 0, 0), 0x80);
     assert_eq!(cart.coprocessor_accesses(), 1);
 }
 

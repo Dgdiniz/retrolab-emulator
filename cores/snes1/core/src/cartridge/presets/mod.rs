@@ -24,6 +24,8 @@
 
 use std::ops::RangeInclusive;
 
+use retro_core::cartridge::MapperId;
+
 use crate::cartridge::{BusSpeed, MapSlot, MapTarget};
 
 mod cx4;
@@ -144,4 +146,69 @@ pub enum PresetKind {
     /// Slots come from a manifest, not from one of the stock
     /// generators.
     Custom,
+}
+
+impl PresetKind {
+    /// The preset's name as a host shows it (`"LoROM"`, `"S-DD1"`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            PresetKind::LoRom => "LoROM",
+            PresetKind::HiRom => "HiROM",
+            PresetKind::ExHiRom => "ExHiROM",
+            PresetKind::Sdd1 => "S-DD1",
+            PresetKind::Spc7110 => "SPC7110",
+            PresetKind::Sa1 => "SA-1",
+            PresetKind::SuperFx => "Super FX",
+            PresetKind::Cx4 => "Cx4",
+            PresetKind::Custom => "Custom",
+        }
+    }
+
+    /// The mapper a cartridge of this preset reports, its plan named
+    /// `plan_name`: the stock LoROM, HiROM and ExHiROM ids, a named custom
+    /// mapper for a chip board (retro-core has no id of its own for them),
+    /// and a manifest's custom plan by the plan's name.
+    pub fn mapper_id(self, plan_name: &str) -> MapperId {
+        match self {
+            PresetKind::LoRom => MapperId::SnesLoROM,
+            PresetKind::HiRom => MapperId::SnesHiROM,
+            PresetKind::ExHiRom => MapperId::SnesExHiROM,
+            PresetKind::Sdd1 => MapperId::Custom("SDD1".to_string()),
+            PresetKind::Spc7110 => MapperId::Custom("SPC7110".to_string()),
+            PresetKind::Sa1 => MapperId::Custom("SA1".to_string()),
+            PresetKind::SuperFx => MapperId::Custom("Super FX".to_string()),
+            PresetKind::Cx4 => MapperId::Custom("Cx4".to_string()),
+            PresetKind::Custom => MapperId::Custom(plan_name.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_preset_names_its_mapper() {
+        assert_eq!(PresetKind::LoRom.mapper_id("lorom"), MapperId::SnesLoROM);
+        assert_eq!(PresetKind::HiRom.mapper_id("hirom"), MapperId::SnesHiROM);
+        assert_eq!(
+            PresetKind::ExHiRom.mapper_id("exhirom"),
+            MapperId::SnesExHiROM
+        );
+        assert_eq!(
+            PresetKind::Sdd1.mapper_id("sdd1"),
+            MapperId::Custom("SDD1".to_string())
+        );
+        assert_eq!(
+            PresetKind::SuperFx.mapper_id("superfx"),
+            MapperId::Custom("Super FX".to_string())
+        );
+        assert_eq!(
+            PresetKind::Custom.mapper_id("my-board"),
+            MapperId::Custom("my-board".to_string()),
+            "a manifest's own plan is named by the plan"
+        );
+        assert_eq!(PresetKind::Sa1.name(), "SA-1");
+        assert_eq!(PresetKind::Custom.name(), "Custom");
+    }
 }

@@ -8,7 +8,7 @@ use retro_core::debug::trace_to_text;
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
 use retro_core::*;
 use retro_wasm::js::{map_as_object, set_property, uint16_array};
-use sg1_core::cartridge::composable::parse_manifest;
+use sg1_core::cartridge::parse_manifest;
 use sg1_core::debugger::{TraceEntryBinaryZ80, SOUND_CPU};
 use sg1_core::system::GenesisSnapshotConsole;
 use sg1_core::GenesisEmulator;
@@ -544,12 +544,6 @@ impl RetroEmulator {
         self.genesis
             .load_cartridge_save_state(data)
             .map_err(|e| JsValue::from_str(&e))
-    }
-
-    /// Get cartridge ROM hash (SHA-256)
-    #[wasm_bindgen(js_name = getCartridgeHash)]
-    pub fn get_cartridge_hash(&self) -> Option<String> {
-        self.genesis.get_cartridge_hash()
     }
 
     /// Get cartridge title
@@ -1457,6 +1451,7 @@ fn snapshot_console(console: &GenesisSnapshotConsole, snapshot: &js_sys::Object)
 
 retro_wasm::capture_bindings!(RetroEmulator, genesis, console = snapshot_console);
 retro_wasm::debugger_bindings!(RetroEmulator, genesis);
+retro_wasm::cartridge_bindings!(RetroEmulator, genesis);
 
 #[cfg(test)]
 mod tests;

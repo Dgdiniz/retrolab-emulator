@@ -96,6 +96,19 @@ fn lorom_running(title: &str, program: &[u8], data: &[(u16, &[u8])]) -> Vec<u8> 
 }
 
 #[wasm_bindgen_test]
+fn the_cartridge_hash_is_the_sha256_of_the_file_loaded_its_copier_header_included() {
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    assert_eq!(emu.get_cartridge_hash(), None, "no load yet");
+    let mut file = vec![0u8; 512];
+    file.extend(synth_lorom("HASHED GAME"));
+    emu.load_rom(&file).unwrap();
+    assert_eq!(
+        emu.get_cartridge_hash(),
+        Some(retro_core::cartridge::rom_sha256(&file))
+    );
+}
+
+#[wasm_bindgen_test]
 fn a_savestate_from_another_rom_is_refused_by_name_and_loads_when_asked() {
     let mut first = RetroEmulator::new("snes").unwrap();
     first.load_rom(&synth_lorom("FIRST BUILD")).unwrap();

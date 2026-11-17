@@ -1,17 +1,15 @@
-//! JSON cartridge manifest (`cartridge-manifest-v1`, Genesis flavor).
+//! The Mega Drive's part of the `cartridge-manifest-v1` format.
 //!
 //! The manifest lets a developer describe a cartridge by hand instead of
 //! relying on heuristic detection. It is the only way to express the special
 //! mappers, coprocessors, or non-stock SRAM layouts the Genesis header
-//! cannot advertise. It is pure data: no code, no blobs, no version-coupled
-//! invariants beyond the advertised `version` string.
-//!
-//! This is the Genesis counterpart of the SNES manifest. The one shape
-//! difference is the address model: the 68000 has a flat 24-bit space, so a
-//! slot is a single `addr_range` (`["0x000000", "0x3FFFFF"]`) instead of the
-//! SNES `bank_range x offset_range` rectangle. The [`MapTarget`] vocabulary
-//! (`Rom`/`Sram`/`ChipMmio`/`OpenBus`) is the shared `retro-core` type,
-//! identical across both consoles.
+//! cannot advertise. The format is retro-core's
+//! ([`retro_core::cartridge::manifest`]), one for every console; what the
+//! Mega Drive adds is its slot, its presets and its SRAM rules. The 68000
+//! has a flat 24-bit space, so a slot is a single `addr_range`
+//! (`["0x000000", "0x3FFFFF"]`), where the SNES writes a
+//! `bank_range x offset_range` rectangle. The Mega Drive adds no key of its
+//! own to `mapping` or to the top.
 //!
 //! ## Pipeline
 //!
@@ -46,27 +44,31 @@
 //!
 //! ## Design notes
 //!
-//! - **Hex addresses as strings.** Address ranges arrive as `"0x300000"`
-//!   strings so the on-disk format is reviewable by humans; the helpers
-//!   parse both `"0x..."` and bare-hex forms.
 //! - **Presets.** `mapping.preset` seeds the plan with a stock shape
 //!   (`plain` / `sega` / `ssf2` / `codemasters` / `eeprom` / `jcart` /
 //!   `svp`), or `custom` for an empty plan the `slots`/`chips` fill in. A
 //!   chip preset uses the first `chips[]` entry's id for its MMIO window.
-//! - **Slot order.** Preset slots come first, then manifest custom slots,
-//!   then chip slots. [`MapPlan::resolve`] is first-wins, so a manifest slot
-//!   that overlaps a preset slot loses the overlap, use `preset: "custom"`
-//!   to shadow a preset slot deliberately.
+//! - **SRAM.** `mapping.sram_size` asks for a stock SRAM window at
+//!   [`DEFAULT_SRAM_BASE`]; a size over [`SRAM_SIZE_LIMIT`] is refused.
 //! - **`chips[].observes`.** Optional `"lo-hi"` 24-bit hex ranges a chip
 //!   passively watches (e.g. `"0xA130F0-0xA130FF"` for a SEGA mapper's bank
-//!   registers). The builder registers them on the `ChipSet`.
+//!   registers). The builder registers them on the chip set.
 //! - **No SHA-256 verification.** [`parse_manifest`] checks the schema, the
 //!   version and the SRAM size; nothing compares `rom.sha256` with the ROM
 //!   (`load_rom` takes a staged manifest as trusted metadata).
 
+use retro_core::cartridge::manifest::{
+    chip_target, map_target, parse_hex_u32, ManifestConsole, NoFields,
+};
 use serde::{Deserialize, Serialize};
 
-use super::map_plan::{MapPlan, MapSlot, MapTarget};
+pub use retro_core::cartridge::manifest::{
+    append_manifest_extras, manifest_to_map_plan, parse_addr_range, ManifestError, ManifestRom,
+    ManifestTarget, SUPPORTED_MANIFEST_VERSION,
+};
+
+use super::board::GenesisBoard;
+use super::map_plan::{MapPlan, MapSlot};
 use super::presets::{
     bank_mapper_plan, eeprom_plan, jcart_plan, plain_plan, svp_plan, PresetKind,
     EEPROM_CONTROL_ADDR,
@@ -74,49 +76,19 @@ use super::presets::{
 use super::savestate::BankMapperKind;
 use crate::cartridge::parsers::SRAM_SIZE_LIMIT;
 
-/// Manifest format version this module accepts.
-pub const SUPPORTED_MANIFEST_VERSION: &str = "1.0";
-
 /// The default stock-SRAM window base for the `sram_size` shorthand, when a
 /// manifest does not spell out an explicit `Sram` slot.
 pub const DEFAULT_SRAM_BASE: u32 = 0x200000;
 
-/// Top-level manifest. Mirrors the on-disk JSON 1:1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CartridgeManifest {
-    #[serde(rename = "$schema", default)]
-    pub schema: Option<String>,
-    pub core: String,
-    pub version: String,
-    pub rom: ManifestRom,
-    pub mapping: ManifestMapping,
-    #[serde(default)]
-    pub chips: Vec<ManifestChip>,
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
-}
+/// A Mega Drive manifest. Mirrors the on-disk JSON 1:1.
+pub type CartridgeManifest = retro_core::cartridge::manifest::CartridgeManifest<GenesisBoard>;
 
-/// ROM-image metadata: digest + advertised size + optional labels. The
-/// digest is *not* verified by [`parse_manifest`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestRom {
-    pub sha256: String,
-    pub size: u64,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub region: Option<String>,
-}
+/// A Mega Drive manifest's mapping section: the preset, the stock-SRAM size
+/// and the extra slots.
+pub type ManifestMapping = retro_core::cartridge::manifest::ManifestMapping<GenesisBoard>;
 
-/// Mapping section: chosen preset + stock-SRAM size + extra slots.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestMapping {
-    pub preset: String,
-    #[serde(default)]
-    pub sram_size: usize,
-    #[serde(default)]
-    pub slots: Vec<ManifestSlot>,
-}
+/// A chip a Mega Drive manifest declares, with its slot.
+pub type ManifestChip = retro_core::cartridge::manifest::ManifestChip<ManifestSlot>;
 
 /// One extra linear slot. Hex addresses arrive as strings so the manifest
 /// stays reviewable.
@@ -128,65 +100,9 @@ pub struct ManifestSlot {
     pub mask: Option<String>,
 }
 
-/// What lives behind a slot. Tag-by-`kind` so the JSON reads naturally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ManifestTarget {
-    Rom {
-        #[serde(default)]
-        base_offset: u32,
-    },
-    Sram {
-        #[serde(default)]
-        base_offset: u32,
-    },
-    ChipMmio {
-        chip_id: u8,
-        #[serde(default)]
-        base: u32,
-    },
-    OpenBus,
-}
-
-/// Coprocessor chip declaration. Each chip carries its own mapping slot plus
-/// an optional list of bus ranges it passively observes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestChip {
-    pub id: u8,
-    pub kind: String,
-    pub mapping: ManifestSlot,
-    #[serde(default)]
-    pub observes: Vec<String>,
-}
-
-/// All the ways [`parse_manifest`] / [`manifest_to_map_plan`] can fail.
-#[derive(Debug, thiserror::Error)]
-pub enum ManifestError {
-    #[error("invalid JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("unsupported manifest version: {0}")]
-    UnsupportedVersion(String),
-    #[error("unsupported preset: {0}")]
-    UnknownPreset(String),
-    #[error("invalid hex in field '{field}': {value}")]
-    InvalidHex { field: String, value: String },
-    #[error("sram_size {size} is larger than the {limit}-byte limit")]
-    SramTooLarge { size: usize, limit: u32 },
-}
-
 /// Parse a JSON string into a typed [`CartridgeManifest`].
 pub fn parse_manifest(json: &str) -> Result<CartridgeManifest, ManifestError> {
-    let manifest: CartridgeManifest = serde_json::from_str(json)?;
-    if manifest.version != SUPPORTED_MANIFEST_VERSION {
-        return Err(ManifestError::UnsupportedVersion(manifest.version));
-    }
-    if manifest.mapping.sram_size > SRAM_SIZE_LIMIT as usize {
-        return Err(ManifestError::SramTooLarge {
-            size: manifest.mapping.sram_size,
-            limit: SRAM_SIZE_LIMIT,
-        });
-    }
-    Ok(manifest)
+    retro_core::cartridge::manifest::parse_manifest(json)
 }
 
 /// Parse the `mapping.preset` string into a [`PresetKind`].
@@ -216,132 +132,66 @@ pub fn manifest_sram_window(manifest: &CartridgeManifest) -> Option<(u32, u32)> 
     }
 }
 
-/// Turn a parsed manifest into a [`MapPlan`]. The preset seeds the plan; the
-/// manifest's custom slots and chip mappings append in source order. A chip
-/// preset (sega/ssf2/...) uses the first `chips[]` entry's id for its MMIO
-/// window.
-pub fn manifest_to_map_plan(
-    manifest: &CartridgeManifest,
-    rom: &[u8],
-) -> Result<MapPlan, ManifestError> {
-    let kind = parse_preset(&manifest.mapping.preset)?;
-    let chip0_id = manifest.chips.first().map(|c| c.id).unwrap_or(0);
-    let sram = manifest_sram_window(manifest);
+impl ManifestConsole for GenesisBoard {
+    type MappingKnobs = NoFields;
+    type Extras = NoFields;
+    type ManifestSlot = ManifestSlot;
 
-    let mut plan = match kind {
-        PresetKind::Plain => plain_plan(rom.len(), sram),
-        PresetKind::Sega => bank_mapper_plan(BankMapperKind::Sega, chip0_id, sram),
-        PresetKind::Ssf2 => bank_mapper_plan(BankMapperKind::Ssf2, chip0_id, sram),
-        PresetKind::Codemasters => bank_mapper_plan(BankMapperKind::Codemasters, chip0_id, sram),
-        PresetKind::Eeprom => eeprom_plan(chip0_id, rom.len(), EEPROM_CONTROL_ADDR),
-        PresetKind::JCart => jcart_plan(chip0_id, rom.len(), sram),
-        PresetKind::Svp => svp_plan(chip0_id, rom.len()),
-        PresetKind::Custom => MapPlan::new("custom"),
-    };
-
-    append_manifest_extras(&mut plan, manifest)?;
-    Ok(plan)
-}
-
-/// Append the manifest's custom slots and chip mappings to a plan. The bus's
-/// first-wins resolver means preset slots beat manifest slots on overlap.
-pub fn append_manifest_extras(
-    plan: &mut MapPlan,
-    manifest: &CartridgeManifest,
-) -> Result<(), ManifestError> {
-    for (i, slot) in manifest.mapping.slots.iter().enumerate() {
-        let map_slot = manifest_slot_to_map_slot(slot, &format!("slots[{i}]"), None)?;
-        plan.push(map_slot);
-    }
-    for (i, chip) in manifest.chips.iter().enumerate() {
-        let path = format!("chips[{i}].mapping");
-        let map_slot = manifest_slot_to_map_slot(&chip.mapping, &path, Some(chip.id))?;
-        plan.push(map_slot);
-    }
-    Ok(())
-}
-
-fn manifest_slot_to_map_slot(
-    slot: &ManifestSlot,
-    path: &str,
-    chip_id_override: Option<u8>,
-) -> Result<MapSlot, ManifestError> {
-    let lo = parse_hex_u32(&slot.addr_range[0], &format!("{path}.addr_range[0]"))?;
-    let hi = parse_hex_u32(&slot.addr_range[1], &format!("{path}.addr_range[1]"))?;
-
-    let mut target = manifest_target_to_map_target(&slot.target);
-    if let Some(chip_id) = chip_id_override {
-        // A chip published in `chips[]` always dispatches through ChipMmio,
-        // regardless of the inline target, so the block need not repeat its
-        // own id on the inner slot.
-        target = MapTarget::ChipMmio {
-            chip_id,
-            base: match slot.target {
-                ManifestTarget::ChipMmio { base, .. } => base,
-                ManifestTarget::Rom { base_offset } | ManifestTarget::Sram { base_offset } => {
-                    base_offset
-                }
-                ManifestTarget::OpenBus => 0,
-            },
+    fn map_slot(
+        slot: &ManifestSlot,
+        path: &str,
+        chip: Option<u8>,
+    ) -> Result<Option<MapSlot>, ManifestError> {
+        let lo = parse_hex_u32(&slot.addr_range[0], &format!("{path}.addr_range[0]"))?;
+        let hi = parse_hex_u32(&slot.addr_range[1], &format!("{path}.addr_range[1]"))?;
+        let target = match chip {
+            Some(chip_id) => chip_target(&slot.target, chip_id),
+            None => map_target(&slot.target),
         };
+        let mut map_slot = MapSlot::new(lo..=hi, target);
+        if let Some(mask) = slot.mask.as_deref() {
+            map_slot = map_slot.with_mask(parse_hex_u32(mask, &format!("{path}.mask"))?);
+        }
+        Ok(Some(map_slot))
     }
 
-    let mut map_slot = MapSlot::new(lo..=hi, target);
-    if let Some(mask_str) = slot.mask.as_deref() {
-        let mask = parse_hex_u32(mask_str, &format!("{path}.mask"))?;
-        map_slot = map_slot.with_mask(mask);
+    /// The preset's plan; a chip preset (sega/ssf2/...) uses the first
+    /// `chips[]` entry's id for its MMIO window.
+    fn preset_plan(manifest: &CartridgeManifest, rom: &[u8]) -> Result<MapPlan, ManifestError> {
+        let kind = parse_preset(&manifest.mapping.preset)?;
+        let chip0_id = manifest.chips.first().map_or(0, |c| c.id);
+        let sram = manifest_sram_window(manifest);
+        Ok(match kind {
+            PresetKind::Plain => plain_plan(rom.len(), sram),
+            PresetKind::Sega => bank_mapper_plan(BankMapperKind::Sega, chip0_id, sram),
+            PresetKind::Ssf2 => bank_mapper_plan(BankMapperKind::Ssf2, chip0_id, sram),
+            PresetKind::Codemasters => {
+                bank_mapper_plan(BankMapperKind::Codemasters, chip0_id, sram)
+            }
+            PresetKind::Eeprom => eeprom_plan(chip0_id, rom.len(), EEPROM_CONTROL_ADDR),
+            PresetKind::JCart => jcart_plan(chip0_id, rom.len(), sram),
+            PresetKind::Svp => svp_plan(chip0_id, rom.len()),
+            PresetKind::Custom => MapPlan::new("custom"),
+        })
     }
-    Ok(map_slot)
-}
 
-fn manifest_target_to_map_target(t: &ManifestTarget) -> MapTarget {
-    match *t {
-        ManifestTarget::Rom { base_offset } => MapTarget::Rom { base_offset },
-        ManifestTarget::Sram { base_offset } => MapTarget::Sram { base_offset },
-        ManifestTarget::ChipMmio { chip_id, base } => MapTarget::ChipMmio { chip_id, base },
-        ManifestTarget::OpenBus => MapTarget::OpenBus,
+    /// A stock SRAM over [`SRAM_SIZE_LIMIT`] is refused.
+    fn validate(manifest: &CartridgeManifest) -> Result<(), ManifestError> {
+        if manifest.mapping.sram_size > SRAM_SIZE_LIMIT as usize {
+            return Err(ManifestError::SramTooLarge {
+                size: manifest.mapping.sram_size,
+                limit: SRAM_SIZE_LIMIT,
+            });
+        }
+        Ok(())
     }
-}
-
-/// Parse an inclusive 24-bit range like `"0xA130F0-0xA130FF"` into a
-/// [`std::ops::RangeInclusive<u32>`], for the per-chip `observes[]` ranges.
-pub fn parse_addr_range(
-    s: &str,
-    field: &str,
-) -> Result<std::ops::RangeInclusive<u32>, ManifestError> {
-    let bounds = s
-        .split_once('-')
-        .and_then(|(lo, hi)| Some((parse_hex_inner(lo.trim())?, parse_hex_inner(hi.trim())?)));
-    match bounds {
-        Some((lo, hi)) if lo <= hi => Ok(lo..=hi),
-        _ => Err(ManifestError::InvalidHex {
-            field: field.to_string(),
-            value: s.to_string(),
-        }),
-    }
-}
-
-fn parse_hex_u32(s: &str, field: &str) -> Result<u32, ManifestError> {
-    parse_hex_inner(s).ok_or_else(|| ManifestError::InvalidHex {
-        field: field.to_string(),
-        value: s.to_string(),
-    })
-}
-
-fn parse_hex_inner(s: &str) -> Option<u32> {
-    let stripped = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    if stripped.is_empty() || stripped.len() > 8 {
-        return None;
-    }
-    u32::from_str_radix(stripped, 16).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cartridge::map_plan::MapTarget;
+    use crate::cartridge::presets::SVP_MAILBOX_BASE;
 
     fn minimal_plain() -> &'static str {
         r#"{
@@ -445,7 +295,7 @@ mod tests {
             plan.slots[mailbox.slot_index as usize].target,
             MapTarget::ChipMmio {
                 chip_id: 3,
-                base: super::super::presets::SVP_MAILBOX_BASE
+                base: SVP_MAILBOX_BASE
             }
         ));
     }
@@ -535,36 +385,6 @@ mod tests {
                 assert_eq!(value, "nope");
             }
             other => panic!("expected InvalidHex, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn error_unsupported_version() {
-        let json = r#"{
-            "core": "sg1",
-            "version": "9.9",
-            "rom": { "sha256": "x", "size": 1 },
-            "mapping": { "preset": "plain" }
-        }"#;
-        let err = parse_manifest(json).unwrap_err();
-        assert!(matches!(err, ManifestError::UnsupportedVersion(ref s) if s == "9.9"));
-    }
-
-    #[test]
-    fn parse_addr_range_valid_and_malformed() {
-        assert_eq!(
-            parse_addr_range("0xA130F0-0xA130FF", "observes[0]").unwrap(),
-            0xA130F0..=0xA130FF
-        );
-        assert_eq!(
-            parse_addr_range(" A130F0 - A130FF ", "observes[0]").unwrap(),
-            0xA130F0..=0xA130FF
-        );
-        for bad in ["0xA130F0", "0xA130F0-nope", "0xA130FF-0xA130F0"] {
-            assert!(matches!(
-                parse_addr_range(bad, "observes[1]"),
-                Err(ManifestError::InvalidHex { .. })
-            ));
         }
     }
 

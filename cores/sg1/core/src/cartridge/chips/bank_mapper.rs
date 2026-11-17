@@ -24,11 +24,10 @@ use std::sync::Arc;
 
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    SourcePlace,
 };
 
-use crate::cartridge::composable::savestate::{
-    BankMapperKind, BankMapperState, GenesisCoprocessorState,
-};
+use crate::cartridge::savestate::{BankMapperKind, BankMapperState, GenesisCoprocessorState};
 
 /// 512 KiB per bank / slot.
 const BANK_SIZE: usize = 0x80000;
@@ -148,41 +147,6 @@ fn physical_offset(kind: BankMapperKind, banks: &[u8], addr: u32) -> usize {
     bank * BANK_SIZE + (addr & BANK_OFFSET_MASK) as usize
 }
 
-/// A bank mapper's table as it stands, read from the chip without changing
-/// it ([`bank_table_of`]): what a ROM-window read reaches, for a debugger
-/// naming the ROM bytes behind an address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BankTable {
-    kind: BankMapperKind,
-    banks: Vec<u8>,
-}
-
-impl BankTable {
-    /// The ROM file offset a read of the ROM-window address `addr` (the
-    /// chip's offset) reaches, as the chip reads it.
-    pub fn physical_offset(&self, addr: u32) -> usize {
-        physical_offset(self.kind, &self.banks, addr)
-    }
-}
-
-/// The bank table of `chip` when it is a bank mapper, read from the state
-/// it saves (the scheme and the banks set), else `None`. Nothing in the
-/// chip changes: its accesses are not counted.
-pub fn bank_table_of(chip: &dyn Coprocessor) -> Option<BankTable> {
-    let ExpansionChipType::Custom(CUSTOM_SEGA | CUSTOM_SSF2 | CUSTOM_CODEMASTERS) =
-        chip.info().chip_type
-    else {
-        return None;
-    };
-    match bincode::deserialize::<GenesisCoprocessorState>(&chip.serialize()).ok()? {
-        GenesisCoprocessorState::BankMapper(state) => Some(BankTable {
-            kind: state.kind,
-            banks: state.banks,
-        }),
-        _ => None,
-    }
-}
-
 impl Coprocessor for BankMapperChip {
     fn info(&self) -> &ExpansionChipInfo {
         &self.info
@@ -205,6 +169,15 @@ impl Coprocessor for BankMapperChip {
                 .copied()
                 .unwrap_or(0xFF),
         )
+    }
+
+    /// The ROM offset a ROM-window read reaches through the banks as they
+    /// are set; `Unknown` past the end of the ROM (the read is open bus).
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        match u32::try_from(self.physical_offset(offset)) {
+            Ok(physical) if (physical as usize) < self.rom.len() => SourcePlace::Rom(physical),
+            _ => SourcePlace::Unknown,
+        }
     }
 
     fn write(&mut self, offset: u32, value: u8, _master_cycle: u64) {
@@ -409,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_read_from_a_mapper_reaches_what_the_chip_reads() {
+    fn a_byte_s_source_is_the_rom_offset_the_chip_reads() {
         let mut sega = BankMapperChip::sega(rom(16));
         sega.observe_write(0xA130F6, 11);
         let mut ssf2 = BankMapperChip::ssf2(rom(9));
@@ -418,29 +391,39 @@ mod tests {
         codemasters.write(0x08000, 5, 0);
         for chip in [&mut sega, &mut ssf2, &mut codemasters] {
             let accesses = chip.accesses();
-            let table = bank_table_of(&*chip).expect("a bank mapper");
-            assert_eq!(
-                chip.accesses(),
-                accesses,
-                "reading the table counts no access"
-            );
             for slot in 0..8u32 {
                 let address = slot * 0x80000 + 0x1234;
+                let physical = chip.physical_offset(address) as u32;
                 assert_eq!(
-                    table.physical_offset(address),
-                    chip.physical_offset(address),
+                    chip.source_place(address),
+                    SourcePlace::Rom(physical),
                     "slot {slot}"
                 );
             }
+            assert_eq!(
+                chip.accesses(),
+                accesses,
+                "naming a source counts no access"
+            );
         }
-        assert_eq!(sega.physical_offset(0x30_0010), 11 * BANK_SIZE + 0x10);
-        assert_eq!(ssf2.physical_offset(0x38_0000), 8 * BANK_SIZE);
+        assert_eq!(
+            sega.source_place(0x30_0010),
+            SourcePlace::Rom((11 * BANK_SIZE + 0x10) as u32)
+        );
+        assert_eq!(
+            ssf2.source_place(0x38_0000),
+            SourcePlace::Rom((8 * BANK_SIZE) as u32)
+        );
     }
 
     #[test]
-    fn another_chip_has_no_bank_table() {
-        let eeprom = crate::cartridge::composable::EepromChip::new(128);
-        assert!(bank_table_of(&eeprom).is_none());
+    fn a_bank_past_the_rom_is_no_source() {
+        // A 4.5 MiB ROM: the SSF2 mapper's bank 8 is its last half bank.
+        let mut ssf2 = BankMapperChip::ssf2(Arc::from(vec![0u8; 0x440000].into_boxed_slice()));
+        ssf2.observe_write(0xA130F1, 0x01);
+        assert_eq!(ssf2.source_place(0x38_0000), SourcePlace::Rom(0x400000));
+        assert_eq!(ssf2.source_place(0x3C_0000), SourcePlace::Unknown);
+        assert_eq!(ssf2.read(0x3C_0000, 0), 0xFF, "the read is open bus too");
     }
 
     #[test]

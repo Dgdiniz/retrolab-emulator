@@ -7,6 +7,7 @@ use super::GenesisEmulator;
 use crate::debugger::GenesisEvent;
 #[cfg(doc)]
 use retro_core::capture::CaptureCore;
+use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Clockable;
 use retro_core::frame::{Due, FrameMachine, StepHooks, Stepped};
 

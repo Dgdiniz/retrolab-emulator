@@ -5,7 +5,7 @@
 
 use retro_core::cpu::Addressable;
 use sg1_core::bus::AddressBus;
-use sg1_core::cartridge::composable::build_genesis_cartridge;
+use sg1_core::cartridge::build_genesis_cartridge;
 use sg1_core::cpu68k::M68k;
 
 /// Helper to create a ROM with instructions and initialize CPU

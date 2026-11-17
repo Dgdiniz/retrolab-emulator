@@ -1,11 +1,13 @@
-//! Typed coprocessor savestate for the composable Genesis cartridge.
+//! Typed coprocessor savestate for the Genesis cartridge.
 //!
 //! The generic [`Coprocessor`](retro_core::cartridge::Coprocessor) trait
 //! serializes to opaque `Vec<u8>` so the `retro-core` layer stays
 //! console-agnostic. Each Genesis chip `bincode`-encodes one variant of
-//! [`GenesisCoprocessorState`] inside that blob, and
-//! [`ComposableCartridge`](super::ComposableCartridge) decodes it back,
-//! exactly the bridge the SNES core uses with its `CoprocessorState`.
+//! [`GenesisCoprocessorState`] inside that blob, and the cartridge
+//! ([`Cartridge::coprocessors_savestate`](retro_core::cartridge::Cartridge::coprocessors_savestate),
+//! with [`GenesisBoard`](super::GenesisBoard) naming this enum as its chip
+//! state) decodes it back, exactly the bridge the SNES core uses with its
+//! `CoprocessorState`.
 //!
 //! The enum is backend-tagged: a blob saved by one chip never silently
 //! restores into another (a J-Cart blob won't load into the SVP). New

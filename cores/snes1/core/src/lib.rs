@@ -28,13 +28,13 @@ pub mod trace_format;
 pub use bus::{IoAccess, PageHandler, SnesBus, SnesPeekBus};
 pub use cartridge::{
     detect_dsp1_layout, detect_preset, detect_preset_with_threshold, detected_manifest,
-    exhirom_preset, hirom_preset, lorom_preset, manifest_to_map_plan, parse_manifest, rom_sha256,
-    score_header, try_parse_header, unsupported_chip, unsupported_preset, BuildError, BusSpeed,
-    CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset, Dsp1Cartridge,
-    Dsp1Layout, ManifestChip, ManifestControllers, ManifestError, ManifestMapping, ManifestRom,
-    ManifestSlot, ManifestTarget, MapPlan, MapSlot, MapTarget, PlainCartridge, PresetKind,
-    Resolved, SnesCartridge, SnesCartridgeDebugger, SnesHeader, SnesVectors, CHIP_CX4_BUILT,
-    CHIP_SA1_BUILT, CHIP_SUPERFX_BUILT, DEFAULT_DETECT_THRESHOLD, DSP1_CHIP_ID, HEADER_CANDIDATES,
+    exhirom_preset, hirom_preset, lorom_preset, manifest_to_map_plan, parse_manifest, score_header,
+    try_parse_header, unsupported_chip, unsupported_preset, BuildError, BusSpeed, CartridgeBuilder,
+    CartridgeManifest, CoprocessorMode, DetectedPreset, Dsp1Layout, ManifestChip,
+    ManifestControllers, ManifestError, ManifestMapping, ManifestRom, ManifestSlot, ManifestTarget,
+    MapPlan, MapSlot, MapTarget, PresetKind, Resolved, SnesBoard, SnesCartridge, SnesHeader,
+    SnesManifestExtras, SnesMappingKnobs, SnesVectors, CHIP_CX4_BUILT, CHIP_SA1_BUILT,
+    CHIP_SUPERFX_BUILT, DEFAULT_DETECT_THRESHOLD, DSP1_CHIP_ID, HEADER_CANDIDATES,
     MAP_MODE_EXHIROM, MAP_MODE_HIROM, MAP_MODE_LOROM, NEC_LLE_BUILT, SUPPORTED_MANIFEST_VERSION,
 };
 pub use controller::{input_state_to_snes_pad, Controller, StandardPad};

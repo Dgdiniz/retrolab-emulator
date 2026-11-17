@@ -226,8 +226,8 @@ impl GenesisEmulator {
         if self.ym_sample_buf.len() < samples_per_frame * 2 {
             self.ym_sample_buf.resize(samples_per_frame * 2, 0.0);
         }
-        if self.cart_sample_buf.len() < samples_per_frame * 2 {
-            self.cart_sample_buf.resize(samples_per_frame * 2, 0.0);
+        if self.mix_sample_buf.len() < samples_per_frame * 2 {
+            self.mix_sample_buf.resize(samples_per_frame * 2, 0.0);
         }
 
         // Zero the used portion of buffers
@@ -235,9 +235,6 @@ impl GenesisEmulator {
             *v = 0.0;
         }
         for v in &mut self.ym_sample_buf[..samples_per_frame * 2] {
-            *v = 0.0;
-        }
-        for v in &mut self.cart_sample_buf[..samples_per_frame * 2] {
             *v = 0.0;
         }
 
@@ -256,32 +253,6 @@ impl GenesisEmulator {
         );
         let _ym_stereo_count = ym_count / 2;
 
-        // Check if cartridge has audio
-        let has_cart_audio = self
-            .bus
-            .cartridge()
-            .and_then(|c| c.audio())
-            .map(|a| a.is_enabled())
-            .unwrap_or(false);
-
-        // Generate cartridge audio if present
-        let cart_count = if has_cart_audio {
-            if let Some(cart) = self.bus.cartridge_mut() {
-                if let Some(audio) = cart.audio_mut() {
-                    audio.generate_audio(
-                        &mut self.cart_sample_buf[..samples_per_frame * 2],
-                        self.audio_sample_rate,
-                    )
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
         // Everything above advanced serialized machine state (the converter and
         // each chip's `clock_accumulator`), so it ran on this frame regardless of
         // presentation. A headless frame stops here: the mix, the waveform ring,
@@ -292,11 +263,10 @@ impl GenesisEmulator {
             return;
         }
 
-        // Mix PSG + YM2612 + Cartridge Audio (stereo interleaved: L, R, L, R, ...)
+        // Mix PSG + YM2612 (stereo interleaved: L, R, L, R, ...)
         // Always output exactly samples_per_frame to keep the audio buffer fill
         // rate matched to the video frame rate. Both sample buffers are pre-zeroed,
         // so if either chip produced slightly fewer samples, the tail is silence.
-        let cart_stereo_count = cart_count / 2;
         let mix_count = samples_per_frame;
 
         for i in 0..mix_count {
@@ -307,44 +277,16 @@ impl GenesisEmulator {
             let ym_left = self.ym_sample_buf[i * 2];
             let ym_right = self.ym_sample_buf[i * 2 + 1];
 
-            // Cartridge audio (stereo or none)
-            let (cart_left, cart_right) = if has_cart_audio && i < cart_stereo_count {
-                let cl = self.cart_sample_buf[i * 2];
-                let cr = self.cart_sample_buf[i * 2 + 1];
-                let cart_volume = self
-                    .bus
-                    .cartridge()
-                    .and_then(|c| c.audio())
-                    .map(|a| a.get_volume())
-                    .unwrap_or(1.0);
-                (cl * cart_volume, cr * cart_volume)
-            } else {
-                (0.0, 0.0)
-            };
-
-            // Mix: PSG (mono->both) + YM2612 (stereo) + Cart (stereo)
+            // Mix: PSG (mono->both) + YM2612 (stereo)
             // PSG/FM balance: the PSG at full scale is about a third of the
             // FM at full scale (0.34, the ratio Genesis Plus GX's default
             // levels give). 0.25/0.75 gives 0.333, with max output = 1.0.
-            let (mixed_left, mixed_right) = if has_cart_audio {
-                (
-                    soft_limit(psg * 0.20 + ym_left * 0.60 + cart_left * 0.20),
-                    soft_limit(psg * 0.20 + ym_right * 0.60 + cart_right * 0.20),
-                )
-            } else {
-                (
-                    soft_limit(psg * 0.25 + ym_left * 0.75),
-                    soft_limit(psg * 0.25 + ym_right * 0.75),
-                )
-            };
+            let mixed_left = soft_limit(psg * 0.25 + ym_left * 0.75);
+            let mixed_right = soft_limit(psg * 0.25 + ym_right * 0.75);
 
-            // Reuse `cart_sample_buf` as a scratch staging area for
-            // stereo-interleaved mixed output: it was zeroed at the top
-            // of this function and we no longer need its original
-            // contents past this point in the mix. Avoids a per-frame
-            // Vec alloc.
-            self.cart_sample_buf[i * 2] = mixed_left;
-            self.cart_sample_buf[i * 2 + 1] = mixed_right;
+            // The stereo-interleaved mixed output, staged for the ring.
+            self.mix_sample_buf[i * 2] = mixed_left;
+            self.mix_sample_buf[i * 2 + 1] = mixed_right;
 
             // Store mono mix for waveform visualization
             let mono = (mixed_left + mixed_right) * 0.5;
@@ -359,6 +301,6 @@ impl GenesisEmulator {
         // oldest samples and bumps `overflow_count`. Callers diagnose
         // backpressure through `audio_ring_overflows()`.
         self.audio_ring
-            .push_slice(&self.cart_sample_buf[..mix_count * 2]);
+            .push_slice(&self.mix_sample_buf[..mix_count * 2]);
     }
 }

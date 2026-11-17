@@ -1497,5 +1497,9 @@ retro_wasm::capture_bindings!(
     after_frame = refresh_present
 );
 
+// The cartridge methods every core exports the same way
+// (`getCartridgeHash`), over the emulator's `get_cartridge_hash`.
+retro_wasm::cartridge_bindings!(RetroEmulator, snes);
+
 #[cfg(test)]
 mod tests;

@@ -71,6 +71,18 @@ fn test_detected_manifest_reflects_loaded_rom() {
 }
 
 #[wasm_bindgen_test]
+fn the_cartridge_hash_is_the_sha256_of_the_file_loaded() {
+    let mut emu = RetroEmulator::new("genesis").unwrap();
+    assert_eq!(emu.get_cartridge_hash(), None, "no load yet");
+    let rom = synth_genesis_rom("HASHED GAME");
+    emu.load_rom(&rom).unwrap();
+    assert_eq!(
+        emu.get_cartridge_hash(),
+        Some(retro_core::cartridge::rom_sha256(&rom))
+    );
+}
+
+#[wasm_bindgen_test]
 fn a_savestate_from_another_rom_is_refused_by_name_and_loads_when_asked() {
     let mut first = RetroEmulator::new("genesis").unwrap();
     first.load_rom(&synth_genesis_rom("FIRST BUILD")).unwrap();

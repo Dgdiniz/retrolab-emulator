@@ -35,7 +35,7 @@ impl SnesEmulator {
     /// Whether a game is loaded: the readers of the held frame answer
     /// nothing before one is.
     fn game_loaded(&self) -> bool {
-        self.bus.cartridge_ref().is_some()
+        self.bus.cartridge().is_some()
     }
 
     /// The number a snapshot of the picture the host holds carries

@@ -4,7 +4,7 @@
 
 use super::common::*;
 use retro_core::cpu::Addressable;
-use sg1_core::cartridge::composable::build_genesis_cartridge;
+use sg1_core::cartridge::build_genesis_cartridge;
 use sg1_core::cpu68k::instructions::Flag;
 
 /// Helper to load a ROM into bus with header

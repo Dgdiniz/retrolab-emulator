@@ -42,8 +42,8 @@ pub use types::*;
 
 // Re-export cartridge types
 pub use cartridge::{
-    BankConfiguration, BankInfo, Cartridge, CartridgeAudio, CartridgeAudioInfo, CartridgeAudioType,
-    CartridgeDebugger, CartridgeInfo, ChipFactory, ChipRegister, ChipSet, ConsoleSystem,
-    Coprocessor, DetectionSource, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
-    MapTarget, MappedAddress, Mapper, MapperId, MapperInfo, MemoryType, Region, SRAMType,
+    BankConfiguration, BankInfo, Cartridge, CartridgeDebugger, CartridgeInfo, ChipFactory,
+    ChipRegister, ChipSet, ConsoleSystem, Coprocessor, DetectionSource, ExpansionChipInfo,
+    ExpansionChipState, ExpansionChipType, MapTarget, MapperId, MapperInfo, MemoryType, Region,
+    SRAMType,
 };

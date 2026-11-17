@@ -13,10 +13,11 @@
 // emulator state, no DOM. That keeps it unit-testable without WASM.
 //
 // This module also owns SNES ROM identity. `sg1-wasm` exposes
-// `getCartridgeHash()` / `getCartridgeTitle()`, but `snes1-wasm` does
-// not, it only offers `getRomInfo()` (`{ title, region, checksum, ... }`).
-// `deriveRomIdentity()` papers over that difference with a JS byte hash
-// so SRAM / breakpoint / save-state storage keys keep working for both.
+// `getCartridgeHash()` / `getCartridgeTitle()`; `snes1-wasm` exposes
+// `getCartridgeHash()` too, but no title call, only `getRomInfo()`
+// (`{ title, region, checksum, ... }`). For snes1, `deriveRomIdentity()`
+// keeps the JS byte hash its SRAM / breakpoint / save-state / manifest
+// stores have always been keyed by, so what they hold keeps loading.
 
 export type WebCore = 'sg1' | 'snes1'
 
@@ -177,8 +178,9 @@ export interface RomIdentity {
  *
  *   - SG1 has native `getCartridgeHash()` / `getCartridgeTitle()`, use
  *     them when present (older builds may lack them, hence the guards).
- *   - snes1 has neither, so we hash the ROM bytes ourselves and read
- *     the title from `getRomInfo()`.
+ *   - snes1 has no title call, so we read the title from `getRomInfo()`,
+ *     and we hash the ROM bytes ourselves: its `getCartridgeHash()` is
+ *     not the key its stores have always been keyed by.
  *
  * The filename is the last-resort title so the UI never shows an empty
  * label. A `null` hash means "don't persist SRAM/breakpoints"; it is

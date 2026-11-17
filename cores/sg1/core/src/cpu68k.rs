@@ -1463,7 +1463,7 @@ impl M68k {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cartridge::composable::build_genesis_cartridge;
+    use crate::cartridge::build_genesis_cartridge;
     use retro_core::memory::Ram;
 
     #[test]

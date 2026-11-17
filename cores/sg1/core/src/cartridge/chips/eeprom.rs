@@ -15,9 +15,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::cartridge::composable::savestate::{
-    EepromChipState, EepromPhase, GenesisCoprocessorState,
-};
+use crate::cartridge::savestate::{EepromChipState, EepromPhase, GenesisCoprocessorState};
 
 /// A serial EEPROM chip driven over the two-wire control byte.
 pub struct EepromChip {

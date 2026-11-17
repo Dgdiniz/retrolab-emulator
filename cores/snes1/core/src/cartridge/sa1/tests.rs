@@ -24,6 +24,29 @@ fn read_mmio(chip: &mut Sa1Chip, reg: u16) -> u8 {
 }
 
 #[test]
+fn both_bwram_views_are_the_cartridges_ram_and_the_rest_the_chips() {
+    let chip = Sa1Chip::new(ramp_rom(0x10_0000), 0x8000, true, NTSC_HZ);
+    for offset in [SA1_BWRAM_BASE + 0x10, SA1_BWRAM_LINEAR_BASE + 0x1_2345] {
+        assert_eq!(
+            chip.source_place(offset),
+            SourcePlace::CartridgeRam,
+            "{offset:#x}"
+        );
+    }
+    for offset in [
+        SA1_MMIO_BASE + 0x09,
+        SA1_IRAM_BASE + 0x10,
+        SA1_ROM_BASE + 0x00_8000,
+    ] {
+        assert_eq!(
+            chip.source_place(offset),
+            SourcePlace::Coprocessor,
+            "{offset:#x}"
+        );
+    }
+}
+
+#[test]
 fn label_type_and_reset_defaults() {
     let chip = Sa1Chip::new(ramp_rom(0x40_0000), 0, false, NTSC_HZ);
     assert_eq!(chip.label(), "SA-1");

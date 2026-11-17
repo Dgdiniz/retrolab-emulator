@@ -391,7 +391,7 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::bus::AddressBus;
-    use crate::cartridge::composable::build_genesis_cartridge;
+    use crate::cartridge::build_genesis_cartridge;
     use crate::cpu68k::make_test_rom_with_header;
 
     #[test]

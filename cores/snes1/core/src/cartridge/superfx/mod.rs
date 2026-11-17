@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    SourcePlace,
 };
 use retro_core::cpu::Addressable;
 use retro_core::debug::TraceEntry;
@@ -252,6 +253,25 @@ impl Coprocessor for SuperFxChip {
             Some(self.scpu_ram_read(offset - SUPERFX_RAM_BASE))
         } else {
             None
+        }
+    }
+
+    /// Where a byte the S-CPU reads comes from: the Game Pak ROM windows
+    /// keep the plain ROM geometry, so they name the image's offset
+    /// (`Unknown` past the image); the Game Pak RAM is the cartridge's RAM;
+    /// the registers are the chip's.
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        if offset >= SUPERFX_ROM_BASE {
+            let rom_offset = offset - SUPERFX_ROM_BASE;
+            if (rom_offset as usize) < self.rom.len() {
+                SourcePlace::Rom(rom_offset)
+            } else {
+                SourcePlace::Unknown
+            }
+        } else if offset >= SUPERFX_RAM_BASE {
+            SourcePlace::CartridgeRam
+        } else {
+            SourcePlace::Coprocessor
         }
     }
 
@@ -640,6 +660,27 @@ mod tests {
             has_battery,
             NTSC_HZ,
         )
+    }
+
+    #[test]
+    fn each_window_names_where_its_bytes_come_from() {
+        let chip = chip(0x8000, false);
+        let accesses = chip.accesses();
+        assert_eq!(
+            chip.source_place(SUPERFX_ROM_BASE + 0x1234),
+            SourcePlace::Rom(0x1234)
+        );
+        assert_eq!(
+            chip.source_place(SUPERFX_ROM_BASE + 0x10_0000),
+            SourcePlace::Unknown,
+            "past the image"
+        );
+        assert_eq!(
+            chip.source_place(SUPERFX_RAM_BASE + 0x10),
+            SourcePlace::CartridgeRam
+        );
+        assert_eq!(chip.source_place(mmio(0x3030)), SourcePlace::Coprocessor);
+        assert_eq!(chip.accesses(), accesses, "naming a source counts nothing");
     }
 
     /// The chip-address the chip's `read`/`write` receives for an MMIO

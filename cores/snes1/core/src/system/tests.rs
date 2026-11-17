@@ -152,7 +152,7 @@ fn manifest_override_changes_installed_plan() {
     // Pure detection: HiROM plan, 2 KiB SRAM.
     emu.load_rom(&rom).expect("loads via detection");
     assert_eq!(emu.get_save_ram().map(<[u8]>::len), Some(2048));
-    assert_eq!(emu.bus.cartridge_ref().unwrap().map_plan().name, "hirom");
+    assert_eq!(emu.bus.cartridge().unwrap().map_plan().name, "hirom");
 
     // Override: force LoROM + 32 KiB SRAM, then reload.
     let mut over = emu.detected_manifest(&rom);
@@ -161,13 +161,13 @@ fn manifest_override_changes_installed_plan() {
     emu.set_cartridge_manifest_override(Some(over));
     emu.load_rom(&rom).expect("loads with override");
     assert_eq!(emu.get_save_ram().map(<[u8]>::len), Some(32 * 1024));
-    assert_eq!(emu.bus.cartridge_ref().unwrap().map_plan().name, "lorom");
+    assert_eq!(emu.bus.cartridge().unwrap().map_plan().name, "lorom");
 
     // Clearing the override reverts to pure detection.
     emu.set_cartridge_manifest_override(None);
     emu.load_rom(&rom).expect("loads after clear");
     assert_eq!(emu.get_save_ram().map(<[u8]>::len), Some(2048));
-    assert_eq!(emu.bus.cartridge_ref().unwrap().map_plan().name, "hirom");
+    assert_eq!(emu.bus.cartridge().unwrap().map_plan().name, "hirom");
 }
 
 #[test]

@@ -14,6 +14,7 @@
 //!   objects, typed-array copies, values serialized with maps as objects).
 //! - [`capture`]: the capture contract's marshallers, and
 //!   [`capture_bindings!`] for its methods.
+//! - [`cartridge`]: [`cartridge_bindings!`] for the cartridge's methods.
 //! - [`debugger`]: the debugger's values (execution modes and breakpoint
 //!   types by name, the coverage figures), and [`debugger_bindings!`] for
 //!   its methods.
@@ -25,6 +26,7 @@
 //! code `#[wasm_bindgen]` writes names that crate.
 
 pub mod capture;
+pub mod cartridge;
 pub mod debugger;
 pub mod js;
 

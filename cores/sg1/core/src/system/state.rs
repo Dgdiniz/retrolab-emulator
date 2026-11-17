@@ -3,6 +3,7 @@
 //! compare.
 
 use super::GenesisEmulator;
+use retro_core::cartridge::Cartridge;
 #[cfg(doc)]
 use retro_core::EmulatorCore;
 
@@ -11,7 +12,7 @@ use retro_core::EmulatorCore;
 /// [`GenesisEmulator::get_cartridge_save_state`].
 type CartridgeSavePayload = (
     Vec<u8>,
-    Vec<(u8, crate::cartridge::composable::GenesisCoprocessorState)>,
+    Vec<(u8, crate::cartridge::GenesisCoprocessorState)>,
 );
 
 impl GenesisEmulator {

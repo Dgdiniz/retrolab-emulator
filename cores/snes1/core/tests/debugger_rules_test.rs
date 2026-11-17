@@ -377,6 +377,22 @@ fn coverage_is_cleared_when_another_program_loads() {
     assert_eq!(covered(&emu), 0, "another program clears it");
 }
 
+#[test]
+fn the_same_image_behind_a_copier_header_keeps_the_coverage() {
+    // The rule reads the image, the file less its copier header.
+    let rom = lorom(LOOP);
+    let mut emu = loaded(&rom);
+    for _ in 0..3 {
+        emu.step_cpu(MAIN_CPU);
+    }
+    assert_eq!(covered(&emu), 2);
+    let mut headed = vec![0u8; 512];
+    headed.extend_from_slice(&rom);
+    emu.load_rom(&headed)
+        .expect("the image behind a copier header loads");
+    assert_eq!(covered(&emu), 2, "the same image keeps it");
+}
+
 /// A coprocessor cartridge, built by `rom`, with a program that loops
 /// reading one of the chip's windows; `chip` is the chip's name.
 #[derive(Clone, Copy)]

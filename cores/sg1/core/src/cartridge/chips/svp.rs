@@ -45,8 +45,8 @@ use ssp1601::{
     SSP_WAIT_PM0, SSP_XST,
 };
 
-use crate::cartridge::composable::presets::{SVP_CELL1_BASE, SVP_CELL2_BASE, SVP_MAILBOX_BASE};
-use crate::cartridge::composable::savestate::{GenesisCoprocessorState, SvpState};
+use crate::cartridge::presets::{SVP_CELL1_BASE, SVP_CELL2_BASE, SVP_MAILBOX_BASE};
+use crate::cartridge::savestate::{GenesisCoprocessorState, SvpState};
 
 /// Size of the 68000-visible SVP DRAM (`0x300000-0x31FFFF`, banks
 /// `0x30`/`0x31`).

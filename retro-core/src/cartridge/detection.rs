@@ -1,14 +1,10 @@
-//! Cartridge detection system
-//!
-//! Provides intelligent ROM detection using multiple strategies:
-//! - Header parsing (console-specific)
-//! - SHA-256 hash database lookup
-//! - JSON manifest files
-//! - Heuristic detection
+//! What a ROM says of itself: the header-parser seam each console
+//! implements, the ROM hash, and the heuristic that tells the consoles'
+//! images apart.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use super::*;
 
@@ -63,213 +59,20 @@ pub struct HeaderInfo {
 }
 
 // ============================================================================
-// ROM Database
-// ============================================================================
-
-/// ROM database entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RomDatabaseEntry {
-    /// SHA-256 hash of ROM
-    pub hash: String,
-
-    /// Title
-    pub title: String,
-
-    /// Serial number
-    pub serial: Option<String>,
-
-    /// Regions
-    pub regions: Vec<Region>,
-
-    /// Mapper
-    pub mapper: MapperId,
-
-    /// Expansion chip
-    pub expansion_chip: Option<ExpansionChipType>,
-
-    /// SRAM size
-    pub sram_size: usize,
-
-    /// SRAM type
-    pub sram_type: SRAMType,
-
-    /// Notes
-    pub notes: Option<String>,
-
-    /// Fixes needed
-    pub fixes: Option<Vec<RomFix>>,
-}
-
-/// ROM fix/patch
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RomFix {
-    /// Patch a byte at offset
-    PatchByte { offset: usize, value: u8 },
-
-    /// Fix checksum
-    FixChecksum,
-
-    /// Trim overdump
-    TrimOverdump { new_size: usize },
-}
-
-/// ROM database
-pub struct RomDatabase {
-    entries: HashMap<String, RomDatabaseEntry>,
-}
-
-impl RomDatabase {
-    /// Create empty database
-    pub fn new() -> Self {
-        RomDatabase {
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Load database from embedded JSON
-    pub fn load_embedded() -> Self {
-        // For now, return empty database
-        // TODO: Load from embedded JSON file
-        RomDatabase::new()
-    }
-
-    /// Load database from JSON string
-    pub fn from_json(json: &str) -> Result<Self, String> {
-        let entries: Vec<RomDatabaseEntry> = serde_json::from_str(json)
-            .map_err(|e| format!("Failed to parse database JSON: {}", e))?;
-
-        let mut map = HashMap::new();
-        for entry in entries {
-            map.insert(entry.hash.clone(), entry);
-        }
-
-        Ok(RomDatabase { entries: map })
-    }
-
-    /// Add entry to database
-    pub fn add_entry(&mut self, entry: RomDatabaseEntry) {
-        self.entries.insert(entry.hash.clone(), entry);
-    }
-
-    /// Lookup ROM by hash
-    pub fn lookup(&self, hash: &str) -> Option<&RomDatabaseEntry> {
-        self.entries.get(hash)
-    }
-
-    /// Get number of entries
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if database is empty
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl Default for RomDatabase {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
-// Manifest
-// ============================================================================
-
-/// Manifest file structure (JSON)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Manifest {
-    /// Format identifier
-    pub format: String,
-
-    /// Version
-    pub version: String,
-
-    /// Console system
-    pub system: String,
-
-    /// Title
-    pub title: String,
-
-    /// Serial number
-    pub serial: Option<String>,
-
-    /// Regions
-    pub regions: Vec<String>,
-
-    /// Mapper configuration
-    pub mapper: Option<ManifestMapper>,
-
-    /// SRAM configuration
-    pub sram: Option<ManifestSram>,
-
-    /// Expansion chip configuration
-    pub expansion_chip: Option<ManifestExpansionChip>,
-
-    /// Notes
-    pub notes: Option<String>,
-
-    /// Overrides
-    pub overrides: Option<ManifestOverrides>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestMapper {
-    #[serde(rename = "type")]
-    pub mapper_type: String,
-    pub banks: Option<u32>,
-    pub bank_size: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestSram {
-    pub size: String,
-    #[serde(rename = "type")]
-    pub sram_type: String,
-    pub address_range: Option<Vec<String>>,
-    pub odd_byte: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestExpansionChip {
-    #[serde(rename = "type")]
-    pub chip_type: String,
-    pub rom_start: Option<String>,
-    pub rom_size: Option<String>,
-    pub chip_ram_size: Option<String>,
-    pub chip_rom_size: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestOverrides {
-    pub force_detection: Option<bool>,
-    pub ignore_header: Option<bool>,
-}
-
-impl Manifest {
-    /// Load manifest from JSON string
-    pub fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json).map_err(|e| format!("Failed to parse manifest: {}", e))
-    }
-
-    /// Convert to JSON string
-    pub fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize manifest: {}", e))
-    }
-}
-
-// ============================================================================
 // Hash Utilities
 // ============================================================================
 
-/// Calculate SHA-256 hash of ROM data
-pub fn calculate_rom_hash(rom_data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(rom_data);
-    let result = hasher.finalize();
-    format!("{:x}", result)
+/// The SHA-256 of `bytes`, in lowercase hex: the hash of a ROM image
+/// (`CartridgeInfo::rom_hash`, a manifest's `rom.sha256`, the savestate
+/// envelope's check) or of the file a host loaded, as the caller chooses
+/// what to hash. It hashes what it is given.
+pub fn rom_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(out, "{byte:02x}").expect("writing to a String does not fail");
+    }
+    out
 }
 
 // ============================================================================
@@ -327,59 +130,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_calculate_rom_hash() {
-        let data = b"test data";
-        let hash = calculate_rom_hash(data);
-
-        // SHA-256 of "test data"
-        assert_eq!(hash.len(), 64); // SHA-256 is 64 hex chars
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_rom_database() {
-        let mut db = RomDatabase::new();
-        assert!(db.is_empty());
-
-        let entry = RomDatabaseEntry {
-            hash: "test_hash".to_string(),
-            title: "Test Game".to_string(),
-            serial: Some("TEST-001".to_string()),
-            regions: vec![Region::USA],
-            mapper: MapperId::GenesisNone,
-            expansion_chip: None,
-            sram_size: 0,
-            sram_type: SRAMType::None,
-            notes: None,
-            fixes: None,
-        };
-
-        db.add_entry(entry.clone());
-        assert_eq!(db.len(), 1);
-
-        let found = db.lookup("test_hash");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().title, "Test Game");
-    }
-
-    #[test]
-    fn test_manifest_json() {
-        let json = r#"{
-            "format": "retro-manifest",
-            "version": "1.0",
-            "system": "genesis",
-            "title": "Test Game",
-            "serial": null,
-            "regions": ["USA"],
-            "mapper": null,
-            "sram": null,
-            "expansion_chip": null,
-            "notes": null,
-            "overrides": null
-        }"#;
-
-        let manifest = Manifest::from_json(json).unwrap();
-        assert_eq!(manifest.system, "genesis");
-        assert_eq!(manifest.title, "Test Game");
+    fn rom_sha256_gives_the_standard_vectors_in_lowercase_hex() {
+        assert_eq!(
+            rom_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            rom_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

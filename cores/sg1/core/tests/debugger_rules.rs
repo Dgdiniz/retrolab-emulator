@@ -18,7 +18,7 @@ use retro_core::debug::TraceEntry;
 use retro_core::frame::run_frame_on;
 use retro_core::types::{Breakpoint, BreakpointType, StackFrame};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
-use sg1_core::cartridge::composable::parse_manifest;
+use sg1_core::cartridge::parse_manifest;
 use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU};
 use sg1_core::GenesisEmulator;
 

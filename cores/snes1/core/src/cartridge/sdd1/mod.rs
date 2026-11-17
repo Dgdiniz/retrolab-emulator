@@ -108,7 +108,7 @@ struct DmaShadow {
 /// four MMC super-bank latches, and the two enable bitmasks, plus the
 /// decompression working set (the per-channel DMA shadow and the pending
 /// output buffer). The ROM/SRAM windows and program banks live in the
-/// [`ComposableCartridge`](super::ComposableCartridge) that hosts this chip;
+/// [`SnesCartridge`](super::SnesCartridge) that hosts this chip;
 /// the chip only ever serves the `$C0-$FF` MMC window and its own registers.
 pub struct Sdd1Chip {
     /// Cartridge ROM image, shared with the bus (the MMC indexes into it and
@@ -326,7 +326,8 @@ impl Coprocessor for Sdd1Chip {
     /// Persist the mapping state: the MMC latches, the two enable masks,
     /// and the per-channel DMA shadow, bincode-encoded as the console's
     /// typed [`CoprocessorState::Sdd1`] (the bridge in
-    /// [`ComposableCartridge`](super::ComposableCartridge) decodes it back).
+    /// [`Cartridge::coprocessors_savestate`](retro_core::cartridge::Cartridge::coprocessors_savestate)
+    /// decodes it back).
     /// The blob is always non-empty, the MMC latches are meaningful state
     /// even at reset, so an S-DD1 cartridge always contributes one snapshot
     /// entry. Diagnostics (`accesses`/`decompressions`) and the volatile

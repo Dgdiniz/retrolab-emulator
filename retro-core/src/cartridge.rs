@@ -1,106 +1,33 @@
-//! Cartridge system for multi-console emulation
+//! The cartridge stack every console shares.
 //!
-//! This module provides generic traits and types for cartridge emulation across
-//! multiple console systems (Genesis, NES, SNES, etc). It covers mappers,
-//! coprocessors (expansion chips) and a cartridge's own audio output.
+//! A cartridge is a ROM image, an optional battery RAM, a [`MapPlan`] its
+//! address space resolves through, and a [`ChipSet`] of independent
+//! [`Coprocessor`]s, put together by one [`ComposableCartridge`] over a
+//! console's [`Board`]. What lives here: the coprocessor model and its chip
+//! set, the map plan ([`map_plan`]), the cartridge trait and the composable
+//! cartridge ([`composable`]), the `cartridge-manifest-v1` format
+//! ([`manifest`]), the cartridge debugger ([`debug`]), the ROM hash
+//! ([`rom_sha256`]), and the types a host is told about a cartridge. What a
+//! console keeps: the shape of its slots, its board, its presets and header
+//! detection, its chips and the factory that builds them.
 
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-pub mod audio;
+use crate::audio::AudioDebugger;
+
+pub mod composable;
+pub mod debug;
 pub mod detection;
+pub mod manifest;
+pub mod map_plan;
 pub mod parsers;
-pub mod savestate;
 
-pub use audio::Msu1Audio;
-pub use savestate::{CartridgeSaveState, SaveStateMetadata, SramManager, SAVE_STATE_VERSION};
-
-// ============================================================================
-// Main Cartridge Trait
-// ============================================================================
-
-/// Main cartridge trait - generic across all consoles
-pub trait Cartridge: Send + Sync {
-    /// Get cartridge metadata
-    fn info(&self) -> &CartridgeInfo;
-
-    /// Read from cartridge address space
-    /// addr is console-specific (Genesis: 0x000000+, NES: CPU space, etc)
-    fn read(&mut self, addr: u32) -> u8;
-
-    /// Write to cartridge address space (for SRAM, mapper registers, etc)
-    fn write(&mut self, addr: u32, value: u8);
-
-    /// Read word (16-bit) - default implementation uses read()
-    fn read_word(&mut self, addr: u32) -> u16 {
-        let hi = self.read(addr) as u16;
-        let lo = self.read(addr + 1) as u16;
-        (hi << 8) | lo
-    }
-
-    /// Write word (16-bit)
-    fn write_word(&mut self, addr: u32, value: u16) {
-        self.write(addr, (value >> 8) as u8);
-        self.write(addr + 1, (value & 0xFF) as u8);
-    }
-
-    /// Clock the cartridge (for chips with timing, e.g. SVP, SuperFX)
-    fn clock(&mut self, cycles: u32) -> u32 {
-        cycles // Default: pass-through
-    }
-
-    /// Get SRAM/save data (if any)
-    fn get_save_ram(&self) -> Option<&[u8]>;
-
-    /// Set SRAM/save data
-    fn set_save_ram(&mut self, data: &[u8]) -> Result<(), String>;
-
-    /// Check if SRAM was modified (dirty flag)
-    fn is_save_ram_dirty(&self) -> bool;
-
-    /// Clear dirty flag
-    fn clear_save_ram_dirty(&mut self);
-
-    /// Serialize cartridge state (for save states)
-    fn serialize_state(&self) -> Result<Vec<u8>, String>;
-
-    /// Deserialize cartridge state
-    fn deserialize_state(&mut self, data: &[u8]) -> Result<(), String>;
-
-    /// Reset cartridge to initial state
-    fn reset(&mut self);
-
-    /// Get mapper if cartridge has one
-    fn mapper(&self) -> Option<&dyn Mapper> {
-        None
-    }
-
-    /// Get mapper (mutable)
-    fn mapper_mut(&mut self) -> Option<&mut dyn Mapper> {
-        None
-    }
-
-    /// Debugging: get cartridge debugger
-    fn debugger(&self) -> Option<&dyn CartridgeDebugger> {
-        None
-    }
-
-    /// Debugging: get cartridge debugger (mutable)
-    fn debugger_mut(&mut self) -> Option<&mut dyn CartridgeDebugger> {
-        None
-    }
-
-    /// Get cartridge audio interface (if cartridge generates audio)
-    fn audio(&self) -> Option<&dyn CartridgeAudio> {
-        None
-    }
-
-    /// Get cartridge audio interface (mutable)
-    fn audio_mut(&mut self) -> Option<&mut dyn CartridgeAudio> {
-        None
-    }
-}
+pub use composable::{install_chips, Board, Cartridge, ChipDecl, ComposableCartridge, UnknownChip};
+pub use debug::{describe_map_plan, MapPlanDebugger, MapRegionSummary};
+pub use detection::rom_sha256;
+pub use map_plan::{MapPlan, Resolved, SlotShape};
 
 // ============================================================================
 // Cartridge Metadata
@@ -149,6 +76,30 @@ pub struct CartridgeInfo {
     pub detection_source: DetectionSource,
 }
 
+impl CartridgeInfo {
+    /// What the image itself says of a cartridge of `system`: its size and
+    /// its hash ([`rom_sha256`] of `image`, the file less any copier
+    /// header), with no title, region, save RAM, mapper, chip or checksum,
+    /// detected from the header. A builder fills in what it detected.
+    pub fn new(system: ConsoleSystem, image: &[u8]) -> Self {
+        Self {
+            system,
+            title: String::new(),
+            serial: None,
+            regions: Vec::new(),
+            rom_size: image.len(),
+            sram_size: 0,
+            sram_type: SRAMType::None,
+            mapper_info: None,
+            expansion_chip_info: None,
+            header_checksum: None,
+            calculated_checksum: None,
+            rom_hash: rom_sha256(image),
+            detection_source: DetectionSource::Header,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsoleSystem {
     Genesis,
@@ -192,51 +143,8 @@ pub enum DetectionSource {
 }
 
 // ============================================================================
-// Mapper Trait
+// Mapping metadata (for the debugger and the cartridge's description)
 // ============================================================================
-
-/// Mapper trait - handles bank switching and memory mapping
-pub trait Mapper: Send + Sync {
-    /// Get mapper info
-    fn info(&self) -> &MapperInfo;
-
-    /// Map address to ROM offset for reading
-    /// Returns (physical_offset, is_writable)
-    fn map_read(&self, addr: u32) -> MappedAddress;
-
-    /// Map address for write
-    /// Returns MappedAddress if writable, None if write-protected
-    fn map_write(&mut self, addr: u32, value: u8) -> Option<MappedAddress>;
-
-    /// Handle mapper register write
-    /// Returns true if handled, false if should pass through
-    fn write_register(&mut self, addr: u32, value: u8) -> bool;
-
-    /// Get current bank configuration
-    fn get_bank_config(&self) -> BankConfiguration;
-
-    /// Reset mapper to initial state
-    fn reset(&mut self);
-
-    /// Serialize mapper state
-    fn serialize_mapper(&self) -> Result<Vec<u8>, String>;
-
-    /// Deserialize mapper state
-    fn deserialize_mapper(&mut self, data: &[u8]) -> Result<(), String>;
-}
-
-/// Mapped address result
-#[derive(Debug, Clone, Copy)]
-pub struct MappedAddress {
-    /// Physical offset in ROM/RAM
-    pub physical_offset: usize,
-
-    /// Memory type
-    pub memory_type: MemoryType,
-
-    /// Is writable?
-    pub writable: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryType {
@@ -376,6 +284,14 @@ pub trait Coprocessor: Send {
     /// catch-up).
     fn read(&mut self, offset: u32, master_cycle: u64) -> u8;
 
+    /// [`read`](Self::read) for a chip whose register drives only some of
+    /// the data bus's bits: `open_bus` is what the console's bus holds, for
+    /// the bits the chip leaves floating. The default ignores it.
+    fn read_with_open_bus(&mut self, offset: u32, master_cycle: u64, open_bus: u8) -> u8 {
+        let _ = open_bus;
+        self.read(offset, master_cycle)
+    }
+
     /// Write the chip MMIO.
     fn write(&mut self, offset: u32, value: u8, master_cycle: u64);
 
@@ -386,6 +302,15 @@ pub trait Coprocessor: Send {
     /// value a read of nothing gives. The default answers `None`.
     fn peek(&self, _offset: u32) -> Option<u8> {
         None
+    }
+
+    /// Where the byte a read at `offset` gives comes from: the ROM image at
+    /// an offset (a window that reaches the ROM in its plain geometry, or
+    /// through banks the chip holds as they stand), the cartridge's RAM, or
+    /// the chip itself. Read without a side effect. The default answers
+    /// [`SourcePlace::Coprocessor`].
+    fn source_place(&self, _offset: u32) -> SourcePlace {
+        SourcePlace::Coprocessor
     }
 
     /// Passive bus observation. Called when the console writes a range the
@@ -408,6 +333,33 @@ pub trait Coprocessor: Send {
     /// Pending IRQ? (SA-1, SuperFX). Default: none.
     fn has_irq(&self) -> bool {
         false
+    }
+
+    /// Whether the chip runs on every cycle of the console's CPU (a
+    /// mapper's scanline counter), and so wants [`tick`](Self::tick). Read
+    /// once, when the chip joins a [`ChipSet`]. Default: no.
+    fn needs_tick(&self) -> bool {
+        false
+    }
+
+    /// One cycle of the console's CPU, at `master_cycle`. Called only on a
+    /// chip that [`needs_tick`](Self::needs_tick). Default: nothing.
+    fn tick(&mut self, _master_cycle: u64) {}
+
+    /// Whether the chip makes sound the console mixes with its own. Read
+    /// once, when the chip joins a [`ChipSet`]. Default: no.
+    fn produces_audio(&self) -> bool {
+        false
+    }
+
+    /// The chip's sound output now, for the console's mix. Default: silence.
+    fn audio_level(&self) -> f32 {
+        0.0
+    }
+
+    /// The chip's sound channels for the debugger, when it makes sound.
+    fn audio_debugger(&mut self) -> Option<&mut dyn AudioDebugger> {
+        None
     }
 
     // -- Steppable secondary CPU ----------------------------------------------
@@ -503,25 +455,56 @@ pub trait Coprocessor: Send {
 /// A collection of independent coprocessors inside one cartridge, indexed by
 /// `chip_id` (the same id a console's chip-MMIO map target carries), plus the
 /// registry of observed bus ranges. Console-agnostic: it knows nothing about
-/// bank:offset address decoding, the console resolves an address to a
+/// a console's address decoding; the console resolves an address to a
 /// `(chip_id, offset)` pair and calls in here.
+///
+/// `C` is the chip object: `dyn Coprocessor` ([`ChipSet`]), or a console's
+/// own subtrait of it when the console reads more of its chips than the
+/// trait gives (a mapper's bank table), so that reaching it takes no
+/// downcast.
 ///
 /// The backing store is sparse: `index == chip_id`, with empty slots (`None`)
 /// allowed. This lets a chip live at a fixed id the console's map plan already
 /// carries (e.g. DSP-1 at id 1) without a chip at id 0, and lets a manifest
-/// place chips at arbitrary ids. Use [`ChipSet::insert`] for an explicit id,
-/// or [`ChipSet::push`] to append at the next free index.
-#[derive(Default)]
-pub struct ChipSet {
-    chips: Vec<Option<Box<dyn Coprocessor>>>, // index = chip_id (holes allowed)
+/// place chips at arbitrary ids. Use [`ChipSetOf::insert`] for an explicit id,
+/// or [`ChipSetOf::push`] to append at the next free index.
+///
+/// The ids of the chips that tick and of the chips that make sound are
+/// noted as each chip joins, so a cycle or a sample visits only those.
+pub struct ChipSetOf<C: ?Sized> {
+    chips: Vec<Option<Box<C>>>, // index = chip_id (holes allowed)
     observers: Vec<(RangeInclusive<u32>, u8)>, // observed range -> chip_id
+    ticking: Vec<u8>,           // ids whose chip needs_tick, ascending
+    sounding: Vec<u8>,          // ids whose chip produces_audio, ascending
 }
 
-impl ChipSet {
+/// The chip set of a console whose chips are plain [`Coprocessor`]s.
+pub type ChipSet = ChipSetOf<dyn Coprocessor>;
+
+impl<C: ?Sized> Default for ChipSetOf<C> {
+    fn default() -> Self {
+        Self {
+            chips: Vec::new(),
+            observers: Vec::new(),
+            ticking: Vec::new(),
+            sounding: Vec::new(),
+        }
+    }
+}
+
+/// Add `id` to the ascending list `ids`, once.
+fn note_id(ids: &mut Vec<u8>, id: u8) {
+    if let Err(at) = ids.binary_search(&id) {
+        ids.insert(at, id);
+    }
+}
+
+impl<C: ?Sized + Coprocessor> ChipSetOf<C> {
     /// Append a chip at the next free index, returning the `chip_id` it was
     /// assigned (its index).
-    pub fn push(&mut self, chip: Box<dyn Coprocessor>) -> u8 {
+    pub fn push(&mut self, chip: Box<C>) -> u8 {
         let id = self.chips.len() as u8;
+        self.note(id, &chip);
         self.chips.push(Some(chip));
         id
     }
@@ -529,12 +512,25 @@ impl ChipSet {
     /// Place `chip` at an explicit `id`, growing the backing store with empty
     /// slots as needed so `index == chip_id` holds. Overwrites any chip
     /// already at `id`.
-    pub fn insert(&mut self, id: u8, chip: Box<dyn Coprocessor>) {
+    pub fn insert(&mut self, id: u8, chip: Box<C>) {
         let idx = id as usize;
         while self.chips.len() <= idx {
             self.chips.push(None);
         }
+        self.ticking.retain(|&t| t != id);
+        self.sounding.retain(|&s| s != id);
+        self.note(id, &chip);
         self.chips[idx] = Some(chip);
+    }
+
+    /// Note `chip`, joining at `id`, among the chips that tick or make sound.
+    fn note(&mut self, id: u8, chip: &C) {
+        if chip.needs_tick() {
+            note_id(&mut self.ticking, id);
+        }
+        if chip.produces_audio() {
+            note_id(&mut self.sounding, id);
+        }
     }
 
     /// Register a bus range for a chip to passively observe (see
@@ -560,12 +556,14 @@ impl ChipSet {
     }
 
     /// Shared borrow of the chip at `id`, if present.
-    pub fn get(&self, id: u8) -> Option<&dyn Coprocessor> {
+    #[inline]
+    pub fn get(&self, id: u8) -> Option<&C> {
         self.chips.get(id as usize)?.as_deref()
     }
 
     /// Mutable borrow of the chip at `id`, if present.
-    pub fn get_mut(&mut self, id: u8) -> Option<&mut (dyn Coprocessor + 'static)> {
+    #[inline]
+    pub fn get_mut(&mut self, id: u8) -> Option<&mut C> {
         self.chips.get_mut(id as usize)?.as_deref_mut()
     }
 
@@ -577,18 +575,41 @@ impl ChipSet {
     }
 
     /// Read the chip `id`'s MMIO. `None` if no such chip.
+    #[inline]
     pub fn read(&mut self, id: u8, offset: u32, master_cycle: u64) -> Option<u8> {
         self.get_mut(id).map(|c| c.read(offset, master_cycle))
+    }
+
+    /// Read the chip `id`'s MMIO with the console bus's open-bus value
+    /// ([`Coprocessor::read_with_open_bus`]). `None` if no such chip.
+    #[inline]
+    pub fn read_with_open_bus(
+        &mut self,
+        id: u8,
+        offset: u32,
+        master_cycle: u64,
+        open_bus: u8,
+    ) -> Option<u8> {
+        self.get_mut(id)
+            .map(|c| c.read_with_open_bus(offset, master_cycle, open_bus))
     }
 
     /// Chip `id`'s byte at `offset`, read without a side effect
     /// ([`Coprocessor::peek`]); `None` if no such chip, or when the chip
     /// cannot answer without one.
+    #[inline]
     pub fn peek(&self, id: u8, offset: u32) -> Option<u8> {
         self.get(id)?.peek(offset)
     }
 
+    /// Where the byte a read of chip `id` at `offset` gives comes from
+    /// ([`Coprocessor::source_place`]); `None` if no such chip.
+    pub fn source_place(&self, id: u8, offset: u32) -> Option<SourcePlace> {
+        Some(self.get(id)?.source_place(offset))
+    }
+
     /// Write the chip `id`'s MMIO. No-op if no such chip.
+    #[inline]
     pub fn write(&mut self, id: u8, offset: u32, value: u8, master_cycle: u64) {
         if let Some(c) = self.get_mut(id) {
             c.write(offset, value, master_cycle);
@@ -596,17 +617,21 @@ impl ChipSet {
     }
 
     /// Forward an observed bus write to every chip whose registered range
-    /// covers `addr`. This is the dispatch behind `observe_write`.
-    pub fn observe_write(&mut self, addr: u32, value: u8) {
+    /// covers `addr`. This is the dispatch behind `observe_write`. Returns
+    /// whether a chip received it.
+    pub fn observe_write(&mut self, addr: u32, value: u8) -> bool {
+        let mut received = false;
         for (range, id) in &self.observers {
             if range.contains(&addr) {
                 if let Some(slot) = self.chips.get_mut(*id as usize) {
                     if let Some(c) = slot.as_deref_mut() {
                         c.observe_write(addr, value);
+                        received = true;
                     }
                 }
             }
         }
+        received
     }
 
     /// Advance every present chip's clock (called once per frame).
@@ -622,6 +647,35 @@ impl ChipSet {
     /// common case) reports `false` and costs nothing.
     pub fn has_irq(&self) -> bool {
         self.chips.iter().flatten().any(|c| c.has_irq())
+    }
+
+    /// Whether any chip ticks on every cycle of the console's CPU.
+    pub fn needs_tick(&self) -> bool {
+        !self.ticking.is_empty()
+    }
+
+    /// One cycle of the console's CPU for every chip that ticks, in id order.
+    pub fn tick(&mut self, master_cycle: u64) {
+        let Self { chips, ticking, .. } = self;
+        for &id in ticking.iter() {
+            if let Some(c) = chips[id as usize].as_deref_mut() {
+                c.tick(master_cycle);
+            }
+        }
+    }
+
+    /// Whether any chip makes sound the console mixes.
+    pub fn produces_audio(&self) -> bool {
+        !self.sounding.is_empty()
+    }
+
+    /// The sum of the sound output of every chip that makes sound.
+    pub fn audio_level(&self) -> f32 {
+        self.sounding
+            .iter()
+            .filter_map(|&id| self.get(id))
+            .map(|c| c.audio_level())
+            .sum()
     }
 
     /// Register snapshot of the first present chip that hosts a steppable
@@ -719,6 +773,15 @@ impl ChipSet {
             .collect()
     }
 
+    /// The id of the lowest-numbered chip that owns battery-backed data
+    /// (the chip a cartridge's save lives in), if any.
+    pub fn battery_id(&self) -> Option<u8> {
+        self.chips
+            .iter()
+            .position(|c| c.as_deref().is_some_and(|c| c.battery().is_some()))
+            .map(|i| i as u8)
+    }
+
     /// Battery-backed persistent data owned by the first present chip that
     /// has any (e.g. the SPC7110's game SRAM). `None` when no chip owns a
     /// battery, the common case, so a cartridge with no battery chip keeps
@@ -750,8 +813,9 @@ impl ChipSet {
 
 /// Builds a concrete chip from a manifest `kind`. The generic layer defines
 /// the seam; each console implements it, because the concrete chip types are
-/// console-owned; each console's cartridge builder calls it.
-pub trait ChipFactory {
+/// console-owned; each console's cartridge builder calls it. `C` is the chip
+/// object the console's chip set holds (`dyn Coprocessor` unless named).
+pub trait ChipFactory<C: ?Sized = dyn Coprocessor> {
     /// Construct the chip named `kind` (e.g. `"sdd1"`), giving it its
     /// `chip_id`, a clone of the cartridge ROM `Arc<[u8]>` (for MMC /
     /// decompression chips), and the initial clock anchor. Returns `None` if
@@ -762,7 +826,7 @@ pub trait ChipFactory {
         chip_id: u8,
         rom: Arc<[u8]>,
         master_clock_hz: u64,
-    ) -> Option<Box<dyn Coprocessor>>;
+    ) -> Option<Box<C>>;
 }
 
 /// Where the bytes addressed by a cartridge map slot actually live.
@@ -836,105 +900,6 @@ impl SourcePlace {
             Self::Unknown => SOURCE_UNKNOWN,
         }
     }
-}
-
-// ============================================================================
-// Cartridge Audio Trait
-// ============================================================================
-
-/// Cartridge audio output trait
-/// For cartridges that generate analog audio (MSU-1, expansion audio chips, etc)
-pub trait CartridgeAudio: Send + Sync {
-    /// Get audio info
-    fn audio_info(&self) -> &CartridgeAudioInfo;
-
-    /// Generate audio samples
-    /// Returns number of samples generated (stereo, interleaved: L, R, L, R, ...)
-    fn generate_audio(&mut self, output: &mut [f32], sample_rate: u32) -> usize;
-
-    /// Get current volume/gain (0.0 to 1.0)
-    fn get_volume(&self) -> f32;
-
-    /// Set volume/gain (0.0 to 1.0)
-    fn set_volume(&mut self, volume: f32);
-
-    /// Is audio enabled?
-    fn is_enabled(&self) -> bool;
-
-    /// Enable/disable audio
-    fn set_enabled(&mut self, enabled: bool);
-
-    /// Get audio debugger (if supported)
-    fn audio_debugger(&self) -> Option<&dyn CartridgeAudioDebugger> {
-        None
-    }
-
-    /// Get audio debugger (mutable)
-    fn audio_debugger_mut(&mut self) -> Option<&mut dyn CartridgeAudioDebugger> {
-        None
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CartridgeAudioInfo {
-    /// Audio chip type
-    pub chip_type: CartridgeAudioType,
-
-    /// Number of channels (1 = mono, 2 = stereo, etc)
-    pub channels: u8,
-
-    /// Native sample rate (if applicable)
-    pub native_sample_rate: Option<u32>,
-
-    /// Features
-    pub features: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CartridgeAudioType {
-    // SNES
-    MSU1, // SD2SNES/FxPak Pro - CD-quality audio
-
-    // NES expansion audio
-    VRC6Audio,
-    VRC7Audio,
-    MMC5Audio,
-    Namco163Audio,
-    FME7Audio,
-
-    // Genesis (future)
-    GenesisPCM, // Sample playback
-
-    // Custom
-    Custom(String),
-}
-
-/// Cartridge audio debugger
-pub trait CartridgeAudioDebugger {
-    /// Get current playback state
-    fn get_playback_state(&self) -> AudioPlaybackState;
-
-    /// Get waveform data (for visualization)
-    fn get_waveform(&self, samples: usize) -> Vec<f32>;
-
-    /// Get current track info (for MSU-1, etc)
-    fn get_track_info(&self) -> Option<AudioTrackInfo>;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioPlaybackState {
-    pub playing: bool,
-    pub position: u64, // In samples
-    pub loop_point: Option<u64>,
-    pub volume: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioTrackInfo {
-    pub track_number: u32,
-    pub title: Option<String>,
-    pub duration: Option<u64>, // In samples
-    pub loop_enabled: bool,
 }
 
 // ============================================================================

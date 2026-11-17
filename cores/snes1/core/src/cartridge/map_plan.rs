@@ -1,4 +1,4 @@
-//! Slot-based cartridge memory mapping plan.
+//! The SNES's map slot.
 //!
 //! The SNES bus does not know what a "LoROM" or "HiROM" cartridge is.
 //! Every cartridge presents the bus with a [`MapPlan`], an ordered
@@ -8,7 +8,7 @@
 //! at `install_cartridge()` time to populate its page table, then
 //! never inspects the mapping again, the per-access hot path looks
 //! at a single page-table entry, indexes a single slot, and dispatches
-//! to a single trait method on the cartridge.
+//! to the cartridge.
 //!
 //! This means:
 //!
@@ -23,8 +23,14 @@
 //!   variant count. A linear walk through `slots` is fine: commercial
 //!   cartridges have 2-6 slots; even adventurous homebrew rarely
 //!   crosses 20.
+//!
+//! The plan, its resolution and [`Resolved`] are retro-core's,
+//! monomorphised on this slot; what stays here is the slot's shape, its
+//! access speed and its page arithmetic.
 
 use std::ops::RangeInclusive;
+
+use retro_core::cartridge::SlotShape;
 
 /// Memory access speed (master cycles per byte).
 ///
@@ -57,10 +63,14 @@ impl BusSpeed {
 /// Where the bytes addressed by a slot actually live.
 ///
 /// Defined in `retro-core` so every console shares one mapping
-/// vocabulary (`Rom`/`Sram`/`ChipMmio`/`OpenBus`); the map *shape*
-/// ([`MapPlan`]/[`MapSlot`] and the bank:offset resolution) stays here,
-/// console-owned. Re-exported so `map_plan::MapTarget` names it too.
+/// vocabulary (`Rom`/`Sram`/`ChipMmio`/`OpenBus`); the slot's *shape*
+/// (the bank:offset rectangle) stays here, console-owned. Re-exported so
+/// `map_plan::MapTarget` names it too.
 pub use retro_core::cartridge::MapTarget;
+pub use retro_core::cartridge::Resolved;
+
+/// A SNES cartridge's map plan.
+pub type MapPlan = retro_core::cartridge::MapPlan<MapSlot>;
 
 /// One rectangular slot in a cartridge map plan.
 ///
@@ -73,7 +83,7 @@ pub use retro_core::cartridge::MapTarget;
 /// real ROM image.
 ///
 /// `bank_stride` overrides the bytes-per-bank step used by
-/// [`MapSlot::compute_target_offset`]. The default (None) means
+/// [`SlotShape::compute_target_offset`]. The default (None) means
 /// "one bank = exactly `offset_range.len()` bytes", which is right
 /// for slots that cover full or contiguous chip slices (LoROM ROM,
 /// LoROM upper mirror, the primary HiROM `$C0-$FF:0000-FFFF`
@@ -124,42 +134,11 @@ impl MapSlot {
     }
 
     /// Override the bank stride used by
-    /// [`MapSlot::compute_target_offset`]. See the type-level docs
+    /// [`SlotShape::compute_target_offset`]. See the type-level docs
     /// for when this matters (HiROM / ExHiROM upper-half mirrors).
     pub fn with_bank_stride(mut self, stride: u32) -> Self {
         self.bank_stride = Some(stride);
         self
-    }
-
-    /// `true` iff `addr24` falls inside this slot's rectangle.
-    pub fn contains(&self, addr24: u32) -> bool {
-        let bank = ((addr24 >> 16) & 0xFF) as u8;
-        let offset = (addr24 & 0xFFFF) as u16;
-        self.bank_range.contains(&bank) && self.offset_range.contains(&offset)
-    }
-
-    /// Linear offset *within* the slot, with the mask (if any)
-    /// applied. The caller is responsible for adding the target's
-    /// base offset before indexing ROM/SRAM/chip storage.
-    ///
-    /// Panics if the address is outside the slot; callers should
-    /// gate on [`MapSlot::contains`] first.
-    pub fn compute_target_offset(&self, addr24: u32) -> u32 {
-        let bank = ((addr24 >> 16) & 0xFF) as u8;
-        let offset = (addr24 & 0xFFFF) as u16;
-        debug_assert!(self.bank_range.contains(&bank));
-        debug_assert!(self.offset_range.contains(&offset));
-
-        let bank_norm = u32::from(bank - self.bank_range.start());
-        let offset_norm = u32::from(offset - self.offset_range.start());
-        let stride = self.bank_stride.unwrap_or_else(|| {
-            (u32::from(*self.offset_range.end()) - u32::from(*self.offset_range.start())) + 1
-        });
-        let linear = bank_norm * stride + offset_norm;
-        match self.mask {
-            Some(mask) => linear & mask,
-            None => linear,
-        }
     }
 
     /// Iterate over every 4 KiB page that this slot covers, expressed
@@ -174,7 +153,7 @@ impl MapSlot {
     /// Slots whose offset range does not start on a 4 KiB boundary
     /// (e.g. a hypothetical `$0500-$0FFF` slot) cover the entire
     /// page that contains either endpoint. The runtime
-    /// [`MapSlot::contains`] check used by the bus dispatch handles
+    /// [`SlotShape::contains`] check used by the bus dispatch handles
     /// the per-byte filtering inside such a page.
     pub fn covered_pages(&self) -> impl Iterator<Item = u16> + '_ {
         let bank_start = u16::from(*self.bank_range.start());
@@ -186,62 +165,56 @@ impl MapSlot {
     }
 }
 
-/// Resolution of an address inside a [`MapPlan`].
-///
-/// `slot_index` is the position of the matching slot in
-/// `MapPlan::slots`. `target_offset` is the slot-relative offset
-/// (already masked) that callers add to the [`MapTarget`] base to
-/// reach the cartridge byte. `speed` carries the slot's access cost
-/// so the speed table can be rebuilt without re-walking the plan.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Resolved {
-    pub slot_index: u16,
-    pub target_offset: u32,
-    pub speed: BusSpeed,
-}
+impl SlotShape for MapSlot {
+    type Target = MapTarget;
 
-/// Ordered list of slots describing a cartridge's view of the
-/// address space.
-///
-/// Construction is cheap (a `Vec` push per slot). Lookup is a linear
-/// walk over `slots`; the first match wins. A name is attached for
-/// diagnostics and persistence (e.g. `"lorom-fastrom"`,
-/// `"hirom-srm-2k"`, or `"custom"` for manifest-driven plans).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MapPlan {
-    pub name: String,
-    pub slots: Vec<MapSlot>,
-}
-
-impl MapPlan {
-    /// Build an empty plan with the given diagnostic name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            slots: Vec::new(),
-        }
+    /// `true` iff `addr24` falls inside this slot's rectangle.
+    #[inline]
+    fn contains(&self, addr24: u32) -> bool {
+        let bank = ((addr24 >> 16) & 0xFF) as u8;
+        let offset = (addr24 & 0xFFFF) as u16;
+        self.bank_range.contains(&bank) && self.offset_range.contains(&offset)
     }
 
-    /// Append a slot. The first slot that covers an address wins,
-    /// so callers should push more-specific slots before more-general
-    /// ones when the windows overlap.
-    pub fn push(&mut self, slot: MapSlot) {
-        self.slots.push(slot);
+    /// The bank's distance from the first bank times the stride, plus the
+    /// offset's distance from the first offset.
+    #[inline]
+    fn linear_offset(&self, addr24: u32) -> u32 {
+        let bank = ((addr24 >> 16) & 0xFF) as u8;
+        let offset = (addr24 & 0xFFFF) as u16;
+        let bank_norm = u32::from(bank - self.bank_range.start());
+        let offset_norm = u32::from(offset - self.offset_range.start());
+        let stride = self.bank_stride.unwrap_or_else(|| {
+            (u32::from(*self.offset_range.end()) - u32::from(*self.offset_range.start())) + 1
+        });
+        bank_norm * stride + offset_norm
     }
 
-    /// Resolve a 24-bit address. Returns `None` if no slot covers
-    /// the address, the bus treats that as open bus.
-    pub fn resolve(&self, addr24: u32) -> Option<Resolved> {
-        for (i, slot) in self.slots.iter().enumerate() {
-            if slot.contains(addr24) {
-                return Some(Resolved {
-                    slot_index: i as u16,
-                    target_offset: slot.compute_target_offset(addr24),
-                    speed: slot.speed,
-                });
-            }
-        }
-        None
+    #[inline]
+    fn mask(&self) -> Option<u32> {
+        self.mask
+    }
+
+    #[inline]
+    fn target(&self) -> MapTarget {
+        self.target
+    }
+
+    /// The rectangle's corners, packed as `(bank << 16) | offset`.
+    fn bounds(&self) -> (u32, u32) {
+        let bank_lo = u32::from(*self.bank_range.start());
+        let bank_hi = u32::from(*self.bank_range.end());
+        let off_lo = u32::from(*self.offset_range.start());
+        let off_hi = u32::from(*self.offset_range.end());
+        ((bank_lo << 16) | off_lo, (bank_hi << 16) | off_hi)
+    }
+
+    /// Total bytes the rectangle covers (`banks x offset-span`).
+    fn size(&self) -> usize {
+        let banks = usize::from(*self.bank_range.end()) - usize::from(*self.bank_range.start()) + 1;
+        let span =
+            usize::from(*self.offset_range.end()) - usize::from(*self.offset_range.start()) + 1;
+        banks * span
     }
 }
 
@@ -275,7 +248,10 @@ mod tests {
         let resolved = plan.resolve(0x80_8000).expect("matches LoROM-like slot");
         assert_eq!(resolved.slot_index, 0);
         assert_eq!(resolved.target_offset, 0);
-        assert_eq!(resolved.speed, BusSpeed::Fast);
+        assert_eq!(
+            plan.slots[resolved.slot_index as usize].speed,
+            BusSpeed::Fast
+        );
 
         // Bank $81, offset $9000 -> linear offset = 1*$8000 + $1000 = $9000.
         let resolved = plan.resolve(0x81_9000).expect("matches LoROM-like slot");
@@ -290,7 +266,10 @@ mod tests {
         let resolved = plan.resolve(0xC0_1234).expect("matches HiROM-like slot");
         assert_eq!(resolved.slot_index, 0);
         assert_eq!(resolved.target_offset, 0x1234);
-        assert_eq!(resolved.speed, BusSpeed::Slow);
+        assert_eq!(
+            plan.slots[resolved.slot_index as usize].speed,
+            BusSpeed::Slow
+        );
 
         // Bank $C1, offset $0000 -> linear offset = 1 * $10000 = $10000.
         let resolved = plan.resolve(0xC1_0000).expect("matches HiROM-like slot");
@@ -353,7 +332,10 @@ mod tests {
         let resolved = plan.resolve(0x30_8000).expect("matches DSP-1 slot");
         assert_eq!(resolved.slot_index, 0);
         assert_eq!(resolved.target_offset, 0);
-        assert_eq!(resolved.speed, BusSpeed::Fast);
+        assert_eq!(
+            plan.slots[resolved.slot_index as usize].speed,
+            BusSpeed::Fast
+        );
 
         // Verify the slot's target is what we put in.
         let slot = &plan.slots[resolved.slot_index as usize];
@@ -466,5 +448,20 @@ mod tests {
         assert_eq!(pages.len(), 14 * 8);
         assert_eq!(pages.first().copied(), Some(0x700));
         assert_eq!(pages.last().copied(), Some(0x7D7));
+    }
+
+    #[test]
+    fn a_slot_reports_its_corners_and_its_area() {
+        let slot = lorom_like_slot();
+        assert_eq!(slot.bounds(), (0x80_8000, 0xFF_FFFF));
+        assert_eq!(slot.size(), 128 * 0x8000);
+        let sram = MapSlot::new(
+            0x20..=0x20,
+            0x6000..=0x7FFF,
+            MapTarget::Sram { base_offset: 0 },
+            BusSpeed::Slow,
+        );
+        assert_eq!(sram.bounds(), (0x20_6000, 0x20_7FFF));
+        assert_eq!(sram.size(), 0x2000);
     }
 }

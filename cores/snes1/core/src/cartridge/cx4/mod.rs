@@ -8,7 +8,7 @@
 //!
 //! Like the other coprocessors (DSP-1, S-DD1, SPC7110, SA-1, Super FX), the
 //! Cx4 is an [`impl Coprocessor`](retro_core::cartridge::Coprocessor) homed in
-//! a `ComposableCartridge` and built by the console factory. It is the closest
+//! a `SnesCartridge` and built by the console factory. It is the closest
 //! sibling to the Super FX, but the HG51B169 core is small enough (45
 //! instruction families, no delay slot, no plot engine) to live in-module
 //! here rather than in a dedicated `cpus/*` crate.
@@ -67,6 +67,7 @@ use memory::Cx4Bus;
 use retro_core::audio::IntegerRateConverter;
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    SourcePlace,
 };
 use retro_core::debug::TraceEntry;
 use retro_core::emulator::StepResult;
@@ -315,6 +316,25 @@ impl Coprocessor for Cx4Chip {
         } else {
             let addr = 0x6000 | (offset.wrapping_sub(CX4_MMIO_BASE) & 0x1FFF) as u16;
             self.core.peek_window(addr, self.last_mdr)
+        }
+    }
+
+    /// Where a byte the S-CPU reads comes from: the cart ROM window keeps
+    /// the plain ROM geometry, so it names the image's offset (`Unknown`
+    /// past the image); the cart RAM is the cartridge's RAM; the registers
+    /// and the data RAM of `$6000-$7FFF` are the chip's.
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        if offset >= CX4_ROM_BASE {
+            let rom_offset = offset - CX4_ROM_BASE;
+            if (rom_offset as usize) < self.rom.len() {
+                SourcePlace::Rom(rom_offset)
+            } else {
+                SourcePlace::Unknown
+            }
+        } else if offset >= CX4_RAM_BASE {
+            SourcePlace::CartridgeRam
+        } else {
+            SourcePlace::Coprocessor
         }
     }
 
@@ -684,6 +704,27 @@ mod tests {
 
     fn chip(ram_size: usize, has_battery: bool) -> Cx4Chip {
         Cx4Chip::new(rom(), ram_size, has_battery, NTSC_HZ)
+    }
+
+    #[test]
+    fn each_window_names_where_its_bytes_come_from() {
+        let chip = chip(0x2000, true);
+        assert_eq!(chip.source_place(CX4_ROM_BASE), SourcePlace::Rom(0));
+        assert_eq!(
+            chip.source_place(CX4_ROM_BASE + 0x1F_FFFF),
+            SourcePlace::Rom(0x1F_FFFF)
+        );
+        assert_eq!(
+            chip.source_place(CX4_ROM_BASE + 0x20_0000),
+            SourcePlace::Unknown,
+            "past the image"
+        );
+        assert_eq!(
+            chip.source_place(CX4_RAM_BASE + 5),
+            SourcePlace::CartridgeRam
+        );
+        assert_eq!(chip.source_place(mmio(0x6000)), SourcePlace::Coprocessor);
+        assert_eq!(chip.source_place(mmio(0x7F5E)), SourcePlace::Coprocessor);
     }
 
     /// The chip-address of an S-CPU access to the `$6000-7FFF` register `addr`.

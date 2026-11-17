@@ -60,6 +60,7 @@ use std::sync::Arc;
 
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    SourcePlace,
 };
 
 use crate::savestate::{CoprocessorState, Spc7110State};
@@ -149,7 +150,7 @@ fn read_data_rom(rom: &[u8], real_rom_len: usize, logical: u32) -> u8 {
 /// decompressor and the data port), the flat `$4800-4842` register
 /// array, the three computed `dx/ex/fx` data-ROM window offsets, and the
 /// battery-backed SRAM. The directly-mapped program ROM windows live in the
-/// hosting [`ComposableCartridge`](super::ComposableCartridge); the chip only
+/// hosting [`SnesCartridge`](super::SnesCartridge); the chip only
 /// serves the routed MCU / DCU / SRAM windows and its own registers.
 pub struct Spc7110Chip {
     /// Cartridge ROM image (padded to a power of two), shared with the bus.
@@ -546,6 +547,17 @@ impl Coprocessor for Spc7110Chip {
         }
     }
 
+    /// Where a byte the S-CPU reads comes from: the SRAM window is the
+    /// cartridge's RAM; the registers, the decompression port and the MCU's
+    /// data-ROM window (through the chip's own banks) are the chip's.
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        if (SPC7110_SRAM_BASE..SPC7110_REG_BASE).contains(&offset) {
+            SourcePlace::CartridgeRam
+        } else {
+            SourcePlace::Coprocessor
+        }
+    }
+
     fn write(&mut self, offset: u32, value: u8, _master_cycle: u64) {
         self.accesses += 1;
         if offset >= SPC7110_REG_BASE {
@@ -832,6 +844,26 @@ mod tests {
             true,
             NTSC_HZ,
         )
+    }
+
+    #[test]
+    fn only_the_sram_window_is_the_cartridges_ram() {
+        let chip = tmz_chip();
+        assert_eq!(
+            chip.source_place(SPC7110_SRAM_BASE + 0x100),
+            SourcePlace::CartridgeRam
+        );
+        for offset in [
+            SPC7110_MCU_BASE + 0x1234,
+            SPC7110_DCU_BASE,
+            SPC7110_REG_BASE + 0x06,
+        ] {
+            assert_eq!(
+                chip.source_place(offset),
+                SourcePlace::Coprocessor,
+                "{offset:#x}"
+            );
+        }
     }
 
     /// Read a register through the public [`Coprocessor::read`] path (as the

@@ -16,7 +16,7 @@ pub use capture::GenesisSnapshotConsole;
 pub use debug::InstructionAccessLog;
 
 use crate::bus::AddressBus;
-use crate::cartridge::composable::CartridgeManifest;
+use crate::cartridge::CartridgeManifest;
 use crate::cpu68k::M68k;
 use crate::debugger::{
     genesis_debugger, GenesisDebugger, TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU,
@@ -116,7 +116,7 @@ pub struct GenesisEmulator {
     // Pre-allocated audio mixing buffers (avoids 3 Vec allocs per frame)
     psg_sample_buf: Vec<f32>,
     ym_sample_buf: Vec<f32>,
-    cart_sample_buf: Vec<f32>,
+    mix_sample_buf: Vec<f32>,
 
     /// Mixed waveform ring buffer for visualization (mono, last N samples)
     mixed_waveform_buffer: std::collections::VecDeque<f32>,
@@ -150,6 +150,11 @@ pub struct GenesisEmulator {
     /// [`Self::detected_manifest`] can re-run the heuristic detector for
     /// the *currently loaded* game without the host re-supplying them.
     last_rom: Vec<u8>,
+
+    /// The SHA-256 of the ROM file the last successful [`EmulatorCore::load_rom`]
+    /// received, in lowercase hex ([`Self::get_cartridge_hash`]); `None`
+    /// before one.
+    cartridge_hash: Option<String>,
 
     /// Whether the stepping paths keep each 68000 instruction's bus
     /// accesses in `instruction_access_log`. Debugger state, never part of
@@ -284,7 +289,7 @@ impl GenesisEmulator {
             // Pre-allocated audio mixing buffers (~735 samples/frame at 44.1kHz/60fps)
             psg_sample_buf: vec![0.0; 1024],
             ym_sample_buf: vec![0.0; 2048],
-            cart_sample_buf: vec![0.0; 2048],
+            mix_sample_buf: vec![0.0; 2048],
             mixed_waveform_buffer: std::collections::VecDeque::with_capacity(2048),
 
             // Previous step's total cycles for FIFO drain timing
@@ -296,6 +301,7 @@ impl GenesisEmulator {
             step_ym_cycles_clocked: 0,
             cartridge_manifest_override: None,
             last_rom: Vec::new(),
+            cartridge_hash: None,
             instruction_access_logging: false,
             instruction_access_log: InstructionAccessLog::default(),
             frame_open: false,
@@ -328,7 +334,7 @@ impl GenesisEmulator {
     /// The editable `cartridge-manifest-v1` the heuristic detector resolves
     /// for `rom`, with no override applied. Side-effect-free.
     pub fn detected_manifest(&self, rom: &[u8]) -> CartridgeManifest {
-        crate::cartridge::composable::detected_manifest(rom)
+        crate::cartridge::detected_manifest(rom)
     }
 
     /// The raw bytes of the currently loaded ROM (empty when none loaded),
@@ -339,10 +345,10 @@ impl GenesisEmulator {
 
     /// The installed cartridge's map-plan regions, for the cartridge
     /// debugger's memory-map view. Empty when no cartridge is loaded.
-    pub fn cartridge_map_regions(&self) -> Vec<crate::cartridge::composable::MapRegionSummary> {
+    pub fn cartridge_map_regions(&self) -> Vec<retro_core::cartridge::MapRegionSummary> {
         self.bus
             .cartridge()
-            .map(|cart| crate::cartridge::composable::describe_map_plan(cart.map_plan()))
+            .map(|cart| retro_core::cartridge::describe_map_plan(cart.map_plan()))
             .unwrap_or_default()
     }
 
@@ -706,9 +712,12 @@ impl GenesisEmulator {
         &mut self.input_manager
     }
 
-    /// Get cartridge ROM hash (SHA-256)
+    /// The SHA-256 of the ROM file the last successful
+    /// [`EmulatorCore::load_rom`] received, in lowercase hex; `None` before
+    /// one. A Mega Drive cartridge's image is the file as given, so this is
+    /// also the image's hash, the one a savestate names.
     pub fn get_cartridge_hash(&self) -> Option<String> {
-        self.bus.cartridge().map(|c| c.info().rom_hash.clone())
+        self.cartridge_hash.clone()
     }
 
     /// Get cartridge title
@@ -914,7 +923,7 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     fn load_rom(&mut self, data: &[u8]) -> Result<(), String> {
-        use crate::cartridge::composable::{build_genesis_cartridge, build_with_manifest};
+        use crate::cartridge::{build_genesis_cartridge, build_with_manifest};
 
         // Build cartridge from a staged manifest override when present, else
         // via heuristic detection (auto-detects mapper/chip type, SVP before
@@ -979,9 +988,9 @@ impl EmulatorCore for GenesisEmulator {
         // the bitmap so the disassembly window stays populated.
         let new_hash = info.rom_hash.clone();
         let same_rom = self
-            .get_cartridge_hash()
-            .map(|h| h == new_hash)
-            .unwrap_or(false);
+            .bus
+            .cartridge()
+            .is_some_and(|installed| installed.info().rom_hash == new_hash);
 
         if !same_rom {
             self.debugger.clear_all_coverage();
@@ -1001,6 +1010,8 @@ impl EmulatorCore for GenesisEmulator {
 
         // Load cartridge into bus
         self.bus.set_cartridge(cartridge);
+        // The file's hash: the image is the file on this console.
+        self.cartridge_hash = Some(new_hash);
 
         // Reset system with new ROM
         self.reset();

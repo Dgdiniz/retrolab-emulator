@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::cartridge::composable::GenesisCoprocessorState;
+use crate::cartridge::GenesisCoprocessorState;
 
 /// Version 3 carries the cartridge's state as the typed `cart_sram` +
 /// `cart_coprocessors` pair; the opaque `cartridge` blob before them is

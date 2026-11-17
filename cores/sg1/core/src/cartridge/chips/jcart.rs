@@ -17,7 +17,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::cartridge::composable::savestate::{GenesisCoprocessorState, JCartState};
+use crate::cartridge::savestate::{GenesisCoprocessorState, JCartState};
 
 /// MMIO base the plan assigns to the port-4 window, so the chip can tell it
 /// apart from the port-3 window (base 0) by the folded offset.

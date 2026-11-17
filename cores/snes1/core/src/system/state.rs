@@ -49,7 +49,7 @@ impl SnesEmulator {
         // Refuse a state captured against a different ROM unless the host
         // asked for any ROM (an empty hash in the state is a wildcard,
         // matching the envelope contract).
-        check_rom_hash(&env, &self.rom_hash, check)?;
+        check_rom_hash(&env, self.image_hash(), check)?;
         // Guard the envelope's own version too, so a tampered wrapper
         // can't smuggle a future schema past the payload check below.
         if env.core_version > SNES_SAVESTATE_VERSION {

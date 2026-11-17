@@ -66,7 +66,7 @@ const SECOND_HALF_BASE: u32 = 0x40_0000;
 /// ExHiROM's stock map
 /// has enough slot capacity for the entire 8 MiB linear space, so
 /// out-of-bounds reads on smaller-than-canonical dumps fall
-/// through to [`PlainCartridge::read_rom`]'s zero default, the
+/// through to the zero the cartridge answers past its image, the
 /// cartridge builder pads ROMs to a power of two
 /// before construction so commercial 6 MiB Mode 25 cartridges
 /// (Tales of Phantasia among them) get well-defined mirrors via

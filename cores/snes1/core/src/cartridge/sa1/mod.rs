@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
+    SourcePlace,
 };
 use retro_core::cpu::Addressable;
 use retro_core::emulator::StepResult;
@@ -709,6 +710,17 @@ impl Coprocessor for Sa1Chip {
             Some(self.iram_read(offset - SA1_IRAM_BASE))
         } else {
             None
+        }
+    }
+
+    /// Where a byte the S-CPU reads comes from: both views of the BW-RAM
+    /// are the cartridge's RAM; the ROM (through the Super MMC's banks),
+    /// the I-RAM and the registers are the chip's.
+    fn source_place(&self, offset: u32) -> SourcePlace {
+        if (SA1_BWRAM_BASE..SA1_ROM_BASE).contains(&offset) {
+            SourcePlace::CartridgeRam
+        } else {
+            SourcePlace::Coprocessor
         }
     }
 

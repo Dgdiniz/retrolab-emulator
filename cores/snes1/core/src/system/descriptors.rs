@@ -114,15 +114,5 @@ pub(super) fn snes_button_layout() -> Vec<ButtonInfo> {
 /// Stable name for a preset (used as the `mapper` field of
 /// [`RomInfo`]).
 pub(super) fn preset_kind_name(kind: PresetKind) -> String {
-    match kind {
-        PresetKind::LoRom => "LoROM".to_string(),
-        PresetKind::HiRom => "HiROM".to_string(),
-        PresetKind::ExHiRom => "ExHiROM".to_string(),
-        PresetKind::Sdd1 => "S-DD1".to_string(),
-        PresetKind::Spc7110 => "SPC7110".to_string(),
-        PresetKind::Sa1 => "SA-1".to_string(),
-        PresetKind::SuperFx => "Super FX".to_string(),
-        PresetKind::Cx4 => "Cx4".to_string(),
-        PresetKind::Custom => "Custom".to_string(),
-    }
+    kind.name().to_string()
 }

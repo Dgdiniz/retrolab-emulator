@@ -2,7 +2,7 @@
 // They test the WHOLE PATH: fetch -> decode -> execute
 
 use sg1_core::bus::AddressBus;
-use sg1_core::cartridge::composable::build_genesis_cartridge;
+use sg1_core::cartridge::build_genesis_cartridge;
 use sg1_core::cpu68k::instructions::Flag;
 use sg1_core::cpu68k::M68k;
 

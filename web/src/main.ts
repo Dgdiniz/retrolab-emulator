@@ -475,7 +475,7 @@ async function loadRomFromFile(file: File): Promise<void> {
     bridge.setRomMeta({ data, name: file.name })
     if (elements.romName) elements.romName.textContent = file.name
 
-    // SG1 has native cartridge hash/title; snes1 does not, so
+    // SG1 uses its native cartridge hash/title; for snes1,
     // `deriveRomIdentity` hashes the bytes + reads `getRomInfo().title`.
     const { hash, title } = deriveRomIdentity(emulator, data, file.name, bootCore)
     bridge.setRomMeta({ hash, title })

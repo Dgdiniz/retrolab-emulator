@@ -41,6 +41,7 @@ use std::collections::VecDeque;
 
 use retro_core::audio::{AudioRingBuffer, LinearResampler};
 use retro_core::capture::{CaptureCore, CaptureRecording};
+use retro_core::cartridge::Cartridge;
 use retro_core::debugger::DebuggerCore;
 use retro_core::input::{GenericInputManager, KeyboardInputProvider};
 use retro_core::{
@@ -59,7 +60,7 @@ use crate::debugger::{
 
 use crate::bus::{IoAccess, SnesBus, SnesPeekBus};
 use crate::cartridge::{
-    detect_preset_with_threshold, detected_manifest, rom_sha256, try_parse_header,
+    copier_header_length, detect_preset_with_threshold, detected_manifest, try_parse_header,
     CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset, PresetKind, SnesHeader,
     HEADER_CANDIDATES,
 };
@@ -149,11 +150,12 @@ pub struct SnesEmulator {
     header: Option<SnesHeader>,
     preset_kind: Option<PresetKind>,
     rom_size: usize,
-    /// SHA-256 (lowercase hex) of the loaded ROM, post-SMC-strip, the
-    /// manifest-convention digest. Embedded in every savestate envelope
-    /// and checked on load so a state can't be applied to the wrong
-    /// ROM. Empty until a ROM is loaded.
-    rom_hash: String,
+    /// The SHA-256 of the ROM file the last successful
+    /// [`EmulatorCore::load_rom`] received, in lowercase hex, its copier
+    /// header included ([`Self::get_cartridge_hash`]); `None` before one.
+    /// The savestate envelope names the image's hash instead, the
+    /// cartridge's (`CartridgeInfo::rom_hash`).
+    cartridge_hash: Option<String>,
 
     /// The raw bytes of the most recently loaded ROM, retained so
     /// [`Self::power_on_reset`] can re-run [`EmulatorCore::load_rom`] to
@@ -347,7 +349,7 @@ impl SnesEmulator {
             header: None,
             preset_kind: None,
             rom_size: 0,
-            rom_hash: String::new(),
+            cartridge_hash: None,
             last_rom: Vec::new(),
             coprocessor_firmware: None,
             coprocessor_mode: CoprocessorMode::Auto,
@@ -434,24 +436,6 @@ impl SnesEmulator {
         detected_manifest(rom)
     }
 
-    /// Human-readable summary of the installed coprocessor (e.g.
-    /// `"DSP-1B (LLE)"`), or `None` for a plain cartridge. Used by the
-    /// CLI `info` command.
-    pub fn coprocessor_label(&self) -> Option<&str> {
-        self.bus.cartridge_ref()?.coprocessor_label()
-    }
-
-    /// Count of CPU accesses to the coprocessor's DR/SR window since the
-    /// last reset (`0` when no coprocessor is installed or the game has
-    /// not touched it yet). A positive value proves the running game is
-    /// actively driving the chip.
-    pub fn coprocessor_accesses(&self) -> u64 {
-        self.bus
-            .cartridge_ref()
-            .map(|c| c.coprocessor_accesses())
-            .unwrap_or(0)
-    }
-
     /// Start (or stop) capturing the host<->coprocessor register stream
     /// (`(is_write, offset, byte)` per DR/SR access). Enabling clears any
     /// previously captured log. Off by default. It lets a real game's
@@ -509,37 +493,6 @@ impl SnesEmulator {
     /// first), leaving the watch disabled. Empty when never enabled.
     pub fn take_addr_watch(&mut self) -> Vec<IoAccess> {
         self.bus.take_addr_watch()
-    }
-
-    /// Live coprocessor chip state (DSP-1 uPD7725 registers + data RAM),
-    /// or `None` for a plain cartridge. Read-only path for the CLI `info`
-    /// command and WASM/frontend debugger, does not borrow the
-    /// breakpoint list like [`Self::cartridge_debugger`] does. Reports the
-    /// primary (lowest-id) chip; see [`Self::coprocessors_debug_state`] for
-    /// the full set.
-    pub fn coprocessor_debug_state(&self) -> Option<retro_core::cartridge::ExpansionChipState> {
-        self.bus.cartridge_ref()?.coprocessor_debug_state()
-    }
-
-    /// Live state of every installed coprocessor, keyed by `chip_id`. Empty
-    /// for a plain cartridge. Read-only path for the CLI `info` command and
-    /// WASM/frontend debugger, enumerates a multi-chip cartridge instead of
-    /// assuming a single coprocessor.
-    pub fn coprocessors_debug_state(&self) -> Vec<(u8, retro_core::cartridge::ExpansionChipState)> {
-        self.bus
-            .cartridge_ref()
-            .map(|c| c.coprocessors_debug_state())
-            .unwrap_or_default()
-    }
-
-    /// Human-readable label of every installed coprocessor, keyed by
-    /// `chip_id` (e.g. `[(1, "DSP-1B (LLE)")]`). Empty for a plain
-    /// cartridge. Used by the CLI `info` command to enumerate the chips.
-    pub fn coprocessor_labels(&self) -> Vec<(u8, String)> {
-        self.bus
-            .cartridge_ref()
-            .map(|c| c.coprocessor_labels())
-            .unwrap_or_default()
     }
 
     /// Borrow the main address-space dispatcher.
@@ -701,6 +654,22 @@ impl SnesEmulator {
     /// if no ROM has been loaded.
     pub fn header(&self) -> Option<&SnesHeader> {
         self.header.as_ref()
+    }
+
+    /// The SHA-256 of the ROM file the last successful
+    /// [`EmulatorCore::load_rom`] received, in lowercase hex, its copier
+    /// header included; `None` before one.
+    pub fn get_cartridge_hash(&self) -> Option<String> {
+        self.cartridge_hash.clone()
+    }
+
+    /// The SHA-256 of the installed cartridge's image (the file less its
+    /// copier header, before padding), in lowercase hex, which the
+    /// savestate envelope names; `""` with no cartridge.
+    pub(crate) fn image_hash(&self) -> &str {
+        self.bus
+            .cartridge()
+            .map_or("", |cart| cart.info().rom_hash.as_str())
     }
 
     /// Detected/forced mapper kind for the currently loaded ROM.
@@ -946,16 +915,24 @@ impl EmulatorCore for SnesEmulator {
         self.header = header_opt;
         self.preset_kind = preset_opt;
         self.rom_size = data.len();
-        // Hash the stripped ROM bytes (the manifest convention) so the
-        // savestate envelope can refuse a state captured against a
-        // different game. Survives `reset()` since the ROM stays loaded.
         // Another game's coverage says nothing of this one's code: it is
-        // cleared, while loading the same bytes again keeps it.
-        let rom_hash = rom_sha256(data);
-        if rom_hash != self.rom_hash {
+        // cleared, while loading the same image again keeps it. The image
+        // is the file less its copier header (the cartridge's hash, which
+        // the savestate envelope names too).
+        let same_image = self
+            .bus
+            .cartridge()
+            .is_some_and(|installed| installed.info().rom_hash == cart.info().rom_hash);
+        if !same_image {
             self.debugger.clear_all_coverage();
         }
-        self.rom_hash = rom_hash;
+        // The file's hash is the image's unless a copier header comes
+        // first, so most loads hash the bytes once.
+        self.cartridge_hash = Some(if copier_header_length(data.len()) == 0 {
+            cart.info().rom_hash.clone()
+        } else {
+            retro_core::cartridge::rom_sha256(data)
+        });
         // Retain the raw bytes so `power_on_reset` can reconstruct a fresh
         // power-on machine (netplay cold boot) by re-running `load_rom`.
         self.last_rom = data.to_vec();
@@ -1002,7 +979,7 @@ impl EmulatorCore for SnesEmulator {
         // `get_cpu_info`).
         let has_secondary = self
             .bus
-            .cartridge_ref()
+            .cartridge()
             .map(|c| c.secondary_cpu_state().is_some())
             .unwrap_or(false);
         let mut cpus = snes_base_cpus();
@@ -1092,7 +1069,7 @@ impl EmulatorCore for SnesEmulator {
             envelope_version: retro_core::savestate::RETRO_SAVESTATE_ENVELOPE_VERSION,
             core_id: "snes1".to_string(),
             core_version: SNES_SAVESTATE_VERSION,
-            rom_hash: self.rom_hash.clone(),
+            rom_hash: self.image_hash().to_string(),
             // The core leaves the timestamp at 0; the host shell sets a
             // real capture time when it persists the bytes. Keeping it
             // 0 here makes `save_state` deterministic for tests.
@@ -1137,11 +1114,7 @@ impl EmulatorCore for SnesEmulator {
         ];
         // Each chip's snapshot stamps `cpu_id = 0` (the SA-1's comes from the
         // shared 65816 helper); rewrite it to the real slot index.
-        if let Some(mut cartridge) = self
-            .bus
-            .cartridge_ref()
-            .and_then(|c| c.secondary_cpu_state())
-        {
+        if let Some(mut cartridge) = self.bus.cartridge().and_then(|c| c.secondary_cpu_state()) {
             cartridge.cpu_id = CARTRIDGE_CPU;
             states.push(cartridge);
         }
@@ -1260,7 +1233,7 @@ impl EmulatorCore for SnesEmulator {
             // read-inert), so a window never perturbs it.
             2 => self
                 .bus
-                .cartridge_ref()
+                .cartridge()
                 .map(|c| c.disassemble_secondary(addr, count))
                 .unwrap_or_default(),
             _ => Vec::new(),

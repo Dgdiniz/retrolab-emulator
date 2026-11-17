@@ -265,6 +265,35 @@ fn any_rom_loads_a_state_made_on_another_rom_and_resumes_it() {
 }
 
 #[test]
+fn a_state_names_the_image_so_the_file_behind_a_copier_header_shares_it() {
+    use retro_core::cartridge::rom_sha256;
+
+    // The cartridge hash is the file's, its 512-byte copier header
+    // included; the state names the image, the file less that header, so
+    // a state saved from the headed file loads on the bare image.
+    let image = build_rom(&RESET_INIT, 0, 0xA1);
+    let mut headed = vec![0u8; 512];
+    headed.extend_from_slice(&image);
+    let mut emu_a = SnesEmulator::new();
+    emu_a.load_rom(&headed).expect("the headed file loads");
+    assert_eq!(emu_a.get_cartridge_hash(), Some(rom_sha256(&headed)));
+    for _ in 0..3 {
+        emu_a.run_frame();
+    }
+    let snapshot = emu_a.save_state();
+    let env = deserialize_compressed::<SnesSaveState>(&snapshot).expect("decode");
+    assert_eq!(env.rom_hash, rom_sha256(&image));
+
+    let mut emu_b = loaded(0, 0xA1);
+    assert_eq!(emu_b.get_cartridge_hash(), Some(rom_sha256(&image)));
+    emu_b
+        .load_state(&snapshot)
+        .expect("the bare image takes the headed file's state");
+    assert_eq!(emu_b.frame_count(), emu_a.frame_count());
+    assert_eq!(emu_b.state_hash(), emu_a.state_hash());
+}
+
+#[test]
 fn version_too_new_rejects_load() {
     let mut emu = loaded(0, 0x44);
     emu.run_frame();
