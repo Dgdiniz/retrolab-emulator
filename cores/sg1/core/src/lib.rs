@@ -12,9 +12,9 @@ pub mod cpu68k;
 pub mod debugger;
 pub mod expr_ctx;
 pub mod golden;
-pub mod input_manager;
 pub mod io;
 pub mod memory;
+pub mod pad_defaults;
 pub mod psg; // SN76489 Programmable Sound Generator
 pub mod savestate;
 pub mod sound;

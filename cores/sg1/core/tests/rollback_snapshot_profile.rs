@@ -133,7 +133,7 @@ fn profile_load_bincode(env: &SaveStateEnvelope<SystemSaveState>) {
 /// (cartridge info falls back to defaults), and the fixed-size RAM / Z80 RAM /
 /// VRAM buffers, which dominate the payload, are already allocated by `new`.
 fn base_payload() -> SystemSaveState {
-    let emulator = GenesisEmulator::new();
+    let mut emulator = GenesisEmulator::new();
     let bytes = emulator.save_state();
     deserialize_compressed::<SystemSaveState>(&bytes)
         .expect("save_state must round-trip")

@@ -39,14 +39,18 @@ pub use descriptors::destination_region_str;
 
 use std::collections::VecDeque;
 
-use retro_core::audio::{AudioRingBuffer, LinearResampler};
+use retro_core::audio::{HostAudioRing, LinearResampler};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cartridge::Cartridge;
+use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
-use retro_core::input::{GenericInputManager, KeyboardInputProvider};
+use retro_core::input::GenericInputManager;
+use retro_core::savestate::{PayloadUse, RomIdentity};
+#[cfg(any(feature = "chip-superfx", feature = "chip-cx4"))]
+use retro_core::CpuArchitecture;
 use retro_core::{
-    AudioInfo, CpuArchitecture, DisplayInfo, EmulatorCore, Framebuffer, InputInfo, InputState,
-    Instruction, PixelFormat, RomInfo, StepResult, SystemInfo,
+    AudioInfo, DisasmRow, DisplayInfo, EmulatorCore, Framebuffer, InputInfo, InputState,
+    Instruction, PixelFormat, RomInfo, StepResult, SystemInfo, VideoRegion,
 };
 
 use wdc65816::Wdc65816;
@@ -64,9 +68,7 @@ use crate::cartridge::{
     CartridgeBuilder, CartridgeManifest, CoprocessorMode, DetectedPreset, PresetKind, SnesHeader,
     HEADER_CANDIDATES,
 };
-use crate::controller::{
-    default_gamepad_mapping, default_keyboard_mapping, input_state_to_snes_pad,
-};
+use crate::controller::{input_state_to_snes_pad, pad_defaults};
 use crate::scheduler::{schedule_frame_events, EventKind, TimingProfile};
 use retro_core::frame::EventQueue;
 
@@ -131,7 +133,7 @@ pub struct SnesEmulator {
 
     /// Host-rate audio queue (44.1 kHz `f32`, interleaved L/R). Fed each
     /// frame from the APU's native 32 kHz `i16` ring through `resampler`.
-    audio_ring: AudioRingBuffer<f32>,
+    host_audio: HostAudioRing,
     /// 32 kHz (S-DSP) -> 44.1 kHz (host) linear resampler. The ratio is
     /// region-independent, so this instance lives for the emulator's
     /// lifetime and is only `reset()`.
@@ -140,9 +142,8 @@ pub struct SnesEmulator {
     /// the APU before resampling (reused to avoid per-frame allocation).
     apu_drain_buf: Vec<i16>,
     /// Scratch for the resampled 44.1 kHz `f32` samples before they are
-    /// pushed into `audio_ring`.
+    /// pushed into `host_audio`.
     audio_resample_buf: Vec<f32>,
-    audio_pending_drain: Vec<f32>,
     audio_enabled: bool,
 
     input_manager: GenericInputManager,
@@ -158,9 +159,10 @@ pub struct SnesEmulator {
     cartridge_hash: Option<String>,
 
     /// The raw bytes of the most recently loaded ROM, retained so
-    /// [`Self::power_on_reset`] can re-run [`EmulatorCore::load_rom`] to
-    /// reconstruct a byte-identical power-on state (the netplay cold boot)
-    /// without the host re-supplying them. Empty until a ROM is loaded.
+    /// [`EmulatorCore::power_cycle`] can re-run [`EmulatorCore::load_rom`]
+    /// to reconstruct a byte-identical power-on state (the netplay cold
+    /// boot) without the host re-supplying them. Empty until a ROM is
+    /// loaded.
     last_rom: Vec<u8>,
 
     /// Coprocessor firmware (e.g. an 8192-byte DSP-1 dump) handed to the
@@ -254,7 +256,7 @@ pub struct SnesEmulator {
     /// presentation steps that do not affect deterministic machine
     /// state: the framebuffer post-process (`finalize_frame`) and the
     /// 32 kHz -> 44.1 kHz host-audio drain. Set to `false` for the
-    /// duration of [`Self::run_frame_headless`] (netplay
+    /// duration of a headless frame (netplay
     /// rollback/catch-up) so re-simulating a span is cheaper while
     /// leaving `state_hash` byte-identical to a presented run. Always
     /// `true` on the normal play path.
@@ -339,13 +341,12 @@ impl SnesEmulator {
             frame_count: 0,
             master_cycles: 0,
             frame_base_cycle: 0,
-            audio_ring: AudioRingBuffer::<f32>::with_capacity(AUDIO_RING_CAPACITY),
+            host_audio: HostAudioRing::with_capacity(AUDIO_RING_CAPACITY),
             resampler: LinearResampler::new(32_000, 44_100),
             apu_drain_buf: Vec::new(),
             audio_resample_buf: Vec::new(),
-            audio_pending_drain: Vec::new(),
             audio_enabled: false,
-            input_manager: default_input_manager(),
+            input_manager: GenericInputManager::new(2, pad_defaults()),
             header: None,
             preset_kind: None,
             rom_size: 0,
@@ -516,21 +517,6 @@ impl SnesEmulator {
         &mut self.cpu
     }
 
-    /// Borrow the generic input manager (providers, port assignments,
-    /// key/gamepad mappings, history). Mirrors SG1's `input_manager()` so
-    /// the WASM layer can expose the same keyboard/gamepad/provider
-    /// surface across cores.
-    pub fn input_manager(&self) -> &GenericInputManager {
-        &self.input_manager
-    }
-
-    /// Mutable borrow of the input manager. Mirrors SG1's
-    /// `input_manager_mut()`; used by the WASM `keyDown`/`keyUp`/`gamepad*`
-    /// and remap exports.
-    pub fn input_manager_mut(&mut self) -> &mut GenericInputManager {
-        &mut self.input_manager
-    }
-
     /// Borrow the event queue. Tests use this to check pending events.
     pub fn scheduler(&self) -> &EventQueue<EventKind> {
         &self.scheduler
@@ -541,113 +527,10 @@ impl SnesEmulator {
         self.timing
     }
 
-    /// Set the video region from a case-insensitive `"ntsc"` / `"pal"`
-    /// string, reconfiguring the timing profile, the event scheduler,
-    /// the APU + coprocessor rate converters, and the `$213F` STAT78
-    /// PAL/NTSC bit, then re-priming the machine via [`Self::reset`].
-    ///
-    /// The netplay session handshake carries region as a string, so this
-    /// keeps the [`TimingProfile`] enum off the WASM/JS boundary. Call it
-    /// right after [`EmulatorCore::load_rom`] and before running any
-    /// frames: it resets the machine (so both peers agree on region
-    /// before frame 0). Without an explicit call the region defaults to
-    /// the cartridge header's destination byte (see `load_rom`).
-    pub fn set_region_str(&mut self, name: &str) -> Result<(), String> {
-        let profile = match name.trim().to_ascii_lowercase().as_str() {
-            "ntsc" => TimingProfile::NTSC,
-            "pal" => TimingProfile::PAL,
-            other => {
-                return Err(format!(
-                    "unknown region '{other}' (expected 'ntsc' or 'pal')"
-                ))
-            }
-        };
-        self.timing = profile;
-        // STAT78 (`$213F` bit 4) must report the new region.
-        self.bus
-            .system_regs_mut()
-            .set_timing_is_pal(profile.scanlines_per_frame == 312);
-        // reset() empties the event queue, arms frame 0's events on the
-        // new scanline count and rebinds the APU + coprocessor rate
-        // converters to `self.timing.master_clock_hz`.
-        self.reset();
-        Ok(())
-    }
-
-    /// Current region as the `"ntsc"` / `"pal"` string used by the
-    /// netplay handshake and the `getRegion` WASM export. PAL profiles
-    /// run 312 scanlines per frame, NTSC 262.
-    pub fn region_str(&self) -> &'static str {
-        if self.timing.scanlines_per_frame == 312 {
-            "pal"
-        } else {
-            "ntsc"
-        }
-    }
-
-    /// Number of frames produced since the last `reset()` /
-    /// `load_rom()`. Used by tests and the host UI for FPS reporting.
-    pub fn frame_count(&self) -> u64 {
-        self.frame_count
-    }
-
-    /// Cold (power-on) reset: reload the current ROM into a fresh CPU and bus,
-    /// which zeroes the 128 KiB work RAM; with no ROM loaded, run the ordinary
-    /// [`EmulatorCore::reset`] and then zero the work RAM. The player's
-    /// controller setup is kept, with nothing it held still pressed.
-    ///
-    /// The plain `reset()` preserves WRAM (SNES *reset-button* semantics); this
-    /// emulates a *power cycle*, which clears it. Netplay needs it: two peers must
-    /// derive a byte-identical frame-0 state hash, but a host that had been running
-    /// the game (dirty WRAM) and a freshly-booted guest reset to frame 0 with
-    /// *different* WRAM, since `reset()` leaves it untouched. Zeroing it gives both
-    /// peers the same deterministic power-on baseline. The cartridge ROM is kept,
-    /// but battery SRAM starts as a fresh image, as after any load of the ROM.
-    pub fn power_on_reset(&mut self) {
-        // A soft reset (the console's reset *button*, `EmulatorCore::reset`) is
-        // faithful to hardware: it re-boots the 65816 off the reset vector but
-        // leaves the CPU registers, the PPU's VRAM/CGRAM/OAM, and the APU holding
-        // whatever the running game left there. A real *power* cycle clears all of
-        // it. Netplay needs the latter: two peers with different pre-session
-        // histories (a host mid-game vs a just-joined guest) MUST converge on a
-        // byte-identical frame-0 state, because the session starts only once
-        // both peers report the same state hash.
-        //
-        // `load_rom` already replaces the bus wholesale (fresh PPU/VRAM/CGRAM/OAM,
-        // APU, and WRAM) and re-reads the retained coprocessor firmware/mode +
-        // cartridge manifest override + re-derives the region from the ROM header,
-        // so re-running it after recreating the CPU (a plain reset leaves its
-        // registers holding the game's values) reconstructs exactly
-        // what a just-loaded guest holds. Because both peers run this identical
-        // logic over the same ROM, the result is identical by construction.
-        // Battery-backed SRAM is intentionally a fresh (empty) image: a game with
-        // a save resumes through the seeded savestate transfer, NOT this cold boot.
-        //
-        // The player's input setup survives, as a console's controllers do (the
-        // input manager lives outside the machine and no savestate holds it),
-        // but what it holds pressed is let go: a host that stops forwarding
-        // input while it drives the ports, as netplay does, would never release
-        // a button held across the cycle, and the machine that boots would read
-        // it on one peer only.
-        self.input_manager.release_all();
-        self.cpu = Wdc65816::new();
-        if !self.last_rom.is_empty() {
-            let rom = std::mem::take(&mut self.last_rom);
-            // These bytes already loaded once, so a re-load cannot fail; swallow
-            // the Result rather than propagate: `power_on_reset` is infallible.
-            let _ = <Self as EmulatorCore>::load_rom(self, &rom);
-        } else {
-            // No ROM ever loaded: fall back to the soft reset + WRAM wipe so a
-            // bare-machine cold boot still zeroes volatile RAM.
-            EmulatorCore::reset(self);
-            self.bus.clear_wram();
-        }
-    }
-
-    /// Master clocks accumulated since the last `reset()` /
-    /// `load_rom()`.
-    pub fn master_cycles(&self) -> u64 {
-        self.master_cycles
+    /// The raw bytes of the currently loaded ROM (empty when none is), so
+    /// a host can detect the live game's manifest again.
+    pub fn last_rom(&self) -> &[u8] {
+        &self.last_rom
     }
 
     /// Parsed SNES header for the currently loaded ROM, or `None`
@@ -661,15 +544,6 @@ impl SnesEmulator {
     /// header included; `None` before one.
     pub fn get_cartridge_hash(&self) -> Option<String> {
         self.cartridge_hash.clone()
-    }
-
-    /// The SHA-256 of the installed cartridge's image (the file less its
-    /// copier header, before padding), in lowercase hex, which the
-    /// savestate envelope names; `""` with no cartridge.
-    pub(crate) fn image_hash(&self) -> &str {
-        self.bus
-            .cartridge()
-            .map_or("", |cart| cart.info().rom_hash.as_str())
     }
 
     /// Detected/forced mapper kind for the currently loaded ROM.
@@ -714,15 +588,48 @@ impl SnesEmulator {
         self.system_info.display.width = w;
         self.system_info.display.height = h;
         // The refresh rate follows the timing profile, which `load_rom`
-        // (header destination), `set_region_str` (netplay handshake) and a
+        // (header destination), `set_region` (the netplay handshake) and a
         // savestate restore can all change, every one of them ends here.
         self.system_info.display.refresh_rate = self.timing.refresh_rate();
     }
 }
 
 impl EmulatorCore for SnesEmulator {
+    type Savestate = crate::savestate::SnesSaveState;
+
     fn system_info(&self) -> &SystemInfo {
         &self.system_info
+    }
+
+    fn rom_identity(&self) -> Option<RomIdentity<'_>> {
+        self.bus.cartridge().map(|cart| {
+            let info = cart.info();
+            RomIdentity {
+                sha256: &info.rom_hash,
+                title: &info.title,
+            }
+        })
+    }
+
+    /// The machine's payload, the same for a save and the state hash: it
+    /// carries no wall clock and no host metadata (the envelope names the
+    /// ROM, and its `created_at` stays 0).
+    fn savestate_payload(&self, _purpose: PayloadUse) -> crate::savestate::SnesSaveState {
+        self.capture_save_state()
+    }
+
+    fn savestate_extension(&self) {}
+
+    fn restore_savestate(&mut self, payload: crate::savestate::SnesSaveState, _extension: ()) {
+        self.restore_payload(payload);
+    }
+
+    /// The frame held at the capture boundary, finished on the play tier
+    /// with the debugger disarmed for its length
+    /// (`retro_core::frame::finish_held_frame`); a frame stopped anywhere
+    /// else is saved where it stands, its queue and its base with it.
+    fn finish_held_frame(&mut self) -> bool {
+        retro_core::frame::finish_held_frame(self)
     }
 
     fn reset(&mut self) {
@@ -748,11 +655,10 @@ impl EmulatorCore for SnesEmulator {
             self.bus.ppu().overscan(),
         );
         self.arm_irq_events(0, 0);
-        self.audio_ring.clear();
+        self.host_audio.clear();
         self.resampler.reset();
         self.apu_drain_buf.clear();
         self.audio_resample_buf.clear();
-        self.audio_pending_drain.clear();
         // Clear both controller ports' strobe / shift-register state.
         self.bus.reset_controllers();
         // Reboot the SPC700 off the IPL vector and rebind the APU's
@@ -796,6 +702,149 @@ impl EmulatorCore for SnesEmulator {
         // defaults. Without this the disassembly view anchors at PC 0
         // until the first single-step.
         self.refresh_debugger_state();
+    }
+
+    /// The power switch, which the reset button is not: [`Self::reset`]
+    /// re-boots the 65816 off the reset vector but leaves its registers,
+    /// work RAM, the PPU's VRAM, CGRAM and OAM, and the APU holding what
+    /// the game left there. This builds them again: a new CPU, and the
+    /// ROM loaded again, which builds a new bus (work RAM, the PPU and its
+    /// memories, the APU) and reads the coprocessor's firmware and mode
+    /// and the manifest override again; the battery SRAM a fresh image.
+    /// Then the region the machine was in, which the header's may not be.
+    /// With no ROM loaded, the reset button and the work RAM cleared. The
+    /// debugger, the input, the audio switch and the host's settings are
+    /// kept; the coverage too, the image being the same.
+    fn power_cycle(&mut self) {
+        let region = self.region();
+        self.cpu = Wdc65816::new();
+        if self.last_rom.is_empty() {
+            EmulatorCore::reset(self);
+            self.bus.clear_wram();
+        } else {
+            let rom = std::mem::take(&mut self.last_rom);
+            // These bytes loaded once, so loading them again cannot fail.
+            let _ = <Self as EmulatorCore>::load_rom(self, &rom);
+        }
+        if self.region() != region {
+            self.apply_region(region);
+            // The reset arms frame 0 on the region's line count and binds
+            // the APU's and the coprocessor's clocks to its master clock.
+            EmulatorCore::reset(self);
+        }
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn master_cycles(&self) -> u64 {
+        self.master_cycles
+    }
+
+    fn master_clock_hz(&self) -> u64 {
+        self.timing.master_clock_hz as u64
+    }
+
+    fn region(&self) -> VideoRegion {
+        self.timing.region()
+    }
+
+    /// The region's timing profile, the PAL bit `$213F` (STAT78) reports
+    /// and the refresh rate the host paces frames against. The frame's
+    /// events, the APU's and the coprocessor's clocks follow it at the
+    /// next reset, which a power cycle and a ROM's load end with; a
+    /// savestate carries the profile itself.
+    fn apply_region(&mut self, region: VideoRegion) {
+        self.timing = TimingProfile::for_region(region);
+        self.bus
+            .system_regs_mut()
+            .set_timing_is_pal(region == VideoRegion::Pal);
+        self.sync_display_info();
+    }
+
+    fn host_audio(&self) -> &HostAudioRing {
+        &self.host_audio
+    }
+
+    fn host_audio_mut(&mut self) -> &mut HostAudioRing {
+        &mut self.host_audio
+    }
+
+    /// The samples a headless frame left in the APU's own ring: a headless
+    /// frame runs the DSP but skips the drain, so after a rollback's frames
+    /// they describe sound the player already heard in its mispredicted
+    /// form. The host ring is left alone: it holds sound presented and
+    /// still on its way to the speaker.
+    fn discard_pending_audio(&mut self) {
+        self.bus.apu_mut().discard_pending_audio();
+    }
+
+    fn input_manager(&self) -> &GenericInputManager {
+        &self.input_manager
+    }
+
+    fn input_manager_mut(&mut self) -> &mut GenericInputManager {
+        &mut self.input_manager
+    }
+
+    /// The PPU: VRAM, the palette, the sprites, the tiles, the layers and
+    /// their toggles.
+    fn video_debugger(&mut self) -> &mut dyn retro_core::video::VideoDebugger {
+        self.bus.ppu_mut()
+    }
+
+    /// The S-DSP, the one sound chip.
+    fn audio_chip_count(&self) -> usize {
+        1
+    }
+
+    /// The S-DSP: its eight voices, their mutes and waveforms.
+    fn audio_debugger(&mut self, chip: usize) -> Option<&mut dyn retro_core::audio::AudioDebugger> {
+        match chip {
+            0 => Some(self.bus.apu_mut()),
+            _ => None,
+        }
+    }
+
+    fn cartridge_debugger(&mut self) -> Box<dyn retro_core::cartridge::CartridgeDebugger + '_> {
+        Box::new(self.map_plan_debugger())
+    }
+
+    /// A byte at a time through the bus's CPU path, so a write to an MMIO
+    /// register has the side effect a CPU store would (a `$420B` write
+    /// starts a DMA, as a game's would); plain WRAM and SRAM edits behave
+    /// as the memory editor expects. A write to a PPU register is not one
+    /// the frame made: until the next frame's line 1, a repaint and a layer
+    /// render draw from the registers as they stand, which show it, rather
+    /// than from the line table. What the PPU's data ports take from it is
+    /// put down to the debugger.
+    fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
+        self.bus.begin_debugger_writes();
+        for (i, &byte) in data.iter().enumerate() {
+            let at = addr.wrapping_add(i as u32);
+            if crate::bus::is_ppu_register_address(at) {
+                self.bus.ppu_mut().note_registers_edited();
+            }
+            self.bus.write(at, byte);
+        }
+        self.bus.end_debugger_writes();
+    }
+
+    /// Bitmap-aware disassembly around `pc` on CPU `cpu_id` (0 the 65C816,
+    /// 1 the SPC700, 2 the cartridge's CPU on an SA-1, Super FX or Cx4
+    /// cart), over [`retro_core::disassemble_window`]. The SPC700 is
+    /// decoded against a side-effect-free view of its memory, so a window
+    /// never perturbs the running audio program.
+    fn disassemble_window(
+        &mut self,
+        cpu_id: usize,
+        pc: u32,
+        before_count: usize,
+        after_count: usize,
+    ) -> Vec<DisasmRow> {
+        let mut driver = debug::SnesDisasmDriver { emu: self, cpu_id };
+        retro_core::disassemble_window(&mut driver, pc, before_count, after_count)
     }
 
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
@@ -857,6 +906,10 @@ impl EmulatorCore for SnesEmulator {
     fn run_frame(&mut self) {
         let tier = self.debugger.execution_tier();
         retro_core::frame::run_frame_on(self, tier);
+    }
+
+    fn run_frame_headless(&mut self) {
+        retro_core::frame::run_frame_headless(self);
     }
 
     /// Run to the start of vertical blanking and stop there: the capture
@@ -933,16 +986,15 @@ impl EmulatorCore for SnesEmulator {
         } else {
             retro_core::cartridge::rom_sha256(data)
         });
-        // Retain the raw bytes so `power_on_reset` can reconstruct a fresh
+        // Retain the raw bytes so `power_cycle` can reconstruct a fresh
         // power-on machine (netplay cold boot) by re-running `load_rom`.
         self.last_rom = data.to_vec();
 
-        let timing = self
+        let region = self
             .header
             .as_ref()
-            .map(|h| TimingProfile::from_destination(h.destination))
-            .unwrap_or(TimingProfile::NTSC);
-        self.timing = timing;
+            .map(|h| TimingProfile::from_destination(h.destination).region())
+            .unwrap_or(VideoRegion::Ntsc);
         // The host resampler runs at a fixed 32 kHz -> 44.1 kHz ratio that
         // is independent of the console region, so it needs no rebuild
         // here; the APU's own region-dependent 32 kHz clock is rebound in
@@ -957,11 +1009,9 @@ impl EmulatorCore for SnesEmulator {
         // the new cart claims its slots.
         self.bus = SnesBus::new();
         self.bus.install_cartridge(cart);
-        // Propagate the PAL/NTSC choice to SystemRegs so STAT78
-        // (`$213F` bit 4) reports the right region. PAL profiles
-        // have 312 scanlines per frame; NTSC has 262.
-        let is_pal = timing.scanlines_per_frame == 312;
-        self.bus.system_regs_mut().set_timing_is_pal(is_pal);
+        // The header's region: the timing profile, and the PAL bit STAT78
+        // (`$213F` bit 4) reports.
+        self.apply_region(region);
 
         // Surface the ROM / SRAM sizes through the debugger's memory-region
         // map now that the cartridge is installed.
@@ -1019,15 +1069,6 @@ impl EmulatorCore for SnesEmulator {
         &self.system_info.display
     }
 
-    fn get_audio_samples(&mut self) -> &[f32] {
-        let want = self.audio_ring.available();
-        self.audio_pending_drain.resize(want, 0.0);
-        if want > 0 {
-            self.audio_ring.drain_into(&mut self.audio_pending_drain);
-        }
-        &self.audio_pending_drain
-    }
-
     fn get_audio_info(&self) -> &AudioInfo {
         &self.system_info.audio
     }
@@ -1051,41 +1092,6 @@ impl EmulatorCore for SnesEmulator {
 
     fn get_input_info(&self) -> &InputInfo {
         &self.system_info.input
-    }
-
-    fn save_state(&self) -> Vec<u8> {
-        use crate::savestate::SNES_SAVESTATE_VERSION;
-
-        // This takes `&self`, so it cannot finish a frame held at the
-        // capture boundary: it saves that frame as it stands, its
-        // `VBlankStart` still queued, and a load goes on with it (the
-        // saved clock says the frame is in progress). A host saves through
-        // `CaptureCore::save_state_at_frame_end`, which finishes it first.
-        //
-        // Shared with `state_hash` so the hashed payload is exactly the
-        // bytes persisted here (minus the envelope + compression).
-        let payload = self.capture_save_state();
-        let env = retro_core::savestate::SaveStateEnvelope {
-            envelope_version: retro_core::savestate::RETRO_SAVESTATE_ENVELOPE_VERSION,
-            core_id: "snes1".to_string(),
-            core_version: SNES_SAVESTATE_VERSION,
-            rom_hash: self.image_hash().to_string(),
-            // The core leaves the timestamp at 0; the host shell sets a
-            // real capture time when it persists the bytes. Keeping it
-            // 0 here makes `save_state` deterministic for tests.
-            created_at: 0,
-            payload,
-        };
-        // zstd level 3 matches SG1: good ratio on the mostly-zero
-        // RAM/VRAM/ARAM payload at ~1 ms. A serialization failure (out
-        // of memory) degrades to empty bytes, which `load_state` then
-        // rejects as "missing magic".
-        retro_core::savestate::serialize_compressed(&env, 3).unwrap_or_default()
-    }
-
-    fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
-        self.load_state_with_rom_check(data, retro_core::savestate::RomCheck::SameRom)
-            .map_err(|e| e.to_string())
     }
 
     fn get_save_ram(&self) -> Option<&[u8]> {
@@ -1239,27 +1245,6 @@ impl EmulatorCore for SnesEmulator {
             _ => Vec::new(),
         }
     }
-}
-
-/// Build the console's input manager: two ports with a default
-/// keyboard provider bound to port 0.
-///
-/// The generic `GenericInputManager::new` registers no providers, so a
-/// core that wants the "keyboard works out of the box" UX must register
-/// one itself (mirrors the SG1 shim). Without this the host's
-/// `keyDown`/`keyUp` events broadcast to zero keyboard providers and no
-/// button ever reaches the pad. The keyboard uses the SNES default
-/// layout from [`default_keyboard_mapping`].
-fn default_input_manager() -> GenericInputManager {
-    let mut manager = GenericInputManager::new(2);
-    let keyboard = KeyboardInputProvider::with_mapping(default_keyboard_mapping());
-    manager.add_keyboard_provider(keyboard);
-    manager.assign_provider_to_port("keyboard".to_string(), 0);
-    // Pads the frontend auto-registers on first input pick up the SNES
-    // face-button order rather than the Genesis layout baked into the
-    // shared provider.
-    manager.set_default_gamepad_mapping(default_gamepad_mapping());
-    manager
 }
 
 #[cfg(test)]

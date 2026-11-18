@@ -1,6 +1,8 @@
+use retro_core::audio::RateConverterState;
+use retro_core::savestate::{
+    part_hash, LoadStateError, RomCheck, RomIdentity, SavestateFormat, SavestatePayload,
+};
 use serde::{Deserialize, Serialize};
-
-use crate::cartridge::GenesisCoprocessorState;
 
 /// Version 3 carries the cartridge's state as the typed `cart_sram` +
 /// `cart_coprocessors` pair; the opaque `cartridge` blob before them is
@@ -35,7 +37,7 @@ pub struct SystemSaveState {
     pub cart_sram: Vec<u8>,
     /// Typed per-coprocessor state, keyed by `chip_id`.
     #[serde(default)]
-    pub cart_coprocessors: Vec<(u8, GenesisCoprocessorState)>,
+    pub cart_coprocessors: Vec<(u8, GenesisChipState)>,
     pub frame_count: u64,
     pub screenshot: Option<Vec<u8>>,
 }
@@ -354,7 +356,7 @@ pub struct SystemTimingState {
     /// aligned to the restored emulation time, which is correct for
     /// continuing playback after a state restore).
     #[serde(default)]
-    pub audio_rate_converter: SerializableConverterState,
+    pub audio_rate_converter: RateConverterState,
     /// Fractional-cycle carry for the per-scanline 68K budget (numerator over
     /// the CPU divider).
     #[serde(default)]
@@ -370,18 +372,132 @@ pub struct SystemTimingState {
     pub bus_refresh_target: u64,
 }
 
-/// Persisted state of the [`retro_core::IntegerRateConverter`] inside
-/// `SystemTimingState`. The all-zero `Default` is reserved as a
-/// sentinel meaning "no captured state": the loader treats it as
-/// "anchor at master_cycles + reset". A genuinely fresh converter
-/// after a `reset(master_cycles)` call will have `reference_cycles ==
-/// master_cycles` (non-zero on any running emulator), so the sentinel
-/// is unambiguous.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct SerializableConverterState {
-    pub reference_cycles: u64,
-    pub samples_at_reference: u64,
-    pub remainder: u64,
+// The cartridge's chips
+
+/// Which dynamic banking scheme a bank-mapper chip implements. The chip
+/// owns the cartridge ROM and translates 68000 ROM-window reads through a
+/// per-slot bank table; this tag records which register protocol drives
+/// that table so a restore rebinds the right one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BankMapperKind {
+    /// SEGA mapper (`0xA130F0..0xA130F7` bank registers, 8 x 512 KiB slots).
+    Sega,
+    /// Super Street Fighter II (`0xA130F1` toggles bank 7/8 into slot 7).
+    Ssf2,
+    /// Codemasters (bank selects written into ROM-window addresses).
+    Codemasters,
+}
+
+/// Volatile state of a bank-switching mapper chip: the per-slot bank
+/// selection. SEGA carries 8 entries (one per 512 KiB slot), Codemasters
+/// 4, SSF2 a single entry (the high bank latched into slot 7). The chip
+/// re-derives `bank_count` from the ROM it is handed on restore, so only
+/// the live selection is persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankMapperState {
+    pub kind: BankMapperKind,
+    pub banks: Vec<u8>,
+}
+
+/// Serial-EEPROM protocol phase (I2C-like state machine). Mirror of the
+/// chip's internal enum so the exact handshake position round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EepromPhase {
+    Idle,
+    DeviceAddress,
+    DeviceAck,
+    MemoryAddress,
+    MemoryAck,
+    WriteData,
+    WriteAck,
+    ReadData,
+    ReadAck,
+    Stop,
+}
+
+/// Volatile state of a serial EEPROM chip (X24C01/X24C02). `data` is the
+/// battery-backed contents (also surfaced as the cartridge's save RAM);
+/// the remaining fields are the mid-transfer protocol state so a savestate
+/// taken during a read/write handshake resumes cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EepromChipState {
+    pub data: Vec<u8>,
+    pub phase: EepromPhase,
+    pub sda: bool,
+    pub scl: bool,
+    pub sda_prev: bool,
+    pub scl_prev: bool,
+    pub bit_count: u8,
+    pub current_byte: u8,
+    pub device_addr: u8,
+    pub rw_bit: bool,
+    pub memory_addr: u8,
+}
+
+/// Volatile state of a J-Cart controller-port expander. Only the latched
+/// port/TH registers persist; the connected controllers' button state is
+/// driven live by the input layer each frame, not saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct JCartState {
+    pub port3_data: u8,
+    pub port4_data: u8,
+    pub port3_th: bool,
+    pub port4_th: bool,
+}
+
+/// Volatile state of the SVP coprocessor.
+///
+/// The SVP shares a block of DRAM with the 68000 and runs an SSP1601 DSP out
+/// of internal RAM. This snapshot persists that shared DRAM plus the entire
+/// SSP1601 register/RAM/stack/PMAC file, including the mailbox registers
+/// (`SSP_XST`/`SSP_PM0` live in `gr`) and the wait-loop flags (`emu_status`),
+/// so a savestate taken mid-handshake or mid-render resumes cleanly. The
+/// program ROM half of the SSP's instruction memory is *not* saved: it is
+/// re-copied from the cartridge on restore, so only the writable `iram`
+/// (words `0x000..0x400`) is persisted. `last_master_cycle`/`ssp_accum` are
+/// the coprocessor's catch-up anchor (in 68K cycles) and its carry. Kept
+/// `Default` so the chip round-trips an empty snapshot with no special-casing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SvpState {
+    /// Shared 68000/SSP DRAM (`0x300000-0x31FFFF`), big-endian bytes.
+    pub dram: Vec<u8>,
+    /// SSP1601 general register file (`gr[16]`; 16-bit regs in the high half,
+    /// `A`/`P`/`PMC` full 32-bit). Carries `SSP_XST`/`SSP_PM0`/`SSP_PC`.
+    pub gr: [u32; 16],
+    /// Two internal RAM banks (512 words).
+    pub ram: Vec<u16>,
+    /// Eight 8-bit pointer registers.
+    pub ptr: [u8; 8],
+    /// Six-level hardware stack.
+    pub stack: [u16; 6],
+    /// PMAC read/write address+mode file for PM0-PM5.
+    pub pmac: [[u32; 6]; 2],
+    /// PMC programming state + wait-loop flags (`SSP_WAIT_*`).
+    pub emu_status: u32,
+    /// Writable IRAM (instruction-memory words `0x000..0x400`); the program
+    /// ROM half is reconstructed from the cartridge on restore.
+    pub iram: Vec<u16>,
+    /// SSP1601 cycle counter (diagnostic).
+    pub cycles: u64,
+    /// 68K-cycle anchor of the last catch-up (`None` before the first).
+    pub last_master_cycle: Option<u64>,
+    /// Fractional master-cycle->SSP-cycle carry across catch-ups.
+    pub ssp_accum: u64,
+}
+
+/// A cartridge chip's state in a savestate. The generic
+/// [`Coprocessor`](retro_core::cartridge::Coprocessor) trait saves a chip
+/// as opaque bytes; each chip writes one variant of this enum in them, and
+/// the cartridge (its board names this enum as its chip state) decodes it
+/// back, keyed by `chip_id` in the payload. The variant tags the chip, so a
+/// blob one chip saved never restores into another; variants are only
+/// appended, so the indices stay and older savestates keep decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenesisChipState {
+    BankMapper(BankMapperState),
+    Eeprom(EepromChipState),
+    JCart(JCartState),
+    Svp(SvpState),
 }
 
 // Validation & helpers
@@ -389,8 +505,19 @@ impl SystemSaveState {
     pub fn size(&self) -> usize {
         bincode::serialized_size(self).unwrap_or(0) as usize
     }
+}
 
-    pub fn validate(&self) -> Result<(), String> {
+impl SavestatePayload for SystemSaveState {
+    retro_core::savestate_codec!();
+
+    const FORMAT: SavestateFormat = SavestateFormat {
+        core_id: "sg1",
+        version: SAVE_STATE_VERSION,
+    };
+    type Extension = ();
+
+    /// A newer layout and memories of the wrong size are refused.
+    fn validate(&self) -> Result<(), String> {
         if self.version > SAVE_STATE_VERSION {
             return Err(format!(
                 "Save state version {} is newer than supported version {}",
@@ -417,6 +544,44 @@ impl SystemSaveState {
         }
         Ok(())
     }
+
+    /// The payload's parts by chip and memory; `frame_count` as itself.
+    fn hash_parts(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("cpu68k", part_hash(&self.cpu68k)),
+            ("z80", part_hash(&self.z80)),
+            ("vdp", part_hash(&self.vdp)),
+            ("psg", part_hash(&self.psg)),
+            ("ym2612", part_hash(&self.ym2612)),
+            ("io", part_hash(&self.io)),
+            ("bus", part_hash(&self.bus)),
+            ("timing", part_hash(&self.timing)),
+            ("ram", part_hash(&self.ram)),
+            ("z80_ram", part_hash(&self.z80_ram)),
+            ("cartridge", part_hash(&self.cartridge)),
+            ("frame_count", self.frame_count),
+        ]
+    }
+
+    /// The form before the envelope: bincode and zstd of the payload alone.
+    /// It names its ROM by hash and title, and the refusal names the titles,
+    /// the only names it ever showed.
+    fn open_without_envelope(
+        bytes: &[u8],
+        rom: Option<RomIdentity<'_>>,
+        check: RomCheck,
+    ) -> Result<Self, LoadStateError> {
+        let state = decompress_and_deserialize(bytes)?;
+        if let (RomCheck::SameRom, Some(rom)) = (check, rom) {
+            if !state.metadata.rom_hash.is_empty() && rom.sha256 != state.metadata.rom_hash {
+                return Err(LoadStateError::OtherRom {
+                    state_rom: state.metadata.game_title.to_string(),
+                    loaded_rom: rom.title.to_string(),
+                });
+            }
+        }
+        Ok(state)
+    }
 }
 
 impl SaveStateMetadata {
@@ -438,12 +603,12 @@ impl SaveStateMetadata {
  */
 
 /// Compress data using zstd
-pub fn compress_zstd(data: &[u8], level: i32) -> Result<Vec<u8>, String> {
+fn compress_zstd(data: &[u8], level: i32) -> Result<Vec<u8>, String> {
     zstd::encode_all(data, level).map_err(|e| format!("Compression failed: {}", e))
 }
 
 /// Decompress data using zstd
-pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
+fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd::decode_all(data).map_err(|e| format!("Decompression failed: {}", e))
 }
 
@@ -460,8 +625,8 @@ pub fn serialize_and_compress(
     compress_zstd(&serialized, compression_level)
 }
 
-/// Decompress and deserialize a save state
-pub fn decompress_and_deserialize(data: &[u8]) -> Result<SystemSaveState, String> {
+/// Decompress and deserialize a save state of the form before the envelope.
+fn decompress_and_deserialize(data: &[u8]) -> Result<SystemSaveState, String> {
     // Decompress
     let decompressed = decompress_zstd(data)?;
 
@@ -470,7 +635,7 @@ pub fn decompress_and_deserialize(data: &[u8]) -> Result<SystemSaveState, String
         .map_err(|e| format!("Deserialization failed: {}", e))?;
 
     // Validate
-    state.validate()?;
+    SavestatePayload::validate(&state)?;
 
     // Check version
     if state.version > SAVE_STATE_VERSION {
@@ -505,5 +670,77 @@ mod tests {
             data.len(),
             compressed.len()
         );
+    }
+
+    #[test]
+    fn bank_mapper_state_round_trips_via_bincode() {
+        let state = GenesisChipState::BankMapper(BankMapperState {
+            kind: BankMapperKind::Sega,
+            banks: vec![0, 1, 2, 3, 4, 5, 6, 7],
+        });
+        let bytes = bincode::serialize(&state).unwrap();
+        let back: GenesisChipState = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn eeprom_state_round_trips_via_bincode() {
+        let state = GenesisChipState::Eeprom(EepromChipState {
+            data: vec![0xAB; 128],
+            phase: EepromPhase::WriteData,
+            sda: false,
+            scl: true,
+            sda_prev: true,
+            scl_prev: false,
+            bit_count: 3,
+            current_byte: 0x5A,
+            device_addr: 0x50,
+            rw_bit: true,
+            memory_addr: 0x10,
+        });
+        let bytes = bincode::serialize(&state).unwrap();
+        assert_eq!(
+            bincode::deserialize::<GenesisChipState>(&bytes).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn jcart_and_svp_states_round_trip() {
+        let jcart = GenesisChipState::JCart(JCartState {
+            port3_data: 0x40,
+            port4_data: 0x00,
+            port3_th: true,
+            port4_th: false,
+        });
+        let svp = GenesisChipState::Svp(SvpState {
+            dram: vec![1, 2, 3],
+            gr: [0x1234_5678; 16],
+            ram: vec![0xAAAA; 512],
+            ptr: [1, 2, 3, 4, 5, 6, 7, 0],
+            stack: [10, 20, 30, 40, 50, 60],
+            pmac: [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]],
+            emu_status: 0x2000,
+            iram: vec![0x0F0F; 0x400],
+            cycles: 999,
+            last_master_cycle: Some(123_456),
+            ssp_accum: 42,
+        });
+        for state in [jcart, svp] {
+            let bytes = bincode::serialize(&state).unwrap();
+            assert_eq!(
+                bincode::deserialize::<GenesisChipState>(&bytes).unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn variants_are_backend_tagged_distinctly() {
+        // A J-Cart blob must not decode as (or equal) an SVP state, the
+        // tag keeps chips from cross-loading each other's bytes.
+        let jcart = GenesisChipState::JCart(JCartState::default());
+        let svp = GenesisChipState::Svp(SvpState::default());
+        assert_ne!(jcart, svp);
     }
 }

@@ -1177,6 +1177,7 @@ mod tests {
     }
 
     impl EmulatorCore for FakeCore {
+        crate::fake_machine::unreachable_machine_items!();
         fn system_info(&self) -> &SystemInfo {
             unreachable!("the bindings call only the capture methods")
         }
@@ -1210,9 +1211,6 @@ mod tests {
         fn get_display_info(&self) -> &DisplayInfo {
             unreachable!()
         }
-        fn get_audio_samples(&mut self) -> &[f32] {
-            unreachable!()
-        }
         fn get_audio_info(&self) -> &AudioInfo {
             unreachable!()
         }
@@ -1226,12 +1224,6 @@ mod tests {
             unreachable!()
         }
         fn get_input_info(&self) -> &InputInfo {
-            unreachable!()
-        }
-        fn save_state(&self) -> Vec<u8> {
-            unreachable!()
-        }
-        fn load_state(&mut self, _data: &[u8]) -> Result<(), String> {
             unreachable!()
         }
         fn get_save_ram(&self) -> Option<&[u8]> {
@@ -1274,9 +1266,6 @@ mod tests {
         }
         fn at_capture_boundary(&self) -> bool {
             self.runs > 0
-        }
-        fn save_state_at_frame_end(&mut self) -> Vec<u8> {
-            Vec::new()
         }
         fn capture_frame_snapshot(&self) -> FrameSnapshot<Console> {
             snapshot()

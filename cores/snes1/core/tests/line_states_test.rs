@@ -10,6 +10,7 @@
 
 use retro_core::capture::{layer, planes, CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
+use retro_core::savestate::RomCheck;
 use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode, Framebuffer};
 use snes1_core::debugger::snes_events;
@@ -839,7 +840,8 @@ fn a_load_or_a_reset_drops_the_table() {
     emu.run_to_capture_boundary();
     assert!(emu.line_states().is_some());
 
-    emu.load_state(&state).expect("its own state loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("its own state loads");
     assert!(emu.line_states().is_none());
     assert_eq!(emu.capture_recording(), line_states_on());
     emu.run_to_capture_boundary();

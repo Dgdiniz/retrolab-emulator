@@ -21,7 +21,7 @@
 use retro_core::cartridge::{Board, ComposableCartridge, Coprocessor, SourcePlace};
 
 use super::map_plan::{rom_mirror_mask, MapSlot};
-use super::savestate::GenesisCoprocessorState;
+use crate::savestate::GenesisChipState;
 
 /// The /TIME register the SEGA mapper protocol uses for the SRAM switch
 /// (`$A130F1`, bit 0).
@@ -84,7 +84,7 @@ impl GenesisBoard {
 impl Board for GenesisBoard {
     type Slot = MapSlot;
     type Chip = dyn Coprocessor;
-    type ChipState = GenesisCoprocessorState;
+    type ChipState = GenesisChipState;
 
     /// The 68000's undriven data bus reads `0xFF`.
     const MISSING: Option<u8> = Some(0xFF);
@@ -156,7 +156,7 @@ mod tests {
     use crate::cartridge::chips::BankMapperChip;
     use crate::cartridge::map_plan::{MapPlan, MapTarget};
     use crate::cartridge::presets::{bank_mapper_plan, plain_plan};
-    use crate::cartridge::savestate::BankMapperKind;
+    use crate::savestate::BankMapperKind;
 
     /// A plain cartridge of `rom` with SRAM over `sram`, as the builder
     /// makes one (a fresh SRAM holds `0xFF`).
@@ -333,7 +333,7 @@ mod tests {
         let saved = saved_from.coprocessors_savestate();
         assert!(matches!(
             saved.as_slice(),
-            [(0, GenesisCoprocessorState::BankMapper(state))] if state.banks[6] == 9
+            [(0, GenesisChipState::BankMapper(state))] if state.banks[6] == 9
         ));
         let mut restored = banked(&rom);
         restored.restore_coprocessors_savestate(&saved, 53_693_175);

@@ -37,7 +37,7 @@ pub use cartridge::{
     CHIP_SUPERFX_BUILT, DEFAULT_DETECT_THRESHOLD, DSP1_CHIP_ID, HEADER_CANDIDATES,
     MAP_MODE_EXHIROM, MAP_MODE_HIROM, MAP_MODE_LOROM, NEC_LLE_BUILT, SUPPORTED_MANIFEST_VERSION,
 };
-pub use controller::{input_state_to_snes_pad, Controller, StandardPad};
+pub use controller::{input_state_to_snes_pad, StandardPad};
 #[cfg(feature = "chip-superfx")]
 pub use debugger::cpu_state_gsu;
 #[cfg(feature = "chip-cx4")]

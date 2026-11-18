@@ -62,7 +62,7 @@ pub fn run(args: ApuDumpArgs) -> Result<()> {
 
     // Per-voice state (owned), captured under the mutable trait borrow.
     let states: Vec<ChannelState> = {
-        let ad = emu.audio_debugger();
+        let ad = emu.audio_debugger(0).unwrap();
         let n = ad.get_channel_count();
         (0..n).filter_map(|i| ad.get_channel_state(i)).collect()
     };

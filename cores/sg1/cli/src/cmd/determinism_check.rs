@@ -28,6 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use retro_core::savestate::RomCheck;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
 use sg1_core::GenesisEmulator;
 
@@ -94,7 +95,7 @@ fn restore(
     state: &[u8],
 ) -> Result<GenesisEmulator> {
     let mut emu = boot(rom, six_button, region)?;
-    emu.load_state(state)
+    emu.load_state(state, RomCheck::SameRom)
         .map_err(|e| anyhow::anyhow!("failed to load savestate: {e}"))?;
     Ok(emu)
 }

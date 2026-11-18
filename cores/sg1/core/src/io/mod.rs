@@ -201,7 +201,7 @@ impl GenesisIo {
         self.data_registers[port] = value;
     }
 
-    /// Sync button states from InputManager into connected devices.
+    /// Sync button states from the input manager into connected devices.
     /// Called once per frame before CPU execution.
     pub fn sync_input(&mut self, port0_state: u32, port1_state: u32) {
         self.ports[0].set_device_button_state(port0_state);

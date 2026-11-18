@@ -88,7 +88,7 @@ use retro_core::debug::{Access, AccessLog};
 
 use crate::apu::Apu;
 use crate::cartridge::{BusSpeed, MapPlan, MapTarget, SnesCartridge, CX4_CHIP_ID};
-use crate::controller::{Controller, StandardPad};
+use crate::controller::StandardPad;
 use crate::dma::DmaController;
 use crate::ppu::{Ppu, PpuAccessCtx};
 use crate::system_regs::{SystemRegWriteFx, SystemRegs};
@@ -632,14 +632,14 @@ impl SnesBus {
     /// the busy flag after the read window.
     pub fn auto_joypad_read(&mut self) {
         // The strobe pulse latches each pad's shift register, mirroring
-        // the hardware sequence even though `read_auto` reads the raw
+        // the hardware sequence even though `buttons` reads the raw
         // snapshot directly.
         for pad in &mut self.controllers {
             pad.strobe(true);
             pad.strobe(false);
         }
-        let joy1 = self.controllers[0].read_auto();
-        let joy2 = self.controllers[1].read_auto();
+        let joy1 = self.controllers[0].buttons();
+        let joy2 = self.controllers[1].buttons();
         // Hardware clocks each pad 16 times while filling JOY1-JOY4,
         // leaving the serial shift register exhausted. Mirror that so a
         // *manual* $4016/$4017 read the game makes afterwards, without
@@ -1455,7 +1455,7 @@ impl SnesBus {
     /// `chip_id`. Empty when no cartridge is installed or it has no chips.
     /// Each entry is backend-tagged (LLE vs HLE). Backs the savestate
     /// capture (mirrors [`SnesBus::cartridge_sram`]).
-    pub fn coprocessors_savestate(&self) -> Vec<(u8, crate::savestate::CoprocessorState)> {
+    pub fn coprocessors_savestate(&self) -> Vec<(u8, crate::savestate::SnesChipState)> {
         self.cartridge
             .as_ref()
             .map(|c| c.coprocessors_savestate())
@@ -1468,7 +1468,7 @@ impl SnesBus {
     /// [`SnesBus::restore_cartridge_sram`]).
     pub fn restore_coprocessors_savestate(
         &mut self,
-        states: &[(u8, crate::savestate::CoprocessorState)],
+        states: &[(u8, crate::savestate::SnesChipState)],
         master_clock_hz: u64,
     ) {
         if let Some(cart) = self.cartridge.as_mut() {
@@ -1497,10 +1497,7 @@ impl SnesBus {
             apu: self.apu.to_savestate(),
             dma: self.dma.to_savestate(),
             system_regs: self.system_regs.to_savestate(),
-            controllers: [
-                self.controllers[0].to_savestate(),
-                self.controllers[1].to_savestate(),
-            ],
+            controllers: [self.controllers[0].state(), self.controllers[1].state()],
             wmdata: self.wmdata.to_savestate(),
             sram: self
                 .cartridge_sram()
@@ -1530,8 +1527,8 @@ impl SnesBus {
         self.apu.from_savestate(&s.apu, master_clock_hz);
         self.dma.from_savestate(&s.dma);
         self.system_regs.from_savestate(&s.system_regs);
-        self.controllers[0].from_savestate(&s.controllers[0]);
-        self.controllers[1].from_savestate(&s.controllers[1]);
+        self.controllers[0].restore(&s.controllers[0]);
+        self.controllers[1].restore(&s.controllers[1]);
         self.wmdata.from_savestate(&s.wmdata);
         self.restore_cartridge_sram(&s.sram);
         // Restore every coprocessor (uPD7725 + converter anchor, ...) the

@@ -10,6 +10,7 @@ mod helpers;
 use helpers::M68kProgram;
 use retro_core::debug::TraceEntry;
 use retro_core::frame::run_frame_on;
+use retro_core::savestate::RomCheck;
 use retro_core::types::{Breakpoint, BreakpointType, InstructionTrace, StackFrame};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::{
@@ -722,7 +723,7 @@ fn the_call_stack_through_an_interrupt_under_host_steps() {
 
 /// The calls program stepped by the host into leaf, then a reset, the same
 /// ROM loaded again, a savestate loaded (one a twin took at its first
-/// frame's end: a frame in progress has none) and another ROM loaded. Each
+/// frame's end) and another ROM loaded. Each
 /// of them empties the call stack, whose frames belonged to the machine it
 /// replaced; the history stays, since it records what ran.
 const ACROSS_A_RESET_AND_A_LOAD: &str = r#"stopped in leaf
@@ -758,10 +759,6 @@ fn the_call_stack_and_history_across_a_reset_and_a_load() {
     let mut emu = GenesisEmulator::new();
     emu.load_rom(&rom).expect("the program loads");
     step_to(&mut emu, LEAF);
-    assert!(
-        emu.save_state().is_empty(),
-        "a frame in progress has no savestate"
-    );
     let mut twin = GenesisEmulator::new();
     twin.load_rom(&rom).expect("the program loads");
     run_frame_on(&mut twin, ExecutionTier::Play);
@@ -780,7 +777,8 @@ fn the_call_stack_and_history_across_a_reset_and_a_load() {
     text.push_str(&describe("after a reset", &emu));
     emu.load_rom(&rom).expect("the program loads again");
     text.push_str(&describe("after the same ROM loaded again", &emu));
-    emu.load_state(&state).expect("the savestate loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     text.push_str(&describe("after the savestate loaded", &emu));
     emu.load_rom(&interrupt_program())
         .expect("another program loads");

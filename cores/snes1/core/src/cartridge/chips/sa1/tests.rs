@@ -361,10 +361,8 @@ fn restore_ignores_garbage_and_foreign_variants() {
     write_mmio(&mut chip, 0x2220, 0x80 | 5); // a non-default mapping
     let before = chip.serialize();
     chip.restore(&[1, 2, 3], NTSC_HZ); // garbage
-    let foreign = bincode::serialize(&CoprocessorState::Sdd1(
-        crate::savestate::Sdd1State::default(),
-    ))
-    .unwrap();
+    let foreign =
+        bincode::serialize(&SnesChipState::Sdd1(crate::savestate::Sdd1State::default())).unwrap();
     chip.restore(&foreign, NTSC_HZ); // foreign variant
     assert_eq!(
         chip.serialize(),

@@ -62,7 +62,7 @@ use wdc65816::instructions::FLAG_I;
 use wdc65816::Wdc65816;
 
 use crate::debugger::cpu_state_65816;
-use crate::savestate::{CoprocessorState, Cpu65816State, Sa1State};
+use crate::savestate::{Cpu65816State, Sa1State, SnesChipState};
 
 mod bitmap;
 mod bus;
@@ -848,7 +848,7 @@ impl Coprocessor for Sa1Chip {
     /// is saved with the battery ([`Coprocessor::battery`]) and ROM never
     /// changes, so neither is in it.
     fn serialize(&self) -> Vec<u8> {
-        let state = CoprocessorState::Sa1(Sa1State {
+        let state = SnesChipState::Sa1(Sa1State {
             mmc_bank: self.rom_block,
             mmc_mode: self.rom_block_mode,
             sbm: self.scpu_bwram_block,
@@ -874,8 +874,7 @@ impl Coprocessor for Sa1Chip {
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
         // A savestate that is damaged, empty, or another chip's leaves the
         // chip as it is.
-        let Ok(CoprocessorState::Sa1(state)) = bincode::deserialize::<CoprocessorState>(data)
-        else {
+        let Ok(SnesChipState::Sa1(state)) = bincode::deserialize::<SnesChipState>(data) else {
             return;
         };
         self.rom_block = state.mmc_bank;

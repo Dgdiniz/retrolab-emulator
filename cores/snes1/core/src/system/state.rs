@@ -1,6 +1,6 @@
 //! The machine into and out of its savestate payload, whose layout is
-//! `crate::savestate`, and the state hash netplay and the golden records
-//! compare.
+//! `crate::savestate`; the trait seals and opens it, and hashes it for
+//! netplay and the golden records.
 
 #[cfg(doc)]
 use retro_core::EmulatorCore;
@@ -10,7 +10,7 @@ use super::SnesEmulator;
 impl SnesEmulator {
     /// Build the full deterministic machine snapshot shared by
     /// [`EmulatorCore::save_state`] (which wraps it in the cross-core
-    /// envelope) and [`Self::state_hash`] (which hashes it). The payload
+    /// envelope) and [`EmulatorCore::state_hash`] (which hashes it). The payload
     /// carries no wall-clock or host metadata (the envelope owns
     /// `created_at` and `rom_hash`), so it is a pure function of
     /// deterministic machine state.
@@ -31,38 +31,9 @@ impl SnesEmulator {
         }
     }
 
-    /// Load a savestate, refusing one captured against another ROM unless
-    /// `check` is `RomCheck::AnyRom`. [`EmulatorCore::load_state`] is this
-    /// with `RomCheck::SameRom` and its refusal as text; a host that asked
-    /// the player first loads a state made on another build of the game
-    /// (a translation in progress, say) with `RomCheck::AnyRom`. The
-    /// refusal says whether the ROM was the reason.
-    pub fn load_state_with_rom_check(
-        &mut self,
-        data: &[u8],
-        check: retro_core::savestate::RomCheck,
-    ) -> Result<(), retro_core::savestate::LoadStateError> {
-        use crate::savestate::{SnesSaveState, SNES_SAVESTATE_VERSION};
-        use retro_core::savestate::{check_rom_hash, deserialize_compressed, LoadStateError};
-
-        let env = deserialize_compressed::<SnesSaveState>(data)?;
-        // Refuse a state captured against a different ROM unless the host
-        // asked for any ROM (an empty hash in the state is a wildcard,
-        // matching the envelope contract).
-        check_rom_hash(&env, self.image_hash(), check)?;
-        // Guard the envelope's own version too, so a tampered wrapper
-        // can't smuggle a future schema past the payload check below.
-        if env.core_version > SNES_SAVESTATE_VERSION {
-            return Err(LoadStateError::Unreadable(format!(
-                "SNES save state core_version {} is newer than supported version {}",
-                env.core_version, SNES_SAVESTATE_VERSION
-            )));
-        }
-        let payload = env.payload;
-        // Reject a newer payload schema and validate the big-memory
-        // lengths before mutating any live state.
-        payload.validate()?;
-
+    /// Make the machine the payload's (the trait's `restore_savestate`),
+    /// the trait's opener having checked it.
+    pub(super) fn restore_payload(&mut self, payload: crate::savestate::SnesSaveState) {
         // Restore only volatile state. The cartridge, its map plan, and
         // the page/speed tables are deliberately preserved, the ROM is
         // already loaded, and `SnesBus::from_savestate` re-syncs the
@@ -99,75 +70,14 @@ impl SnesEmulator {
         // Host-side audio is not in the wire format: clear the ring and
         // reset the resampler so playback resumes from the restored APU
         // without replaying stale samples.
-        self.audio_ring.clear();
+        self.host_audio.clear();
         self.resampler.reset();
         self.apu_drain_buf.clear();
         self.audio_resample_buf.clear();
-        self.audio_pending_drain.clear();
 
         // The restored PPU register file may imply a different active
         // display size (hires / overscan); resync the cached DisplayInfo
         // so the next host poll matches.
         self.sync_display_info();
-        Ok(())
-    }
-
-    /// Deterministic FNV-1a-64 hash of the full machine state, for
-    /// netplay desync detection and the determinism harness. Hashes the
-    /// exact payload [`EmulatorCore::save_state`] serializes and
-    /// [`EmulatorCore::load_state`] restores (raw bincode, no
-    /// compression), so a save/load round-trip is hash-preserving by
-    /// construction, two emulators in the same logical state hash equal,
-    /// and [`Self::run_frame_headless`] leaves the same hash as a
-    /// presented frame.
-    pub fn state_hash(&self) -> u64 {
-        let bytes = bincode::serialize(&self.capture_save_state()).unwrap_or_default();
-        retro_core::fnv1a64(&bytes)
-    }
-
-    /// Per-subsystem FNV-1a-64 hashes of the canonical savestate payload,
-    /// for netplay desync triage: when two instances (or a save/load
-    /// round-trip) disagree on [`Self::state_hash`], this pinpoints which
-    /// subsystem's serialized state diverged. `frame_count` is reported
-    /// verbatim (not hashed) so a frame-alignment mismatch is obvious.
-    pub fn state_hash_parts(&self) -> Vec<(&'static str, u64)> {
-        let s = self.capture_save_state();
-        let h = |bytes: Vec<u8>| retro_core::fnv1a64(&bytes);
-        vec![
-            ("cpu", h(bincode::serialize(&s.cpu).unwrap_or_default())),
-            (
-                "wram",
-                h(bincode::serialize(&s.bus.wram).unwrap_or_default()),
-            ),
-            ("ppu", h(bincode::serialize(&s.bus.ppu).unwrap_or_default())),
-            ("apu", h(bincode::serialize(&s.bus.apu).unwrap_or_default())),
-            ("dma", h(bincode::serialize(&s.bus.dma).unwrap_or_default())),
-            (
-                "system_regs",
-                h(bincode::serialize(&s.bus.system_regs).unwrap_or_default()),
-            ),
-            (
-                "controllers",
-                h(bincode::serialize(&s.bus.controllers).unwrap_or_default()),
-            ),
-            (
-                "sram",
-                h(bincode::serialize(&s.bus.sram).unwrap_or_default()),
-            ),
-            (
-                "coprocessors",
-                h(bincode::serialize(&s.bus.coprocessors).unwrap_or_default()),
-            ),
-            ("bus", h(bincode::serialize(&s.bus).unwrap_or_default())),
-            (
-                "scheduler",
-                h(bincode::serialize(&s.scheduler).unwrap_or_default()),
-            ),
-            (
-                "timing",
-                h(bincode::serialize(&s.timing).unwrap_or_default()),
-            ),
-            ("frame_count", s.frame_count),
-        ]
     }
 }

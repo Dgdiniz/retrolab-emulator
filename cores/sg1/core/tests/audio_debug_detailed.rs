@@ -41,18 +41,21 @@ fn test_genesis_audio_step_by_step() {
     eprintln!("\n=== DETAILED AUDIO DEBUG ===\n");
     eprintln!(
         "Step 1: Initial buffer = {} samples",
-        genesis.get_audio_buffer().len()
+        genesis.host_audio_mut().take_all().len()
     );
 
-    genesis.clear_audio_buffer();
-    eprintln!("Step 2: After clear = {}", genesis.get_audio_buffer().len());
+    genesis.host_audio_mut().clear();
+    eprintln!(
+        "Step 2: After clear = {}",
+        genesis.host_audio_mut().take_all().len()
+    );
 
     eprintln!("Step 3: ROM loaded = {}", genesis.get_rom_info().is_some());
 
     eprintln!("Step 4: Running one frame...");
     genesis.run_frame();
 
-    let samples = genesis.get_audio_buffer();
+    let samples = genesis.host_audio_mut().take_all();
     eprintln!(
         "Step 5: After run_frame() = {} samples ({} stereo pairs)",
         samples.len(),
@@ -83,10 +86,10 @@ fn test_genesis_multiple_frames() {
     eprintln!("\n=== MULTIPLE FRAMES TEST ===\n");
 
     for frame in 0..5 {
-        genesis.clear_audio_buffer();
+        genesis.host_audio_mut().clear();
         genesis.run_frame();
 
-        let samples = genesis.get_audio_buffer().len();
+        let samples = genesis.host_audio_mut().take_all().len();
         eprintln!("Frame {}: {} samples", frame, samples);
         assert!(samples > 0, "Frame {} produced no samples!", frame);
     }
@@ -106,7 +109,7 @@ fn test_no_rom_produces_no_audio() {
     genesis.run_frame();
 
     assert!(
-        genesis.get_audio_buffer().is_empty(),
+        genesis.host_audio_mut().take_all().is_empty(),
         "Without a ROM, no master_cycles advance and the rate converter must emit 0 samples"
     );
 }

@@ -17,7 +17,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::cartridge::savestate::{GenesisCoprocessorState, JCartState};
+use crate::savestate::{GenesisChipState, JCartState};
 
 /// MMIO base the plan assigns to the port-4 window, so the chip can tell it
 /// apart from the port-3 window (base 0) by the folded offset.
@@ -139,7 +139,7 @@ impl Coprocessor for JCartChip {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let state = GenesisCoprocessorState::JCart(JCartState {
+        let state = GenesisChipState::JCart(JCartState {
             port3_data: self.port3_data,
             port4_data: self.port4_data,
             port3_th: self.port3_th,
@@ -149,9 +149,7 @@ impl Coprocessor for JCartChip {
     }
 
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
-        if let Ok(GenesisCoprocessorState::JCart(s)) =
-            bincode::deserialize::<GenesisCoprocessorState>(data)
-        {
+        if let Ok(GenesisChipState::JCart(s)) = bincode::deserialize::<GenesisChipState>(data) {
             self.port3_data = s.port3_data;
             self.port4_data = s.port4_data;
             self.port3_th = s.port3_th;

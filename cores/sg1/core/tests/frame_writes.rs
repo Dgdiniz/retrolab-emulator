@@ -18,6 +18,7 @@ use retro_core::capture::{
 use retro_core::cartridge::{SOURCE_COPROCESSOR, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
 use retro_core::cpu::Addressable;
 use retro_core::frame::run_frame_on;
+use retro_core::savestate::RomCheck;
 use retro_core::{EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::vdp::WriteTarget;
 use sg1_core::GenesisEmulator;
@@ -476,7 +477,7 @@ fn turned_on_each_starts_empty_and_a_reset_a_load_and_a_new_rom_empty_it() {
     };
     assert!(empty(&mut emu));
     run_frame_on(&mut emu, ExecutionTier::Play);
-    let state = emu.save_state_at_frame_end();
+    let state = emu.save_state();
     assert!(!empty(&mut emu), "the first frame wrote");
 
     // Turned off, nothing is kept; on again, it starts empty.
@@ -497,7 +498,8 @@ fn turned_on_each_starts_empty_and_a_reset_a_load_and_a_new_rom_empty_it() {
     assert!(empty(&mut emu), "a reset empties them");
     emu.set_execution_mode(ExecutionMode::Running);
     run_frame_on(&mut emu, ExecutionTier::Play);
-    emu.load_state(&state).expect("the savestate loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     assert!(empty(&mut emu), "a savestate load empties them");
     emu.set_execution_mode(ExecutionMode::Running);
     run_frame_on(&mut emu, ExecutionTier::Play);
@@ -508,7 +510,11 @@ fn turned_on_each_starts_empty_and_a_reset_a_load_and_a_new_rom_empty_it() {
 
 /// The samples the frames so far left for the host.
 fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
-    emu.get_audio_buffer().iter().map(|s| s.to_bits()).collect()
+    emu.host_audio_mut()
+        .take_all()
+        .iter()
+        .map(|s| s.to_bits())
+        .collect()
 }
 
 #[test]

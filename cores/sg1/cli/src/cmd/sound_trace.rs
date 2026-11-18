@@ -85,7 +85,7 @@ pub fn run(args: SoundTraceArgs) -> Result<()> {
         // Drain the rendered audio so the chips' ring buffers don't back up;
         // each write was already timestamped at render time, so this does not
         // affect the captured offsets.
-        emu.clear_audio_buffer();
+        emu.host_audio_mut().clear();
 
         let fm = if want_fm {
             emu.ym2612_mut().take_write_log()

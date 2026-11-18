@@ -60,7 +60,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::savestate::{CoprocessorState, Dsp1HleState};
+use crate::savestate::{Dsp1HleState, SnesChipState};
 use commands::{Answer, Command, Registers};
 
 /// `SR` as the host reads it: bit 7, "ready for a transfer", always set.
@@ -251,7 +251,7 @@ impl Dsp1Hle {
     }
 
     /// The host-visible state, for a savestate.
-    pub fn savestate(&self) -> Option<CoprocessorState> {
+    pub fn savestate(&self) -> Option<SnesChipState> {
         let operands = self.operands[..self.operand_bytes_seen.min(OPERAND_BYTES)].to_vec();
         let result = if self.dumping_rom {
             Vec::new()
@@ -260,7 +260,7 @@ impl Dsp1Hle {
             let to = (self.result_cursor + self.result_bytes_due).min(RESULT_BYTES);
             self.result[from..to].to_vec()
         };
-        Some(CoprocessorState::Dsp1Hle(Dsp1HleState {
+        Some(SnesChipState::Dsp1Hle(Dsp1HleState {
             command: self.command_byte,
             awaiting_command: self.awaiting_command,
             command_is_fresh: self.command_is_fresh,
@@ -280,8 +280,8 @@ impl Dsp1Hle {
 
     /// Take the state back from a savestate. A state of another chip is
     /// ignored.
-    pub fn restore_savestate(&mut self, state: &CoprocessorState, _master_clock_hz: u64) {
-        let CoprocessorState::Dsp1Hle(saved) = state else {
+    pub fn restore_savestate(&mut self, state: &SnesChipState, _master_clock_hz: u64) {
+        let SnesChipState::Dsp1Hle(saved) = state else {
             return;
         };
         self.power_on();
@@ -347,7 +347,7 @@ impl Coprocessor for Dsp1Hle {
     }
 
     /// The savestate as bytes: a `bincode`-encoded
-    /// [`CoprocessorState::Dsp1Hle`].
+    /// [`SnesChipState::Dsp1Hle`].
     fn serialize(&self) -> Vec<u8> {
         match self.savestate() {
             Some(state) => bincode::serialize(&state).unwrap_or_default(),
@@ -356,7 +356,7 @@ impl Coprocessor for Dsp1Hle {
     }
 
     fn restore(&mut self, data: &[u8], master_clock_hz: u64) {
-        if let Ok(state) = bincode::deserialize::<CoprocessorState>(data) {
+        if let Ok(state) = bincode::deserialize::<SnesChipState>(data) {
             self.restore_savestate(&state, master_clock_hz);
         }
     }

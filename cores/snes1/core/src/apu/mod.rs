@@ -440,8 +440,8 @@ impl Apu {
             timer2: self.state.timer2.to_savestate(),
             dsp: self.state.dsp.to_savestate(),
             control: self.state.control,
-            spc_sync: converter_to_state(&self.spc_sync),
-            dsp_clock: converter_to_state(&self.dsp_clock),
+            spc_sync: self.spc_sync.state(),
+            dsp_clock: self.dsp_clock.state(),
             apu_cycles: self.apu_cycles,
             dsp_samples_emitted: self.dsp_samples_emitted,
         }
@@ -463,33 +463,13 @@ impl Apu {
         self.state.timer2.from_savestate(&s.timer2);
         self.state.dsp.from_savestate(&s.dsp);
         self.state.control = s.control;
-        self.spc_sync = IntegerRateConverter::with_state(
-            SPC_CLOCK_HZ,
-            master_clock_hz,
-            s.spc_sync.reference_cycles,
-            s.spc_sync.samples_at_reference,
-            s.spc_sync.remainder,
-        );
-        self.dsp_clock = IntegerRateConverter::with_state(
-            DSP_SAMPLE_RATE_HZ,
-            master_clock_hz,
-            s.dsp_clock.reference_cycles,
-            s.dsp_clock.samples_at_reference,
-            s.dsp_clock.remainder,
-        );
+        self.spc_sync =
+            IntegerRateConverter::from_state(SPC_CLOCK_HZ, master_clock_hz, &s.spc_sync);
+        self.dsp_clock =
+            IntegerRateConverter::from_state(DSP_SAMPLE_RATE_HZ, master_clock_hz, &s.dsp_clock);
         self.apu_cycles = s.apu_cycles;
         self.dsp_samples_emitted = s.dsp_samples_emitted;
         self.audio_ring.clear();
-    }
-}
-
-/// Snapshot a rate converter's drifting anchor (the ratio is re-derived
-/// from the region clock on restore).
-fn converter_to_state(conv: &IntegerRateConverter) -> crate::savestate::ConverterState {
-    crate::savestate::ConverterState {
-        reference_cycles: conv.reference_cycles(),
-        samples_at_reference: conv.samples_at_reference(),
-        remainder: conv.remainder(),
     }
 }
 

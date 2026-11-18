@@ -535,3 +535,6 @@ mod capture;
 /// program with an execute breakpoint, a write watch, an event
 /// breakpoint, a stepped history and a chunk of trace on both CPUs.
 mod debugger_shape_tests;
+
+/// What the bindings answer about the machine, recorded.
+mod machine_baseline;

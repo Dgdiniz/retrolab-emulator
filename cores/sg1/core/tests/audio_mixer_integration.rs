@@ -35,10 +35,10 @@ fn stepping_emulator() -> GenesisEmulator {
 #[test]
 fn test_audio_samples_generated_per_frame() {
     let mut genesis = stepping_emulator();
-    genesis.clear_audio_buffer();
+    genesis.host_audio_mut().clear();
     genesis.run_frame();
 
-    let samples = genesis.get_audio_buffer();
+    let samples = genesis.host_audio_mut().take_all();
     let expected_samples = 1470; // 735 stereo pairs * 2 channels
     let tolerance = 100;
 
@@ -55,10 +55,10 @@ fn test_audio_samples_generated_per_frame() {
 #[test]
 fn test_psg_ym2612_both_contribute_to_buffer() {
     let mut genesis = stepping_emulator();
-    genesis.clear_audio_buffer();
+    genesis.host_audio_mut().clear();
     genesis.run_frame();
 
-    let samples = genesis.get_audio_buffer();
+    let samples = genesis.host_audio_mut().take_all();
     assert!(
         !samples.is_empty(),
         "Audio mixer must generate samples even when chips are silent"
@@ -77,10 +77,10 @@ fn test_audio_clocking_synchronization() {
     let mut genesis = stepping_emulator();
 
     for frame in 0..10 {
-        genesis.clear_audio_buffer();
+        genesis.host_audio_mut().clear();
         genesis.run_frame();
 
-        let samples = genesis.get_audio_buffer();
+        let samples = genesis.host_audio_mut().take_all();
         assert!(!samples.is_empty(), "Frame {} produced no samples!", frame);
         assert!(
             samples.len() >= 1370 && samples.len() <= 1570,
@@ -94,7 +94,7 @@ fn test_audio_clocking_synchronization() {
 #[test]
 fn test_audio_mixer_no_clipping() {
     let mut genesis = stepping_emulator();
-    genesis.clear_audio_buffer();
+    genesis.host_audio_mut().clear();
 
     // Drain after every frame: the ring caps at ~4 frames, so 30
     // un-drained frames would otherwise drop the early samples we'd
@@ -102,7 +102,7 @@ fn test_audio_mixer_no_clipping() {
     let mut all_samples: Vec<f32> = Vec::with_capacity(30 * 1470);
     for _ in 0..30 {
         genesis.run_frame();
-        all_samples.extend_from_slice(&genesis.get_audio_buffer());
+        all_samples.extend_from_slice(&genesis.host_audio_mut().take_all());
     }
 
     assert!(
@@ -127,9 +127,9 @@ fn test_multiple_frames_consistent_output() {
     let mut sample_counts = Vec::new();
 
     for _ in 0..10 {
-        genesis.clear_audio_buffer();
+        genesis.host_audio_mut().clear();
         genesis.run_frame();
-        sample_counts.push(genesis.get_audio_buffer().len());
+        sample_counts.push(genesis.host_audio_mut().take_all().len());
     }
 
     let first_count = sample_counts[0];
@@ -151,41 +151,37 @@ fn test_reset_clears_audio_state() {
     for _ in 0..10 {
         genesis.run_frame();
     }
-    // Drain *available* count instead of `get_audio_buffer().len()`
+    // Drain *available* count instead of `take_all().len()`
     // because the ring caps at ~4 frames: 10 frames un-drained will
     // have overflowed and the consumer count won't be `10 *
     // samples_per_frame`. The point of this test is "reset doesn't
     // break later audio", not "buffer is unbounded".
-    let queued_before_reset = genesis.audio_available();
+    let queued_before_reset = genesis.host_audio().available();
     assert!(queued_before_reset > 0, "Should have samples before reset");
 
     genesis.reset();
-    // reset() leaves the debugger in Paused; re-enable Running so
-    // run_frame() actually steps the CPU. The ROM stays loaded:
-    // reset does not unload it.
-    genesis
-        .debugger()
-        .set_execution_mode(ExecutionMode::Running);
+    // The reset leaves the debugger running, so run_frame() steps the CPU.
+    // The ROM stays loaded: reset does not unload it.
 
-    genesis.clear_audio_buffer();
+    genesis.host_audio_mut().clear();
     genesis.run_frame();
 
-    let samples_after_reset = genesis.get_audio_buffer().len();
+    let samples_after_reset = genesis.host_audio_mut().take_all().len();
     assert!(samples_after_reset > 0, "Must generate samples after reset");
 }
 
 #[test]
 fn test_audio_buffer_accumulation() {
     let mut genesis = stepping_emulator();
-    genesis.clear_audio_buffer();
+    genesis.host_audio_mut().clear();
 
-    // Use `audio_available()` to peek instead of `get_audio_buffer()`,
+    // Use `available()` to peek instead of `take_all()`,
     // which drains the ring. We want to verify that running two
     // frames back-to-back without draining produces ~2x the queue.
     genesis.run_frame();
-    let after_frame1 = genesis.audio_available();
+    let after_frame1 = genesis.host_audio().available();
     genesis.run_frame();
-    let after_frame2 = genesis.audio_available();
+    let after_frame2 = genesis.host_audio().available();
 
     assert!(
         after_frame2 > after_frame1,
@@ -210,7 +206,7 @@ fn test_audio_buffer_size_limited() {
         genesis.run_frame();
     }
 
-    let queued = genesis.audio_available();
+    let queued = genesis.host_audio().available();
     assert!(
         queued <= 6000,
         "Ring buffer should hard-cap at ~4 frames (<=6000 stereo samples), got {}",
@@ -220,7 +216,7 @@ fn test_audio_buffer_size_limited() {
     // overflow event drops samples, so `overflow_count()` must be
     // strictly positive.
     assert!(
-        genesis.audio_ring_overflows() > 0,
+        genesis.host_audio().overflows() > 0,
         "Expected overflow events after 100 undrained frames"
     );
 }
@@ -233,7 +229,7 @@ fn test_long_running_stability() {
         genesis.run_frame();
 
         if frame % 60 == 0 {
-            let queued = genesis.audio_available();
+            let queued = genesis.host_audio().available();
             assert!(
                 queued <= 6000,
                 "Frame {}: ring queue size {} exceeds 6000-cap",
@@ -242,7 +238,7 @@ fn test_long_running_stability() {
             );
             // Continuously drain so the ring doesn't permanently
             // overflow: this mirrors what the real host does each frame.
-            let _ = genesis.get_audio_buffer();
+            let _ = genesis.host_audio_mut().take_all();
         }
     }
 }

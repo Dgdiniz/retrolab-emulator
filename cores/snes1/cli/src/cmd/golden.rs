@@ -1,7 +1,7 @@
 //! `golden` / `golden-set` / `golden-compare`: record what the core
 //! produces, frame by frame, and hold a later build to it.
 //!
-//! `golden` runs one ROM through [`snes1_core::golden::run_golden`] and
+//! `golden` runs one ROM through [`retro_core::golden::run_golden`] and
 //! writes a folder: `hashes.txt` (one line per frame: the state, picture
 //! and audio hashes), `frame-NNNNN.png` at the listed shots, optionally
 //! `audio.wav`, and `summary.txt`. `golden-set` does that for every entry
@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use retro_core::{fnv1a64, EmulatorCore};
-use snes1_core::golden::{
-    entry_spec, first_divergence, format_records, parse_manifest, parse_records, run_golden,
-    FrameRecord, GoldenSpec, FORCE_DETECT,
+use retro_core::golden::{
+    entry_spec_of, first_divergence, format_records_of, parse_manifest_of, parse_records_of,
+    run_golden, FrameRecord, GoldenSpec,
 };
+use retro_core::{fnv1a64, EmulatorCore};
+use snes1_core::golden::FORCE_DETECT;
 use snes1_core::SnesEmulator;
 
 use super::{
@@ -138,7 +139,7 @@ pub fn run(args: GoldenArgs) -> Result<()> {
 pub fn run_set(args: GoldenSetArgs) -> Result<()> {
     let text = fs::read_to_string(&args.manifest)
         .with_context(|| format!("failed to read manifest: {}", args.manifest.display()))?;
-    let entries = parse_manifest(&text).map_err(anyhow::Error::msg)?;
+    let entries = parse_manifest_of::<SnesEmulator>(&text).map_err(anyhow::Error::msg)?;
     let root = args.root.clone().unwrap_or_else(|| PathBuf::from("."));
     let coprocessor = CoprocessorArgs::default();
     let (mut ran, mut skipped, mut failed) = (0usize, 0usize, 0usize);
@@ -158,7 +159,7 @@ pub fn run_set(args: GoldenSetArgs) -> Result<()> {
             skipped += 1;
             continue;
         }
-        let spec = entry_spec(entry).map_err(anyhow::Error::msg)?;
+        let spec = entry_spec_of::<SnesEmulator>(entry).map_err(anyhow::Error::msg)?;
         match run_one(
             &entry.name,
             &rom,
@@ -274,8 +275,11 @@ fn run_one(
             force_detect
         ),
     ];
-    fs::write(out.join("hashes.txt"), format_records(&header, &records))
-        .with_context(|| format!("failed to write {}", out.join("hashes.txt").display()))?;
+    fs::write(
+        out.join("hashes.txt"),
+        format_records_of::<SnesEmulator>(&header, &records),
+    )
+    .with_context(|| format!("failed to write {}", out.join("hashes.txt").display()))?;
 
     let last = records.last();
     let total_samples: u64 = records.iter().map(|r| u64::from(r.samples)).sum();
@@ -359,7 +363,7 @@ fn compare_runs(a: &Path, b: &Path) -> Result<CompareReport> {
         let path = dir.join("hashes.txt");
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (_, records) = parse_records(&text).map_err(anyhow::Error::msg)?;
+        let (_, records) = parse_records_of::<SnesEmulator>(&text).map_err(anyhow::Error::msg)?;
         Ok(records)
     };
     let ra = read(a)?;

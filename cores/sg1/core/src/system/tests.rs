@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::vdp::dma::MemoryDma;
+use retro_core::savestate::RomCheck;
 
 #[test]
 fn test_genesis_creation() {
@@ -198,12 +199,13 @@ fn power_on_reset_zeroes_volatile_ram() {
 }
 
 #[test]
-fn soft_reset_preserves_usp_but_power_on_reset_clears_it() {
+fn soft_reset_preserves_usp_but_a_power_cycle_clears_it() {
     // A soft reset re-boots the 68000 (PC/SP/SR from the vector, GP registers
     // cleared) but, faithful to hardware, does NOT clear the user stack
     // pointer, so a host that has been playing and a fresh guest diverge on
-    // `cpu68k` and their netplay start commitments differ. A power-on reset
-    // rebuilds the machine, clearing it.
+    // `cpu68k` and their netplay start commitments differ. A power cycle
+    // (netplay's, and the app's Reset, which keeps the save) builds a new
+    // 68000, clearing it.
     let mut genesis = GenesisEmulator::new();
     genesis.load_rom(&create_test_rom()).unwrap();
     genesis.cpu_mut().usp = 0x00CA_FE00;
@@ -224,52 +226,14 @@ fn soft_reset_preserves_usp_but_power_on_reset_clears_it() {
         0,
         "power-on reset must clear the 68K user stack pointer"
     );
-}
 
-#[test]
-fn power_on_reset_converges_cpu_and_ram_across_divergent_history() {
-    // The netplay committed-start premise: a host that has been running (its
-    // 68K state + RAM dirtied) and a freshly-joined guest must reach a byte-identical
-    // frame-0 once both cold-reset. Compares the (tiny) 68K savestate + RAM
-    // directly rather than the full `state_hash`; the SNES convergence test
-    // exercises the full `state_hash` path.
-    let rom = create_test_rom();
-    let cpu_state = |g: &GenesisEmulator| bincode::serialize(&g.cpu().to_savestate()).unwrap();
-
-    let mut host = GenesisEmulator::new();
-    host.load_rom(&rom).unwrap();
-    // Dirty the 68K field a soft reset preserves (USP) plus the volatile RAM.
-    host.cpu_mut().usp = 0x00CA_FE00;
-    host.bus.memory_mut().work_ram.as_mut_slice().fill(0x5A);
-    host.bus.memory_mut().z80_ram.as_mut_slice().fill(0xA5);
-
-    let mut guest = GenesisEmulator::new();
-    guest.load_rom(&rom).unwrap();
-
-    // Sanity: the two genuinely diverge before the cold reset.
-    assert_ne!(
-        cpu_state(&host),
-        cpu_state(&guest),
-        "divergent 68K state should differ before the cold reset"
-    );
-
-    host.power_on_reset();
-    guest.power_on_reset();
-
+    // The app's Reset is the same power cycle.
+    genesis.cpu_mut().usp = 0x00CA_FE00;
+    genesis.hard_reset();
     assert_eq!(
-        cpu_state(&host),
-        cpu_state(&guest),
-        "cold reset converges the 68K state"
-    );
-    assert_eq!(
-        host.bus.memory().work_ram.as_slice(),
-        guest.bus.memory().work_ram.as_slice(),
-        "cold reset converges the work RAM"
-    );
-    assert_eq!(
-        host.bus.memory().z80_ram.as_slice(),
-        guest.bus.memory().z80_ram.as_slice(),
-        "cold reset converges the Z80 RAM"
+        genesis.cpu().usp,
+        0,
+        "a hard reset must clear the 68K user stack pointer"
     );
 }
 
@@ -363,7 +327,7 @@ fn svp_cartridge_maps_windows_and_savestate_round_trips() {
     genesis.bus.write(0xA15001, 0x00);
     assert_eq!(genesis.bus.read_word(0x300000), 0x5A5A);
 
-    genesis.load_state(&snapshot).unwrap();
+    genesis.load_state(&snapshot, RomCheck::SameRom).unwrap();
     assert_eq!(genesis.bus.read_word(0x300000), 0x1234, "DRAM restored");
     assert_eq!(genesis.bus.read(0xA15000), 0xBE, "XST high restored");
     assert_eq!(genesis.bus.read(0xA15001), 0xEF, "XST low restored");
@@ -992,7 +956,7 @@ fn test_region_change() {
     let mut genesis = GenesisEmulator::new();
     assert_eq!(genesis.region(), VideoRegion::Ntsc);
 
-    genesis.set_region(VideoRegion::Pal);
+    genesis.set_region(VideoRegion::Pal).unwrap();
     assert_eq!(genesis.region(), VideoRegion::Pal);
 }
 
@@ -1000,9 +964,9 @@ fn test_region_change() {
 fn display_info_refresh_rate_tracks_set_region() {
     let mut genesis = GenesisEmulator::new();
     assert!((genesis.get_display_info().refresh_rate - 59.9227).abs() < 1e-4);
-    genesis.set_region(VideoRegion::Pal);
+    genesis.set_region(VideoRegion::Pal).unwrap();
     assert!((genesis.get_display_info().refresh_rate - 49.7015).abs() < 1e-4);
-    genesis.set_region(VideoRegion::Ntsc);
+    genesis.set_region(VideoRegion::Ntsc).unwrap();
     assert!((genesis.get_display_info().refresh_rate - 59.9227).abs() < 1e-4);
 }
 
@@ -1039,7 +1003,7 @@ fn load_rom_header_region_replaces_a_stale_explicit_region() {
     // A PAL choice left over from a previous session must not leak
     // onto the next cartridge: the header decides on every load.
     let mut genesis = GenesisEmulator::new();
-    genesis.set_region(VideoRegion::Pal);
+    genesis.set_region(VideoRegion::Pal).unwrap();
     genesis.load_rom(&test_rom_with_regions(b"JUE")).unwrap();
     assert_eq!(genesis.region(), VideoRegion::Ntsc);
 }
@@ -1051,7 +1015,7 @@ fn power_on_reset_keeps_an_explicit_region_over_the_header() {
     let mut genesis = GenesisEmulator::new();
     genesis.load_rom(&test_rom_with_regions(b"E")).unwrap();
     assert_eq!(genesis.region(), VideoRegion::Pal);
-    genesis.set_region(VideoRegion::Ntsc);
+    genesis.set_region(VideoRegion::Ntsc).unwrap();
     genesis.power_on_reset();
     assert_eq!(genesis.region(), VideoRegion::Ntsc);
     assert!((genesis.get_display_info().refresh_rate - 59.9227).abs() < 1e-4);
@@ -1074,7 +1038,7 @@ fn the_console_mix_is_in_range() {
     genesis.run_frame();
 
     // Audio buffer should have samples (PSG + YM2612)
-    let audio = genesis.get_audio_buffer();
+    let audio = genesis.host_audio_mut().take_all();
     assert!(
         !audio.is_empty(),
         "Audio buffer should not be empty after a frame"
@@ -1240,7 +1204,7 @@ fn test_debugger_shows_both_cpus() {
 // EmulatorCore::set_input: touch overlay / virtual-input bridge
 //
 // The JS-side touch overlay calls `setInput(player, mask)`. `set_input`
-// routes `InputState.buttons` through `InputManager` as a direct
+// routes `InputState.buttons` through the input manager as a direct
 // override that OR-merges with the assigned provider's state, so touch +
 // keyboard + gamepad all stack onto the same port and a press reaches
 // the I/O ports.
@@ -1269,7 +1233,7 @@ fn test_set_input_combines_with_keyboard_provider() {
     let mut genesis = GenesisEmulator::new();
 
     // Keyboard arrow-up presses Genesis UP (bit 0) via the default
-    // keyboard mapping in `InputManager::new()`.
+    // keyboard mapping in `pad_defaults()`.
     genesis
         .input_manager_mut()
         .update_keyboard("ArrowUp".to_string(), true);

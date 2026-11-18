@@ -69,7 +69,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::savestate::{CoprocessorState, Sdd1State};
+use crate::savestate::{Sdd1State, SnesChipState};
 
 // The pure bitstream decompressor, driven by the matched-read path below.
 mod decomp;
@@ -325,7 +325,7 @@ impl Coprocessor for Sdd1Chip {
 
     /// Persist the mapping state: the MMC latches, the two enable masks,
     /// and the per-channel DMA shadow, bincode-encoded as the console's
-    /// typed [`CoprocessorState::Sdd1`] (the bridge in
+    /// typed [`SnesChipState::Sdd1`] (the bridge in
     /// [`Cartridge::coprocessors_savestate`](retro_core::cartridge::Cartridge::coprocessors_savestate)
     /// decodes it back).
     /// The blob is always non-empty, the MMC latches are meaningful state
@@ -341,7 +341,7 @@ impl Coprocessor for Sdd1Chip {
             dma_addr[i] = shadow.addr;
             dma_size[i] = shadow.size;
         }
-        let state = CoprocessorState::Sdd1(Sdd1State {
+        let state = SnesChipState::Sdd1(Sdd1State {
             mmc: self.mmc,
             sdd1_enable: self.sdd1_enable,
             xfer_enable: self.xfer_enable,
@@ -354,8 +354,7 @@ impl Coprocessor for Sdd1Chip {
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
         // A garbage/empty blob or a foreign variant decodes to something we
         // can't consume and is dropped, leaving the chip untouched.
-        let Ok(CoprocessorState::Sdd1(state)) = bincode::deserialize::<CoprocessorState>(data)
-        else {
+        let Ok(SnesChipState::Sdd1(state)) = bincode::deserialize::<SnesChipState>(data) else {
             return;
         };
         self.mmc = state.mmc;
@@ -657,7 +656,7 @@ mod tests {
         chip.restore(&[1, 2, 3], NTSC_HZ);
         assert_eq!(read_reg(&mut chip, 0x4), 5);
         // A foreign backend blob (DSP-1 HLE) is a different variant -> dropped.
-        let foreign = bincode::serialize(&CoprocessorState::Dsp1Hle(
+        let foreign = bincode::serialize(&SnesChipState::Dsp1Hle(
             crate::savestate::Dsp1HleState::default(),
         ))
         .unwrap();

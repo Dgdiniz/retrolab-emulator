@@ -501,3 +501,6 @@ mod capture;
 /// reads changed: record a new one only for a change a host is meant to
 /// see.
 mod debugger_shape_tests;
+
+/// What the bindings answer about the machine, recorded.
+mod machine_baseline;

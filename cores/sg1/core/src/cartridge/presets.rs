@@ -14,7 +14,7 @@
 use std::ops::RangeInclusive;
 
 use super::map_plan::{rom_mirror_mask, MapPlan, MapSlot, MapTarget};
-use super::savestate::BankMapperKind;
+use crate::savestate::BankMapperKind;
 
 /// The two-wire serial-EEPROM control byte most Genesis EEPROM carts use.
 pub const EEPROM_CONTROL_ADDR: u32 = 0x200001;

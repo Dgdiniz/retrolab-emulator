@@ -3,6 +3,7 @@
 use super::*;
 use crate::scheduler::EventKind;
 use retro_core::cpu::Addressable;
+use retro_core::savestate::RomCheck;
 use retro_core::{CpuArchitecture, ExecutionMode, InputState};
 
 #[test]
@@ -203,111 +204,19 @@ fn power_on_reset_zeroes_wram() {
     assert_eq!(emu.frame_count(), 0);
 }
 
+/// What the SNES alone keeps across a power cycle, beside what the machine
+/// conformance suite checks on both consoles: the overscan preference,
+/// which the bus the load builds again must take from the emulator.
 #[test]
-fn power_on_reset_converges_state_hash_across_divergent_history() {
-    // The netplay premise: two peers that reached different states (a host
-    // that ran the game vs a freshly-booted guest) must derive the SAME
-    // frame-0 state hash after a cold reset, so both start the session
-    // from the same state. Dirty both WRAM (via the real bus write path)
-    // and the CPU (direct-page register), since a plain `reset()`
-    // preserves both and would leave the peers divergent.
-    let rom = synth_hirom_2kib_sram_rom();
-    let mut host = SnesEmulator::new();
-    let mut guest = SnesEmulator::new();
-    host.load_rom(&rom).expect("host loads");
-    guest.load_rom(&rom).expect("guest loads");
-
-    for i in 0..256u32 {
-        host.bus.write_fast(0x7E_0000 + i, 0x11);
-        guest.bus.write_fast(0x7E_0000 + i, 0x22);
-    }
-    host.cpu_mut().d = 0x1234;
-    host.cpu_mut().c = 0xBEEF;
-    assert_ne!(
-        host.state_hash(),
-        guest.state_hash(),
-        "divergent WRAM + CPU should hash differently before the cold reset"
-    );
-
-    host.power_on_reset();
-    guest.power_on_reset();
-    assert_eq!(
-        host.state_hash(),
-        guest.state_hash(),
-        "cold reset must give both peers a byte-identical frame-0 baseline"
-    );
-}
-
-#[test]
-fn power_on_reset_keeps_the_input_setup_and_lets_go_of_held_input() {
-    // Netplay power-cycles both peers before its session. The controller
-    // setup is the player's (a remapped key, a pad with its mapping and
-    // dead zone, the port it feeds) and outlives the cycle, as a console's
-    // controllers do; what it holds pressed does not, since the host stops
-    // forwarding input to the core while the session drives the ports and
-    // the release never comes. Kept, a held key reaches the host's pads
-    // and not the guest's.
-    use crate::controller::{BTN_A, BTN_B, BTN_X};
-    use std::collections::HashMap;
-    let rom = synth_hirom_2kib_sram_rom();
-    let mut host = SnesEmulator::new();
-    host.load_rom(&rom).expect("host loads");
-    let mut keys = host.input_manager().get_keyboard_mapping();
-    keys.insert("KeyQ".to_string(), BTN_X);
-    let pad_buttons = HashMap::from([(0, BTN_A)]);
-    let input = host.input_manager_mut();
-    input.set_keyboard_mapping(keys.clone());
-    assert!(input.add_gamepad("gamepad-0"));
-    input.set_gamepad_mapping("gamepad-0", pad_buttons.clone());
-    input.set_gamepad_deadzone("gamepad-0", 0.3);
-    input.set_provider_port("gamepad-0", Some(1));
-    input.update_keyboard("KeyQ".to_string(), true);
-    input.update_gamepad_button("gamepad-0".to_string(), 0, true);
-    host.set_input(
-        0,
-        InputState {
-            buttons: 1 << BTN_B,
-        },
-    );
-    assert_eq!(
-        host.input_manager().get_port_state(0),
-        1 << BTN_X | 1 << BTN_B
-    );
-    assert_eq!(host.input_manager().get_port_state(1), 1 << BTN_A);
-
-    let mut guest = SnesEmulator::new();
-    guest.load_rom(&rom).expect("guest loads");
-    host.power_on_reset();
-    guest.power_on_reset();
-
-    let input = host.input_manager();
-    assert_eq!(
-        input.get_port_state(0),
-        0,
-        "a key or the override still held"
-    );
-    assert_eq!(input.get_port_state(1), 0, "the pad's button still held");
-    assert_eq!(input.get_keyboard_mapping(), keys);
-    assert_eq!(input.get_gamepad_mapping("gamepad-0"), pad_buttons);
-    assert_eq!(input.get_gamepad_deadzone("gamepad-0"), 0.3);
-    assert_eq!(input.provider_port("gamepad-0"), Some(1));
-
-    // The two peers play the same input from there and stay one machine.
-    for _ in 0..3 {
-        host.set_input(0, InputState { buttons: 0 });
-        guest.set_input(0, InputState { buttons: 0 });
-        host.run_frame_headless();
-        guest.run_frame_headless();
-        assert_eq!(host.state_hash(), guest.state_hash());
-    }
-
-    // And the setup still plays: the remapped key and the pad reach their
-    // ports.
-    let input = host.input_manager_mut();
-    input.update_keyboard("KeyQ".to_string(), true);
-    input.update_gamepad_button("gamepad-0".to_string(), 0, true);
-    assert_eq!(input.get_port_state(0), 1 << BTN_X);
-    assert_eq!(input.get_port_state(1), 1 << BTN_A);
+fn a_power_cycle_keeps_the_overscan_preference() {
+    let mut emu = SnesEmulator::new();
+    emu.load_rom(&synth_hirom_2kib_sram_rom()).expect("loads");
+    emu.set_show_overscan(true);
+    emu.power_on_reset();
+    assert!(emu.show_overscan_enabled());
+    assert!(emu.ppu().show_overscan_enabled());
+    emu.hard_reset();
+    assert!(emu.ppu().show_overscan_enabled());
 }
 
 #[test]
@@ -379,7 +288,7 @@ fn set_input_refreshes_controller_pads() {
 fn boots_with_keyboard_provider_bound_to_port_zero() {
     // The keyboard path (`keyDown`/`keyUp` -> `update_keyboard`) only
     // reaches a port if a keyboard provider is registered AND
-    // assigned. A bare `GenericInputManager::new(2)` registers none,
+    // assigned. A manager built with no providers registers none,
     // which is exactly the bug this guards against.
     let emu = SnesEmulator::new();
     assert_eq!(
@@ -510,15 +419,17 @@ fn save_state_emits_envelope_and_round_trips_without_rom() {
     let bytes = emu.save_state();
     assert!(!bytes.is_empty());
     assert!(retro_core::savestate::has_magic(&bytes));
-    assert!(emu.load_state(&bytes).is_ok());
+    assert!(emu.load_state(&bytes, RomCheck::SameRom).is_ok());
 }
 
 #[test]
 fn load_state_rejects_empty_and_garbage() {
     let mut emu = SnesEmulator::new();
     // No magic prefix -> clear error, not a panic.
-    assert!(emu.load_state(&[]).is_err());
-    assert!(emu.load_state(&[0xDE, 0xAD, 0xBE, 0xEF]).is_err());
+    assert!(emu.load_state(&[], RomCheck::SameRom).is_err());
+    assert!(emu
+        .load_state(&[0xDE, 0xAD, 0xBE, 0xEF], RomCheck::SameRom)
+        .is_err());
 }
 
 #[test]

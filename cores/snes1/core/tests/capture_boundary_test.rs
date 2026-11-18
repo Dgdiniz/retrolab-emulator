@@ -12,6 +12,7 @@
 
 use retro_core::capture::{planes, CaptureCore, FrameSnapshot};
 use retro_core::cpu::Addressable;
+use retro_core::savestate::RomCheck;
 use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
 use snes1_core::apu::Apu;
 use snes1_core::debugger::snes_events;
@@ -573,14 +574,14 @@ fn a_savestate_at_the_boundary_is_taken_once_the_frame_is_finished() {
     // A paused debugger does not stop the finish: a savestate never holds
     // a frame stopped at the boundary.
     held.set_execution_mode(ExecutionMode::Paused);
-    let saved = held.save_state_at_frame_end();
+    let saved = held.save_state();
     assert!(!held.at_capture_boundary());
     whole.run_frame();
     whole.run_frame();
     assert_eq!(saved, whole.save_state());
 
     // Anywhere else the save path saves the machine as it stands.
-    assert_eq!(whole.save_state_at_frame_end(), whole.save_state());
+    assert_eq!(whole.save_state(), whole.save_state());
 }
 
 #[test]
@@ -589,7 +590,8 @@ fn a_reset_and_a_state_load_drop_the_boundary() {
     emu.run_frame();
     let state = emu.save_state();
     emu.run_to_capture_boundary();
-    emu.load_state(&state).expect("its own state loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("its own state loads");
     assert!(!emu.at_capture_boundary());
     emu.run_to_capture_boundary();
     emu.reset();
@@ -810,7 +812,7 @@ fn a_save_at_the_boundary_finishes_the_frame_past_a_breakpoint_in_its_rest() {
             condition: None,
         });
         held.set_execution_mode(mode);
-        let saved = held.save_state_at_frame_end();
+        let saved = held.save_state();
         assert!(!held.at_capture_boundary(), "{mode:?}");
         assert!(!held.frame_in_progress(), "{mode:?}: the frame ended");
         assert_eq!(held.debugger().get_execution_mode(), mode, "not stopped");
@@ -843,7 +845,7 @@ fn the_rest_of_the_frame_a_save_runs_leaves_no_event_for_the_next_frame() {
         cpu_id: None,
         condition: None,
     });
-    emu.save_state_at_frame_end();
+    emu.save_state();
     assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
     assert_eq!(hits(&mut emu, colour_0), 0);
 

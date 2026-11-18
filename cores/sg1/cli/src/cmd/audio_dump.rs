@@ -1,7 +1,7 @@
 //! `audio-dump`: run a ROM with audio enabled and write the mixed
 //! output as a 16-bit PCM stereo WAV, reporting peak level and clipping.
 //! Runs the play tier by name, so capture runs at full speed with no debug
-//! overhead; `get_audio_buffer()` drains the ring each frame.
+//! overhead; the host ring is drained each frame.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -65,7 +65,7 @@ pub fn run(args: AudioDumpArgs) -> Result<()> {
     for frame in 0..args.frames {
         super::apply_press(&mut emu, schedule.as_ref(), frame);
         run_frame_on(&mut emu, ExecutionTier::Play);
-        let audio = emu.get_audio_buffer();
+        let audio = emu.host_audio_mut().take_all();
         all_samples.extend_from_slice(&audio);
         progress.set_position(frame + 1);
     }

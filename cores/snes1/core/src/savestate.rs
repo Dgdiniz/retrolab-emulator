@@ -33,6 +33,8 @@
 //!   scratch vecs) and the input manager: audio resumes cleanly from
 //!   the restored APU, input is re-sampled from the host every frame.
 
+use retro_core::audio::RateConverterState;
+use retro_core::savestate::{part_hash, SavestateFormat, SavestatePayload};
 use serde::{Deserialize, Serialize};
 use spc700::Spc700;
 #[cfg(feature = "nec-lle")]
@@ -45,10 +47,10 @@ use wdc65816::Wdc65816;
 /// own `envelope_version` (the on-disk wrapper format).
 ///
 /// v2 added `BusState::coprocessor` (the optional DSP-1 uPD7725 blob).
-/// v3 generalised that field to [`CoprocessorState`] (an enum that now
+/// v3 generalised that field to [`SnesChipState`] (an enum that now
 /// also carries the HLE backend's state), so the byte layout shifted
 /// again. v4 generalised the single optional coprocessor into
-/// [`BusState::coprocessors`]: a `Vec<(chip_id, CoprocessorState)>` so a
+/// [`BusState::coprocessors`]: a `Vec<(chip_id, SnesChipState)>` so a
 /// composable cartridge persists every chip in its set, not just one.
 /// Because `bincode` is positional, each bump is a hard format break:
 /// older states no longer deserialize. That matches the "no legacy
@@ -349,17 +351,6 @@ pub struct ApuTimerState {
     pub output: u8,
 }
 
-/// Snapshot of a [`retro_core::IntegerRateConverter`] anchor. `num`/`den`
-/// are re-derived from the console region on restore, so only the
-/// drifting state (anchor cycle, cumulative samples, fractional
-/// remainder) is persisted.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ConverterState {
-    pub reference_cycles: u64,
-    pub samples_at_reference: u64,
-    pub remainder: u64,
-}
-
 /// Snapshot of the whole APU (SPC700 + ARAM + ports + timers + S-DSP +
 /// the two drift-free rate converters). The host audio ring is *not*
 /// captured, it refills from the restored DSP.
@@ -375,8 +366,8 @@ pub struct ApuSaveState {
     pub timer2: ApuTimerState,
     pub dsp: DspState,
     pub control: u8,
-    pub spc_sync: ConverterState,
-    pub dsp_clock: ConverterState,
+    pub spc_sync: RateConverterState,
+    pub dsp_clock: RateConverterState,
     pub apu_cycles: u64,
     pub dsp_samples_emitted: u64,
 }
@@ -516,7 +507,7 @@ impl Upd7725State {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Dsp1State {
     pub core: Upd7725State,
-    pub sync: ConverterState,
+    pub sync: RateConverterState,
     pub dsp_cycles: u64,
 }
 
@@ -851,7 +842,7 @@ pub struct Sa1VarBitState {
 /// battery-backed and persists separately via `Coprocessor::battery`, and the
 /// ROM is immutable, so neither is captured here.
 ///
-/// Fields are *appended* (no `CoprocessorState` version bump); `Sa1Chip::restore`
+/// Fields are *appended* (no `SnesChipState` version bump); `Sa1Chip::restore`
 /// is bincode-tolerant, so a legacy shorter blob simply fails to decode and is
 /// dropped, leaving the chip at its reset defaults. The `timer`/`irq`/`dma`/
 /// `varbit` sub-DTOs each derive `Default`, so a `Sa1State::default()` stays valid.
@@ -1071,7 +1062,7 @@ pub struct Cx4State {
     /// The 3072-byte internal data RAM.
     pub data_ram: Vec<u8>,
     /// The lazy-catch-up rate-converter anchor.
-    pub sync: ConverterState,
+    pub sync: RateConverterState,
     /// Cumulative HG51B169 chip cycles (the core's `add_clocks` accumulator).
     pub cx4_cycles: u64,
     /// S-CPU accesses to the chip since reset.
@@ -1085,7 +1076,7 @@ pub struct Cx4State {
 /// the tag explicit means a state saved under one backend never silently
 /// corrupts the other.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum CoprocessorState {
+pub enum SnesChipState {
     /// Low-level emulation: the full uPD7725 core + converter anchor.
     Dsp1Lle(Dsp1State),
     /// High-level emulation: the host-visible command/handshake state.
@@ -1172,12 +1163,7 @@ pub struct SystemRegsState {
 
 /// Snapshot of one standard controller port (held buttons + serial
 /// shift register + strobe line).
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct ControllerState {
-    pub buttons: u16,
-    pub shift_register: u16,
-    pub strobe: bool,
-}
+pub type ControllerState = retro_core::input::SerialPadState;
 
 /// Snapshot of the WMDATA/WMADD 17-bit WRAM portal pointer.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -1261,7 +1247,7 @@ pub struct BusState {
     /// backend-tagged (LLE uPD7725 core + converter anchor, or the HLE
     /// command/handshake state). Empty for plain cartridges and the idle
     /// stub; a composable cartridge with two chips persists two entries.
-    pub coprocessors: Vec<(u8, CoprocessorState)>,
+    pub coprocessors: Vec<(u8, SnesChipState)>,
 }
 
 /// The complete SNES1 savestate payload wrapped by the shared
@@ -1289,14 +1275,24 @@ impl SnesSaveState {
     pub fn size(&self) -> usize {
         bincode::serialized_size(self).unwrap_or(0) as usize
     }
+}
+
+impl SavestatePayload for SnesSaveState {
+    retro_core::savestate_codec!();
+
+    const FORMAT: SavestateFormat = SavestateFormat {
+        core_id: "snes1",
+        version: SNES_SAVESTATE_VERSION,
+    };
+    type Extension = ();
 
     /// Reject payloads from a newer schema or with the wrong big-memory
-    /// lengths. Called by `load_state` before any field is restored.
+    /// lengths, before any field is restored.
     ///
     /// The version check rejects anything newer than the current schema;
     /// the size checks then validate the big memories, including the
     /// DSP-1 data RAM when a coprocessor blob is present.
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
         if self.version > SNES_SAVESTATE_VERSION {
             return Err(format!(
                 "SNES save state version {} is newer than supported version {}",
@@ -1313,11 +1309,31 @@ impl SnesSaveState {
         // the HLE variant has variable-length protocol buffers with no
         // length invariant to assert here. Every chip in the set is checked.
         for (_id, state) in &self.bus.coprocessors {
-            if let CoprocessorState::Dsp1Lle(dsp) = state {
+            if let SnesChipState::Dsp1Lle(dsp) = state {
                 check_len("DSP-1 data RAM", dsp.core.data_ram.len(), DSP1_DATA_RAM_LEN)?;
             }
         }
         Ok(())
+    }
+
+    /// The payload's parts by chip and memory, the bus whole too;
+    /// `frame_count` as itself, so a frame-alignment mismatch is obvious.
+    fn hash_parts(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("cpu", part_hash(&self.cpu)),
+            ("wram", part_hash(&self.bus.wram)),
+            ("ppu", part_hash(&self.bus.ppu)),
+            ("apu", part_hash(&self.bus.apu)),
+            ("dma", part_hash(&self.bus.dma)),
+            ("system_regs", part_hash(&self.bus.system_regs)),
+            ("controllers", part_hash(&self.bus.controllers)),
+            ("sram", part_hash(&self.bus.sram)),
+            ("coprocessors", part_hash(&self.bus.coprocessors)),
+            ("bus", part_hash(&self.bus)),
+            ("scheduler", part_hash(&self.scheduler)),
+            ("timing", part_hash(&self.timing)),
+            ("frame_count", self.frame_count),
+        ]
     }
 }
 
@@ -1423,9 +1439,9 @@ mod tests {
         let mut state = sample_state();
         state.bus.coprocessors = vec![(
             1,
-            CoprocessorState::Dsp1Lle(Dsp1State {
+            SnesChipState::Dsp1Lle(Dsp1State {
                 core: Upd7725State::blank(),
-                sync: ConverterState::default(),
+                sync: RateConverterState::default(),
                 dsp_cycles: 42,
             }),
         )];
@@ -1439,9 +1455,9 @@ mod tests {
         dsp_core.data_ram.truncate(10); // not 256 words
         state.bus.coprocessors = vec![(
             1,
-            CoprocessorState::Dsp1Lle(Dsp1State {
+            SnesChipState::Dsp1Lle(Dsp1State {
                 core: dsp_core,
-                sync: ConverterState::default(),
+                sync: RateConverterState::default(),
                 dsp_cycles: 0,
             }),
         )];
@@ -1457,7 +1473,7 @@ mod tests {
         let mut state = sample_state();
         state.bus.coprocessors = vec![(
             1,
-            CoprocessorState::Dsp1Hle(Dsp1HleState {
+            SnesChipState::Dsp1Hle(Dsp1HleState {
                 command: 0x10,
                 awaiting_command: false,
                 command_is_fresh: false,
@@ -1620,8 +1636,8 @@ mod tests {
                         echo_return: [0; 2],
                     },
                     control: 0x80,
-                    spc_sync: ConverterState::default(),
-                    dsp_clock: ConverterState::default(),
+                    spc_sync: RateConverterState::default(),
+                    dsp_clock: RateConverterState::default(),
                     apu_cycles: 0,
                     dsp_samples_emitted: 0,
                 },

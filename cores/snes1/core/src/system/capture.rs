@@ -9,6 +9,7 @@ use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN};
 use retro_core::video::{
     crop_rgba, equals_cropped_rgba, LineStateTable, PixelImage, VideoDebugger,
 };
+#[cfg(doc)]
 use retro_core::EmulatorCore;
 
 use super::SnesEmulator;
@@ -151,24 +152,14 @@ impl CaptureCore for SnesEmulator {
     /// `run_frame_headless`), which finishes that frame and returns, on
     /// the next boundary call (`run_until_vblank` is one), on the next
     /// step, which leaves the boundary first (`leave_capture_boundary`),
-    /// or on the save path ([`Self::save_state_at_frame_end`]). A reset, a
-    /// ROM load or a state load drops it.
+    /// or on the save path ([`EmulatorCore::save_state`], which finishes it
+    /// first). A reset, a ROM load or a state load drops it.
     fn run_to_capture_boundary(&mut self) {
         retro_core::frame::run_to_capture_boundary(self);
     }
 
     fn at_capture_boundary(&self) -> bool {
         self.held_at_capture_boundary
-    }
-
-    /// The frame held at a capture boundary, if any, is finished first
-    /// ([`SnesEmulator::finish_held_frame`]): on the fast loop, whatever the
-    /// debugger is doing, so no breakpoint stops it and the save holds the
-    /// frame's end, the state a player's run of that frame reaches.
-    /// Anywhere else it is [`EmulatorCore::save_state`].
-    fn save_state_at_frame_end(&mut self) -> Vec<u8> {
-        retro_core::frame::finish_held_frame(self);
-        EmulatorCore::save_state(self)
     }
 
     /// The console's part is OAM and the PPU's settings

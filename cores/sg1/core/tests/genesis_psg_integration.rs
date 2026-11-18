@@ -77,11 +77,11 @@ fn test_psg_audio_buffer_generated() {
     emu.psg_mut().write(0x0F);
     emu.psg_mut().write(0x90);
 
-    assert_eq!(emu.audio_available(), 0, "ring should start empty");
+    assert_eq!(emu.host_audio().available(), 0, "ring should start empty");
 
     emu.run_frame();
 
-    let buffer_len = emu.get_audio_buffer().len();
+    let buffer_len = emu.host_audio_mut().take_all().len();
     assert!(
         buffer_len > 0,
         "Audio buffer should contain samples after frame"
@@ -100,14 +100,14 @@ fn test_psg_audio_buffer_accumulates() {
     emu.psg_mut().write(0x0F);
     emu.psg_mut().write(0x90);
 
-    // Peek the queue with `audio_available()` instead of
-    // `get_audio_buffer()`, which would drain it between frames and
+    // Peek the queue with `available()` instead of
+    // `take_all()`, which would drain it between frames and
     // hide the accumulation we're trying to measure.
     emu.run_frame();
-    let buffer_len_1 = emu.audio_available();
+    let buffer_len_1 = emu.host_audio().available();
 
     emu.run_frame();
-    let buffer_len_2 = emu.audio_available();
+    let buffer_len_2 = emu.host_audio().available();
 
     assert!(
         buffer_len_2 > buffer_len_1,
@@ -134,9 +134,13 @@ fn test_psg_audio_buffer_clears() {
     emu.psg_mut().write(0x90);
     emu.run_frame();
 
-    assert!(emu.audio_available() > 0);
-    emu.clear_audio_buffer();
-    assert_eq!(emu.audio_available(), 0, "Ring should be empty after clear");
+    assert!(emu.host_audio().available() > 0);
+    emu.host_audio_mut().clear();
+    assert_eq!(
+        emu.host_audio().available(),
+        0,
+        "Ring should be empty after clear"
+    );
 }
 
 #[test]
@@ -153,7 +157,7 @@ fn test_psg_audio_buffer_max_size() {
         emu.run_frame();
     }
 
-    let queued = emu.audio_available();
+    let queued = emu.host_audio().available();
     assert!(
         queued <= 6400,
         "Ring should be hard-capped at ~4 frames, got {}",
@@ -173,7 +177,7 @@ fn test_psg_produces_audio_signal() {
     let mut buffer: Vec<f32> = Vec::new();
     for _ in 0..3 {
         emu.run_frame();
-        buffer.extend_from_slice(&emu.get_audio_buffer());
+        buffer.extend_from_slice(&emu.host_audio_mut().take_all());
     }
 
     // Should have non-zero samples. The PSG averages all 4 channels
@@ -209,7 +213,7 @@ fn test_psg_muted_produces_silence() {
     // Run frame
     emu.run_frame();
 
-    let buffer = emu.get_audio_buffer();
+    let buffer = emu.host_audio_mut().take_all();
 
     // Should be silent
     let max_amplitude = buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -237,7 +241,7 @@ fn test_psg_multi_channel() {
 
     emu.run_frame();
 
-    let buffer = emu.get_audio_buffer();
+    let buffer = emu.host_audio_mut().take_all();
 
     // Should have strong signal (3 channels mixed)
     let max_amplitude = buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -262,7 +266,7 @@ fn test_psg_noise_channel() {
     let mut buffer: Vec<f32> = Vec::new();
     for _ in 0..3 {
         emu.run_frame();
-        buffer.extend_from_slice(&emu.get_audio_buffer());
+        buffer.extend_from_slice(&emu.host_audio_mut().take_all());
     }
 
     // Should produce noise. Same calibration as test_psg_produces_audio_signal:

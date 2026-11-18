@@ -8,6 +8,7 @@
 //! load empties, are the frame driver's conformance suite
 //! (`frame_conformance_test.rs`).
 
+use retro_core::savestate::RomCheck;
 use retro_core::{
     Breakpoint, BreakpointAction, BreakpointType, EmulatorCore, ExecutionMode, ExecutionTier,
     MatchSpec, BREAKPOINT_PARAM_ANY,
@@ -293,7 +294,8 @@ fn a_state_loaded_at_a_stop_is_checked_at_its_own_address() {
     emu.run_frame();
     assert_eq!(hits(&emu, id), 2);
 
-    emu.load_state(&state).expect("the state loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the state loads");
     let cycles = emu.cpu().cycles_executed;
     emu.set_execution_mode(ExecutionMode::Running);
     emu.run_frame();
@@ -675,7 +677,8 @@ fn the_focus_is_no_part_of_the_machine() {
     emu.set_focused_cpu(SOUND_CPU);
     let state = emu.save_state();
     emu.set_focused_cpu(CARTRIDGE_CPU);
-    emu.load_state(&state).expect("the state loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the state loads");
     assert_eq!(
         emu.focused_cpu(),
         CARTRIDGE_CPU,

@@ -208,6 +208,38 @@ impl IntegerRateConverter {
     pub fn remainder(&self) -> u64 {
         self.remainder
     }
+
+    /// What a savestate keeps of the converter: everything but the
+    /// ratio, which the machine's region gives again on a load.
+    pub fn state(&self) -> RateConverterState {
+        RateConverterState {
+            reference_cycles: self.reference_cycles,
+            samples_at_reference: self.samples_at_reference,
+            remainder: self.remainder,
+        }
+    }
+
+    /// A converter of `num / den` that goes on from `state`
+    /// ([`Self::with_state`]).
+    pub fn from_state(num: u64, den: u64, state: &RateConverterState) -> Self {
+        Self::with_state(
+            num,
+            den,
+            state.reference_cycles,
+            state.samples_at_reference,
+            state.remainder,
+        )
+    }
+}
+
+/// The part of an [`IntegerRateConverter`] a savestate holds: the anchor,
+/// the samples counted at it and the fractional remainder. Its fields, in
+/// this order, are the bytes both consoles' layouts carry.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RateConverterState {
+    pub reference_cycles: u64,
+    pub samples_at_reference: u64,
+    pub remainder: u64,
 }
 
 #[cfg(test)]

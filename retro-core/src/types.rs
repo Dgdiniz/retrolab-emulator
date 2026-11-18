@@ -215,6 +215,51 @@ pub enum ExecutionMode {
     StepOut,
 }
 
+/// The television standard a console's video and clocks follow.
+///
+/// Not the market a cartridge was sold for
+/// ([`crate::cartridge::Region`]): a machine runs in one of these, and a
+/// console says which it supports
+/// ([`crate::EmulatorCore::supported_regions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum VideoRegion {
+    /// 525 lines at about 60 frames a second.
+    #[default]
+    Ntsc,
+    /// 625 lines at about 50 frames a second.
+    Pal,
+}
+
+impl VideoRegion {
+    /// The region as the host names it: `"ntsc"` or `"pal"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ntsc => "ntsc",
+            Self::Pal => "pal",
+        }
+    }
+
+    /// The region `name` names (any case, spaces around ignored), if
+    /// `supported` holds it. The refusal lists the names `supported`
+    /// holds: "unknown region 'secam' (expected 'ntsc' or 'pal')".
+    pub fn parse_among(name: &str, supported: &[VideoRegion]) -> Result<Self, String> {
+        let wanted = name.trim().to_ascii_lowercase();
+        if let Some(region) = supported.iter().find(|r| r.name() == wanted) {
+            return Ok(*region);
+        }
+        let names: Vec<String> = supported
+            .iter()
+            .map(|r| format!("'{}'", r.name()))
+            .collect();
+        let expected = match names.split_last() {
+            None => String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        };
+        Err(format!("unknown region '{wanted}' (expected {expected})"))
+    }
+}
+
 /// Access kinds a breakpoint watches, as independent flags.
 ///
 /// A single breakpoint can match any combination of execute / read /

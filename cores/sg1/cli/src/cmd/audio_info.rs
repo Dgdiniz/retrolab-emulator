@@ -40,7 +40,7 @@ pub fn run(args: AudioInfoArgs) -> Result<()> {
         println!();
         for frame in 0..total {
             run_frame_on(&mut emu, ExecutionTier::Play);
-            emu.clear_audio_buffer();
+            emu.host_audio_mut().clear();
             if interval_frames > 0 && (frame + 1) % interval_frames == 0 {
                 println!("--- Frame {} ---", frame + 1);
                 print_audio_state(&emu);
@@ -51,7 +51,7 @@ pub fn run(args: AudioInfoArgs) -> Result<()> {
         println!("Running {} frames...", args.frames);
         for _ in 0..args.frames {
             run_frame_on(&mut emu, ExecutionTier::Play);
-            emu.clear_audio_buffer();
+            emu.host_audio_mut().clear();
         }
         println!();
         print_audio_state(&emu);

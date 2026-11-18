@@ -5,6 +5,7 @@
 
 use super::GenesisEmulator;
 use crate::debugger::GenesisEvent;
+use crate::timing::GenesisTiming;
 #[cfg(doc)]
 use retro_core::capture::CaptureCore;
 use retro_core::cartridge::Cartridge;
@@ -271,31 +272,6 @@ impl GenesisEmulator {
         self.capture_boundary_requested = false;
         self.interrupt_cycles = 0;
     }
-
-    /// Finish a frame left part of the way through (at a breakpoint, a
-    /// step, the capture boundary) before a save, on the loop a player
-    /// runs, whatever the debugger is doing, so no breakpoint can stop it
-    /// (`retro_core::frame::finish_held_frame`). Returns whether there was
-    /// a frame to finish.
-    pub fn finish_held_frame(&mut self) -> bool {
-        retro_core::frame::finish_held_frame(self)
-    }
-
-    /// Headless frame for netplay rollback/catch-up: the full
-    /// deterministic simulation with only the *presentation* outputs
-    /// suppressed; the mixed audio is not pushed to the host ring and
-    /// the host-visible framebuffer copy is skipped. Audio is still
-    /// *synthesized* (the rate converter and each chip's sample-phase
-    /// accumulators advance) because that is serialized machine state;
-    /// suppressing it would make a re-simulated span hash differently
-    /// from a live audible run and trip a spurious netplay resync.
-    /// Produces the exact same machine state (including `frame_count`)
-    /// as a presented frame on the play tier, the debugger disarmed for its
-    /// length (`retro_core::frame::run_frame_headless`). Like every frame
-    /// call, it finishes a frame left part of the way through.
-    pub fn run_frame_headless(&mut self) {
-        retro_core::frame::run_frame_headless(self);
-    }
 }
 
 /// The Mega Drive's frame is a count of lines: each line's start takes the
@@ -316,7 +292,7 @@ impl FrameMachine for GenesisEmulator {
     /// and the frame being drawn numbered (it is counted once it ends).
     fn enter_frame(&mut self) -> u64 {
         if !self.frame_open {
-            // Sync input state from InputManager into I/O devices
+            // Sync input state from the input manager into I/O devices
             let p0 = self.input_manager.get_port_state(0);
             let p1 = self.input_manager.get_port_state(1);
             self.bus.io_mut().sync_input(p0, p1);

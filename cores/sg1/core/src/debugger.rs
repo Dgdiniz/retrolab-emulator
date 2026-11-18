@@ -16,8 +16,7 @@ use retro_core::debug::{
     BreakpointChecks, BreakpointList, ConsoleDebug, CpuDebugSpec, DebugEvent, DebuggerState,
     EventParam, EventSpec, ParamSet, TraceEntry, TraceText,
 };
-use retro_core::types::{EventKind, ExecutionMode, MemoryRegion, MemoryRegionInfo, SystemInfo};
-use retro_core::DebuggerCore;
+use retro_core::types::{EventKind, MemoryRegion, MemoryRegionInfo, SystemInfo};
 
 use crate::system::GenesisEmulator;
 use crate::vdp::{VideoEvent, VideoEventWatch, WriteTarget};
@@ -56,16 +55,14 @@ const SOUND_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
 /// slot [`SOUND_CPU`], and the console's own part.
 pub type GenesisDebugger = DebuggerState<2, GenesisDebugConsole>;
 
-/// A debugger for a machine described by `system_info`, paused, with
+/// A debugger for a machine described by `system_info`, running, with
 /// nothing recorded.
 pub fn genesis_debugger(system_info: SystemInfo) -> GenesisDebugger {
-    let mut debugger = DebuggerState::new(
+    DebuggerState::new(
         [MAIN_CPU_SPEC, SOUND_CPU_SPEC],
         system_info,
         GenesisDebugConsole::default(),
-    );
-    debugger.set_execution_mode(ExecutionMode::Paused);
-    debugger
+    )
 }
 
 /// Genesis event-breakpoint codes, carried in the `code` field of
@@ -682,11 +679,13 @@ impl<'a> FieldReader<'a> {
 mod tests {
     use super::*;
     use retro_core::debug::check_catalogue;
+    use retro_core::types::ExecutionMode;
     use retro_core::types::{
         AudioInfo, Breakpoint, BreakpointId, BreakpointType, CpuArchitecture, CpuInfo, CpuLocation,
         CpuState, DisplayInfo, InputInfo, InstructionTrace, PixelFormat, RegisterValue, StackFrame,
         BREAKPOINT_PARAM_ANY,
     };
+    use retro_core::DebuggerCore;
 
     fn cpu_info(id: usize, architecture: CpuArchitecture) -> CpuInfo {
         CpuInfo {
@@ -748,9 +747,9 @@ mod tests {
     }
 
     #[test]
-    fn a_new_debugger_is_paused_with_the_68000_focused() {
+    fn a_new_debugger_is_running_with_the_68000_focused() {
         let debugger = create_test_debugger();
-        assert_eq!(debugger.get_execution_mode(), ExecutionMode::Paused);
+        assert_eq!(debugger.get_execution_mode(), ExecutionMode::Running);
         assert_eq!(debugger.focused_cpu(), MAIN_CPU);
         assert!(debugger.list_breakpoints().is_empty());
     }

@@ -1,119 +1,65 @@
-//! Golden runs of the Mega Drive core: the shared harness of
-//! [`retro_core::golden`] with what is the Mega Drive's own: the state
-//! hash, the pad's button names, the `six-button` manifest flag and the
-//! record format's tag.
+//! Golden runs of the Mega Drive core: what is this console's own in the
+//! shared harness of [`retro_core::golden`] ([`GoldenConsole`]): the record
+//! format's tag, the pad's button names and the `six-button` manifest flag.
 //!
 //! A golden test uses it; the records it makes are kept outside this tree,
 //! beside the manifest `genesis.txt`, in the folder
 //! [`retro_core::golden::GoldenDir`] finds. They are made on the play tier,
-//! the loop a player runs ([`run_golden`]); every other tier is held to them
-//! ([`run_golden_on`]).
+//! the loop a player runs ([`retro_core::golden::run_golden`]); every other
+//! tier is held to them ([`retro_core::golden::run_golden_on`]).
 
-use retro_core::frame::run_frame_on;
-pub use retro_core::golden::{
-    crop_framebuffer_rgb, first_divergence, hash_samples, Divergence, FrameRecord, GoldenEntry,
-    GoldenSpec,
-};
-use retro_core::ExecutionTier;
+use retro_core::golden::{GoldenConsole, GoldenEntry};
+use retro_core::EmulatorCore;
 
 use crate::io::devices::Genesis6ButtonDevice as Pad;
 use crate::GenesisEmulator;
-
-/// Version tag on the first line of a Mega Drive record file.
-pub const RECORD_FORMAT: &str = "sg1-golden 1";
 
 /// The manifest flag that plugs six-button pads in, for a ROM whose
 /// header does not ask for them.
 pub const SIX_BUTTON: &str = "six-button";
 
-/// Button names with their bit in `InputState::buttons`, the pad's own
-/// layout. `x`, `y`, `z` and `mode` only reach a game through a
-/// six-button pad.
-pub const BUTTONS: [(&str, u32); 12] = [
-    ("up", Pad::BTN_UP),
-    ("down", Pad::BTN_DOWN),
-    ("left", Pad::BTN_LEFT),
-    ("right", Pad::BTN_RIGHT),
-    ("a", Pad::BTN_A),
-    ("b", Pad::BTN_B),
-    ("c", Pad::BTN_C),
-    ("start", Pad::BTN_START),
-    ("x", Pad::BTN_X),
-    ("y", Pad::BTN_Y),
-    ("z", Pad::BTN_Z),
-    ("mode", Pad::BTN_MODE),
-];
+impl GoldenConsole for GenesisEmulator {
+    const RECORD_FORMAT: &'static str = "sg1-golden 1";
 
-/// Drive `emu` through `spec` on the play tier, calling `on_shot(frame,
-/// width, height, rgb)` at each listed shot and `on_audio(samples)` with
-/// every frame's samples, and return one record per frame. `emu` must
-/// have its ROM loaded; audio capture is armed by the run. The tier is
-/// named, not picked from the debugger's state: a reset the spec asks for
-/// pauses this core's debugger, and a paused debugger's tier runs nothing.
-pub fn run_golden(
-    emu: &mut GenesisEmulator,
-    spec: &GoldenSpec,
-    on_shot: impl FnMut(u64, u32, u32, &[u8]),
-    on_audio: impl FnMut(&[f32]),
-) -> Vec<FrameRecord> {
-    retro_core::golden::run_golden(
-        emu,
-        spec,
-        |emu| {
-            run_frame_on(emu, ExecutionTier::Play);
-        },
-        GenesisEmulator::state_hash,
-        on_shot,
-        on_audio,
-    )
-}
+    /// The pad's own layout, with its bits in `InputState::buttons`. `x`,
+    /// `y`, `z` and `mode` reach a game only through a six-button pad.
+    const BUTTONS: &'static [(&'static str, u32)] = &[
+        ("up", Pad::BTN_UP),
+        ("down", Pad::BTN_DOWN),
+        ("left", Pad::BTN_LEFT),
+        ("right", Pad::BTN_RIGHT),
+        ("a", Pad::BTN_A),
+        ("b", Pad::BTN_B),
+        ("c", Pad::BTN_C),
+        ("start", Pad::BTN_START),
+        ("x", Pad::BTN_X),
+        ("y", Pad::BTN_Y),
+        ("z", Pad::BTN_Z),
+        ("mode", Pad::BTN_MODE),
+    ];
 
-/// [`run_golden`] with every frame on `tier` through the frame driver
-/// (`retro_core::golden::run_golden_on`): held to the records, it shows
-/// the tier runs the play tier's machine.
-pub fn run_golden_on(
-    emu: &mut GenesisEmulator,
-    spec: &GoldenSpec,
-    tier: ExecutionTier,
-    on_shot: impl FnMut(u64, u32, u32, &[u8]),
-    on_audio: impl FnMut(&[f32]),
-) -> Vec<FrameRecord> {
-    retro_core::golden::run_golden_on(
-        emu,
-        spec,
-        tier,
-        GenesisEmulator::state_hash,
-        on_shot,
-        on_audio,
-    )
-}
+    const FLAGS: &'static [&'static str] = &[SIX_BUTTON];
 
-/// Render records as the text file the test writes and reads.
-pub fn format_records(header: &[String], records: &[FrameRecord]) -> String {
-    retro_core::golden::format_records(RECORD_FORMAT, header, records)
-}
+    fn new_for_golden() -> Self {
+        GenesisEmulator::new()
+    }
 
-/// Parse a Mega Drive record file back; the format line must be
-/// [`RECORD_FORMAT`].
-pub fn parse_records(text: &str) -> Result<(Vec<String>, Vec<FrameRecord>), String> {
-    retro_core::golden::parse_records(RECORD_FORMAT, text)
-}
-
-/// Parse a Mega Drive manifest (`genesis.txt`): the shared
-/// grammar with the pad's buttons and the [`SIX_BUTTON`] flag.
-pub fn parse_manifest(text: &str) -> Result<Vec<GoldenEntry>, String> {
-    retro_core::golden::parse_manifest(text, &BUTTONS, &[SIX_BUTTON])
-}
-
-/// The run spec a manifest entry describes, its presses read with the
-/// pad's buttons.
-pub fn entry_spec(entry: &GoldenEntry) -> Result<GoldenSpec, String> {
-    entry.spec(&BUTTONS)
+    /// The ROM loaded, and six-button pads plugged in when the entry says.
+    fn load_for_golden(&mut self, entry: &GoldenEntry, rom: &[u8]) -> Result<(), String> {
+        self.load_rom(rom)?;
+        if entry.has_flag(SIX_BUTTON) {
+            self.connect_controllers(true);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retro_core::golden::{
+        entry_spec_of, format_records_of, parse_manifest_of, parse_records_of, FrameRecord,
+    };
 
     #[test]
     fn the_mega_drive_layer_reads_its_own_format_buttons_and_flag() {
@@ -126,23 +72,35 @@ mod tests {
             width: 320,
             height: 224,
         }];
-        let text = format_records(&["rom=sonic1.bin".to_string()], &records);
+        let text = format_records_of::<GenesisEmulator>(&["rom=sonic1.bin".to_string()], &records);
         assert!(text.starts_with("# sg1-golden 1\n# rom=sonic1.bin\n"));
-        assert_eq!(parse_records(&text).unwrap().1, records);
-        assert!(parse_records("# snes1-golden 1\n").is_err());
+        assert_eq!(
+            parse_records_of::<GenesisEmulator>(&text).unwrap().1,
+            records
+        );
+        assert!(parse_records_of::<GenesisEmulator>("# snes1-golden 1\n").is_err());
 
-        let entries = parse_manifest(
+        let entries = parse_manifest_of::<GenesisEmulator>(
             "name=a rom=a.bin frames=10 press-at=3:start;5:a+c;7:z six-button\nname=b rom=b.bin frames=5\n",
         )
         .unwrap();
         assert!(entries[0].has_flag(SIX_BUTTON));
         assert!(!entries[1].has_flag(SIX_BUTTON));
-        let presses = entry_spec(&entries[0]).unwrap().presses.unwrap();
+        let presses = entry_spec_of::<GenesisEmulator>(&entries[0])
+            .unwrap()
+            .presses
+            .unwrap();
         assert_eq!(presses.mask_at(3), Some(1 << 7));
         assert_eq!(presses.mask_at(5), Some((1 << 6) | (1 << 5)));
         assert_eq!(presses.mask_at(7), Some(1 << 8));
         // A SNES button or flag is not a Mega Drive one.
-        assert!(parse_manifest("name=a rom=a.bin frames=10 press-at=3:select").is_err());
-        assert!(parse_manifest("name=a rom=a.bin frames=10 force-detect").is_err());
+        assert!(parse_manifest_of::<GenesisEmulator>(
+            "name=a rom=a.bin frames=10 press-at=3:select"
+        )
+        .is_err());
+        assert!(
+            parse_manifest_of::<GenesisEmulator>("name=a rom=a.bin frames=10 force-detect")
+                .is_err()
+        );
     }
 }

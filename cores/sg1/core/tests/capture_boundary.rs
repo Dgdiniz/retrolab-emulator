@@ -12,6 +12,7 @@
 use retro_core::capture::{planes, CaptureCore};
 use retro_core::debug::DebugEvent;
 use retro_core::frame::{run_frame_on, run_to_capture_boundary_on, FrameMachine};
+use retro_core::savestate::RomCheck;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
@@ -155,7 +156,11 @@ fn emulator() -> GenesisEmulator {
 
 /// The samples the frames so far left for the host.
 fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
-    emu.get_audio_buffer().iter().map(|s| s.to_bits()).collect()
+    emu.host_audio_mut()
+        .take_all()
+        .iter()
+        .map(|s| s.to_bits())
+        .collect()
 }
 
 /// One whole frame on `tier` (a frame in progress goes on to its end).
@@ -374,11 +379,7 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
     play(&mut whole);
     emu.run_to_capture_boundary();
 
-    assert!(
-        EmulatorCore::save_state(&emu).is_empty(),
-        "a held frame has no savestate: it needs finishing first"
-    );
-    let state = emu.save_state_at_frame_end();
+    let state = emu.save_state();
     assert!(!state.is_empty());
     assert!(!emu.at_capture_boundary(), "the frame was finished");
     assert_eq!(emu.frame_count(), whole.frame_count());
@@ -386,7 +387,9 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
 
     // The savestate is that of the finished frame, and goes on as it does.
     let mut restored = emulator();
-    restored.load_state(&state).expect("the savestate loads");
+    restored
+        .load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     assert_eq!(restored.state_hash(), whole.state_hash());
     play(&mut restored);
     play(&mut whole);
@@ -394,7 +397,7 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
 
     // Taken where no frame is held, nothing runs first.
     let count = emu.frame_count();
-    assert!(!emu.save_state_at_frame_end().is_empty());
+    assert!(!emu.save_state().is_empty());
     assert_eq!(emu.frame_count(), count);
 }
 
@@ -416,11 +419,7 @@ fn a_savestate_after_host_steps_finishes_the_frame_first() {
         FrameMachine::frame_in_progress(&emu),
         "the steps opened a frame"
     );
-    assert!(
-        EmulatorCore::save_state(&emu).is_empty(),
-        "a frame in progress has no savestate: it needs finishing first"
-    );
-    let state = emu.save_state_at_frame_end();
+    let state = emu.save_state();
     assert!(!state.is_empty());
     assert!(
         !FrameMachine::frame_in_progress(&emu),
@@ -430,7 +429,9 @@ fn a_savestate_after_host_steps_finishes_the_frame_first() {
     assert_eq!(emu.state_hash(), whole.state_hash());
 
     let mut restored = emulator();
-    restored.load_state(&state).expect("the savestate loads");
+    restored
+        .load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     assert_eq!(restored.state_hash(), whole.state_hash());
 }
 
@@ -438,7 +439,7 @@ fn a_savestate_after_host_steps_finishes_the_frame_first() {
 fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
     let mut emu = emulator();
     play(&mut emu);
-    let state = emu.save_state_at_frame_end();
+    let state = emu.save_state();
 
     emu.run_to_capture_boundary();
     EmulatorCore::reset(&mut emu);
@@ -447,7 +448,8 @@ fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
 
     emu.set_execution_mode(ExecutionMode::Running);
     emu.run_to_capture_boundary();
-    emu.load_state(&state).expect("the savestate loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     assert!(!emu.at_capture_boundary());
     assert!(!FrameMachine::frame_in_progress(&emu));
 
@@ -465,7 +467,9 @@ fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
         );
         match drop {
             0 => EmulatorCore::reset(&mut emu),
-            1 => emu.load_state(&state).expect("the savestate loads"),
+            1 => emu
+                .load_state(&state, RomCheck::SameRom)
+                .expect("the savestate loads"),
             _ => emu.load_rom(&program_rom()).expect("the program loads"),
         }
         assert!(!FrameMachine::frame_in_progress(&emu), "{what} drops it");
@@ -474,7 +478,7 @@ fn a_reset_a_savestate_load_and_a_rom_load_drop_the_held_frame() {
     // A refused savestate changes nothing, the held frame included.
     emu.set_execution_mode(ExecutionMode::Running);
     emu.run_to_capture_boundary();
-    assert!(emu.load_state(&[1, 2, 3]).is_err());
+    assert!(emu.load_state(&[1, 2, 3], RomCheck::SameRom).is_err());
     assert!(emu.at_capture_boundary());
 }
 

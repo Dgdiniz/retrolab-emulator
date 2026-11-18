@@ -28,10 +28,35 @@
 pub mod capture;
 pub mod cartridge;
 pub mod debugger;
+#[cfg(test)]
+mod fake_machine;
 pub mod js;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+/// A core's build identity, which the netplay handshake compares:
+/// `"{core_id}@{version}+{git_hash}"`, the hash `"unknown"` outside a git
+/// checkout. Two peers refuse to connect on a mismatch, since another build
+/// can diverge deterministically.
+pub fn build_id(core_id: &str, version: &str, git_hash: Option<&str>) -> String {
+    format!("{core_id}@{version}+{}", git_hash.unwrap_or("unknown"))
+}
+
+#[cfg(test)]
+mod build_id_tests {
+    #[test]
+    fn names_the_core_its_version_and_its_commit() {
+        assert_eq!(
+            super::build_id("sg1", "0.1.0", Some("ab12cd3")),
+            "sg1@0.1.0+ab12cd3"
+        );
+        assert_eq!(
+            super::build_id("snes1", "0.1.0", None),
+            "snes1@0.1.0+unknown"
+        );
+    }
+}
 
 /// What the macros of this crate name through `$crate`; not for direct use.
 #[doc(hidden)]

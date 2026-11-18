@@ -81,7 +81,7 @@ impl GenesisControllerPort {
     }
 
     /// Set the connected device's button state directly from a bitmask.
-    /// This is used by the frame loop to sync InputManager state into the I/O devices.
+    /// This is used by the frame loop to sync the input manager's state into the I/O devices.
     pub fn set_device_button_state(&mut self, state: u32) {
         if let Some(device) = &mut self.device {
             device.set_state_direct(state);

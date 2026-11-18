@@ -1,10 +1,26 @@
 //! The JavaScript values every binding crate builds the same way: plain
-//! objects, typed-array copies owned by JavaScript, and values serialized
-//! with every map as a plain object.
+//! objects, typed-array copies owned by JavaScript, values serialized with
+//! every map as a plain object, and a savestate's refusal.
 
 use js_sys::{Object, Reflect};
+use retro_core::savestate::LoadStateError;
 use serde::Serialize;
 use wasm_bindgen::JsValue;
+
+/// A `loadState` refusal for JS. A savestate made on another ROM is an
+/// `Error` named `SaveStateOtherRom`, what the platform reads to offer
+/// loading it anyway (`loadStateAnyRom`); any other refusal is its reason
+/// as text.
+pub fn load_state_refusal(error: LoadStateError) -> JsValue {
+    match &error {
+        LoadStateError::OtherRom { .. } => {
+            let err = js_sys::Error::new(&error.to_string());
+            err.set_name("SaveStateOtherRom");
+            err.into()
+        }
+        LoadStateError::Unreadable(reason) => JsValue::from_str(reason),
+    }
+}
 
 /// A plain JS object with these properties, in this order.
 pub fn plain_object(entries: &[(&str, JsValue)]) -> JsValue {

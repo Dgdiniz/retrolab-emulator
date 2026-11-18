@@ -17,7 +17,7 @@ use std::sync::Arc;
 use retro_core::cartridge::{ChipFactory, Coprocessor};
 
 use super::chips::{BankMapperChip, EepromChip, JCartChip, SvpCoprocessor};
-use super::savestate::BankMapperKind;
+use crate::savestate::BankMapperKind;
 
 /// Default serial-EEPROM size (X24C01, 128 bytes), the size the builder gives
 /// every EEPROM cart.

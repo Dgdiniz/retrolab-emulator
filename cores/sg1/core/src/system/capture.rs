@@ -9,8 +9,8 @@ use retro_core::capture::{
     PixelSources, RenderedLayer, VideoMemorySources,
 };
 use retro_core::video::{crop_rgba, LineStateTable, PixelImage, VideoDebugger};
-
-use retro_core::*;
+#[cfg(doc)]
+use retro_core::EmulatorCore;
 
 /// What only the Mega Drive has in a frame snapshot
 /// ([`CaptureCore::capture_frame_snapshot`]).
@@ -57,10 +57,9 @@ impl GenesisEmulator {
 ///   pixel sources and the line sprites number the frames finished, plus
 ///   one while the frame in progress is on the boundary's line or past it,
 ///   where the framebuffer shows its finished picture.
-/// - A save finishes any frame in progress on the play tier, whatever the
-///   debugger is doing, so no breakpoint stops it;
-///   [`EmulatorCore::save_state`] returns no bytes while a frame is in
-///   progress.
+/// - A save ([`EmulatorCore::save_state`]) finishes any frame in progress
+///   on the play tier, whatever the debugger is doing, so no breakpoint
+///   stops it.
 /// - The repaint, a layer, the pixel sources and the line sprites draw each
 ///   line the line table holds from its record (the lines below a stop part
 ///   of the way down from the frame before's) and every other line from the
@@ -100,13 +99,6 @@ impl CaptureCore for GenesisEmulator {
 
     fn at_capture_boundary(&self) -> bool {
         self.held_at_capture_boundary
-    }
-
-    /// A frame in progress is finished
-    /// ([`GenesisEmulator::finish_held_frame`]), then the state saved.
-    fn save_state_at_frame_end(&mut self) -> Vec<u8> {
-        self.finish_held_frame();
-        <Self as EmulatorCore>::save_state(self)
     }
 
     /// The picture cut to the display info (the mode's width by

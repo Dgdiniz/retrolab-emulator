@@ -17,7 +17,7 @@
 
 mod helpers;
 
-use helpers::{M68kRomBuilder, MiniCartridgeBuilder};
+use helpers::M68kRomBuilder;
 use retro_core::frame::run_frame_on;
 use retro_core::EmulatorCore;
 use retro_core::ExecutionTier;
@@ -101,82 +101,6 @@ fn reloading_the_same_rom_is_still_a_plain_reset() {
         emu.read_memory_debug(0xFF0000, 4),
         vec![0xA5; 4],
         "reloading the same ROM must behave like the reset button and keep work RAM",
-    );
-}
-
-#[test]
-fn hard_reset_clears_volatile_state_but_keeps_the_cartridge() {
-    let a = mini_rom(0x1111);
-
-    let mut fresh = GenesisEmulator::new();
-    fresh.load_rom(&a).expect("load a");
-
-    let mut cycled = GenesisEmulator::new();
-    cycled.load_rom(&a).expect("load a");
-    dirty(&mut cycled);
-    cycled.hard_reset();
-
-    assert_eq!(
-        cycled.state_hash(),
-        fresh.state_hash(),
-        "hard_reset must return the console to its power-on state; \
-         diverging subsystems: {:?}",
-        diverging_parts(&cycled, &fresh),
-    );
-    assert!(
-        cycled.get_rom_info().is_some(),
-        "the cartridge must stay plugged in across a power cycle",
-    );
-}
-
-/// The three resets differ in exactly one user-visible way: what happens to the
-/// battery save. `power_on_reset` blanks it (netplay needs both peers
-/// byte-identical regardless of either one's save file), which is why the UI's
-/// Reset control routes through `hard_reset` instead: the platform saves
-/// whatever SRAM the core reports, so a blank image would overwrite the player's save.
-#[test]
-fn only_power_on_reset_blanks_the_battery_save() {
-    fn save_after(cycle: impl Fn(&mut GenesisEmulator)) -> Option<Vec<u8>> {
-        let rom = MiniCartridgeBuilder::new()
-            .with_title("SRAM TEST")
-            .with_sram(0x2000)
-            .build();
-        let mut emu = GenesisEmulator::new();
-        emu.load_rom(&rom).expect("load");
-        for _ in 0..4 {
-            run_frame_on(&mut emu, ExecutionTier::Play);
-        }
-
-        // Written exactly as the platform restores a stored save.
-        let mut save = vec![0u8; 0x2000];
-        save[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        emu.set_save_ram(&save);
-        assert_eq!(
-            emu.get_save_ram().map(|s| s[..4].to_vec()),
-            Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-            "precondition: the save must read back before the reset",
-        );
-
-        cycle(&mut emu);
-        emu.get_save_ram().map(|s| s[..4].to_vec())
-    }
-
-    let saved = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    assert_eq!(
-        save_after(|e| e.reset()),
-        saved,
-        "the reset button keeps the save"
-    );
-    assert_eq!(
-        save_after(|e| e.hard_reset()),
-        saved,
-        "hard_reset is the UI's Reset: it MUST keep the save",
-    );
-    assert_ne!(
-        save_after(|e| e.power_on_reset()),
-        saved,
-        "power_on_reset is netplay's cold boot and blanks the save by design; if this \
-         ever starts preserving it, the doc comments claiming otherwise need revisiting",
     );
 }
 

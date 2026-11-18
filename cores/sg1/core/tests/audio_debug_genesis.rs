@@ -31,15 +31,18 @@ fn test_genesis_audio_generation() {
     eprintln!("=== Genesis Audio Debug ===");
     eprintln!(
         "Initial audio buffer: {} samples",
-        genesis.get_audio_buffer().len()
+        genesis.host_audio_mut().take_all().len()
     );
 
-    genesis.clear_audio_buffer();
-    eprintln!("After clear: {} samples", genesis.get_audio_buffer().len());
+    genesis.host_audio_mut().clear();
+    eprintln!(
+        "After clear: {} samples",
+        genesis.host_audio_mut().take_all().len()
+    );
 
     genesis.run_frame();
 
-    let samples = genesis.get_audio_buffer();
+    let samples = genesis.host_audio_mut().take_all();
     eprintln!(
         "After run_frame(): {} samples (stereo pairs: {})",
         samples.len(),

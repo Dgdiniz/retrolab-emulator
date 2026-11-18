@@ -33,20 +33,10 @@ pub struct GamepadInputProvider {
 }
 
 impl GamepadInputProvider {
-    /// Create a new gamepad provider with default Genesis mapping
+    /// A gamepad provider with no button mapped: the console gives its map
+    /// ([`Self::with_mapping`]).
     pub fn new(gamepad_id: String) -> Self {
-        Self {
-            gamepad_id,
-            button_state: [false; 16],
-            axis_state: [0.0; 4],
-            button_mapping: Self::default_genesis_mapping(),
-            analog_to_dpad_config: Some(AnalogToDPad {
-                axis_x: AnalogAxis::LeftX,
-                axis_y: AnalogAxis::LeftY,
-                threshold: 0.5,
-            }),
-            deadzone: 0.15,
-        }
+        Self::with_mapping(gamepad_id, HashMap::new())
     }
 
     /// Create a new gamepad provider with custom mapping
@@ -63,44 +53,6 @@ impl GamepadInputProvider {
             }),
             deadzone: 0.15,
         }
-    }
-
-    /// Default Genesis button mapping for standard gamepads
-    ///
-    /// Maps Web Gamepad API standard button indices to Genesis:
-    /// - Button 0 (A/Cross) -> Genesis A (button 6)
-    /// - Button 1 (B/Circle) -> Genesis B (button 4)
-    /// - Button 2 (X/Square) -> Genesis C (button 5)
-    /// - Button 3 (Y/Triangle) -> Genesis X (button 10)
-    /// - Button 4 (L1/LB) -> Genesis Y (button 9)
-    /// - Button 5 (R1/RB) -> Genesis Z (button 8)
-    /// - Button 9 (Start) -> Start (button 7)
-    /// - Button 8 (Select/Back) -> Mode (button 11)
-    /// - Buttons 12-15 (D-Pad) -> D-Pad (buttons 0-3)
-    fn default_genesis_mapping() -> HashMap<u32, u32> {
-        let mut map = HashMap::new();
-
-        // Face buttons
-        map.insert(0, 6); // A/Cross -> Genesis A
-        map.insert(1, 4); // B/Circle -> Genesis B
-        map.insert(2, 5); // X/Square -> Genesis C
-        map.insert(3, 10); // Y/Triangle -> Genesis X
-
-        // Shoulder buttons
-        map.insert(4, 9); // L1/LB -> Genesis Y
-        map.insert(5, 8); // R1/RB -> Genesis Z
-
-        // Start/Select
-        map.insert(9, 7); // Start -> Start
-        map.insert(8, 11); // Select/Back -> Mode
-
-        // D-Pad (buttons 12-15)
-        map.insert(12, 0); // D-Pad Up
-        map.insert(13, 1); // D-Pad Down
-        map.insert(14, 2); // D-Pad Left
-        map.insert(15, 3); // D-Pad Right
-
-        map
     }
 
     /// Update button state
@@ -241,7 +193,10 @@ mod tests {
 
     #[test]
     fn test_creation() {
-        let provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
         assert_eq!(provider.get_state(), 0);
         assert_eq!(
             provider.provider_info().provider_type,
@@ -252,16 +207,22 @@ mod tests {
 
     #[test]
     fn test_button_mapping() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
-        // Button 0 (A/Cross) maps to Genesis A (button 6)
+        // Button 0 (A/Cross) maps to the test map's A (button 6)
         provider.update_button(0, true);
         assert!(provider.is_pressed(6));
     }
 
     #[test]
     fn test_multiple_buttons() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Press multiple buttons
         provider.update_button(0, true); // A -> button 6
@@ -274,7 +235,10 @@ mod tests {
 
     #[test]
     fn test_analog_to_dpad_up() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Move left stick up (negative Y)
         provider.update_axis(1, -0.8);
@@ -285,7 +249,10 @@ mod tests {
 
     #[test]
     fn test_analog_to_dpad_down() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Move left stick down (positive Y)
         provider.update_axis(1, 0.8);
@@ -296,7 +263,10 @@ mod tests {
 
     #[test]
     fn test_analog_to_dpad_left() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Move left stick left (negative X)
         provider.update_axis(0, -0.8);
@@ -307,7 +277,10 @@ mod tests {
 
     #[test]
     fn test_analog_to_dpad_right() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Move left stick right (positive X)
         provider.update_axis(0, 0.8);
@@ -318,7 +291,10 @@ mod tests {
 
     #[test]
     fn test_deadzone() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Set axis value below deadzone (0.15)
         provider.update_axis(0, 0.1);
@@ -335,7 +311,10 @@ mod tests {
 
     #[test]
     fn test_get_analog() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Set LeftX (deadzone will be applied)
         provider.update_axis(0, 0.5);
@@ -360,7 +339,10 @@ mod tests {
 
     #[test]
     fn test_deadzone_application() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
         provider.set_deadzone(0.2);
 
         // Value below deadzone
@@ -380,7 +362,10 @@ mod tests {
 
     #[test]
     fn test_set_deadzone() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         provider.set_deadzone(0.3);
         assert_eq!(provider.get_deadzone(), 0.3);
@@ -395,7 +380,10 @@ mod tests {
 
     #[test]
     fn test_disable_analog_to_dpad() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Disable analog to D-Pad
         provider.set_analog_to_dpad_config(None);
@@ -415,7 +403,10 @@ mod tests {
 
     #[test]
     fn test_provider_info() {
-        let provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
         let info = provider.provider_info();
 
         assert_eq!(info.name, "Gamepad gamepad-0");
@@ -425,7 +416,10 @@ mod tests {
 
     #[test]
     fn test_dpad_buttons() {
-        let mut provider = GamepadInputProvider::new("gamepad-0".to_string());
+        let mut provider = GamepadInputProvider::with_mapping(
+            "gamepad-0".to_string(),
+            super::super::test_maps::gamepad(),
+        );
 
         // Test physical D-Pad buttons (12-15)
         provider.update_button(12, true); // D-Pad Up

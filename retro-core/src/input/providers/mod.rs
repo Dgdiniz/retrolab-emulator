@@ -5,6 +5,8 @@
 
 pub mod gamepad;
 pub mod keyboard;
+#[cfg(test)]
+pub(crate) mod test_maps;
 
 pub use gamepad::GamepadInputProvider;
 pub use keyboard::KeyboardInputProvider;

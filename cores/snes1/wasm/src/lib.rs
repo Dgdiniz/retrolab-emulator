@@ -20,12 +20,12 @@
 //! produces a new frame and expose that buffer (and the active
 //! dimensions) through the framebuffer accessors.
 
-use retro_core::capture::CaptureCore;
-use retro_core::cartridge::CartridgeDebugger;
 use retro_core::debug::{trace_to_text, TraceEntry};
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
 use retro_core::*;
-use retro_wasm::js::{map_as_object, plain_object, set_property, uint16_array, uint8_array};
+use retro_wasm::js::{
+    load_state_refusal, map_as_object, plain_object, set_property, uint16_array, uint8_array,
+};
 use snes1_core::{
     parse_manifest, CoprocessorMode, SnesEmulator, SnesSnapshotConsole, TileSetSource,
     TraceEntryBinaryCx4, TraceEntryBinaryGsu, TraceEntryBinarySpc700, CARTRIDGE_CPU, SOUND_CPU,
@@ -41,21 +41,6 @@ fn unsupported_chip_error(chip: &str, message: &str) -> JsValue {
     err.set_name("UnsupportedChip");
     let _ = js_sys::Reflect::set(&err, &JsValue::from_str("chip"), &JsValue::from_str(chip));
     err.into()
-}
-
-/// A `loadState` refusal for JS. A savestate made on another ROM is an
-/// `Error` named `SaveStateOtherRom`, what the platform reads to offer
-/// loading it anyway (`loadStateAnyRom`); any other refusal is its reason
-/// as text, as before.
-fn load_state_refusal(error: LoadStateError) -> JsValue {
-    match &error {
-        LoadStateError::OtherRom { .. } => {
-            let err = js_sys::Error::new(&error.to_string());
-            err.set_name("SaveStateOtherRom");
-            err.into()
-        }
-        LoadStateError::Unreadable(reason) => JsValue::from_str(reason),
-    }
 }
 
 /// Install the panic-hook so Rust panics surface as readable browser
@@ -121,11 +106,6 @@ pub struct RetroEmulator {
     present_buf: Vec<u8>,
     present_w: u32,
     present_h: u32,
-    /// Raw bytes of the last ROM passed to `loadRom`, retained so
-    /// `getDetectedManifest` can re-run the heuristic detector for the
-    /// running game without the host re-supplying the image. Empty
-    /// before the first load.
-    last_rom: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -143,7 +123,6 @@ impl RetroEmulator {
                     present_buf: Vec::new(),
                     present_w: 0,
                     present_h: 0,
-                    last_rom: Vec::new(),
                 };
                 emu.refresh_present();
                 Ok(emu)
@@ -196,16 +175,28 @@ impl RetroEmulator {
         self.refresh_present();
     }
 
-    /// Power-on (cold) reset: a power cycle, not the reset button. Recreates the
-    /// CPU fresh and reloads the ROM, clearing every volatile subsystem a soft
-    /// reset leaves dirty (the 128 KiB WRAM, the 65816 registers, the PPU's
-    /// VRAM/CGRAM/OAM, and the APU). Netplay uses this so two peers derive a
-    /// byte-identical frame-0 state hash regardless of how long each ran the game
-    /// before the session. Cartridge ROM is preserved; SRAM is a fresh image (a
-    /// save resumes via the seeded savestate transfer).
+    /// Netplay's power cycle, not the reset button: a new CPU and the ROM
+    /// loaded again, which clears every volatile subsystem a soft reset
+    /// leaves as the game left it (the 128 KiB WRAM, the 65816 registers,
+    /// the PPU's VRAM, CGRAM and OAM, and the APU), in the region the
+    /// machine is in, the SRAM a fresh image (a save resumes through the
+    /// seeded savestate transfer). The host's settings and the debugger's
+    /// mode are kept; every breakpoint, watchpoint and event breakpoint is
+    /// removed, every trace switched off, and nothing the input holds stays
+    /// pressed. Two peers that ran the game for different lengths reach the
+    /// same frame-0 state hash.
     #[wasm_bindgen(js_name = powerOnReset)]
     pub fn power_on_reset(&mut self) {
         self.snes.power_on_reset();
+        self.refresh_present();
+    }
+
+    /// The app's Reset: the power cycle of [`Self::power_on_reset`] that
+    /// keeps the battery save, and the debugger's breakpoints and traces.
+    /// [`Self::reset`] is the console's reset button, which keeps work RAM.
+    #[wasm_bindgen(js_name = hardReset)]
+    pub fn hard_reset(&mut self) {
+        self.snes.hard_reset();
         self.refresh_present();
     }
 
@@ -283,7 +274,6 @@ impl RetroEmulator {
             self.snes.set_cartridge_manifest_override(None);
             retry.map_err(|e| JsValue::from_str(&e))?;
         }
-        self.last_rom = data.to_vec();
         self.refresh_present();
         Ok(())
     }
@@ -426,10 +416,10 @@ impl RetroEmulator {
         self.snes.frame_count()
     }
 
-    /// Set the video region (`"ntsc"` / `"pal"`). Call right after
-    /// `loadRom`, before running frames: it resets the machine, and
-    /// both netplay peers agree on region in the handshake. Errors on an
-    /// unknown region string.
+    /// Run in the region `"ntsc"` / `"pal"` (any case): a power cycle in it
+    /// that keeps the save; the region the machine is in already changes
+    /// nothing. Both netplay peers agree on the region in the handshake.
+    /// Errors on an unknown region string.
     #[wasm_bindgen(js_name = setRegion)]
     pub fn set_region(&mut self, region: &str) -> Result<(), JsValue> {
         self.snes
@@ -450,10 +440,10 @@ impl RetroEmulator {
     /// since a different build can diverge deterministically.
     #[wasm_bindgen(js_name = getBuildId)]
     pub fn get_build_id(&self) -> String {
-        format!(
-            "snes1@{}+{}",
+        retro_wasm::build_id(
+            SnesEmulator::CORE_ID,
             env!("CARGO_PKG_VERSION"),
-            option_env!("GIT_HASH").unwrap_or("unknown")
+            option_env!("GIT_HASH"),
         )
     }
 
@@ -539,9 +529,9 @@ impl RetroEmulator {
     /// `Float32Array` of length `min(n, getAudioAvailable())`.
     #[wasm_bindgen(js_name = getAudioSamplesN)]
     pub fn get_audio_samples_n(&mut self, n: usize) -> Vec<f32> {
-        let take = n.min(self.snes.audio_available());
+        let take = n.min(self.snes.host_audio().available());
         let mut out = vec![0.0_f32; take];
-        let written = self.snes.drain_audio_into(&mut out);
+        let written = self.snes.host_audio_mut().drain_into(&mut out);
         out.truncate(written);
         out
     }
@@ -550,7 +540,7 @@ impl RetroEmulator {
     /// interleaved: `1470` means 735 stereo pairs ready).
     #[wasm_bindgen(js_name = getAudioAvailable)]
     pub fn get_audio_available(&self) -> usize {
-        self.snes.audio_available()
+        self.snes.host_audio().available()
     }
 
     /// Cumulative count of samples dropped from the front because
@@ -558,12 +548,12 @@ impl RetroEmulator {
     ///
     /// There is no underrun counterpart, on purpose. The ring can only
     /// record an underrun when a drain asks for more than it holds, and
-    /// every path out of here sizes its request from `audio_available()`
+    /// every path out of here sizes its request from the queued count
     /// first, so such a counter could never move, and the host would read
     /// a constant zero as though it were a measurement.
     #[wasm_bindgen(js_name = getAudioRingOverflows)]
     pub fn get_audio_ring_overflows(&self) -> u64 {
-        self.snes.audio_overflows()
+        self.snes.host_audio().overflows()
     }
 
     /// **Deprecated, intentionally a no-op.** The `getAudioSamples`
@@ -821,7 +811,7 @@ impl RetroEmulator {
     /// savestate never holds it.
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&mut self) -> Vec<u8> {
-        let state = self.snes.save_state_at_frame_end();
+        let state = self.snes.save_state();
         self.refresh_present();
         state
     }
@@ -842,7 +832,7 @@ impl RetroEmulator {
 
     fn load_state_checking_rom(&mut self, data: &[u8], check: RomCheck) -> Result<(), JsValue> {
         self.snes
-            .load_state_with_rom_check(data, check)
+            .load_state(data, check)
             .map_err(load_state_refusal)?;
         self.refresh_present();
         Ok(())
@@ -1097,7 +1087,7 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = getDspVoiceStates)]
     pub fn get_dsp_voice_states(&mut self) -> JsValue {
         let voices: Vec<_> = (0..8)
-            .map(|i| self.snes.audio_debugger().get_channel_state(i))
+            .map(|i| self.snes.audio_debugger(0).unwrap().get_channel_state(i))
             .collect();
         serde_wasm_bindgen::to_value(&voices).unwrap()
     }
@@ -1328,10 +1318,11 @@ impl RetroEmulator {
     /// the editor can diff the user's override against the baseline.
     #[wasm_bindgen(js_name = getDetectedManifest)]
     pub fn get_detected_manifest(&self) -> Result<String, JsValue> {
-        if self.last_rom.is_empty() {
+        let rom = self.snes.last_rom();
+        if rom.is_empty() {
             return Ok("null".to_string());
         }
-        let manifest = self.snes.detected_manifest(&self.last_rom);
+        let manifest = self.snes.detected_manifest(rom);
         serde_json::to_string(&manifest).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -1457,7 +1448,10 @@ impl RetroEmulator {
     /// the game's key-on state.
     #[wasm_bindgen(js_name = muteDspChannel)]
     pub fn mute_dsp_channel(&mut self, channel: u32, muted: bool) {
-        self.snes.audio_debugger().mute_channel(channel, muted);
+        self.snes
+            .audio_debugger(0)
+            .unwrap()
+            .mute_channel(channel, muted);
     }
 
     /// `samples` of the mixed S-DSP output as mono f32 in [-1, 1] for the
@@ -1465,7 +1459,10 @@ impl RetroEmulator {
     /// it, so the host's normal audio pull is unaffected.
     #[wasm_bindgen(js_name = getDspMixedWaveform)]
     pub fn get_dsp_mixed_waveform(&mut self, samples: u32) -> Vec<f32> {
-        self.snes.audio_debugger().get_output_waveform(samples)
+        self.snes
+            .audio_debugger(0)
+            .unwrap()
+            .get_output_waveform(samples)
     }
 
     /// `samples` of one S-DSP voice's approximated waveform (the mixed
@@ -1473,7 +1470,10 @@ impl RetroEmulator {
     /// when the voice is muted or keyed off).
     #[wasm_bindgen(js_name = getDspWaveform)]
     pub fn get_dsp_waveform(&mut self, channel: u32, samples: u32) -> Vec<f32> {
-        self.snes.audio_debugger().get_waveform(channel, samples)
+        self.snes
+            .audio_debugger(0)
+            .unwrap()
+            .get_waveform(channel, samples)
     }
 }
 

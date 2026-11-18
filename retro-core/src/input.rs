@@ -9,13 +9,15 @@
 
 pub mod manager;
 pub mod providers;
+pub mod serial_pad;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 // Re-export providers for convenience
-pub use manager::GenericInputManager;
+pub use manager::{GenericInputManager, PadDefaults};
 pub use providers::{GamepadInputProvider, KeyboardInputProvider};
+pub use serial_pad::{SerialPad, SerialPadState};
 
 // ============================================================================
 // Input Provider Traits

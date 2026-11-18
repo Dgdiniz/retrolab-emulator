@@ -21,10 +21,10 @@ use crate::cpu68k::M68k;
 use crate::debugger::{
     genesis_debugger, GenesisDebugger, TraceEntryBinary, TraceEntryBinaryZ80, MAIN_CPU, SOUND_CPU,
 };
-use crate::input_manager::InputManager;
 use crate::io::devices::genesis_3button::Genesis3ButtonDevice;
 use crate::io::devices::genesis_6button::Genesis6ButtonDevice;
-use crate::timing::VideoRegion;
+use crate::pad_defaults::pad_defaults;
+use crate::timing::{GenesisTiming, VideoRegion};
 use crate::z80::Z80;
 use descriptors::{genesis_button_layout, genesis_cpus};
 use frame::LineRun;
@@ -41,7 +41,7 @@ use retro_core::*;
 pub struct GenesisEmulator {
     system_info: SystemInfo,
     debugger: GenesisDebugger,
-    input_manager: InputManager,
+    input_manager: GenericInputManager,
 
     // Hardware components
     cpu: M68k,
@@ -88,18 +88,13 @@ pub struct GenesisEmulator {
     /// from one instruction to the next.
     watch_accesses: AccessLog,
 
-    /// Bounded ring buffer holding mixed stereo samples ready for the
-    /// host. Capacity ~ 4 frames stereo @ 44.1 kHz/60 fps so the host
-    /// can tolerate ~67 ms of jitter without the producer dropping
-    /// samples or the consumer starving the worklet. The ring MUST
-    /// NOT be cleared while playback is live: a mid-stream `clear()`
-    /// races the consumer worklet and causes audible ticks. Drop
-    /// individual frames by simply not pushing instead.
-    audio_ring: retro_core::AudioRingBuffer<f32>,
-    /// Scratch buffer used by `EmulatorCore::get_audio_samples()` to
-    /// preserve its `&[f32]` return type, drained from the ring on
-    /// each call. Kept alive across calls to avoid per-call alloc.
-    pending_audio_drain: Vec<f32>,
+    /// The mixed stereo samples on their way to the host. Capacity about
+    /// 4 frames stereo at 44.1 kHz and 60 fps, so the host can tolerate
+    /// about 67 ms of jitter without the producer dropping samples or the
+    /// consumer starving the worklet. It MUST NOT be cleared while playback
+    /// is live: a clear in the middle of the stream races the consumer
+    /// worklet and ticks. Drop a frame by not pushing it instead.
+    host_audio: HostAudioRing,
     audio_sample_rate: u32,
     /// Drift-free cycle->sample mapper. The integer formula
     /// `cumulative = (num * (cycles - ref) + remainder) / den` carries
@@ -244,7 +239,7 @@ impl GenesisEmulator {
 
         Self {
             debugger: genesis_debugger(system_info.clone()),
-            input_manager: InputManager::new(),
+            input_manager: GenericInputManager::new(2, pad_defaults()),
             system_info,
             cpu: M68k::new(),
             z80: Z80::new(),
@@ -269,8 +264,7 @@ impl GenesisEmulator {
             // ~4 frames stereo @ 44.1 kHz/60 fps; bounded, overflow
             // drops oldest samples (host already drained them in the
             // previous frame in the typical case).
-            audio_ring: retro_core::AudioRingBuffer::with_capacity(5880),
-            pending_audio_drain: Vec::with_capacity(2048),
+            host_audio: HostAudioRing::with_capacity(5880),
             audio_sample_rate: 44100,
             // The converter's denominator is the **68K CPU clock**
             // (master_clock / 7 ~ 7.67 MHz NTSC), because
@@ -352,11 +346,6 @@ impl GenesisEmulator {
             .unwrap_or_default()
     }
 
-    /// Get the current video region (NTSC/PAL).
-    pub fn region(&self) -> VideoRegion {
-        self.region
-    }
-
     /// Get VDP reference for debugging.
     pub fn vdp(&self) -> &crate::vdp::Vdp {
         self.bus.vdp()
@@ -424,142 +413,6 @@ impl GenesisEmulator {
         self.bus.ym2612_mut()
     }
 
-    /// Set the video region.
-    ///
-    /// Recreates the audio rate converter with the new region's 68K
-    /// CPU clock so the cycles->samples mapping stays accurate across
-    /// an NTSC<->PAL switch, and re-anchors it at the current
-    /// `master_cycles` so no audible discontinuity is introduced.
-    ///
-    /// Also pushes the region into the VDP so the system-level scanline
-    /// budget (`region.scanlines()`) and the VDP's own timing (line
-    /// count, VBLANK window) stay coherent; otherwise a PAL system
-    /// would run 313-line frames against an NTSC VDP. For netplay both
-    /// peers agree on region in the session handshake and call this
-    /// right after `load_rom`, before running any frame.
-    pub fn set_region(&mut self, region: VideoRegion) {
-        self.region = region;
-        // The published refresh rate follows the region: it is what the
-        // host paces frames against, so a PAL machine must advertise 49.7 Hz.
-        self.system_info.display.refresh_rate = region.frame_rate();
-        let mut conv = retro_core::IntegerRateConverter::new(
-            self.audio_sample_rate as u64,
-            region.cpu_clock(),
-        );
-        conv.reset(self.master_cycles);
-        self.audio_rate_converter = conv;
-
-        // Keep the VDP's region in lockstep with the system region.
-        let vdp_region = match region {
-            VideoRegion::Ntsc => crate::vdp::timing::VideoRegion::Ntsc,
-            VideoRegion::Pal => crate::vdp::timing::VideoRegion::Pal,
-        };
-        self.bus.vdp_mut().set_region(vdp_region);
-    }
-
-    /// Set the video region from a case-insensitive `"ntsc"`/`"pal"`
-    /// string. The netplay session handshake carries region as a
-    /// string, so this keeps the enum out of the WASM/JS boundary.
-    pub fn set_region_str(&mut self, name: &str) -> Result<(), String> {
-        let region = match name.trim().to_ascii_lowercase().as_str() {
-            "ntsc" => VideoRegion::Ntsc,
-            "pal" => VideoRegion::Pal,
-            other => {
-                return Err(format!(
-                    "unknown region '{other}' (expected 'ntsc' or 'pal')"
-                ))
-            }
-        };
-        self.set_region(region);
-        Ok(())
-    }
-
-    /// Current region as the `"ntsc"`/`"pal"` string used by the
-    /// netplay handshake and the `getRegion` WASM export.
-    pub fn region_str(&self) -> &'static str {
-        match self.region {
-            VideoRegion::Ntsc => "ntsc",
-            VideoRegion::Pal => "pal",
-        }
-    }
-
-    /// Get the number of frames executed.
-    pub fn frame_count(&self) -> u64 {
-        self.frame_count
-    }
-
-    /// Cold (power-on) reset: rebuild the emulator to the state [`Self::new`]
-    /// and `load_rom` give, so work RAM and Z80 RAM start zeroed. Only the
-    /// player's controller setup is kept, with nothing it held still pressed.
-    ///
-    /// The plain `reset()` emulates the Genesis *reset button*, which
-    /// preserves RAM on real hardware; this emulates a *power cycle*, which does
-    /// not. Netplay needs it: two peers must derive a byte-identical frame-0
-    /// state hash, but a host that had been running the game (dirty RAM) and a
-    /// freshly-booted guest reset to frame 0 with *different* RAM contents, since
-    /// `reset()` leaves RAM untouched. Zeroing it here gives both peers the same
-    /// deterministic power-on baseline. The cartridge ROM is preserved, but
-    /// battery-backed **SRAM is deliberately blanked** to a fresh image: the
-    /// cartridge is rebuilt from the ROM bytes, so both peers start byte-identical
-    /// regardless of either one's save file (a save-resume start arrives through
-    /// the seeded savestate transfer, not through this cold boot). That makes this
-    /// UNSAFE behind a user-facing Reset button: use [`Self::hard_reset`], which
-    /// power-cycles the same volatile hardware while keeping the save.
-    pub fn power_on_reset(&mut self) {
-        // A soft reset (the console's reset *button*, `EmulatorCore::reset`)
-        // re-boots the 68000 (PC/SP/SR from the vector table; D0-D7/A0-A6,
-        // undefined on real hardware after reset, are zeroed) and clears
-        // VRAM/CRAM/VSRAM and the audio chips, but leaves work RAM, Z80 RAM, the
-        // USP, the VDP registers other than R0/R1/R12/R15, the I/O ports and the
-        // Z80 bank register holding whatever the running game left there. A
-        // real *power* cycle clears all of it. Netplay needs the latter: two peers
-        // with different pre-session histories (a host mid-game vs a just-joined
-        // guest) MUST converge on a byte-identical frame-0 state for the
-        // start-commit baseline to match, and they diverge on exactly those
-        // subsystems a soft reset preserves.
-        //
-        // Rebuild the whole machine to the state a freshly-constructed emulator +
-        // `load_rom` produces (byte-for-byte what a just-joined guest holds),
-        // preserving what is invariant across peers: the ROM image, the
-        // cartridge manifest override, and the video region (all three pinned
-        // identical by the netplay handshake). Because both peers run this exact
-        // logic over identical preserved inputs, the result is identical by
-        // construction. Battery-backed SRAM is intentionally reset to a fresh
-        // (empty) image: a game with a save resumes through the seeded savestate
-        // transfer, NOT this cold boot, so both peers still start byte-identical.
-        //
-        // The player's input setup survives too, as a console's controllers do:
-        // the key mapping, the pads and their mappings and dead zones, the port
-        // each feeds, the split keyboard. It is the host's, not the machine's:
-        // no savestate holds it, so the peers' machines still match. What any of
-        // it holds pressed is let go, so a button held across the cycle (a host
-        // that stops forwarding input never releases it) cannot reach the
-        // machine that boots.
-        let rom = std::mem::take(&mut self.last_rom);
-        let manifest = self.cartridge_manifest_override.take();
-        let region = self.region;
-        let capture_recording = self.capture_recording;
-        let mut input_manager = std::mem::take(&mut self.input_manager);
-        input_manager.release_all();
-
-        *self = GenesisEmulator::new();
-        self.input_manager = input_manager;
-        // What a capture records is the host's setting, not the machine's.
-        self.set_capture_recording(capture_recording);
-        // Must precede `load_rom`, which reads it to build the cartridge.
-        self.cartridge_manifest_override = manifest;
-        if !rom.is_empty() {
-            // These bytes already loaded once, so a re-load cannot fail; swallow
-            // the Result rather than propagate: `power_on_reset` is infallible.
-            let _ = <Self as EmulatorCore>::load_rom(self, &rom);
-        }
-        // Re-apply the region *after* load_rom (mirroring the normal load ->
-        // set-region order) through the setter, which rebuilds the audio-rate
-        // converter for the region's clock and syncs the VDP region; `new()`
-        // starts at the NTSC default.
-        self.set_region(region);
-    }
-
     /// Rebuild every volatile subsystem to its power-on state, keeping the
     /// cartridge plugged in.
     ///
@@ -596,7 +449,12 @@ impl GenesisEmulator {
         // `AddressBus::with_region` only sizes the audio chip clocks; the VDP
         // is constructed at its NTSC default, so re-apply the system region to
         // keep its scanline timing in lockstep (a no-op on NTSC).
-        self.set_region(self.region);
+        self.apply_region(self.region);
+        // The new chips render as the audio switch says.
+        self.bus
+            .ym2612_mut()
+            .set_rendering_enabled(self.audio_enabled);
+        self.bus.psg_mut().set_rendering_enabled(self.audio_enabled);
         // The new VDP records what the host asked the old one to.
         self.bus
             .vdp_mut()
@@ -611,33 +469,9 @@ impl GenesisEmulator {
         self.input_manager.clear_all_direct_overrides();
     }
 
-    /// Power-cycle the console: the "turn it off and on again" that the
-    /// reset button is not.
-    ///
-    /// [`EmulatorCore::reset`] emulates the Genesis *reset button*: it
-    /// re-boots the CPUs but leaves work RAM, Z80 RAM and most of the VDP
-    /// register file holding whatever the running game left there. This
-    /// clears all of it while keeping the cartridge,
-    /// ROM **and** battery-backed SRAM, plugged in, so a player who hits
-    /// "Reset" on a game with a save file does not lose it.
-    ///
-    /// Distinct from [`Self::power_on_reset`], which rebuilds the whole
-    /// emulator (dropping SRAM to a fresh image) because netplay needs two
-    /// peers to converge on a byte-identical frame-0 baseline.
-    pub fn hard_reset(&mut self) {
-        self.rebuild_volatile_hardware();
-        self.reset();
-        // Re-apply the ROM's controller configuration, which lives on the
-        // I/O ports the rebuild replaced.
-        let rom = std::mem::take(&mut self.last_rom);
-        if !rom.is_empty() {
-            self.connect_controllers_for_rom(&rom);
-        }
-        self.last_rom = rom;
-    }
-
-    /// Get the total number of CPU cycles executed.
-    pub fn master_cycles(&self) -> u64 {
+    /// The 68000 cycles run since the last reset or load: the master clocks
+    /// [`EmulatorCore::master_cycles`] counts, divided by seven.
+    pub fn cpu_cycles(&self) -> u64 {
         self.master_cycles
     }
 
@@ -700,16 +534,6 @@ impl GenesisEmulator {
     /// Get mutable reference to the bus.
     pub fn bus_mut(&mut self) -> &mut AddressBus {
         &mut self.bus
-    }
-
-    /// Get reference to the input manager.
-    pub fn input_manager(&self) -> &InputManager {
-        &self.input_manager
-    }
-
-    /// Get mutable reference to the input manager.
-    pub fn input_manager_mut(&mut self) -> &mut InputManager {
-        &mut self.input_manager
     }
 
     /// The SHA-256 of the ROM file the last successful
@@ -803,14 +627,70 @@ impl Default for GenesisEmulator {
 }
 
 impl EmulatorCore for GenesisEmulator {
+    type Savestate = crate::savestate::SystemSaveState;
+
     fn system_info(&self) -> &SystemInfo {
         &self.system_info
     }
 
+    fn rom_identity(&self) -> Option<retro_core::savestate::RomIdentity<'_>> {
+        self.bus.cartridge().map(|cart| {
+            let info = cart.info();
+            retro_core::savestate::RomIdentity {
+                sha256: &info.rom_hash,
+                title: &info.title,
+            }
+        })
+    }
+
+    /// The machine's payload: a savestate's stamped with the wall clock,
+    /// the game's title and its hash; the state hash's with neither.
+    fn savestate_payload(
+        &self,
+        purpose: retro_core::savestate::PayloadUse,
+    ) -> crate::savestate::SystemSaveState {
+        use crate::savestate::SaveStateMetadata;
+        let metadata = match purpose {
+            retro_core::savestate::PayloadUse::Savestate => {
+                let (title, hash) = self
+                    .bus
+                    .cartridge()
+                    .map(|c| (c.info().title.clone(), c.info().rom_hash.clone()))
+                    .unwrap_or_default();
+                SaveStateMetadata::now(title, hash, 0)
+            }
+            retro_core::savestate::PayloadUse::StateHash => SaveStateMetadata {
+                game_title: String::new(),
+                rom_hash: String::new(),
+                timestamp: String::new(),
+                slot: 0,
+                emulator_version: String::new(),
+            },
+        };
+        self.build_save_state(metadata)
+    }
+
+    fn savestate_extension(&self) {}
+
+    fn restore_savestate(&mut self, payload: crate::savestate::SystemSaveState, _extension: ()) {
+        self.restore_payload(payload);
+    }
+
+    /// The wall clock, in seconds since 1970: the envelope's twin of the
+    /// payload's RFC 3339 stamp, for tools that do not parse one.
+    fn savestate_created_at(&self) -> u64 {
+        chrono::Utc::now().timestamp().max(0) as u64
+    }
+
+    /// A frame part of the way through, finished on the play tier: the
+    /// savestate's layout holds a machine where a frame ends.
+    fn finish_held_frame(&mut self) -> bool {
+        retro_core::frame::finish_held_frame(self)
+    }
+
     fn reset(&mut self) {
-        // Reset debugger state first (ensures clean execution mode). The
-        // calls the call stack holds belong to the machine the reset ends.
-        self.debugger.set_execution_mode(ExecutionMode::Paused);
+        // The calls the call stack holds belong to the machine the reset
+        // ends.
         self.debugger.console_mut().clear_instruction_boundaries();
         self.debugger.machine_replaced();
         // The machine starts over: a frame in progress is dropped, not
@@ -861,8 +741,8 @@ impl EmulatorCore for GenesisEmulator {
         // mid-stream: the host is expected to drain after) and
         // re-anchor the rate converter at the new master_cycles
         // baseline (34, set above).
-        self.audio_ring.clear();
-        self.audio_ring.reset_counters();
+        self.host_audio.clear();
+        self.host_audio.reset_counters();
         self.audio_rate_converter.reset(self.master_cycles);
 
         // Leave the reset state in the debugger, so a host that reads it
@@ -870,6 +750,126 @@ impl EmulatorCore for GenesisEmulator {
         // right after a load) shows the reset vector instead of nothing.
         // It reads the registers only: nothing here runs or changes state.
         self.refresh_debugger_state();
+    }
+
+    /// The power switch, which the reset button is not: [`Self::reset`]
+    /// re-boots the CPUs but leaves work RAM, Z80 RAM, the 68000's user
+    /// stack pointer, most of the VDP's registers, the I/O ports and the
+    /// Z80's bank register as the game left them; this builds all of them
+    /// again. A new 68000 and Z80; a new bus in the machine's region, with
+    /// every chip on it; the cartridge built again from its ROM, its save
+    /// RAM blank; the pads the ROM's header asks for; then the machine's
+    /// region, not the one the header names. The debugger, the input, the
+    /// audio switch and what a capture records are the host's and are
+    /// kept; the coverage, which the same ROM keeps true, too.
+    fn power_cycle(&mut self) {
+        let region = self.region;
+        self.cpu = M68k::new();
+        self.z80 = Z80::new();
+        drop(self.bus.take_cartridge());
+        self.rebuild_volatile_hardware();
+        let rom = std::mem::take(&mut self.last_rom);
+        if rom.is_empty() {
+            self.reset();
+        } else {
+            // These bytes loaded once, so loading them again cannot fail;
+            // the load sees the ROM it loaded last, so it builds nothing
+            // more and keeps the coverage.
+            let _ = <Self as EmulatorCore>::load_rom(self, &rom);
+        }
+        self.apply_region(region);
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// The 68000's cycles times seven: the master clocks (the field counts
+    /// 68000 cycles, which the line budget and the trace are kept in).
+    fn master_cycles(&self) -> u64 {
+        self.master_cycles * 7
+    }
+
+    fn master_clock_hz(&self) -> u64 {
+        self.region.master_clock()
+    }
+
+    fn region(&self) -> VideoRegion {
+        self.region
+    }
+
+    /// The machine retimed for `region`: the refresh rate the host paces
+    /// frames against, the audio converter (whose denominator is the
+    /// region's 68000 clock) anchored again at the present cycle so no
+    /// sample is lost or doubled, and the VDP's line count and blanking.
+    fn apply_region(&mut self, region: VideoRegion) {
+        self.region = region;
+        self.system_info.display.refresh_rate = region.frame_rate();
+        let mut converter = retro_core::IntegerRateConverter::new(
+            self.audio_sample_rate as u64,
+            region.cpu_clock(),
+        );
+        converter.reset(self.master_cycles);
+        self.audio_rate_converter = converter;
+        self.bus.vdp_mut().set_region(region);
+    }
+
+    fn host_audio(&self) -> &HostAudioRing {
+        &self.host_audio
+    }
+
+    fn host_audio_mut(&mut self) -> &mut HostAudioRing {
+        &mut self.host_audio
+    }
+
+    fn input_manager(&self) -> &GenericInputManager {
+        &self.input_manager
+    }
+
+    fn input_manager_mut(&mut self) -> &mut GenericInputManager {
+        &mut self.input_manager
+    }
+
+    fn video_debugger(&mut self) -> &mut dyn retro_core::video::VideoDebugger {
+        self.bus.vdp_mut()
+    }
+
+    /// The YM2612 (0) and the PSG (1).
+    fn audio_chip_count(&self) -> usize {
+        2
+    }
+
+    fn audio_debugger(&mut self, chip: usize) -> Option<&mut dyn retro_core::audio::AudioDebugger> {
+        match chip {
+            0 => Some(self.bus.ym2612_mut()),
+            1 => Some(self.bus.psg_mut()),
+            _ => None,
+        }
+    }
+
+    fn cartridge_debugger(&mut self) -> Box<dyn retro_core::cartridge::CartridgeDebugger + '_> {
+        Box::new(self.map_plan_debugger())
+    }
+
+    /// A byte at a time through the bus's CPU path: a write to an I/O or
+    /// VDP port acts as a CPU write would.
+    fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
+        for (i, &byte) in data.iter().enumerate() {
+            self.bus.write(addr.wrapping_add(i as u32), byte);
+        }
+    }
+
+    /// Bitmap-aware disassembly around `pc` (0 the 68000, 1 the Z80), over
+    /// [`retro_core::disassemble_window`].
+    fn disassemble_window(
+        &mut self,
+        cpu_id: usize,
+        pc: u32,
+        before_count: usize,
+        after_count: usize,
+    ) -> Vec<DisasmRow> {
+        let mut driver = debug::GenesisDisasmDriver { emu: self, cpu_id };
+        retro_core::disassemble_window(&mut driver, pc, before_count, after_count)
     }
 
     fn step_cpu(&mut self, cpu_id: usize) -> StepResult {
@@ -913,6 +913,10 @@ impl EmulatorCore for GenesisEmulator {
     fn run_frame(&mut self) {
         let tier = self.debugger.execution_tier();
         retro_core::frame::run_frame_on(self, tier);
+    }
+
+    fn run_frame_headless(&mut self) {
+        retro_core::frame::run_frame_headless(self);
     }
 
     /// Run to the start of vertical blanking and stop there: the capture
@@ -987,10 +991,7 @@ impl EmulatorCore for GenesisEmulator {
         // no-op output, or external load_rom of identical data) keeps
         // the bitmap so the disassembly window stays populated.
         let new_hash = info.rom_hash.clone();
-        let same_rom = self
-            .bus
-            .cartridge()
-            .is_some_and(|installed| installed.info().rom_hash == new_hash);
+        let same_rom = self.cartridge_hash.as_deref() == Some(new_hash.as_str());
 
         if !same_rom {
             self.debugger.clear_all_coverage();
@@ -1015,7 +1016,7 @@ impl EmulatorCore for GenesisEmulator {
 
         // Reset system with new ROM
         self.reset();
-        self.set_region(header_region);
+        self.apply_region(header_region);
 
         // The ROM's I/O-support field (header $190-$19F) names a "6" when
         // the game expects 6-button pads. Contra Hard Corps
@@ -1067,19 +1068,6 @@ impl EmulatorCore for GenesisEmulator {
         &self.system_info.display
     }
 
-    fn get_audio_samples(&mut self) -> &[f32] {
-        // Drain the ring into the scratch buffer so we can satisfy
-        // the trait's `&[f32]` contract without per-call allocation.
-        // Hosts that can take an explicit count should call
-        // `drain_audio_into(&mut [f32]) -> usize` on the concrete
-        // type to skip the resize.
-        let n = self.audio_ring.available();
-        self.pending_audio_drain.clear();
-        self.pending_audio_drain.resize(n, 0.0);
-        self.audio_ring.drain_into(&mut self.pending_audio_drain);
-        &self.pending_audio_drain
-    }
-
     fn get_audio_info(&self) -> &AudioInfo {
         &self.system_info.audio
     }
@@ -1091,7 +1079,7 @@ impl EmulatorCore for GenesisEmulator {
         self.bus.ym2612_mut().set_rendering_enabled(enabled);
         self.bus.psg_mut().set_rendering_enabled(enabled);
         if !enabled {
-            self.audio_ring.clear();
+            self.host_audio.clear();
         }
     }
 
@@ -1100,7 +1088,7 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     fn set_input(&mut self, player: u8, input: InputState) {
-        // Route the bitmask through `InputManager` as a "direct override"
+        // Route the bitmask through the input manager as a "direct override"
         // that OR-merges with whatever provider (keyboard / gamepad) is
         // assigned to the port. This is the path the JS frontend uses for
         // virtual-input sources like the mobile touch overlay: they get
@@ -1117,52 +1105,6 @@ impl EmulatorCore for GenesisEmulator {
 
     fn get_input_info(&self) -> &InputInfo {
         &self.system_info.input
-    }
-
-    /// The machine's state, where a frame ends. A frame in progress (a
-    /// frame call that stopped, a host step, a capture boundary) has no
-    /// place in a savestate, which cannot say where to resume it, and
-    /// finishing it needs `&mut self`: while one is in progress this returns
-    /// nothing. [`CaptureCore::save_state_at_frame_end`] finishes the frame
-    /// first, and is what every host calls.
-    fn save_state(&self) -> Vec<u8> {
-        use crate::savestate::*;
-        use retro_core::savestate::{
-            serialize_compressed, SaveStateEnvelope, RETRO_SAVESTATE_ENVELOPE_VERSION,
-        };
-
-        // The savestate holds no frame part of the way through.
-        if self.frame_open {
-            return Vec::new();
-        }
-
-        let (game_title, rom_hash) = self
-            .bus
-            .cartridge()
-            .map(|c| (c.info().title.clone(), c.info().rom_hash.clone()))
-            .unwrap_or_default();
-
-        let state = self.build_save_state(SaveStateMetadata::now(game_title, rom_hash.clone(), 0));
-
-        // Wrap the SG1-specific snapshot in the cross-core envelope.
-        // `created_at` mirrors chrono's RFC3339 timestamp in
-        // `state.metadata.timestamp` but encoded as a plain unix
-        // seconds counter for tooling that doesn't parse RFC3339.
-        let envelope = SaveStateEnvelope {
-            envelope_version: RETRO_SAVESTATE_ENVELOPE_VERSION,
-            core_id: "sg1".to_string(),
-            core_version: SAVE_STATE_VERSION,
-            rom_hash,
-            created_at: chrono::Utc::now().timestamp().max(0) as u64,
-            payload: state,
-        };
-
-        serialize_compressed(&envelope, 3).unwrap_or_default()
-    }
-
-    fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
-        self.load_state_with_rom_check(data, retro_core::savestate::RomCheck::SameRom)
-            .map_err(|e| e.to_string())
     }
 
     fn get_save_ram(&self) -> Option<&[u8]> {

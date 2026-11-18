@@ -648,6 +648,7 @@ mod binding_tests {
     }
 
     impl<C: ConsoleDebug> EmulatorCore for FakeCore<C> {
+        crate::fake_machine::unreachable_machine_items!();
         fn system_info(&self) -> &SystemInfo {
             &self.system
         }
@@ -732,9 +733,6 @@ mod binding_tests {
         fn get_display_info(&self) -> &DisplayInfo {
             unreachable!()
         }
-        fn get_audio_samples(&mut self) -> &[f32] {
-            unreachable!()
-        }
         fn get_audio_info(&self) -> &AudioInfo {
             unreachable!()
         }
@@ -748,12 +746,6 @@ mod binding_tests {
             unreachable!()
         }
         fn get_input_info(&self) -> &InputInfo {
-            unreachable!()
-        }
-        fn save_state(&self) -> Vec<u8> {
-            unreachable!()
-        }
-        fn load_state(&mut self, _data: &[u8]) -> Result<(), String> {
             unreachable!()
         }
         fn get_save_ram(&self) -> Option<&[u8]> {

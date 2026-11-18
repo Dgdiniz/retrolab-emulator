@@ -126,15 +126,6 @@ pub trait CaptureCore: EmulatorCore {
     /// Whether the core is held at a capture boundary.
     fn at_capture_boundary(&self) -> bool;
 
-    /// A savestate taken where a frame ends: a frame held at its capture
-    /// boundary is finished first, on the frame loop no breakpoint can stop
-    /// (the loop a player runs), and then saved, so a save taken at the
-    /// boundary never holds part of a frame and a breakpoint set in the rest
-    /// of the frame changes nothing: the saved machine is the one a twin
-    /// that ran the same frames whole holds. A host saves through this:
-    /// [`EmulatorCore::save_state`] takes `&self` and cannot finish a frame.
-    fn save_state_at_frame_end(&mut self) -> Vec<u8>;
-
     /// Copies of the picture the host shows and of the video memory, the
     /// palette and the registers it was drawn from ([`FrameSnapshot`]). At a
     /// capture boundary both belong to the frame held there; anywhere else

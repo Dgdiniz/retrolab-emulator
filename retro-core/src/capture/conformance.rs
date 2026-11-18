@@ -307,7 +307,7 @@ pub fn each_boundary_call_runs_one_frame<E: CaptureCore>(core: &CoreUnderTest<E>
     );
 }
 
-/// [`CaptureCore::save_state_at_frame_end`] at the boundary finishes the
+/// [`EmulatorCore::save_state`] at the boundary finishes the
 /// frame first, with the debugger running or paused: the core is held no
 /// more, and its state and its savestate are those of a twin that ran the
 /// same frames whole. Where no frame is held it runs nothing.
@@ -322,14 +322,14 @@ pub fn a_save_at_the_boundary_finishes_the_frame<E: CaptureCore>(core: &CoreUnde
         if paused {
             held.debugger().set_execution_mode(ExecutionMode::Paused);
         }
-        let saved = held.save_state_at_frame_end();
+        let saved = held.save_state();
         core.holds_the_frame_run_whole(&held, &whole, &saved, &format!("debugger {mode}"));
     }
 
     let mut emu = core.warmed_up(CaptureRecording::default());
     let (frames, hash) = (core.frames(&emu), core.hash(&emu));
     assert!(
-        !emu.save_state_at_frame_end().is_empty(),
+        !emu.save_state().is_empty(),
         "with no frame held, the save gave no bytes"
     );
     assert_eq!(
@@ -375,7 +375,7 @@ pub fn a_save_at_the_boundary_finishes_the_frame_past_a_breakpoint<E: CaptureCor
     held.run_to_capture_boundary();
     assert!(held.at_capture_boundary(), "no frame held to save");
     held.debugger().add_breakpoint(breakpoint);
-    let saved = held.save_state_at_frame_end();
+    let saved = held.save_state();
     assert_eq!(
         held.debugger().get_execution_mode(),
         ExecutionMode::Running,
@@ -395,7 +395,7 @@ pub fn a_save_at_the_boundary_finishes_the_frame_past_a_breakpoint<E: CaptureCor
 /// savestate.
 pub fn a_reset_a_state_load_and_a_rom_load_drop_the_hold<E: CaptureCore>(core: &CoreUnderTest<E>) {
     let mut emu = core.warmed_up(CaptureRecording::default());
-    let saved = emu.save_state_at_frame_end();
+    let saved = emu.save_state();
 
     emu.run_to_capture_boundary();
     assert!(emu.at_capture_boundary(), "no frame held before the reset");
@@ -411,7 +411,7 @@ pub fn a_reset_a_state_load_and_a_rom_load_drop_the_hold<E: CaptureCore>(core: &
         emu.at_capture_boundary(),
         "no frame held before the state load"
     );
-    emu.load_state(&saved)
+    emu.load_state(&saved, crate::savestate::RomCheck::SameRom)
         .expect("the program's own savestate loads");
     assert!(
         !emu.at_capture_boundary(),
@@ -419,7 +419,7 @@ pub fn a_reset_a_state_load_and_a_rom_load_drop_the_hold<E: CaptureCore>(core: &
     );
     let mut loaded = (core.build)();
     loaded
-        .load_state(&saved)
+        .load_state(&saved, crate::savestate::RomCheck::SameRom)
         .expect("the program's own savestate loads");
     for machine in [&mut emu, &mut loaded] {
         run_debugger(machine);
@@ -592,7 +592,7 @@ pub fn the_recorders_start_empty_and_a_reset_or_a_load_empties_them<E: CaptureCo
     core: &CoreUnderTest<E>,
 ) {
     let mut emu = core.warmed_up(CaptureRecording::default());
-    let saved = emu.save_state_at_frame_end();
+    let saved = emu.save_state();
     emu.set_capture_recording(EVERY_RECORDER);
     assert_eq!(
         emu.capture_recording(),
@@ -626,7 +626,7 @@ pub fn the_recorders_start_empty_and_a_reset_or_a_load_empties_them<E: CaptureCo
 
     run_debugger(&mut emu);
     core.fill_recorders(&mut emu, "before the state load");
-    emu.load_state(&saved)
+    emu.load_state(&saved, crate::savestate::RomCheck::SameRom)
         .expect("the program's own savestate loads");
     assert_eq!(
         emu.capture_recording(),
@@ -1027,7 +1027,7 @@ impl<E: CaptureCore> CoreUnderTest<E> {
         );
         let mut loaded = (self.build)();
         loaded
-            .load_state(saved)
+            .load_state(saved, crate::savestate::RomCheck::SameRom)
             .unwrap_or_else(|error| panic!("{case}: the savestate does not load: {error}"));
         assert_eq!(
             self.hash(&loaded),

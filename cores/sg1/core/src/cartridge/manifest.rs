@@ -73,8 +73,8 @@ use super::presets::{
     bank_mapper_plan, eeprom_plan, jcart_plan, plain_plan, svp_plan, PresetKind,
     EEPROM_CONTROL_ADDR,
 };
-use super::savestate::BankMapperKind;
 use crate::cartridge::header::SRAM_SIZE_LIMIT;
+use crate::savestate::BankMapperKind;
 
 /// The default stock-SRAM window base for the `sram_size` shorthand, when a
 /// manifest does not spell out an explicit `Sram` slot.

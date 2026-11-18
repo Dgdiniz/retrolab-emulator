@@ -3,14 +3,8 @@
 //! The Genesis VDP operates on a scanline-based rendering model,
 //! with different timing for NTSC and PAL systems.
 
-/// Video region (NTSC or PAL).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoRegion {
-    /// NTSC (North America, Japan): 60 Hz
-    Ntsc,
-    /// PAL (Europe): 50 Hz
-    Pal,
-}
+/// The video region (NTSC or PAL): retro-core's, which the system shares.
+pub use retro_core::types::VideoRegion;
 
 /// Timing constants for NTSC region.
 pub mod ntsc {

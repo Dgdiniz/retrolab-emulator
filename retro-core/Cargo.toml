@@ -14,6 +14,9 @@ capture-conformance = []
 # The frame driver's conformance suite (`frame::conformance`), which each
 # core's tests run against its own emulator.
 frame-conformance = []
+# The machine's conformance suite (`emulator::conformance`), which each
+# core's tests run against its own emulator.
+emulator-conformance = []
 
 [dependencies]
 serde = { workspace = true }

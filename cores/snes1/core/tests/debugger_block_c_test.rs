@@ -9,7 +9,7 @@
 //! debugger plumbing exercised here is what an integration test is
 //! actually good at: a real ROM, a real frame loop, a real pause.
 
-use retro_core::cartridge::{CartridgeDebugger, MapperId, MemoryType, WatchType};
+use retro_core::cartridge::{MapperId, MemoryType, WatchType};
 use retro_core::types::{BreakpointType, DisasmRowKind, BREAKPOINT_PARAM_ANY};
 use retro_core::{Breakpoint, EmulatorCore, ExecutionMode};
 

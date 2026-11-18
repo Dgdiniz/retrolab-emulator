@@ -6,6 +6,7 @@
 use super::frame::LineRun;
 use super::GenesisEmulator;
 use crate::debugger::{record_z80_trace, SOUND_CPU};
+use crate::timing::GenesisTiming;
 use retro_core::cpu::Clockable;
 use retro_core::frame::{Flow, StepHooks, Stepped};
 

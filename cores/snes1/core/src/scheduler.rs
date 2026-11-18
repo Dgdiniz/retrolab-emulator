@@ -39,6 +39,7 @@
 //! `SnesEmulator::handle_event_at` (`system/frame.rs`).
 
 use retro_core::frame::EventQueue;
+use retro_core::types::VideoRegion;
 
 /// Region-specific timing constants (master-clock rate, scanline
 /// length, frame layout).
@@ -79,6 +80,23 @@ impl TimingProfile {
         scanlines_per_frame: 312,
         vblank_start_line: 240,
     };
+
+    /// The profile of `region`.
+    pub const fn for_region(region: VideoRegion) -> Self {
+        match region {
+            VideoRegion::Ntsc => Self::NTSC,
+            VideoRegion::Pal => Self::PAL,
+        }
+    }
+
+    /// The region this profile times: PAL's 312 scanlines, NTSC's 262.
+    pub const fn region(&self) -> VideoRegion {
+        if self.scanlines_per_frame == Self::PAL.scanlines_per_frame {
+            VideoRegion::Pal
+        } else {
+            VideoRegion::Ntsc
+        }
+    }
 
     /// Total master clocks in a full frame (`cycles_per_scanline *
     /// scanlines_per_frame`).

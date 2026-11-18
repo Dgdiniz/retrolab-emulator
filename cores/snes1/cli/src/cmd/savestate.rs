@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use retro_core::savestate::RomCheck;
 use retro_core::EmulatorCore;
 use snes1_core::SnesEmulator;
 
@@ -116,7 +117,7 @@ fn load(args: LoadArgs) -> Result<()> {
 
     let bytes = std::fs::read(&args.state)
         .with_context(|| format!("failed to read savestate: {}", args.state.display()))?;
-    emu.load_state(&bytes)
+    emu.load_state(&bytes, RomCheck::SameRom)
         .map_err(|e| anyhow::anyhow!("failed to load savestate: {e}"))?;
 
     println!(

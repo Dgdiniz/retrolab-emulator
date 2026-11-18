@@ -15,7 +15,7 @@ use retro_core::cartridge::{
     ChipRegister, Coprocessor, ExpansionChipInfo, ExpansionChipState, ExpansionChipType,
 };
 
-use crate::cartridge::savestate::{EepromChipState, EepromPhase, GenesisCoprocessorState};
+use crate::savestate::{EepromChipState, EepromPhase, GenesisChipState};
 
 /// A serial EEPROM chip driven over the two-wire control byte.
 pub struct EepromChip {
@@ -227,7 +227,7 @@ impl Coprocessor for EepromChip {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let state = GenesisCoprocessorState::Eeprom(EepromChipState {
+        let state = GenesisChipState::Eeprom(EepromChipState {
             data: self.data.clone(),
             phase: self.phase,
             sda: self.sda,
@@ -244,9 +244,7 @@ impl Coprocessor for EepromChip {
     }
 
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
-        if let Ok(GenesisCoprocessorState::Eeprom(s)) =
-            bincode::deserialize::<GenesisCoprocessorState>(data)
-        {
+        if let Ok(GenesisChipState::Eeprom(s)) = bincode::deserialize::<GenesisChipState>(data) {
             if s.data.len() == self.size {
                 self.data = s.data;
                 self.phase = s.phase;

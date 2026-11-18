@@ -48,7 +48,7 @@ fn debug_psg_tone_in_genesis() {
     let mut buffer: Vec<f32> = Vec::new();
     for i in 0..5 {
         emu.run_frame();
-        let drained = emu.get_audio_buffer();
+        let drained = emu.host_audio_mut().take_all();
         eprintln!("  Frame {}: {} samples", i + 1, drained.len());
         buffer.extend_from_slice(&drained);
     }
@@ -99,7 +99,7 @@ fn debug_psg_noise_in_genesis() {
     let mut buffer: Vec<f32> = Vec::new();
     for i in 0..5 {
         emu.run_frame();
-        let drained = emu.get_audio_buffer();
+        let drained = emu.host_audio_mut().take_all();
         eprintln!("  Frame {}: {} samples", i + 1, drained.len());
         buffer.extend_from_slice(&drained);
     }

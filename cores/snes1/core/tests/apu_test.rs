@@ -653,7 +653,7 @@ fn host_audio_bridge_is_drift_free() {
         "resampler drift {drift} (host={total}, dsp_frames={dsp_frames}, expected~{expected})"
     );
     assert_eq!(
-        emu.audio_overflows(),
+        emu.host_audio().overflows(),
         0,
         "draining every frame must keep the host ring from overflowing"
     );
@@ -684,5 +684,9 @@ fn apu_no_drift_60s() {
         (total as f64 - expected).abs() <= 16.0,
         "60 s host drift too large (host={total}, expected~{expected})"
     );
-    assert_eq!(emu.audio_overflows(), 0, "no overflow over a 60 s soak");
+    assert_eq!(
+        emu.host_audio().overflows(),
+        0,
+        "no overflow over a 60 s soak"
+    );
 }

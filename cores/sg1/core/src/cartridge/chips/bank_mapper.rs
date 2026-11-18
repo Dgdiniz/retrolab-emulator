@@ -27,7 +27,7 @@ use retro_core::cartridge::{
     SourcePlace,
 };
 
-use crate::cartridge::savestate::{BankMapperKind, BankMapperState, GenesisCoprocessorState};
+use crate::savestate::{BankMapperKind, BankMapperState, GenesisChipState};
 
 /// 512 KiB per bank / slot.
 const BANK_SIZE: usize = 0x80000;
@@ -233,7 +233,7 @@ impl Coprocessor for BankMapperChip {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let state = GenesisCoprocessorState::BankMapper(BankMapperState {
+        let state = GenesisChipState::BankMapper(BankMapperState {
             kind: self.kind,
             banks: self.banks.clone(),
         });
@@ -241,8 +241,7 @@ impl Coprocessor for BankMapperChip {
     }
 
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
-        if let Ok(GenesisCoprocessorState::BankMapper(s)) =
-            bincode::deserialize::<GenesisCoprocessorState>(data)
+        if let Ok(GenesisChipState::BankMapper(s)) = bincode::deserialize::<GenesisChipState>(data)
         {
             // Only accept a table for the same scheme and shape.
             if s.kind == self.kind && s.banks.len() == self.banks.len() {

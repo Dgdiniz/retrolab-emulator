@@ -32,6 +32,7 @@ use retro_core::{EmulatorCore, InputState};
 use snes1_core::SnesEmulator;
 
 use super::{apply_force_detect, parse_press_schedule, read_rom, CoprocessorArgs, PressSchedule};
+use retro_core::savestate::RomCheck;
 
 #[derive(clap::Args, Debug)]
 pub struct DeterminismCheckArgs {
@@ -105,7 +106,7 @@ fn restore(
     state: &[u8],
 ) -> Result<SnesEmulator> {
     let mut emu = boot(rom, region, coprocessor, force_detect)?;
-    emu.load_state(state)
+    emu.load_state(state, RomCheck::SameRom)
         .map_err(|e| anyhow::anyhow!("failed to load savestate: {e}"))?;
     Ok(emu)
 }

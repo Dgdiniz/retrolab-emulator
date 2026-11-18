@@ -497,34 +497,6 @@ impl SnesEmulator {
         }
     }
 
-    /// Headless frame for netplay rollback / catch-up: the full
-    /// deterministic simulation with the host-facing presentation steps
-    /// (framebuffer post-process + 32 kHz -> 44.1 kHz audio drain)
-    /// suppressed, on the play tier with the debugger disarmed for its
-    /// length (`retro_core::frame::run_frame_headless`). Every
-    /// state-changing step still runs (the per-scanline PPU render, which
-    /// updates the serialized sprite range/time-over flags, the interlace
-    /// field toggle, the OAM re-anchor, and the APU + coprocessor
-    /// catch-up), so it produces the exact same machine state (and
-    /// `frame_count`) as a presented frame. Re-simulating a mispredicted
-    /// span therefore leaves the emulator byte-identical to a live run,
-    /// which [`Self::state_hash`] verifies.
-    pub fn run_frame_headless(&mut self) {
-        retro_core::frame::run_frame_headless(self);
-    }
-
-    /// Finish the frame held at the capture boundary on the loop a player
-    /// runs, whatever the debugger is doing: the play tier, with nothing of
-    /// the debugger armed, so no breakpoint, watchpoint or event can stop
-    /// it before the frame's end, and nothing of it is traced or counted
-    /// (`retro_core::frame::finish_held_frame`). The debugger's hooks are
-    /// armed again after, as its breakpoints and traces ask, and its cached
-    /// CPU states show where the frame ended. Returns whether there was a
-    /// frame to finish.
-    pub fn finish_held_frame(&mut self) -> bool {
-        retro_core::frame::finish_held_frame(self)
-    }
-
     /// Per-frame tail shared by every tier: advance the frame counter,
     /// pre-schedule the next frame's events, and re-arm the H/V IRQ
     /// triggers anchored at the current master cycle (which carries the

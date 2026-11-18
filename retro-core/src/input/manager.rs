@@ -5,9 +5,12 @@
 //! future touch / mouse...) onto them. Each core decides how many ports
 //! it needs:
 //!
-//! - SG1 (Mega Drive): 2 ports (DE-9 P1 + P2). Use [`GenericInputManager::for_2_ports`].
+//! - SG1 (Mega Drive): 2 ports (DE-9 P1 + P2).
 //! - SNES1: 2 ports by default; multitap adapter brings it up to 5.
-//!   Use [`GenericInputManager::new(5)`](GenericInputManager::new).
+//!
+//! The console says how its pad is played: [`PadDefaults`], the keyboard
+//! map the manager starts with on port 0 and the map each gamepad gets
+//! when the manager registers it ([`GenericInputManager::new`]).
 //!
 //! Design choices:
 //!
@@ -101,13 +104,10 @@ pub struct GenericInputManager {
     input_history: Vec<InputSnapshot>,
     max_history: usize,
     n_ports: usize,
-    /// Button map handed to gamepads the manager registers itself (see
-    /// [`add_gamepad`](Self::add_gamepad)). `None` keeps the Genesis
-    /// layout baked into [`GamepadInputProvider::new`], so a core that
-    /// never sets it (SG1) gets that layout. A core with a different
-    /// physical pad (SNES face buttons, NES two-button) sets this once
-    /// at construction.
-    default_gamepad_mapping: Option<HashMap<u32, u32>>,
+    /// The console's maps: the keyboard's when the split keyboard is
+    /// turned off with no mapping of its own kept, and each gamepad's that
+    /// the manager registers itself (see [`add_gamepad`](Self::add_gamepad)).
+    defaults: PadDefaults,
     /// Providers the host has placed itself with
     /// [`set_provider_port`](Self::set_provider_port). The automatic
     /// placement of a newly seen gamepad never applies to one of them,
@@ -115,19 +115,36 @@ pub struct GenericInputManager {
     host_placed: HashSet<String>,
     /// The single keyboard's mapping while the split keyboard replaces
     /// it, so turning the split off brings back that mapping rather than
-    /// the Genesis default of [`KeyboardInputProvider::new`].
+    /// the console's default.
     single_keyboard_mapping: Option<HashMap<String, u32>>,
 }
 
+/// How a console's pad is played from a keyboard and a gamepad, out of the
+/// box: the maps a host's input starts with, which the player can change.
+#[derive(Clone, Debug, Default)]
+pub struct PadDefaults {
+    /// `KeyboardEvent.code` to the `InputState` bit it presses.
+    pub keyboard: HashMap<String, u32>,
+    /// A standard gamepad's button index to the `InputState` bit it presses.
+    pub gamepad: HashMap<u32, u32>,
+}
+
 impl GenericInputManager {
-    /// Build an empty manager with `n_ports` ports.
-    ///
-    /// No providers are registered. Cores that want the SG1-style
-    /// "default keyboard on port 0" behaviour should call
-    /// [`add_keyboard_provider`](Self::add_keyboard_provider) +
-    /// [`assign_provider_to_port`](Self::assign_provider_to_port)
-    /// after `new` (the SG1 shim does this).
-    pub fn new(n_ports: usize) -> Self {
+    /// A manager with `n_ports` ports, played as `defaults` says: a keyboard
+    /// with `defaults.keyboard` on port 0 (with at least one port), and
+    /// `defaults.gamepad` for every gamepad the manager registers.
+    pub fn new(n_ports: usize, defaults: PadDefaults) -> Self {
+        let keyboard = KeyboardInputProvider::with_mapping(defaults.keyboard.clone());
+        let mut manager = Self::without_providers(n_ports, defaults);
+        if n_ports > 0 {
+            manager.add_keyboard_provider(keyboard);
+            manager.assign_provider_to_port("keyboard".to_string(), 0);
+        }
+        manager
+    }
+
+    /// A manager with no provider registered.
+    fn without_providers(n_ports: usize, defaults: PadDefaults) -> Self {
         Self {
             providers: HashMap::new(),
             port_providers: vec![Vec::new(); n_ports],
@@ -135,15 +152,10 @@ impl GenericInputManager {
             input_history: Vec::new(),
             max_history: 60,
             n_ports,
-            default_gamepad_mapping: None,
+            defaults,
             host_placed: HashSet::new(),
             single_keyboard_mapping: None,
         }
-    }
-
-    /// Convenience for the common SG1/SNES1 two-port layout.
-    pub fn for_2_ports() -> Self {
-        Self::new(2)
     }
 
     /// Number of ports this manager was configured for. Doesn't change
@@ -164,26 +176,10 @@ impl GenericInputManager {
             .insert(id, ProviderWrapper::Gamepad(provider));
     }
 
-    /// Set the button map applied to gamepads the manager registers
-    /// itself. Already-registered providers are untouched (rebind those
-    /// via [`set_gamepad_mapping`](Self::set_gamepad_mapping)).
-    ///
-    /// Cores call this once at construction to pick a console-correct
-    /// default, e.g. the SNES face-button order, instead of the
-    /// Genesis layout that [`GamepadInputProvider::new`] bakes in. Left
-    /// unset, the manager falls back to that Genesis layout.
-    pub fn set_default_gamepad_mapping(&mut self, mapping: HashMap<u32, u32>) {
-        self.default_gamepad_mapping = Some(mapping);
-    }
-
-    /// Build a gamepad provider for an id the manager hasn't seen
-    /// before, honouring [`set_default_gamepad_mapping`](Self::set_default_gamepad_mapping)
-    /// when present and falling back to the Genesis default otherwise.
+    /// A gamepad provider for an id the manager hasn't seen before, with
+    /// the console's gamepad map.
     fn new_auto_gamepad(&self, gamepad_id: String) -> GamepadInputProvider {
-        match &self.default_gamepad_mapping {
-            Some(mapping) => GamepadInputProvider::with_mapping(gamepad_id, mapping.clone()),
-            None => GamepadInputProvider::new(gamepad_id),
-        }
+        GamepadInputProvider::with_mapping(gamepad_id, self.defaults.gamepad.clone())
     }
 
     /// Register a gamepad the manager has not seen yet, with the core's
@@ -567,10 +563,11 @@ impl GenericInputManager {
         self.move_provider("keyboard-p1", None);
         self.move_provider("keyboard-p2", None);
 
-        let keyboard = match self.single_keyboard_mapping.take() {
-            Some(mapping) => KeyboardInputProvider::with_mapping(mapping),
-            None => KeyboardInputProvider::new(),
-        };
+        let mapping = self
+            .single_keyboard_mapping
+            .take()
+            .unwrap_or_else(|| self.defaults.keyboard.clone());
+        let keyboard = KeyboardInputProvider::with_mapping(mapping);
         self.add_keyboard_provider(keyboard);
         self.move_provider("keyboard", Some(port));
     }
@@ -600,15 +597,29 @@ impl GenericInputManager {
 mod tests {
     use super::*;
 
-    /// Build the canonical SG1-style manager (2 ports, default keyboard
-    /// on port 0) used by most of the tests. Lets us keep test
-    /// bodies focused on what they actually assert.
+    use crate::input::providers::test_maps;
+
+    /// A two-port manager played with the test maps: the keyboard on port
+    /// 0, pads registered with the test gamepad map.
     fn sg1_style_manager() -> GenericInputManager {
-        let mut mgr = GenericInputManager::for_2_ports();
-        let keyboard = KeyboardInputProvider::new();
-        mgr.add_keyboard_provider(keyboard);
-        mgr.assign_provider_to_port("keyboard".to_string(), 0);
-        mgr
+        GenericInputManager::new(
+            2,
+            PadDefaults {
+                keyboard: test_maps::keyboard(),
+                gamepad: test_maps::gamepad(),
+            },
+        )
+    }
+
+    /// A manager with `n` ports and no provider, played with the test maps.
+    fn manager_without_providers(n: usize) -> GenericInputManager {
+        GenericInputManager::without_providers(
+            n,
+            PadDefaults {
+                keyboard: test_maps::keyboard(),
+                gamepad: test_maps::gamepad(),
+            },
+        )
     }
 
     // --------------------------------------------------------------------
@@ -636,7 +647,8 @@ mod tests {
     fn test_gamepad_assignment() {
         let mut manager = sg1_style_manager();
 
-        let gamepad = GamepadInputProvider::new("gamepad-0".to_string());
+        let gamepad =
+            GamepadInputProvider::with_mapping("gamepad-0".to_string(), test_maps::gamepad());
         manager.add_gamepad_provider(gamepad);
 
         manager.assign_provider_to_port("gamepad-0".to_string(), 1);
@@ -840,7 +852,7 @@ mod tests {
     fn test_n_ports_zero_is_legal_but_inert() {
         // Edge case: a console with no controllers (?). Manager
         // should not panic and every port query returns 0.
-        let manager = GenericInputManager::new(0);
+        let manager = manager_without_providers(0);
         assert_eq!(manager.n_ports(), 0);
         assert_eq!(manager.get_port_state(0), 0);
         assert_eq!(manager.get_port_state(7), 0);
@@ -850,7 +862,7 @@ mod tests {
     fn test_n_ports_five_for_multitap() {
         // SNES multitap = 5 ports. Each must be independently
         // addressable.
-        let mut manager = GenericInputManager::new(5);
+        let mut manager = manager_without_providers(5);
         for p in 0..5 {
             manager.set_direct_override(p, 1 << p);
         }
@@ -863,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_assign_out_of_range_is_silent() {
-        let mut manager = GenericInputManager::for_2_ports();
+        let mut manager = manager_without_providers(2);
         manager.assign_provider_to_port("missing".to_string(), 99);
         assert_eq!(manager.get_port_assignment(99), None);
         assert_eq!(manager.get_port_assignment(0), None);
@@ -993,10 +1005,15 @@ mod tests {
 
     #[test]
     fn test_add_gamepad_uses_the_default_mapping_and_no_port() {
-        let mut manager = GenericInputManager::new(2);
         let mut map = HashMap::new();
         map.insert(0u32, 5u32);
-        manager.set_default_gamepad_mapping(map.clone());
+        let mut manager = GenericInputManager::without_providers(
+            2,
+            PadDefaults {
+                gamepad: map.clone(),
+                ..PadDefaults::default()
+            },
+        );
         manager.add_gamepad("pad");
         assert_eq!(manager.get_gamepad_mapping("pad"), map);
         assert_eq!(manager.provider_port("pad"), None);
@@ -1060,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_split_keyboard_keeps_the_pads_and_restores_the_single_mapping() {
-        let mut manager = GenericInputManager::new(2);
+        let mut manager = manager_without_providers(2);
         let mut single = HashMap::new();
         single.insert("KeyZ".to_string(), 3u32);
         manager.add_keyboard_provider(KeyboardInputProvider::with_mapping(single.clone()));
@@ -1115,13 +1132,10 @@ mod tests {
 
     #[test]
     fn test_disable_split_keyboard_without_a_remembered_mapping_uses_the_default() {
-        let mut manager = GenericInputManager::new(2);
+        let mut manager = manager_without_providers(2);
         manager.enable_split_keyboard(HashMap::new(), HashMap::new());
         manager.disable_split_keyboard();
-        assert_eq!(
-            manager.get_keyboard_mapping(),
-            KeyboardInputProvider::new().get_button_mapping().clone()
-        );
+        assert_eq!(manager.get_keyboard_mapping(), test_maps::keyboard());
         assert_eq!(manager.port_providers(0), ["keyboard".to_string()]);
     }
 
@@ -1131,10 +1145,15 @@ mod tests {
         // auto-registers. Use a distinctive map (Web button 0 -> console
         // bit 5) so we can tell it apart from the Genesis fallback,
         // which sends button 0 -> bit 6.
-        let mut manager = GenericInputManager::new(2);
         let mut map = HashMap::new();
         map.insert(0u32, 5u32);
-        manager.set_default_gamepad_mapping(map);
+        let mut manager = GenericInputManager::without_providers(
+            2,
+            PadDefaults {
+                gamepad: map,
+                ..PadDefaults::default()
+            },
+        );
 
         manager.update_gamepad_button("pad".to_string(), 0, true);
 
@@ -1152,7 +1171,7 @@ mod tests {
     fn test_auto_gamepad_falls_back_to_genesis_when_unset() {
         // With no default set (the SG1 case), an auto-registered pad
         // keeps the Genesis layout: Web button 0 -> bit 6.
-        let mut manager = GenericInputManager::new(2);
+        let mut manager = manager_without_providers(2);
         manager.update_gamepad_button("pad".to_string(), 0, true);
         let state = manager.get_port_state(0);
         assert_eq!(
@@ -1166,8 +1185,8 @@ mod tests {
     fn test_auto_assign_gamepad_takes_the_lowest_port_without_a_pad() {
         // 3-port manager with pad-A already on port 1: a new pad-B
         // takes port 0, the lowest port no pad feeds, and pad-C port 2.
-        let mut manager = GenericInputManager::new(3);
-        let pad_a = GamepadInputProvider::new("pad-A".to_string());
+        let mut manager = manager_without_providers(3);
+        let pad_a = GamepadInputProvider::with_mapping("pad-A".to_string(), test_maps::gamepad());
         manager.add_gamepad_provider(pad_a);
         manager.assign_provider_to_port("pad-A".to_string(), 1);
 
@@ -1179,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_a_pad_put_on_a_port_before_its_first_input_is_not_moved() {
-        let mut manager = GenericInputManager::new(2);
+        let mut manager = manager_without_providers(2);
         manager.assign_provider_to_port("pad-A".to_string(), 1);
         manager.update_gamepad_button("pad-A".to_string(), 0, true);
         assert_eq!(manager.port_providers(0), [] as [String; 0]);
@@ -1188,7 +1207,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_port_states_length_matches_n_ports() {
-        let mut mgr5 = GenericInputManager::new(5);
+        let mut mgr5 = manager_without_providers(5);
         mgr5.snapshot(7);
         let history = mgr5.get_history(1);
         assert_eq!(history.len(), 1);
@@ -1200,7 +1219,7 @@ mod tests {
     fn test_split_keyboard_noop_when_single_port() {
         // n_ports = 1 -> split keyboard makes no sense, must be a
         // silent no-op (no panic, no provider mutation).
-        let mut manager = GenericInputManager::new(1);
+        let mut manager = manager_without_providers(1);
         let m_p1 = HashMap::new();
         let m_p2 = HashMap::new();
         manager.enable_split_keyboard(m_p1, m_p2);

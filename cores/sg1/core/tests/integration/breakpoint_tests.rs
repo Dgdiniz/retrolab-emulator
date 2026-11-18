@@ -253,16 +253,16 @@ fn test_breakpoint_disabled_not_triggered() {
 fn test_execution_mode_changes() {
     let mut emu = GenesisEmulator::new();
 
-    // Check initial mode
+    // A new machine runs.
     assert_eq!(
         emu.debugger().get_execution_mode(),
-        ExecutionMode::Paused,
-        "Should start paused"
+        ExecutionMode::Running,
+        "Should start running"
     );
 
-    // Change to running
-    emu.debugger().set_execution_mode(ExecutionMode::Running);
-    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Running);
+    // Change to paused
+    emu.debugger().set_execution_mode(ExecutionMode::Paused);
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
 
     // Change to step into
     emu.debugger().set_execution_mode(ExecutionMode::StepInto);

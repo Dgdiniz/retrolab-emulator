@@ -23,7 +23,6 @@ pub mod header;
 pub mod manifest;
 pub mod map_plan;
 pub mod presets;
-pub mod savestate;
 
 pub use board::{GenesisBoard, GenesisCartridge, SRAM_CONTROL_ADDR};
 pub use builder::{build_genesis_cartridge, build_with_manifest, detected_manifest};
@@ -37,7 +36,3 @@ pub use header::*;
 pub use manifest::{parse_manifest, CartridgeManifest};
 pub use map_plan::{MapPlan, MapSlot, MapTarget, Resolved};
 pub use presets::PresetKind;
-pub use savestate::{
-    BankMapperKind, BankMapperState, EepromChipState, EepromPhase, GenesisCoprocessorState,
-    JCartState, SvpState,
-};

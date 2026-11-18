@@ -46,7 +46,7 @@ use ssp1601::{
 };
 
 use crate::cartridge::presets::{SVP_CELL1_BASE, SVP_CELL2_BASE, SVP_MAILBOX_BASE};
-use crate::cartridge::savestate::{GenesisCoprocessorState, SvpState};
+use crate::savestate::{GenesisChipState, SvpState};
 
 /// Size of the 68000-visible SVP DRAM (`0x300000-0x31FFFF`, banks
 /// `0x30`/`0x31`).
@@ -379,7 +379,7 @@ impl Coprocessor for SvpCoprocessor {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let state = GenesisCoprocessorState::Svp(SvpState {
+        let state = GenesisChipState::Svp(SvpState {
             dram: self.dram.clone(),
             gr: self.ssp.gr,
             ram: self.ssp.ram.to_vec(),
@@ -396,9 +396,7 @@ impl Coprocessor for SvpCoprocessor {
     }
 
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
-        if let Ok(GenesisCoprocessorState::Svp(s)) =
-            bincode::deserialize::<GenesisCoprocessorState>(data)
-        {
+        if let Ok(GenesisChipState::Svp(s)) = bincode::deserialize::<GenesisChipState>(data) {
             if s.dram.len() == self.dram.len() {
                 self.dram = s.dram;
             }

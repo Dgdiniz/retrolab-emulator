@@ -1,6 +1,6 @@
 //! `savestate save|load`: capture or restore the full emulator state via
-//! `CaptureCore::save_state_at_frame_end` (a savestate is taken where a
-//! frame ends) / `EmulatorCore::load_state`.
+//! `EmulatorCore::save_state` (a savestate is taken where a frame ends) /
+//! `EmulatorCore::load_state`.
 //!
 //! `save` boots a ROM, advances `--frames`, and writes the binary state
 //! blob (optionally pre-loading an SRAM image first). `load` boots the
@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use retro_core::capture::CaptureCore;
 use retro_core::frame::run_frame_on;
+use retro_core::savestate::RomCheck;
 use retro_core::{EmulatorCore, ExecutionTier};
 
 #[derive(Args, Debug)]
@@ -88,7 +88,7 @@ fn save(args: SaveArgs) -> Result<()> {
         run_frame_on(&mut emu, ExecutionTier::Play);
     }
 
-    let state_data = emu.save_state_at_frame_end();
+    let state_data = emu.save_state();
     if state_data.is_empty() {
         anyhow::bail!("the savestate came back empty");
     }
@@ -115,7 +115,7 @@ fn load(args: LoadArgs) -> Result<()> {
         state_data.len(),
         args.state.display()
     );
-    emu.load_state(&state_data)
+    emu.load_state(&state_data, RomCheck::SameRom)
         .map_err(|e| anyhow::anyhow!("failed to load state: {e}"))?;
 
     println!(

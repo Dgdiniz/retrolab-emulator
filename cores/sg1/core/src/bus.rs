@@ -10,7 +10,7 @@ use crate::cartridge::GenesisCartridge;
 use crate::io::GenesisIo;
 use crate::memory::GenesisMemory;
 use crate::psg::Psg;
-use crate::timing::VideoRegion;
+use crate::timing::{GenesisTiming, VideoRegion};
 use crate::vdp::dma::{DmaTarget, MemoryDma};
 use crate::vdp::Vdp;
 use crate::ym2612::Ym2612;

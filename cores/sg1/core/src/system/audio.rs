@@ -56,81 +56,6 @@ impl GenesisEmulator {
         })
     }
 
-    /// Drain every available sample from the audio ring into a
-    /// freshly-allocated `Vec<f32>`.
-    ///
-    /// Convenience API for callers (CLI, integration tests) that need
-    /// an owned `Vec`. Hosts on the hot path should prefer
-    /// [`Self::drain_audio_into`] (zero-alloc pull) and
-    /// [`Self::audio_available`] (peek the queued count).
-    pub fn get_audio_buffer(&mut self) -> Vec<f32> {
-        let n = self.audio_ring.available();
-        let mut out = vec![0.0; n];
-        self.audio_ring.drain_into(&mut out);
-        out
-    }
-
-    /// Drop every queued sample without delivering it. Used by reset
-    /// paths and `set_audio_enabled(false)`.
-    ///
-    /// **Do not call from mid-stream code paths.** The ring is shared
-    /// with the host's audio worklet (via repeated drains); clearing
-    /// it while playback is live races the consumer and produces
-    /// audible ticks. Hosts that want to skip ahead should simply
-    /// stop pulling: overflow drops oldest samples automatically.
-    pub fn clear_audio_buffer(&mut self) {
-        self.audio_ring.clear();
-    }
-
-    /// Drop audio that has been generated but not yet handed to the host.
-    ///
-    /// Deliberately empty on this core, and that is the whole point: a
-    /// headless frame here never queues anything. `generate_and_mix_audio`
-    /// advances the converter and both chips, serialized state the desync
-    /// hash covers, and then returns *before* the mix and the ring push, so
-    /// a rollback re-simulation leaves nothing pending to discard. Clearing
-    /// the host ring instead would throw away audio that was presented and
-    /// is still on its way to the speaker.
-    ///
-    /// Exists so the netplay runner has one call it can make after a re-sim
-    /// without asking which core it is talking to.
-    pub fn discard_pending_audio(&mut self) {}
-
-    /// Drain up to `out.len()` queued samples into `out`. Returns the
-    /// number actually written; if fewer than `out.len()` are
-    /// available the tail of `out` is left untouched (caller must
-    /// `truncate` if they want the exact count).
-    ///
-    /// Zero-alloc pull path. Wired through the WASM bridge as
-    /// `getAudioSamplesN(n)`.
-    pub fn drain_audio_into(&mut self, out: &mut [f32]) -> usize {
-        self.audio_ring.drain_into(out)
-    }
-
-    /// Number of stereo-interleaved samples currently queued. Used
-    /// by the host to right-size pulls, see `getAudioAvailable()` in
-    /// the WASM bridge.
-    pub fn audio_available(&self) -> usize {
-        self.audio_ring.available()
-    }
-
-    /// Cumulative count of "silence fillers" the ring inserted on
-    /// drain because the host asked for more than was available.
-    /// A non-zero value means the producer is behind, the symptom
-    /// the user hears as audio dropouts. Exposed for telemetry /
-    /// diagnostics.
-    pub fn audio_ring_underruns(&self) -> u64 {
-        self.audio_ring.underrun_count()
-    }
-
-    /// Cumulative count of samples the ring dropped from the front
-    /// because incoming data wouldn't fit. > 0 means the host is
-    /// behind, usually a stalled animation frame loop. Useful for
-    /// the same telemetry overlay as `audio_ring_underruns()`.
-    pub fn audio_ring_overflows(&self) -> u64 {
-        self.audio_ring.overflow_count()
-    }
-
     /// Get the mixed waveform ring buffer for visualization.
     /// Returns the last N mono samples of the mixed PSG+YM2612 output.
     pub fn get_mixed_waveform(&self, samples: u32) -> Vec<f32> {
@@ -172,7 +97,10 @@ impl GenesisEmulator {
     /// waveform-visualization ring, and the host audio ring) is pure
     /// presentation (none of it is serialized), so a headless frame returns
     /// before it: audio is generated but not rendered, exactly as rollback
-    /// netcode requires.
+    /// netcode requires. So a headless frame queues nothing, and after a
+    /// rollback's frames there is nothing pending to discard (the trait's
+    /// `discard_pending_audio` does nothing here): clearing the host ring
+    /// instead would throw away sound presented and still on its way.
     pub(super) fn generate_and_mix_audio(&mut self, present: bool) {
         /// Soft limiter using tanh-like curve.
         /// Below threshold (0.8), signal passes through linearly.
@@ -298,9 +226,9 @@ impl GenesisEmulator {
 
         // The ring is bounded; if the host is way behind (debugger
         // paused, tab backgrounded) `push_slice` quietly drops the
-        // oldest samples and bumps `overflow_count`. Callers diagnose
-        // backpressure through `audio_ring_overflows()`.
-        self.audio_ring
+        // oldest samples and counts them, which `host_audio().overflows()`
+        // reports.
+        self.host_audio
             .push_slice(&self.mix_sample_buf[..mix_count * 2]);
     }
 }

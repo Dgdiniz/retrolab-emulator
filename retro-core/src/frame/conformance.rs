@@ -920,7 +920,8 @@ pub fn a_reset_or_a_load_empties_the_call_stack_and_keeps_the_history<E: DebugMa
     assert_eq!(history(&e), kept, "a load of the program keeps the history");
 
     let kept = into_the_call(&mut e);
-    e.load_state(&state).expect("the state loads");
+    e.load_state(&state, crate::savestate::RomCheck::SameRom)
+        .expect("the state loads");
     assert!(call_stack(&e).is_empty(), "after a state load");
     assert_eq!(history(&e), kept, "a state load keeps the history");
 }

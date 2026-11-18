@@ -12,7 +12,6 @@ use crate::debugger::{
 };
 use crate::expr_ctx::m68k_register;
 use crate::vdp::dma::MemoryDma;
-use retro_core::cpu::Addressable;
 use retro_core::debug::{Access, ByteOrder, CpuExprContext};
 use retro_core::frame::DebugMachine;
 
@@ -115,33 +114,15 @@ impl GenesisEmulator {
         std::mem::take(&mut self.instruction_access_log)
     }
 
-    /// Live video debugger over the VDP: per-layer toggles plus
-    /// tile/palette/sprite/register inspection through the generic
-    /// `retro_core::video::VideoDebugger` interface. Mirrors
-    /// `SnesEmulator::video_debugger()` so the host drives both consoles
-    /// through the same trait.
-    pub fn video_debugger(&mut self) -> &mut dyn retro_core::video::VideoDebugger {
-        self.bus.vdp_mut()
-    }
-
-    /// Live audio debugger over the primary FM chip (YM2612): channel,
-    /// operator, and register inspection through the generic
-    /// `retro_core::audio::AudioDebugger` interface. Mirrors
-    /// `SnesEmulator::audio_debugger()`. The PSG is a second audio chip
-    /// reached via [`Self::psg`]; the generic single-chip trait exposes the
-    /// FM synth, which is what the host's primary audio panels drive.
-    pub fn audio_debugger(&mut self) -> &mut dyn retro_core::audio::AudioDebugger {
-        self.bus.ym2612_mut()
-    }
-
     /// A [`CartridgeDebugger`](retro_core::cartridge::CartridgeDebugger) over
     /// the installed cartridge: memory-map / ROM / SRAM regions, the mapper
     /// state (every Genesis shape a custom mapper named by its plan), the
     /// per-chip coprocessor snapshots, and ROM/SRAM breakpoints (which
     /// append to the emulator's shared breakpoint list). The same surface
-    /// as `SnesEmulator::cartridge_debugger()`. With no cartridge loaded it
-    /// binds an empty plan so the surface stays non-`Option`.
-    pub fn cartridge_debugger(
+    /// as the SNES's. With no cartridge loaded it binds an empty plan so
+    /// the surface stays non-`Option`; [`EmulatorCore::cartridge_debugger`]
+    /// is it boxed.
+    pub fn map_plan_debugger(
         &mut self,
     ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
         let (plan, rom_size, sram_size, chip_states) = match self.bus.cartridge() {
@@ -224,14 +205,6 @@ impl GenesisEmulator {
         (0..size)
             .map(|i| self.bus.peek_byte(addr.wrapping_add(i)))
             .collect()
-    }
-
-    /// Write memory for debugging, a byte at a time through the bus's CPU path:
-    /// a write to an I/O or VDP port acts as a CPU write would.
-    pub fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
-        for (i, &byte) in data.iter().enumerate() {
-            self.bus.write(addr + i as u32, byte);
-        }
     }
 
     /// Disassemble instructions starting at address.
@@ -367,35 +340,15 @@ impl GenesisEmulator {
 
         instructions
     }
-
-    /// Bitmap-aware disassembly window around `pc` for the given CPU.
-    ///
-    /// Thin wrapper that builds a [`GenesisDisasmDriver`] and delegates
-    /// to [`retro_core::debug::disassemble_window`]. The algorithm
-    /// (backward probe + forward decode) lives in `retro-core` so
-    /// other cores share it; only the CPU-specific decoding and the
-    /// 68K-vs-Z80 probe-offset table stay here.
-    ///
-    /// `cpu_id`: 0 = 68K, 1 = Z80.
-    pub fn disassemble_window(
-        &mut self,
-        cpu_id: usize,
-        pc: u32,
-        before_count: usize,
-        after_count: usize,
-    ) -> Vec<DisasmRow> {
-        let mut driver = GenesisDisasmDriver { emu: self, cpu_id };
-        retro_core::disassemble_window(&mut driver, pc, before_count, after_count)
-    }
 }
 
 /// Adapter wiring [`GenesisEmulator`] into the generic
 /// [`retro_core::DisasmDriver`] contract for one CPU at a time. Owned
-/// briefly inside [`GenesisEmulator::disassemble_window`] so we can
+/// briefly inside [`EmulatorCore::disassemble_window`] so we can
 /// borrow the emulator mutably across the (back + forward) walk.
-struct GenesisDisasmDriver<'a> {
-    emu: &'a mut GenesisEmulator,
-    cpu_id: usize,
+pub(super) struct GenesisDisasmDriver<'a> {
+    pub(super) emu: &'a mut GenesisEmulator,
+    pub(super) cpu_id: usize,
 }
 
 impl<'a> retro_core::DisasmDriver for GenesisDisasmDriver<'a> {

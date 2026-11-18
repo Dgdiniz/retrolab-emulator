@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use retro_core::cartridge::{AccessType, CartridgeDebugger, MemoryType};
+use retro_core::cartridge::{AccessType, MemoryType};
 use retro_core::EmulatorCore;
 use snes1_core::{PresetKind, SnesEmulator};
 

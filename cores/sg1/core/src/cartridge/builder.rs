@@ -38,7 +38,7 @@ use super::manifest::{
 };
 use super::map_plan::MapPlan;
 use super::presets::{self, PresetKind};
-use super::savestate::BankMapperKind;
+use crate::savestate::BankMapperKind;
 
 /// Genesis NTSC master clock. The composable chips are re-anchored to the
 /// real region clock by `reset_chip` once the system is up; this is only the

@@ -214,56 +214,28 @@ pub(super) fn genesis_cpus() -> Vec<CpuInfo> {
     ]
 }
 
-/// The pad's buttons, as the host is told them.
+/// The pad's buttons, as the host is told them: each id the button's bit
+/// in `InputState::buttons`, the bit the six-button pad reads it from.
 pub(super) fn genesis_button_layout() -> Vec<ButtonInfo> {
-    vec![
-        ButtonInfo {
-            name: "Up".to_string(),
-            id: 0,
-        },
-        ButtonInfo {
-            name: "Down".to_string(),
-            id: 1,
-        },
-        ButtonInfo {
-            name: "Left".to_string(),
-            id: 2,
-        },
-        ButtonInfo {
-            name: "Right".to_string(),
-            id: 3,
-        },
-        ButtonInfo {
-            name: "A".to_string(),
-            id: 4,
-        },
-        ButtonInfo {
-            name: "B".to_string(),
-            id: 5,
-        },
-        ButtonInfo {
-            name: "C".to_string(),
-            id: 6,
-        },
-        ButtonInfo {
-            name: "Start".to_string(),
-            id: 7,
-        },
-        ButtonInfo {
-            name: "X".to_string(),
-            id: 8,
-        },
-        ButtonInfo {
-            name: "Y".to_string(),
-            id: 9,
-        },
-        ButtonInfo {
-            name: "Z".to_string(),
-            id: 10,
-        },
-        ButtonInfo {
-            name: "Mode".to_string(),
-            id: 11,
-        },
+    use crate::io::devices::Genesis6ButtonDevice as Pad;
+    [
+        ("Up", Pad::BTN_UP),
+        ("Down", Pad::BTN_DOWN),
+        ("Left", Pad::BTN_LEFT),
+        ("Right", Pad::BTN_RIGHT),
+        ("A", Pad::BTN_A),
+        ("B", Pad::BTN_B),
+        ("C", Pad::BTN_C),
+        ("Start", Pad::BTN_START),
+        ("X", Pad::BTN_X),
+        ("Y", Pad::BTN_Y),
+        ("Z", Pad::BTN_Z),
+        ("Mode", Pad::BTN_MODE),
     ]
+    .into_iter()
+    .map(|(name, id)| ButtonInfo {
+        name: name.to_string(),
+        id,
+    })
+    .collect()
 }

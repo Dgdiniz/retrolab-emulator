@@ -6,7 +6,7 @@
 //! nothing between an access and the byte it reaches: a SNES cartridge has
 //! no RAM switch, no register outside its plan, and no write it watches
 //! itself (a chip's observers are the chip set's). What it names is the
-//! typed list of chip states the savestate holds ([`CoprocessorState`]) and
+//! typed list of chip states the savestate holds ([`SnesChipState`]) and
 //! what the cartridge answers where it holds nothing: `0x00`, for a ROM read
 //! past the image, a battery-RAM read past its size and a chip window with
 //! no chip, as this core has always answered them; an address no slot
@@ -15,7 +15,7 @@
 use retro_core::cartridge::{Board, ComposableCartridge, Coprocessor};
 
 use super::map_plan::MapSlot;
-use crate::savestate::CoprocessorState;
+use crate::savestate::SnesChipState;
 
 /// A SNES cartridge: retro-core's composable cartridge over the SNES's
 /// board.
@@ -29,7 +29,7 @@ pub struct SnesBoard;
 impl Board for SnesBoard {
     type Slot = MapSlot;
     type Chip = dyn Coprocessor;
-    type ChipState = CoprocessorState;
+    type ChipState = SnesChipState;
 
     const MISSING: Option<u8> = Some(0x00);
 }
@@ -125,7 +125,7 @@ mod tests {
 
     /// A *real* `Sdd1Chip` round-trips its mapping state through the
     /// cartridge's typed savestate bridge, exercising the
-    /// `CoprocessorState::Sdd1` bincode path (MMC latches + enables + the
+    /// `SnesChipState::Sdd1` bincode path (MMC latches + enables + the
     /// `$43xx` DMA shadow).
     #[test]
     fn savestate_bridge_round_trips_real_sdd1_chip() {
@@ -161,7 +161,7 @@ mod tests {
 
         let saved = a.coprocessors_savestate();
         let orig = match saved.as_slice() {
-            [(id, CoprocessorState::Sdd1(s))] if *id == SDD1_CHIP_ID => s.clone(),
+            [(id, SnesChipState::Sdd1(s))] if *id == SDD1_CHIP_ID => s.clone(),
             other => panic!("expected one S-DD1 entry, got {other:?}"),
         };
         assert_eq!(orig.mmc[0], 5 << 20);
@@ -172,7 +172,7 @@ mod tests {
         let mut b = test_cartridge_with_chips(rom, plan(), sdd1_chips());
         b.restore_coprocessors_savestate(&saved, HZ);
         let round = match b.coprocessors_savestate().as_slice() {
-            [(_, CoprocessorState::Sdd1(s))] => s.clone(),
+            [(_, SnesChipState::Sdd1(s))] => s.clone(),
             other => panic!("expected one S-DD1 entry after restore, got {other:?}"),
         };
         assert_eq!(round, orig, "the S-DD1 state round-trips byte-for-byte");

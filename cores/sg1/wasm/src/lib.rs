@@ -3,11 +3,11 @@
 //! This crate provides a generic WASM interface that works with any
 //! `EmulatorCore` implementation.
 
-use retro_core::capture::CaptureCore;
 use retro_core::debug::trace_to_text;
 use retro_core::input::{gamepad_map_from_text_keys, gamepad_map_with_text_keys};
+use retro_core::savestate::RomCheck;
 use retro_core::*;
-use retro_wasm::js::{map_as_object, set_property, uint16_array};
+use retro_wasm::js::{load_state_refusal, map_as_object, set_property, uint16_array};
 use sg1_core::cartridge::parse_manifest;
 use sg1_core::debugger::{TraceEntryBinaryZ80, SOUND_CPU};
 use sg1_core::system::GenesisSnapshotConsole;
@@ -18,21 +18,6 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
-}
-
-/// A `loadState` refusal for JS. A savestate made on another ROM is an
-/// `Error` named `SaveStateOtherRom`, what the platform reads to offer
-/// loading it anyway (`loadStateAnyRom`); any other refusal is its reason
-/// as text, as before.
-fn load_state_refusal(error: LoadStateError) -> JsValue {
-    match &error {
-        LoadStateError::OtherRom { .. } => {
-            let err = js_sys::Error::new(&error.to_string());
-            err.set_name("SaveStateOtherRom");
-            err.into()
-        }
-        LoadStateError::Unreadable(reason) => JsValue::from_str(reason),
-    }
 }
 
 /// Read a gamepad button map sent from JS: a `Map` with number keys, or a
@@ -121,28 +106,25 @@ impl RetroEmulator {
         self.genesis.reset();
     }
 
-    /// Power-on (cold) reset: a power cycle, not the reset button. Rebuilds the
-    /// whole machine to a freshly-constructed + reloaded state, clearing every
-    /// volatile subsystem a soft reset leaves dirty (work/Z80 RAM, the 68K user
-    /// stack pointer, VDP VRAM/CRAM/VSRAM, the audio chips, and the I/O + bus
-    /// latches). Netplay uses this so two peers derive a byte-identical frame-0
-    /// state hash regardless of how long each ran the game before the session.
-    /// Cartridge ROM is preserved; SRAM is a fresh image (a save resumes via the
-    /// seeded savestate transfer).
+    /// Netplay's power cycle, not the reset button: every chip as a fresh
+    /// load of the cartridge leaves it (work and Z80 RAM, the 68000's user
+    /// stack pointer, the VDP and its memories, the sound chips, the I/O and
+    /// bus latches), in the region the machine is in, the save RAM a fresh
+    /// image (a save resumes through the seeded savestate transfer). The
+    /// host's settings and the debugger's mode are kept; every breakpoint,
+    /// watchpoint and event breakpoint is removed, every trace switched off,
+    /// and nothing the input holds stays pressed. Two peers that ran the game
+    /// for different lengths reach the same frame-0 state hash.
     #[wasm_bindgen(js_name = powerOnReset)]
     pub fn power_on_reset(&mut self) {
         self.genesis.power_on_reset();
     }
 
-    /// Hard reset (power cycle): clear every volatile subsystem the reset
-    /// button leaves behind (work RAM, Z80 RAM, the VDP register file plus
-    /// VRAM/CRAM/VSRAM, the audio chips, and the I/O + bus latches), while
-    /// keeping the cartridge plugged in, so battery-backed SRAM survives.
+    /// The app's Reset: the power cycle of [`Self::power_on_reset`] that
+    /// keeps the battery save, and the debugger's breakpoints and traces.
     ///
     /// This is what a player means by "reset the game"; [`Self::reset`] is
-    /// the hardware reset *button*, which preserves RAM. Unlike
-    /// [`Self::power_on_reset`] (netplay's byte-identical cold boot) this
-    /// does NOT blank SRAM, so it is safe to expose in the UI.
+    /// the hardware reset *button*, which preserves RAM.
     #[wasm_bindgen(js_name = hardReset)]
     pub fn hard_reset(&mut self) {
         self.genesis.hard_reset();
@@ -239,9 +221,10 @@ impl RetroEmulator {
         self.genesis.frame_count()
     }
 
-    /// Set the video region from `"ntsc"` | `"pal"` (case-insensitive).
-    /// Call right after `loadRom`, before running frames: both netplay
-    /// peers agree on region in the session handshake.
+    /// Run in the region `"ntsc"` | `"pal"` (case-insensitive): a power
+    /// cycle in it that keeps the save; the region the machine is in already
+    /// changes nothing. Both netplay peers agree on the region in the session
+    /// handshake.
     #[wasm_bindgen(js_name = setRegion)]
     pub fn set_region(&mut self, region: &str) -> Result<(), JsValue> {
         self.genesis
@@ -262,10 +245,10 @@ impl RetroEmulator {
     /// checkout.
     #[wasm_bindgen(js_name = getBuildId)]
     pub fn get_build_id(&self) -> String {
-        format!(
-            "sg1@{}+{}",
+        retro_wasm::build_id(
+            GenesisEmulator::CORE_ID,
             env!("CARGO_PKG_VERSION"),
-            option_env!("GIT_HASH").unwrap_or("unknown")
+            option_env!("GIT_HASH"),
         )
     }
 
@@ -333,11 +316,11 @@ impl RetroEmulator {
     /// `getAudioSamplesN(n)` instead.
     #[wasm_bindgen(js_name = getAudioSamples)]
     pub fn get_audio_samples(&mut self) -> Vec<f32> {
-        self.genesis.get_audio_buffer()
+        self.genesis.host_audio_mut().take_all()
     }
 
     /// Drain **at most `n`** queued samples from the audio ring.
-    /// Returns a `Float32Array` of length `min(n, audio_available())`.
+    /// Returns a `Float32Array` of length `min(n, getAudioAvailable())`.
     ///
     /// Preferred over `getAudioSamples` for AudioWorklets that pull a
     /// fixed lookahead each tick, avoids over-drain (silence on the
@@ -345,10 +328,10 @@ impl RetroEmulator {
     /// when 4096 is all the worklet wanted).
     #[wasm_bindgen(js_name = getAudioSamplesN)]
     pub fn get_audio_samples_n(&mut self, n: usize) -> Vec<f32> {
-        let available = self.genesis.audio_available();
+        let available = self.genesis.host_audio().available();
         let take = n.min(available);
         let mut out = vec![0.0_f32; take];
-        let written = self.genesis.drain_audio_into(&mut out);
+        let written = self.genesis.host_audio_mut().drain_into(&mut out);
         out.truncate(written);
         out
     }
@@ -359,7 +342,7 @@ impl RetroEmulator {
     /// Used by the host to right-size a `getAudioSamplesN` pull.
     #[wasm_bindgen(js_name = getAudioAvailable)]
     pub fn get_audio_available(&self) -> usize {
-        self.genesis.audio_available()
+        self.genesis.host_audio().available()
     }
 
     /// Cumulative count of samples the ring dropped from the front
@@ -368,12 +351,12 @@ impl RetroEmulator {
     ///
     /// There is no underrun counterpart, on purpose. The ring can only
     /// record an underrun when a drain asks for more than it holds, and
-    /// every path out of here sizes its request from `audio_available()`
+    /// every path out of here sizes its request from the queued count
     /// first, so such a counter could never move, and the host would read
     /// a constant zero as though it were a measurement.
     #[wasm_bindgen(js_name = getAudioRingOverflows)]
     pub fn get_audio_ring_overflows(&self) -> u64 {
-        self.genesis.audio_ring_overflows()
+        self.genesis.host_audio().overflows()
     }
 
     /// **Deprecated and intentionally a no-op.** `getAudioSamples`
@@ -494,7 +477,7 @@ impl RetroEmulator {
     /// player runs.
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&mut self) -> Vec<u8> {
-        self.genesis.save_state_at_frame_end()
+        self.genesis.save_state()
     }
 
     /// Load emulator state. A savestate made on another ROM is refused
@@ -502,7 +485,7 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = loadState)]
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), JsValue> {
         self.genesis
-            .load_state_with_rom_check(data, RomCheck::SameRom)
+            .load_state(data, RomCheck::SameRom)
             .map_err(load_state_refusal)
     }
 
@@ -511,7 +494,7 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = loadStateAnyRom)]
     pub fn load_state_any_rom(&mut self, data: &[u8]) -> Result<(), JsValue> {
         self.genesis
-            .load_state_with_rom_check(data, RomCheck::AnyRom)
+            .load_state(data, RomCheck::AnyRom)
             .map_err(load_state_refusal)
     }
 
@@ -569,7 +552,6 @@ impl RetroEmulator {
     /// cartridge debugger; a plain cartridge reports `mapper_type: "None"`.
     #[wasm_bindgen(js_name = getMapperState)]
     pub fn get_mapper_state(&mut self) -> Result<JsValue, JsValue> {
-        use retro_core::cartridge::CartridgeDebugger;
         let state = self.genesis.cartridge_debugger().get_mapper_state();
         Ok(map_as_object(&mapper_state_json(state)))
     }
@@ -626,7 +608,6 @@ impl RetroEmulator {
     /// debugger (`mapper_type: "None"` for a plain cartridge).
     #[wasm_bindgen(js_name = getCartridgeManifest)]
     pub fn get_cartridge_manifest(&mut self) -> JsValue {
-        use retro_core::cartridge::CartridgeDebugger;
         let regions = self.genesis.cartridge_map_regions();
         let rom_regions: Vec<_> = regions
             .iter()

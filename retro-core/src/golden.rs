@@ -9,8 +9,9 @@
 //! audio capture armed so the host mix is produced and drained every
 //! frame. What is here is the same for every console, the run loop, the
 //! record file, the comparison, the manifest grammar and where the records
-//! are looked for; each core adds its own layer (the state hash, the button
-//! names, its manifest flags).
+//! are looked for; each core says what its console makes different
+//! ([`GoldenConsole`]: the record's tag, the pad's buttons, the manifest's
+//! flags, how an entry's ROM is loaded, its real-time clock).
 //!
 //! The records themselves are not in this tree. They are made from games
 //! the repository does not carry (hashes of their frames, savestates taken
@@ -60,22 +61,66 @@ pub struct FrameRecord {
     pub height: u32,
 }
 
+/// The time every real-time clock reads during a golden run:
+/// 2026-01-01 00:00:00 UTC.
+pub const GOLDEN_UNIX_TIME: i64 = 1_767_225_600;
+
+/// What a console's golden runs need to know of it.
+pub trait GoldenConsole: EmulatorCore + Sized {
+    /// The tag on the first line of its record files (`"sg1-golden 1"`).
+    const RECORD_FORMAT: &'static str;
+    /// Its pad's buttons, as a manifest names them, with their bits.
+    const BUTTONS: &'static [(&'static str, u32)];
+    /// The bare words its manifest's entries may carry.
+    const FLAGS: &'static [&'static str];
+
+    /// A new machine, as a golden run starts with.
+    fn new_for_golden() -> Self;
+
+    /// Load the entry's ROM as its flags say.
+    fn load_for_golden(&mut self, entry: &GoldenEntry, rom: &[u8]) -> Result<(), String>;
+
+    /// Pin the real-time clock a cartridge reads to `unix_time` (`None`:
+    /// the host's clock); returns the pin it replaced. A console with no
+    /// cartridge clock pins nothing.
+    fn pin_real_time_clock(unix_time: Option<i64>) -> Option<i64> {
+        let _ = unix_time;
+        None
+    }
+}
+
+/// [`run_golden_with`] on the play tier, what a player runs.
+pub fn run_golden<E: GoldenConsole + DebugMachine>(
+    emu: &mut E,
+    spec: &GoldenSpec,
+    on_shot: impl FnMut(u64, u32, u32, &[u8]),
+    on_audio: impl FnMut(&[f32]),
+) -> Vec<FrameRecord> {
+    run_golden_with(
+        emu,
+        spec,
+        |e| {
+            run_frame_on(e, ExecutionTier::Play);
+        },
+        on_shot,
+        on_audio,
+    )
+}
+
 /// Drive `emu` through `spec`, calling `on_shot(frame, width, height,
 /// rgb)` at each listed shot and `on_audio(samples)` with every frame's
-/// samples, and return one record per frame. `run_frame` advances the
-/// machine one presented frame (the trait's `run_frame`, or the frame
-/// loop a player's host actually calls when a core has more than one),
-/// and `state_hash` is the core's hash of its whole serialized state.
-/// `emu` must have its ROM loaded and be ready to run; audio capture is
-/// armed here.
-pub fn run_golden<E: EmulatorCore>(
+/// samples, and return one record per frame, the state hash the trait's.
+/// `run_frame` advances the machine one presented frame. `emu` must have
+/// its ROM loaded and be ready to run; audio capture is armed here, and the
+/// real-time clock pinned to [`GOLDEN_UNIX_TIME`] for the run.
+pub fn run_golden_with<E: GoldenConsole>(
     emu: &mut E,
     spec: &GoldenSpec,
     mut run_frame: impl FnMut(&mut E),
-    state_hash: impl Fn(&E) -> u64,
     mut on_shot: impl FnMut(u64, u32, u32, &[u8]),
     mut on_audio: impl FnMut(&[f32]),
 ) -> Vec<FrameRecord> {
+    let previous_time = E::pin_real_time_clock(Some(GOLDEN_UNIX_TIME));
     emu.set_audio_enabled(true);
     let mut records = Vec::with_capacity(spec.frames as usize);
     for i in 0..spec.frames {
@@ -106,7 +151,7 @@ pub fn run_golden<E: EmulatorCore>(
         }
         records.push(FrameRecord {
             frame,
-            state: state_hash(emu),
+            state: emu.state_hash(),
             video: fnv1a64(&rgb),
             audio,
             samples,
@@ -114,21 +159,21 @@ pub fn run_golden<E: EmulatorCore>(
             height,
         });
     }
+    E::pin_real_time_clock(previous_time);
     records
 }
 
-/// [`run_golden`] with every frame on `tier` through the frame driver
+/// [`run_golden_with`] with every frame on `tier` through the frame driver
 /// ([`run_frame_on`]), what each CPU's trace holds dropped after each
 /// frame. Held to a golden manifest's records, it shows a tier runs the
 /// play tier's machine: a run on a debug tier arms only breakpoints that
 /// log ([`arm_everything`]), so a frame call that does not end its frame
 /// is the defect such a run looks for, and it panics naming the frame.
 /// `FullDebug` steps rather than running frames and is refused.
-pub fn run_golden_on<E: DebugMachine>(
+pub fn run_golden_on<E: GoldenConsole + DebugMachine>(
     emu: &mut E,
     spec: &GoldenSpec,
     tier: ExecutionTier,
-    state_hash: impl Fn(&E) -> u64,
     on_shot: impl FnMut(u64, u32, u32, &[u8]),
     on_audio: impl FnMut(&[f32]),
 ) -> Vec<FrameRecord> {
@@ -150,7 +195,7 @@ pub fn run_golden_on<E: DebugMachine>(
             e.debugger().clear_trace_flushed(cpu);
         }
     };
-    run_golden(emu, spec, run_frame, state_hash, on_shot, on_audio)
+    run_golden_with(emu, spec, run_frame, on_shot, on_audio)
 }
 
 /// Arm every check the debugger has, each set to log rather than stop: an
@@ -636,6 +681,29 @@ pub fn parse_manifest(
         entries.push(entry);
     }
     Ok(entries)
+}
+
+/// The console's record file: [`format_records`] with its tag.
+pub fn format_records_of<E: GoldenConsole>(header: &[String], records: &[FrameRecord]) -> String {
+    format_records(E::RECORD_FORMAT, header, records)
+}
+
+/// [`parse_records`] of the console's record file, its tag required.
+pub fn parse_records_of<E: GoldenConsole>(
+    text: &str,
+) -> Result<(Vec<String>, Vec<FrameRecord>), String> {
+    parse_records(E::RECORD_FORMAT, text)
+}
+
+/// [`parse_manifest`] with the console's buttons and flags.
+pub fn parse_manifest_of<E: GoldenConsole>(text: &str) -> Result<Vec<GoldenEntry>, String> {
+    parse_manifest(text, E::BUTTONS, E::FLAGS)
+}
+
+/// The run spec an entry describes, its presses read with the console's
+/// buttons.
+pub fn entry_spec_of<E: GoldenConsole>(entry: &GoldenEntry) -> Result<GoldenSpec, String> {
+    entry.spec(E::BUTTONS)
 }
 
 #[cfg(test)]

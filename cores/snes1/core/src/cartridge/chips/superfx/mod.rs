@@ -59,7 +59,7 @@ use superfx_gsu::Gsu;
 
 use self::bus::{GsuBus, GsuPeekBus};
 use crate::debugger::{cpu_state_gsu, TraceEntryBinaryGsu};
-use crate::savestate::{CoprocessorState, SuperFxPixelCacheState, SuperFxState};
+use crate::savestate::{SnesChipState, SuperFxPixelCacheState, SuperFxState};
 
 pub use crate::cartridge::chips::{SUPERFX_MMIO_BASE, SUPERFX_RAM_BASE, SUPERFX_ROM_BASE};
 
@@ -358,7 +358,7 @@ impl Coprocessor for SuperFxChip {
     /// keeps its own field names (`sfr`, `pbr`, `romcl`, ...), not the GSU's.
     fn serialize(&self) -> Vec<u8> {
         let g = &self.gsu;
-        let state = CoprocessorState::SuperFx(SuperFxState {
+        let state = SnesChipState::SuperFx(SuperFxState {
             r: g.registers,
             sfr: g.status,
             pbr: g.program_bank,
@@ -406,8 +406,7 @@ impl Coprocessor for SuperFxChip {
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
         // A garbage/empty blob or a foreign variant decodes to something we
         // can't consume and is dropped, leaving the chip untouched.
-        let Ok(CoprocessorState::SuperFx(state)) = bincode::deserialize::<CoprocessorState>(data)
-        else {
+        let Ok(SnesChipState::SuperFx(state)) = bincode::deserialize::<SnesChipState>(data) else {
             return;
         };
         let g = &mut self.gsu;
@@ -915,7 +914,7 @@ mod tests {
         );
 
         // A foreign coprocessor variant is also dropped.
-        let foreign = bincode::serialize(&CoprocessorState::Sa1(Default::default())).unwrap();
+        let foreign = bincode::serialize(&SnesChipState::Sa1(Default::default())).unwrap();
         c.restore(&foreign, NTSC_HZ);
         assert_eq!(c.read(mmio(0x3000), 0), 0xAB, "foreign variant dropped");
     }

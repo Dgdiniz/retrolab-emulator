@@ -63,7 +63,7 @@ use retro_core::cartridge::{
     SourcePlace,
 };
 
-use crate::savestate::{CoprocessorState, Spc7110State};
+use crate::savestate::{SnesChipState, Spc7110State};
 
 mod alu;
 mod dataport;
@@ -578,7 +578,7 @@ impl Coprocessor for Spc7110Chip {
         self.decomp_triggers = 0;
     }
 
-    /// Volatile savestate: the typed [`CoprocessorState::Spc7110`] blob, the
+    /// Volatile savestate: the typed [`SnesChipState::Spc7110`] blob, the
     /// flat `$4800-$4842` register array, the resolved `dx/ex/fx` window
     /// offsets, and each functional unit (ALU, data-port, decoder incl. the
     /// mid-decompression decoder state, and, on `$F9` carts, the RTC command
@@ -588,7 +588,7 @@ impl Coprocessor for Spc7110Chip {
     /// mapping latches are meaningful even at reset), so an SPC7110 cartridge
     /// always contributes one snapshot entry.
     fn serialize(&self) -> Vec<u8> {
-        let state = CoprocessorState::Spc7110(Spc7110State {
+        let state = SnesChipState::Spc7110(Spc7110State {
             regs: self.regs.to_vec(),
             dx_offset: self.dx_offset,
             ex_offset: self.ex_offset,
@@ -604,8 +604,7 @@ impl Coprocessor for Spc7110Chip {
     fn restore(&mut self, data: &[u8], _master_clock_hz: u64) {
         // A garbage/empty blob or a foreign variant decodes to something we
         // can't consume and is dropped, leaving the chip untouched.
-        let Ok(CoprocessorState::Spc7110(state)) = bincode::deserialize::<CoprocessorState>(data)
-        else {
+        let Ok(SnesChipState::Spc7110(state)) = bincode::deserialize::<SnesChipState>(data) else {
             return;
         };
         let n = self.regs.len().min(state.regs.len());
@@ -1382,8 +1381,8 @@ mod tests {
         assert!(!blob.is_empty(), "SPC7110 always contributes a snapshot");
         assert!(
             matches!(
-                bincode::deserialize::<CoprocessorState>(&blob),
-                Ok(CoprocessorState::Spc7110(_))
+                bincode::deserialize::<SnesChipState>(&blob),
+                Ok(SnesChipState::Spc7110(_))
             ),
             "blob decodes to the typed SPC7110 variant"
         );
@@ -1463,10 +1462,9 @@ mod tests {
 
         chip.restore(&[], NTSC_HZ); // empty
         chip.restore(&[0xFF, 0x00, 0x13, 0x37], NTSC_HZ); // garbage
-        let foreign = bincode::serialize(&CoprocessorState::Sdd1(
-            crate::savestate::Sdd1State::default(),
-        ))
-        .unwrap();
+        let foreign =
+            bincode::serialize(&SnesChipState::Sdd1(crate::savestate::Sdd1State::default()))
+                .unwrap();
         chip.restore(&foreign, NTSC_HZ); // foreign variant
 
         assert_eq!(

@@ -270,7 +270,8 @@ fn what_the_event_catalogue_holds() {
     );
 }
 
-/// A name the binding does not know sets the running mode.
+/// A new emulator runs and a load leaves the mode as it was; a name the
+/// binding does not know sets the running mode.
 #[wasm_bindgen_test]
 fn what_the_execution_mode_reads() {
     let mut emu = RetroEmulator::new("genesis").unwrap();
@@ -300,8 +301,8 @@ fn what_the_execution_mode_reads() {
     assert_shapes(
         &found,
         &[
-            ("a new emulator", "\"Paused\""),
-            ("after a load", "\"Paused\""),
+            ("a new emulator", "\"Running\""),
+            ("after a load", "\"Running\""),
             ("set to Running", "\"Running\""),
             ("set to StepOver", "\"StepOver\""),
             ("set to a name it does not know", "\"Running\""),

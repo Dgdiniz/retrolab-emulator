@@ -74,7 +74,7 @@ use retro_core::emulator::StepResult;
 use retro_core::types::{CpuState, Instruction};
 
 use crate::debugger::{cpu_state_hg51b, TraceEntryBinaryCx4};
-use crate::savestate::{ConverterState, CoprocessorState, Cx4State};
+use crate::savestate::{Cx4State, SnesChipState};
 
 pub use crate::cartridge::chips::{CX4_CHIP_ID, CX4_MMIO_BASE, CX4_RAM_BASE, CX4_ROM_BASE};
 
@@ -422,7 +422,7 @@ impl Coprocessor for Cx4Chip {
         let mut cache_data = Vec::with_capacity(512);
         cache_data.extend_from_slice(&core.cache[0].words);
         cache_data.extend_from_slice(&core.cache[1].words);
-        let state = CoprocessorState::Cx4(Cx4State {
+        let state = SnesChipState::Cx4(Cx4State {
             pc: core.pc,
             p: core.page,
             n: core.flags.negative,
@@ -466,11 +466,7 @@ impl Coprocessor for Cx4Chip {
             cache_page_number: [core.cache[0].page, core.cache[1].page],
             cache_data,
             data_ram: core.data_ram.to_vec(),
-            sync: ConverterState {
-                reference_cycles: self.sync.reference_cycles(),
-                samples_at_reference: self.sync.samples_at_reference(),
-                remainder: self.sync.remainder(),
-            },
+            sync: self.sync.state(),
             cx4_cycles: core.cycles,
             accesses: self.accesses,
         });
@@ -480,8 +476,7 @@ impl Coprocessor for Cx4Chip {
     fn restore(&mut self, data: &[u8], master_clock_hz: u64) {
         // A blob that does not decode to a Cx4 state is ignored and the chip
         // left as it is.
-        let Ok(CoprocessorState::Cx4(state)) = bincode::deserialize::<CoprocessorState>(data)
-        else {
+        let Ok(SnesChipState::Cx4(state)) = bincode::deserialize::<SnesChipState>(data) else {
             return;
         };
         let core = &mut self.core;
@@ -554,13 +549,7 @@ impl Coprocessor for Cx4Chip {
         } else {
             master_clock_hz
         };
-        self.sync = IntegerRateConverter::with_state(
-            CX4_CLOCK_HZ,
-            master_clock_hz,
-            state.sync.reference_cycles,
-            state.sync.samples_at_reference,
-            state.sync.remainder,
-        );
+        self.sync = IntegerRateConverter::from_state(CX4_CLOCK_HZ, master_clock_hz, &state.sync);
         self.accesses = state.accesses;
     }
 
@@ -904,8 +893,7 @@ mod tests {
 
         // A foreign coprocessor variant is also dropped.
         let foreign =
-            bincode::serialize(&CoprocessorState::Sa1(crate::savestate::Sa1State::default()))
-                .unwrap();
+            bincode::serialize(&SnesChipState::Sa1(crate::savestate::Sa1State::default())).unwrap();
         c.restore(&foreign, NTSC_HZ);
         assert_eq!(c.core.accumulator, 0x00_00AB, "foreign variant dropped");
     }

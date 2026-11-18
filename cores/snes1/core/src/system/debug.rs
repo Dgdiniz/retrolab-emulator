@@ -2,12 +2,10 @@
 //! snapshots and trace entries, and the checks the debugger makes around a
 //! step (execute, watch, call stack, events).
 
-use retro_core::audio::AudioDebugger;
 use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
 use retro_core::debugger::DebuggerCore;
 use retro_core::frame::DebugMachine;
-use retro_core::video::VideoDebugger;
 use retro_core::{DisasmRow, DisasmRowKind, InstructionTrace, StackFrame};
 
 use wdc65816::Wdc65816;
@@ -25,27 +23,6 @@ use crate::trace_format::{effective_address, EffRegs};
 use crate::bus::{BusDebugEvent, SnesBus, SnesPeekBus};
 
 impl SnesEmulator {
-    /// Mutable [`VideoDebugger`] view of the PPU (VRAM / palette /
-    /// sprites / tiles / layers + `toggle_layer`).
-    ///
-    /// Mirrors the SG1 precedent: `DebuggerCore::video_debugger()`
-    /// returns `None` because the debugger struct doesn't own the PPU,
-    /// so the host inspects video state through this emulator accessor
-    /// instead.
-    pub fn video_debugger(&mut self) -> &mut dyn VideoDebugger {
-        self.bus.ppu_mut()
-    }
-
-    /// Mutable [`AudioDebugger`] view of the S-DSP (8 voices, per-voice
-    /// mute, output/per-voice waveforms).
-    ///
-    /// As with [`Self::video_debugger`], `DebuggerCore::audio_debugger()`
-    /// returns `None` (the debugger doesn't own the APU); inspection
-    /// goes through this emulator accessor instead.
-    pub fn audio_debugger(&mut self) -> &mut dyn AudioDebugger {
-        self.bus.apu_mut()
-    }
-
     /// Live Mode 7 matrix as signed `[A, B, C, D, X, Y]`, for the Mode 7 viewer.
     pub fn get_mode7_matrix(&self) -> [i16; 6] {
         self.bus.ppu().get_mode7_matrix()
@@ -128,9 +105,9 @@ impl SnesEmulator {
     /// [`crate::cartridge::MapPlan`], the mapper state (the preset's
     /// [`crate::cartridge::PresetKind::mapper_id`]), the per-chip coprocessor
     /// snapshots, and ROM/SRAM breakpoints delegating into the emulator's
-    /// own breakpoint list. The same surface as
-    /// `GenesisEmulator::cartridge_debugger()`.
-    pub fn cartridge_debugger(
+    /// own breakpoint list. The same surface as the Mega Drive's;
+    /// [`EmulatorCore::cartridge_debugger`] is it boxed.
+    pub fn map_plan_debugger(
         &mut self,
     ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
         let plan = self.bus.cartridge_plan().cloned().unwrap_or_default();
@@ -177,7 +154,7 @@ impl SnesEmulator {
     /// uPD7725 registers + data RAM), or `None` for a plain cartridge.
     /// Read-only path for the CLI `info` command and the WASM debugger; it
     /// does not borrow the breakpoint list like
-    /// [`Self::cartridge_debugger`] does. See
+    /// [`Self::map_plan_debugger`] does. See
     /// [`Self::coprocessors_debug_state`] for the full set.
     pub fn coprocessor_debug_state(&self) -> Option<retro_core::cartridge::ExpansionChipState> {
         self.bus.cartridge()?.coprocessor_debug_state()
@@ -200,29 +177,6 @@ impl SnesEmulator {
             .cartridge()
             .map(|c| c.coprocessor_labels())
             .unwrap_or_default()
-    }
-
-    /// Write `data` to the 65C816 address space starting at `addr` for
-    /// debugging. This drives the live bus, so writes to register space take
-    /// effect with their normal side effects (matching what a CPU store would
-    /// do); plain WRAM/SRAM edits behave as the memory editor expects.
-    /// [`EmulatorCore::read_memory_debug`] reads through the bus's
-    /// side-effect-free peek instead.
-    ///
-    /// A write to a PPU register is not one the frame made: until the next
-    /// frame's line 1, a repaint and a layer render draw from the registers
-    /// as they stand, which show it, rather than from the line table. What
-    /// the PPU's data ports take from it is put down to the debugger.
-    pub fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
-        self.bus.begin_debugger_writes();
-        for (i, &byte) in data.iter().enumerate() {
-            let at = addr.wrapping_add(i as u32);
-            if crate::bus::is_ppu_register_address(at) {
-                self.bus.ppu_mut().note_registers_edited();
-            }
-            self.bus.write(at, byte);
-        }
-        self.bus.end_debugger_writes();
     }
 
     /// Snapshot the live 65C816 state into a binary trace entry, resolving
@@ -509,27 +463,6 @@ impl SnesEmulator {
             cycle_count,
         }
     }
-
-    /// Bitmap-aware disassembly window around `pc` for the given CPU
-    /// (`0` = 65C816, `1` = SPC700, `2` = the cartridge's CPU on an SA-1,
-    /// Super FX or Cx4 cart).
-    ///
-    /// Thin wrapper that builds a [`SnesDisasmDriver`] and delegates to
-    /// [`retro_core::debug::disassemble_window`]. The backward probe +
-    /// forward decode algorithm lives in `retro-core`; only the
-    /// CPU-specific decoding and the probe-offset table stay here. The
-    /// SPC700 is decoded against a side-effect-free view of its memory
-    /// so a window can never perturb the running audio program.
-    pub fn disassemble_window(
-        &mut self,
-        cpu_id: usize,
-        pc: u32,
-        before_count: usize,
-        after_count: usize,
-    ) -> Vec<DisasmRow> {
-        let mut driver = SnesDisasmDriver { emu: self, cpu_id };
-        retro_core::disassemble_window(&mut driver, pc, before_count, after_count)
-    }
 }
 
 /// What [`SnesEmulator::maintain_call_stack_65816`] needs to know of a
@@ -641,11 +574,11 @@ fn decode_one_snes(emu: &mut SnesEmulator, cpu_id: usize, addr: u32) -> DisasmRo
 
 /// Adapter wiring [`SnesEmulator`] into the generic
 /// [`retro_core::DisasmDriver`] contract for one CPU at a time. Owned
-/// briefly inside [`SnesEmulator::disassemble_window`] so the emulator
+/// briefly inside [`EmulatorCore::disassemble_window`] so the emulator
 /// can be borrowed mutably across the (backward + forward) walk.
-struct SnesDisasmDriver<'a> {
-    emu: &'a mut SnesEmulator,
-    cpu_id: usize,
+pub(super) struct SnesDisasmDriver<'a> {
+    pub(super) emu: &'a mut SnesEmulator,
+    pub(super) cpu_id: usize,
 }
 
 impl retro_core::DisasmDriver for SnesDisasmDriver<'_> {

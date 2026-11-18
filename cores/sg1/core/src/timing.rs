@@ -35,74 +35,59 @@ pub const SCANLINES_NTSC: u32 = 262;
 /// Number of scanlines per frame (PAL).
 pub const SCANLINES_PAL: u32 = 313;
 
-/// Number of 68000 CPU cycles per scanline (NTSC).
-/// Approximately: 7.67 MHz / 59.92 Hz / 262 scanlines
-pub const CYCLES_PER_SCANLINE_NTSC: u32 = 488;
-
-/// 68000 CPU cycles per scanline (PAL), as [`VideoRegion::cycles_per_scanline`]
-/// reports it. A PAL line is 3420 master clocks, 488.57 68K cycles as on NTSC.
-pub const CYCLES_PER_SCANLINE_PAL: u32 = 487;
-
-/// Video region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoRegion {
-    #[default]
-    Ntsc,
-    Pal,
+/// The Mega Drive's clocks and line counts in each video region (the region
+/// itself is retro-core's [`VideoRegion`]).
+pub trait GenesisTiming {
+    /// The master clock, in Hz.
+    fn master_clock(&self) -> u64;
+    /// The 68000's clock, the master clock over 7, in Hz.
+    fn cpu_clock(&self) -> u64;
+    /// Lines in a frame.
+    fn scanlines(&self) -> u32;
+    /// Master clocks in a line, 3420 in both regions.
+    fn master_clocks_per_scanline(&self) -> u32;
+    /// The 68000's divider of the master clock, 7.
+    fn cpu_divider(&self) -> u32;
+    /// Frames per second: the master clock over the master clocks in one
+    /// frame (`scanlines x 3420`), NTSC 59.9227 Hz, PAL 49.7015 Hz. Derived
+    /// from the same arithmetic the VDP runs, so the rate the host paces
+    /// against can never drift from the frame the machine produces.
+    fn frame_rate(&self) -> f32;
 }
 
-impl VideoRegion {
-    /// Get the master clock for this region.
-    pub fn master_clock(&self) -> u64 {
+pub use retro_core::types::VideoRegion;
+
+impl GenesisTiming for VideoRegion {
+    fn master_clock(&self) -> u64 {
         match self {
             VideoRegion::Ntsc => MASTER_CLOCK_NTSC,
             VideoRegion::Pal => MASTER_CLOCK_PAL,
         }
     }
 
-    /// Get the 68000 CPU clock for this region.
-    pub fn cpu_clock(&self) -> u64 {
+    fn cpu_clock(&self) -> u64 {
         match self {
             VideoRegion::Ntsc => CPU_68K_CLOCK_NTSC,
             VideoRegion::Pal => CPU_68K_CLOCK_PAL,
         }
     }
 
-    /// Get the number of scanlines per frame for this region.
-    pub fn scanlines(&self) -> u32 {
+    fn scanlines(&self) -> u32 {
         match self {
             VideoRegion::Ntsc => SCANLINES_NTSC,
             VideoRegion::Pal => SCANLINES_PAL,
         }
     }
 
-    /// Get the number of CPU cycles per scanline for this region (approximate).
-    pub fn cycles_per_scanline(&self) -> u32 {
-        match self {
-            VideoRegion::Ntsc => CYCLES_PER_SCANLINE_NTSC,
-            VideoRegion::Pal => CYCLES_PER_SCANLINE_PAL,
-        }
-    }
-
-    /// Get the exact number of master clocks per scanline (no fractional error).
-    /// NTSC/PAL: 3420 master clocks per scanline.
-    pub fn master_clocks_per_scanline(&self) -> u32 {
-        // Both NTSC and PAL use 3420 master clocks per scanline
+    fn master_clocks_per_scanline(&self) -> u32 {
         3420
     }
 
-    /// Get the CPU clock divider from master clock.
-    /// The 68000 runs at master_clock / 7.
-    pub fn cpu_divider(&self) -> u32 {
+    fn cpu_divider(&self) -> u32 {
         7
     }
 
-    /// Frames per second for this region: the master clock over the
-    /// master clocks in one frame (`scanlines x 3420`), NTSC 59.9227 Hz,
-    /// PAL 49.7015 Hz. Derived from the same arithmetic the VDP runs, so
-    /// the rate the host paces against can never drift from the frame
-    /// the machine actually produces.
-    pub fn frame_rate(&self) -> f32 {
+    fn frame_rate(&self) -> f32 {
         let clocks_per_frame = self.scanlines() as f64 * self.master_clocks_per_scanline() as f64;
         (self.master_clock() as f64 / clocks_per_frame) as f32
     }
@@ -129,12 +114,10 @@ mod tests {
     fn test_video_region_methods() {
         let ntsc = VideoRegion::Ntsc;
         assert_eq!(ntsc.scanlines(), 262);
-        assert_eq!(ntsc.cycles_per_scanline(), 488);
         assert!((ntsc.frame_rate() - 59.9227).abs() < 1e-4);
 
         let pal = VideoRegion::Pal;
         assert_eq!(pal.scanlines(), 313);
-        assert_eq!(pal.cycles_per_scanline(), 487);
         assert!((pal.frame_rate() - 49.7015).abs() < 1e-4);
     }
 

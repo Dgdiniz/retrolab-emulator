@@ -59,9 +59,9 @@ use retro_core::cpu::Resettable;
 #[cfg(feature = "nec-lle")]
 use upd7725::Upd7725;
 
-use crate::savestate::CoprocessorState;
 #[cfg(feature = "nec-lle")]
 use crate::savestate::Dsp1State;
+use crate::savestate::SnesChipState;
 
 #[cfg(feature = "nec-lle")]
 use super::firmware::{ByteOrder, Dsp1Firmware, Dsp1Revision};
@@ -425,23 +425,19 @@ impl Dsp1Chip {
     /// `None` for the idle stub. Never includes the firmware/program ROM,
     /// that is re-staged from the host on load, like the cartridge ROM. The
     /// generic [`Coprocessor::serialize`] bridges this to opaque bytes.
-    pub fn savestate(&self) -> Option<CoprocessorState> {
+    pub fn savestate(&self) -> Option<SnesChipState> {
         match &self.backend {
             #[cfg(feature = "nec-lle")]
             Backend::Lle {
                 core,
                 sync,
                 dsp_cycles,
-            } => Some(CoprocessorState::Dsp1Lle(Dsp1State {
+            } => Some(SnesChipState::Dsp1Lle(Dsp1State {
                 core: crate::savestate::Upd7725State::capture(core),
                 // Same three-field converter anchor the APU persists; the
                 // num/den ratio is re-derived from the region clock on
                 // restore (see `restore_savestate`).
-                sync: crate::savestate::ConverterState {
-                    reference_cycles: sync.reference_cycles(),
-                    samples_at_reference: sync.samples_at_reference(),
-                    remainder: sync.remainder(),
-                },
+                sync: sync.state(),
                 dsp_cycles: *dsp_cycles,
             })),
             // The idle stub has no internal state worth persisting.
@@ -454,9 +450,9 @@ impl Dsp1Chip {
     /// arriving at the idle stub (firmware absent on this run), is dropped,
     /// there's no matching core to receive it.
     #[cfg(feature = "nec-lle")]
-    pub fn restore_savestate(&mut self, state: &CoprocessorState, master_clock_hz: u64) {
+    pub fn restore_savestate(&mut self, state: &SnesChipState, master_clock_hz: u64) {
         if let (
-            CoprocessorState::Dsp1Lle(lle),
+            SnesChipState::Dsp1Lle(lle),
             Backend::Lle {
                 core,
                 sync,
@@ -465,13 +461,7 @@ impl Dsp1Chip {
         ) = (state, &mut self.backend)
         {
             lle.core.restore(core);
-            *sync = IntegerRateConverter::with_state(
-                DSP1_CLOCK_HZ,
-                master_clock_hz,
-                lle.sync.reference_cycles,
-                lle.sync.samples_at_reference,
-                lle.sync.remainder,
-            );
+            *sync = IntegerRateConverter::from_state(DSP1_CLOCK_HZ, master_clock_hz, &lle.sync);
             *dsp_cycles = lle.dsp_cycles;
         }
     }
@@ -479,7 +469,7 @@ impl Dsp1Chip {
     /// Without the `nec-lle` feature no backend here holds state, so every
     /// blob is dropped.
     #[cfg(not(feature = "nec-lle"))]
-    pub fn restore_savestate(&mut self, _state: &CoprocessorState, _master_clock_hz: u64) {}
+    pub fn restore_savestate(&mut self, _state: &SnesChipState, _master_clock_hz: u64) {}
 }
 
 impl Coprocessor for Dsp1Chip {
@@ -588,7 +578,7 @@ impl Coprocessor for Dsp1Chip {
     }
 
     /// Volatile state as opaque bytes: a `bincode`-encoded
-    /// [`CoprocessorState`] (empty for the idle stub). Bridges the console's
+    /// [`SnesChipState`] (empty for the idle stub). Bridges the console's
     /// typed savestate to the generic [`Coprocessor`] surface so the on-disk
     /// format is unchanged.
     fn serialize(&self) -> Vec<u8> {
@@ -601,7 +591,7 @@ impl Coprocessor for Dsp1Chip {
     fn restore(&mut self, data: &[u8], master_clock_hz: u64) {
         // A garbage/empty blob decodes to `Err` and is dropped, matching the
         // idle-stub no-op path.
-        if let Ok(state) = bincode::deserialize::<CoprocessorState>(data) {
+        if let Ok(state) = bincode::deserialize::<SnesChipState>(data) {
             self.restore_savestate(&state, master_clock_hz);
         }
     }
@@ -1035,7 +1025,7 @@ mod tests {
 
         let saved = chip.savestate().expect("LLE chip yields a savestate");
         let saved_dsp = match &saved {
-            CoprocessorState::Dsp1Lle(s) => s.clone(),
+            SnesChipState::Dsp1Lle(s) => s.clone(),
             other => panic!("expected an LLE savestate, got {other:?}"),
         };
 
@@ -1084,9 +1074,9 @@ mod tests {
         assert!(chip.savestate().is_none());
 
         // A foreign blob restored into the idle stub is dropped silently.
-        let blob = CoprocessorState::Dsp1Lle(crate::savestate::Dsp1State {
+        let blob = SnesChipState::Dsp1Lle(crate::savestate::Dsp1State {
             core: crate::savestate::Upd7725State::blank(),
-            sync: crate::savestate::ConverterState::default(),
+            sync: retro_core::audio::RateConverterState::default(),
             dsp_cycles: 123,
         });
         chip.restore_savestate(&blob, DEFAULT_MASTER_CLOCK_HZ);

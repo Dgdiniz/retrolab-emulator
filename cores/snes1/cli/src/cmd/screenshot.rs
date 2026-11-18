@@ -271,7 +271,7 @@ fn save_layer_images(emu: &mut SnesEmulator, output_path: &Path) -> Result<()> {
 /// The active-rectangle crop every PNG-producing command uses; it lives
 /// with the golden harness so the picture a golden hashes and the picture
 /// a screenshot shows are the same bytes.
-pub(crate) use snes1_core::golden::crop_framebuffer_rgb;
+pub(crate) use retro_core::golden::crop_framebuffer_rgb;
 
 fn make_bar(show: bool, len: u64) -> Option<ProgressBar> {
     if !show {

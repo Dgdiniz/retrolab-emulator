@@ -11,6 +11,7 @@ use retro_core::capture::{
     CaptureCore, CaptureRecording, FrameWrite, WriteKind, WriteOrigin, Writer, WORDS_PER_RECORD,
 };
 use retro_core::cpu::Addressable;
+use retro_core::savestate::RomCheck;
 use retro_core::EmulatorCore;
 use snes1_core::ppu::writes::{port, FRAME_WRITES_CAP, VRAM_BYTES};
 use snes1_core::{parse_manifest, SnesBus, SnesEmulator};
@@ -715,7 +716,8 @@ fn the_recorders_start_empty_and_a_reset_a_state_load_and_a_rom_load_empty_them(
     step_to(&mut emu, spin);
     assert!(!is_empty(&mut emu));
     emu.write_vram_debug(0, &[9]);
-    emu.load_state(&state).expect("its own state loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("its own state loads");
     assert!(is_empty(&mut emu), "a state load empties them");
 
     step_to(&mut emu, spin);

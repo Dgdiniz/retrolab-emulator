@@ -19,6 +19,7 @@ use retro_core::capture::{
 };
 use retro_core::debug::DebugEvent;
 use retro_core::frame::{run_frame_on, run_to_capture_boundary_on};
+use retro_core::savestate::RomCheck;
 use retro_core::types::{Breakpoint, BreakpointType};
 use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
@@ -665,7 +666,11 @@ fn a_cram_transfer_with_the_display_off_paints_its_lines_and_they_come_back() {
 
 /// The samples the frames so far left for the host.
 fn take_audio(emu: &mut GenesisEmulator) -> Vec<u32> {
-    emu.get_audio_buffer().iter().map(|s| s.to_bits()).collect()
+    emu.host_audio_mut()
+        .take_all()
+        .iter()
+        .map(|s| s.to_bits())
+        .collect()
 }
 
 #[test]
@@ -704,7 +709,7 @@ fn recording_changes_nothing_on_any_frame_loop() {
 fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not() {
     let rom = raster_program();
     let mut emu = recording(&rom);
-    let state = emu.save_state_at_frame_end();
+    let state = emu.save_state();
     let all_unrecorded = |emu: &GenesisEmulator| {
         let table = emu.line_states().expect("still armed");
         column(&table, "kind")
@@ -719,7 +724,8 @@ fn the_setting_outlives_a_reset_a_load_and_a_power_cycle_but_the_records_do_not(
     emu.set_execution_mode(ExecutionMode::Running);
     run_frame_on(&mut emu, ExecutionTier::Play);
     assert!(!all_unrecorded(&emu));
-    emu.load_state(&state).expect("the savestate loads");
+    emu.load_state(&state, RomCheck::SameRom)
+        .expect("the savestate loads");
     assert!(all_unrecorded(&emu));
 
     // A ROM that is another: the whole machine but the cartridge is

@@ -22,6 +22,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use retro_core::frame::run_frame_on;
+use retro_core::savestate::RomCheck;
 use retro_core::EmulatorCore;
 use retro_core::ExecutionTier;
 use sg1_core::savestate::SAVE_STATE_VERSION;
@@ -152,7 +153,7 @@ fn every_savestate_layout_written_keeps_loading() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = fs::read(&path).expect("the fixture reads");
         let mut emu = emulator_with_program();
-        emu.load_state(&bytes)
+        emu.load_state(&bytes, RomCheck::SameRom)
             .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
         assert_holds_the_program_state(&emu, &name);
     }
