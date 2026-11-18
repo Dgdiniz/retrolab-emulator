@@ -169,16 +169,20 @@ impl RetroEmulator {
         }
     }
 
-    /// Reset the emulator. Cartridge ROM and SRAM are preserved.
+    /// The console's reset button: the 65816 and the sound processor boot
+    /// again, the registers of the 5A22, its DMA channels and the PPU go
+    /// back to their power-on values, and the sprite table is cleared.
+    /// Work RAM, the PPU's VRAM and CGRAM, the sound processor's memory and
+    /// the battery save keep what the game left there.
     pub fn reset(&mut self) {
         self.snes.reset();
         self.refresh_present();
     }
 
     /// Netplay's power cycle, not the reset button: a new CPU and the ROM
-    /// loaded again, which clears every volatile subsystem a soft reset
-    /// leaves as the game left it (the 128 KiB WRAM, the 65816 registers,
-    /// the PPU's VRAM, CGRAM and OAM, and the APU), in the region the
+    /// loaded again, which clears every volatile subsystem the reset button
+    /// leaves as the game left it (the 128 KiB WRAM, the PPU's VRAM and
+    /// CGRAM, and the sound processor's memory), in the region the
     /// machine is in, the SRAM a fresh image (a save resumes through the
     /// seeded savestate transfer). The host's settings and the debugger's
     /// mode are kept; every breakpoint, watchpoint and event breakpoint is

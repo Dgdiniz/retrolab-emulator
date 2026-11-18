@@ -219,6 +219,154 @@ fn a_power_cycle_keeps_the_overscan_preference() {
     assert!(emu.ppu().show_overscan_enabled());
 }
 
+/// A 1 MiB LoROM image (FastROM) with 8 KiB of battery SRAM. Its boot code
+/// counts its boots in work RAM ($12), waits about five frames with the
+/// NMI not enabled, stores in $11 how many NMIs ran during that wait, then
+/// enables the NMI and sets BG mode 1, BG1 on the main screen and the
+/// display on at full brightness. The NMI handler counts NMIs in $10.
+fn boot_counting_rom() -> Vec<u8> {
+    #[rustfmt::skip]
+    const BOOT: [u8; 44] = [
+        0x78,             // SEI
+        0xA9, 0x80,       // LDA #$80
+        0x8D, 0x00, 0x21, // STA $2100: forced blank
+        0x64, 0x10,       // STZ $10: the NMI count
+        0xE6, 0x12,       // INC $12: boots
+        0xA0, 0x00,       // LDY #$00
+        0xA2, 0x00,       // outer: LDX #$00
+        0xCA,             // inner: DEX
+        0xD0, 0xFD,       // BNE inner
+        0x88,             // DEY
+        0xD0, 0xF8,       // BNE outer
+        0xA5, 0x10,       // LDA $10
+        0x85, 0x11,       // STA $11: the NMIs that ran during the wait
+        0xA9, 0x80,       // LDA #$80
+        0x8D, 0x00, 0x42, // STA $4200: NMI on
+        0xA9, 0x01,       // LDA #$01
+        0x8D, 0x05, 0x21, // STA $2105: BG mode 1
+        0x8D, 0x2C, 0x21, // STA $212C: BG1 on the main screen
+        0xA9, 0x0F,       // LDA #$0F
+        0x8D, 0x00, 0x21, // STA $2100: display on, brightness 15
+        0x80, 0xFE,       // BRA *
+    ];
+    let mut chip = vec![0u8; 0x10_0000];
+    chip[..BOOT.len()].copy_from_slice(&BOOT);
+    // NMI: INC $10 / LDA $4210 / RTI. IRQ: RTI.
+    chip[0x40..0x46].copy_from_slice(&[0xE6, 0x10, 0xAD, 0x10, 0x42, 0x40]);
+    chip[0x60] = 0x40;
+    let h = 0x7FB0;
+    chip[h + 0x10..h + 0x10 + 21].copy_from_slice(b"RESET LINE TEST      ");
+    chip[h + 0x25] = 0x30; // LoROM, FastROM
+    chip[h + 0x26] = 0x02; // ROM, RAM and battery
+    chip[h + 0x27] = 0x0A; // 1 MiB
+    chip[h + 0x28] = 0x03; // 8 KiB of RAM
+    chip[h + 0x29] = 0x01; // North America: NTSC
+    chip[h + 0x2A] = 0x01;
+    let checksum: u16 = 0x1234;
+    chip[h + 0x2C..h + 0x2E].copy_from_slice(&(!checksum).to_le_bytes());
+    chip[h + 0x2E..h + 0x30].copy_from_slice(&checksum.to_le_bytes());
+    chip[0x7FFA..0x7FFC].copy_from_slice(&0x8040u16.to_le_bytes());
+    chip[0x7FFC..0x7FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+    chip[0x7FFE..0x8000].copy_from_slice(&0x8060u16.to_le_bytes());
+    chip
+}
+
+/// The reset button does what the console's reset line does: the 5A22's
+/// registers, its DMA channels and the PPU's registers go back to the
+/// values a power-on gives and the sprite table is cleared, and work RAM,
+/// VRAM, CGRAM, the sound processor's memory and the battery save keep the
+/// game's. So the boot's wait, which runs with no NMI after a power-on,
+/// runs with none after a reset: the NMI the game had enabled is off again.
+#[test]
+fn the_reset_button_resets_the_registers_and_clears_the_sprite_table() {
+    use crate::dma::DmaController;
+    use crate::ppu::Ppu;
+    use crate::savestate::PpuState;
+    use crate::system_regs::SystemRegs;
+
+    // The NMIs during the boot's wait ($11) and the boots ($12).
+    let counts = |emu: &mut SnesEmulator| {
+        let ram = emu.read_memory_debug(0x7E_0011, 2);
+        (ram[0], ram[1])
+    };
+    // The PPU's state but VRAM and CGRAM, which a reset keeps.
+    let registers = |state: PpuState| {
+        let mut state = state;
+        state.vram.clear();
+        state.cgram.clear();
+        format!("{state:?}")
+    };
+
+    let mut emu = SnesEmulator::new();
+    emu.load_rom(&boot_counting_rom()).expect("loads");
+    emu.set_execution_mode(ExecutionMode::Running);
+    emu.write_vram_debug(0, &[0xAB, 0xCD]);
+    emu.write_cgram_debug(1, &[0x001F]);
+    emu.write_oam_debug(0, &[0x10, 0x20, 0x30, 0x40]);
+    emu.write_oam_debug(0x21F, &[0x55]);
+    emu.bus.apu_mut().spc_write(0x8000, 0x77);
+    emu.set_save_ram(&[0x5A; 8192]);
+    for _ in 0..10 {
+        emu.run_frame();
+    }
+    assert_eq!(counts(&mut emu), (0, 1));
+    assert_eq!(emu.bus.system_regs().nmitimen(), 0x80);
+    assert_eq!(emu.ppu().bgmode(), 1);
+    assert_eq!(emu.ppu().display_brightness(), 15);
+
+    // What else a game leaves in the 5A22 and its channels, and what a
+    // register write leaves for the next instruction boundary.
+    emu.bus.write_fast(0x00_420D, 0x01); // FastROM on
+    emu.bus.write_fast(0x00_4202, 0x12); // WRMPYA
+    emu.bus.write_fast(0x00_4302, 0x34); // channel 0's A-bus address
+    emu.bus.write_fast(0x00_2181, 0x56); // the WRAM port's address
+    emu.bus.write_fast(0x00_420B, 0x01); // a general DMA asked for
+    emu.bus.system_regs_mut().set_nmi_flag(true);
+    emu.bus.write_fast(0x00_4200, 0x00);
+    emu.bus.write_fast(0x00_4200, 0x80); // an NMI enabled with its flag up
+    assert_eq!(emu.bus.cycles_for(0x80_8000), 6);
+
+    emu.reset();
+
+    assert_eq!(
+        format!("{:?}", emu.bus.system_regs().to_savestate()),
+        format!("{:?}", SystemRegs::new().to_savestate())
+    );
+    assert_eq!(
+        format!("{:?}", emu.bus.dma().to_savestate()),
+        format!("{:?}", DmaController::new().to_savestate())
+    );
+    assert_eq!(
+        registers(emu.ppu().to_savestate()),
+        registers(Ppu::new().to_savestate())
+    );
+    assert!(!emu.bus.memsel_fast());
+    assert_eq!(emu.bus.cycles_for(0x80_8000), 8);
+    let bus = emu.bus.to_savestate();
+    assert_eq!(bus.wmdata.wm_addr, 0);
+    assert_eq!(bus.pending_general_dma, 0);
+    assert!(!bus.pending_irq_reschedule);
+    assert!(!bus.pending_nmi);
+    assert_eq!((bus.cached_h_dot, bus.cached_v_scanline), (0, 0));
+    // The sprite table is cleared, both tables (the comparison above holds
+    // OAM to a new PPU's); work RAM, VRAM, CGRAM, the sound processor's
+    // memory and the save keep what the game left there.
+    let ppu = emu.ppu().to_savestate();
+    assert!(ppu.oam.iter().all(|&b| b == 0));
+    assert_eq!(counts(&mut emu), (0, 1));
+    assert_eq!(ppu.vram[0], 0xCDAB);
+    assert_eq!(ppu.cgram[1], 0x001F);
+    assert_eq!(emu.bus.apu().aram()[0x8000], 0x77);
+    assert_eq!(emu.get_save_ram().map(|s| s[0]), Some(0x5A));
+
+    for _ in 0..10 {
+        emu.run_frame();
+    }
+    assert_eq!(counts(&mut emu), (0, 2));
+    assert_eq!(emu.bus.system_regs().nmitimen(), 0x80);
+    assert_eq!(emu.ppu().bgmode(), 1);
+}
+
 #[test]
 fn step_cpu_one_returns_empty_step_result() {
     let mut emu = SnesEmulator::new();

@@ -90,6 +90,13 @@ impl WmdataState {
     }
 }
 
+impl super::SnesBus {
+    /// The reset line puts the port's address back to 0.
+    pub(crate) fn reset_wram_port(&mut self) {
+        self.wmdata = WmdataState::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

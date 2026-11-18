@@ -446,8 +446,14 @@ const RECORDED: &[(&str, &str)] = &[
     ("load: no ROM loaded", "Ok | the saved machine's state: false"),
     ("load: garbage", "Unreadable(\"not a retro-core savestate (missing magic)\") | not a retro-core savestate (missing magic)"),
     ("load: empty", "Unreadable(\"not a retro-core savestate (missing magic)\") | not a retro-core savestate (missing magic)"),
-    ("reset: right after", "hash fd279d71fe23a45e | work RAM 406ec6cb96e116a6 boots 1 NMIs 44 | save RAM 146a7cfda5862325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
-    ("reset: two frames later", "hash 31287c8fe886622f | work RAM 218554fdc070772f boots 2 NMIs 46 | save RAM 146a7cfda5862325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
+    // The reset button resets the registers of the 5A22, its DMA channels
+    // and the PPU, as the console's reset line does. The state moves, and
+    // two frames on work RAM too: the loop adds the pad registers, which
+    // read 0 after the reset until the next automatic read, where they kept
+    // the Start the pad held at frame 300.
+    ("reset: right after", "hash f989ff0e5b73ca4e | work RAM 406ec6cb96e116a6 boots 1 NMIs 44 | save RAM 146a7cfda5862325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
+    // As the line above.
+    ("reset: two frames later", "hash c7ac4597f8dcf27f | work RAM 53ecd1d7fe8b189f boots 2 NMIs 46 | save RAM 146a7cfda5862325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
     // The app's Reset, a power cycle that keeps the save; its breakpoints
     // and its mode are kept.
     ("hard_reset: right after", "hash cda23afb8772ab20 | work RAM c74b47c8c74a2325 boots 0 NMIs 0 | save RAM 146a7cfda5862325 | mode Running | breakpoints 1 | region ntsc | frames 0"),

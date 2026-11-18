@@ -1037,20 +1037,19 @@ impl Ppu {
         self.forget_recorded_writes();
     }
 
-    /// Reset to the canonical PPU power-on state. Memories are
-    /// **not** zeroed (so a quick reset preserves whatever the
-    /// debugger was inspecting); registers are reset to the
-    /// settings the chip settles on (checked against bsnes-plus):
-    /// `display_disable = true`, `vram_incsize = 1`, everything
-    /// else cleared. Real silicon initialises most registers to
-    /// random patterns, software that runs on a cold boot
-    /// always writes them itself, so the deterministic zero is
-    /// the safe choice for replays and tests.
+    /// The reset line, which a new PPU starts from too: every register
+    /// back to the settings the chip settles on (checked against
+    /// bsnes-plus): `display_disable = true`, `vram_incsize = 1`,
+    /// everything else cleared; and the sprite table cleared, both its
+    /// tables. VRAM and CGRAM keep what the game left there. Real silicon
+    /// initialises most registers to random patterns, software that runs
+    /// on a cold boot always writes them itself, so the deterministic zero
+    /// is the safe choice for replays and tests.
     pub fn reset(&mut self) {
-        // Register-side reset only, VRAM/OAM/CGRAM persist so a
-        // debugger reset is non-destructive. The boot ROM writes
-        // its own initial palette / sprite table before enabling
-        // the display anyway.
+        // The sprites vanish with the reset; the boot code writes its own
+        // palette and sprite table before it turns the display on anyway.
+        self.oam.fill(0);
+
         self.display_disable = true;
         self.display_brightness = 0;
 
@@ -1484,11 +1483,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_registers_but_preserves_memories() {
+    fn reset_clears_the_registers_and_the_sprite_table_and_keeps_vram_and_cgram() {
         let mut ppu = Ppu::new();
         // Stir some state.
         ppu.vram[0x1234] = 0xBEEF;
         ppu.oam[0x10] = 0xAA;
+        ppu.oam[0x21F] = 0x55;
         ppu.cgram[5] = 0x7FFF;
         ppu.display_disable = false;
         ppu.bgmode = 7;
@@ -1497,10 +1497,10 @@ mod tests {
 
         assert!(ppu.display_disable, "reset re-asserts forced blank");
         assert_eq!(ppu.bgmode, 0, "reset zeroes bgmode");
-        // Memories are preserved across reset, the boot ROM
-        // re-initialises them on its own.
+        // The sprite table is cleared, both tables; VRAM and CGRAM keep
+        // what the game left there.
+        assert!(ppu.oam.iter().all(|&b| b == 0));
         assert_eq!(ppu.vram[0x1234], 0xBEEF);
-        assert_eq!(ppu.oam[0x10], 0xAA);
         assert_eq!(ppu.cgram[5], 0x7FFF);
     }
 

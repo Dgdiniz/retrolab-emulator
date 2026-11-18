@@ -141,6 +141,16 @@ impl SystemRegs {
         Self::default()
     }
 
+    /// The reset line: every register back to its power-on value, the
+    /// flags and the latched H/V counters with them. The PAL bit STAT78
+    /// reports is kept: it is how the console is wired, not a register.
+    pub fn reset(&mut self) {
+        *self = Self {
+            timing_is_pal: self.timing_is_pal,
+            ..Self::new()
+        };
+    }
+
     /// Capture the `$4200-$421F` register file (including the settled
     /// multiply/divide results and the latched H/V counters) into a
     /// snapshot.
@@ -907,6 +917,48 @@ mod tests {
         assert_eq!(regs.read_hcounter(), 0xCD);
         // The latched value itself is intact.
         assert_eq!(regs.read_hcounter(), 0xAB);
+    }
+
+    #[test]
+    fn reset_puts_every_register_back_and_keeps_the_pal_bit() {
+        let mut regs = SystemRegs::new();
+        regs.set_timing_is_pal(true);
+        for (reg, value) in [
+            (0x4200, 0xB1),
+            (0x4201, 0x80),
+            (0x4202, 0x12),
+            (0x4203, 0x34),
+            (0x4204, 0x56),
+            (0x4205, 0x78),
+            (0x4206, 0x09),
+            (0x4207, 0x40),
+            (0x4208, 0x01),
+            (0x4209, 0x60),
+            (0x420A, 0x01),
+            (0x420B, 0x03),
+            (0x420C, 0x0C),
+            (0x420D, 0x01),
+        ] {
+            regs.write(reg, value);
+        }
+        regs.set_nmi_flag(true);
+        // The CPU sees the NMI flag.
+        let _ = regs.read(0x4210);
+        regs.set_irq_flag(true);
+        regs.set_joypad_busy(true);
+        regs.set_joy_byte(0, 0x5A);
+        regs.latch_hv(0x0123, 0x0045);
+        let _ = regs.read_hcounter();
+
+        regs.reset();
+
+        let mut fresh = SystemRegs::new();
+        fresh.set_timing_is_pal(true);
+        assert_eq!(
+            format!("{:?}", regs.to_savestate()),
+            format!("{:?}", fresh.to_savestate())
+        );
+        assert!(!regs.take_nmi_flag_observed());
     }
 
     #[test]

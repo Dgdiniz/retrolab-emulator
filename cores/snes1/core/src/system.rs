@@ -640,6 +640,21 @@ impl EmulatorCore for SnesEmulator {
     }
 
     fn reset(&mut self) {
+        // The reset line. The 5A22's registers (FastROM off, the WRAM
+        // port's address 0, nothing a register write left for the next
+        // instruction boundary), its eight DMA channels, and the PPU's
+        // registers and counters go back to their power-on values, and the
+        // sprite table is cleared; work RAM, VRAM, CGRAM and the battery
+        // save keep what the game left there.
+        self.bus.system_regs_mut().reset();
+        self.bus.apply_memsel(false);
+        self.bus.reset_wram_port();
+        self.bus.take_pending_nmi();
+        self.bus.take_pending_irq_reschedule();
+        self.bus.take_pending_general_dma();
+        self.bus.dma_mut().reset();
+        self.bus.ppu_mut().reset();
+        self.bus.set_raster_snapshot(0, 0);
         self.cpu.reset_with_bus(&mut self.bus);
         self.frame_count = 0;
         self.master_cycles = 0;
@@ -696,9 +711,9 @@ impl EmulatorCore for SnesEmulator {
         ppu.drop_recorded_frame();
         ppu.forget_recorded_writes();
         ppu.set_recording_frame(1);
-        // The bus reset zeroes the PPU register file -> bgmode 0
-        // (non-hires) + overscan off -> resync the public display
-        // dimensions to the default 256x224 view.
+        // The PPU's registers are back at BG mode 0 (not hires) with
+        // overscan off: the public display dimensions go back to the
+        // default 256x224 view.
         self.sync_display_info();
         // The calls the debugger saw belonged to the machine before the
         // reset; the history stays, it records what ran.
@@ -712,16 +727,18 @@ impl EmulatorCore for SnesEmulator {
     }
 
     /// The power switch, which the reset button is not: [`Self::reset`]
-    /// re-boots the 65816 off the reset vector but leaves its registers,
-    /// work RAM, the PPU's VRAM, CGRAM and OAM, and the APU holding what
-    /// the game left there. This builds them again: a new CPU, and the
-    /// ROM loaded again, which builds a new bus (work RAM, the PPU and its
-    /// memories, the APU) and reads the coprocessor's firmware and mode
-    /// and the manifest override again; the battery SRAM a fresh image.
-    /// Then the region the machine was in, which the header's may not be.
-    /// With no ROM loaded, the reset button and the work RAM cleared. The
-    /// debugger, the input, the audio switch and the host's settings are
-    /// kept; the coverage too, the image being the same.
+    /// re-boots the 65816 off the reset vector, puts the registers of the
+    /// 5A22, its DMA channels and the PPU back to their power-on values and
+    /// clears the sprite table, but leaves work RAM, the PPU's VRAM and
+    /// CGRAM, and the APU's memory holding what the game left there. This
+    /// builds them again: a new CPU, and the ROM loaded again, which builds
+    /// a new bus (work RAM, the PPU and its memories, the APU) and reads
+    /// the coprocessor's firmware and mode and the manifest override again;
+    /// the battery SRAM a fresh image. Then the region the machine was in,
+    /// which the header's may not be. With no ROM loaded, the reset button
+    /// and the work RAM cleared. The debugger, the input, the audio switch
+    /// and the host's settings are kept; the coverage too, the image being
+    /// the same.
     fn power_cycle(&mut self) {
         let region = self.region();
         self.cpu = Wdc65816::new();
