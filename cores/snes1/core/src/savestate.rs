@@ -32,6 +32,16 @@
 //! - Host-side audio (`audio_ring`, the 32 kHz->44.1 kHz resampler, the
 //!   scratch vecs) and the input manager: audio resumes cleanly from
 //!   the restored APU, input is re-sampled from the host every frame.
+//!   A load keeps the resampler where the machine's own sound left it,
+//!   so the host's sound goes on from the last sample it played.
+//!
+//! ## After the payload
+//!
+//! [`SnesExtension`] holds what the layout has no field for: an NMI on
+//! its way and an IRQ a `$4211` read acknowledged early. It is written
+//! after the payload only when it holds one of them, so a state without
+//! it keeps the layout's bytes, and a build older than it reads the
+//! payload and stops there.
 
 use retro_core::audio::RateConverterState;
 use retro_core::savestate::{part_hash, SavestateFormat, SavestatePayload};
@@ -1284,7 +1294,7 @@ impl SavestatePayload for SnesSaveState {
         core_id: "snes1",
         version: SNES_SAVESTATE_VERSION,
     };
-    type Extension = ();
+    type Extension = SnesExtension;
 
     /// Reject payloads from a newer schema or with the wrong big-memory
     /// lengths, before any field is restored.
@@ -1335,6 +1345,24 @@ impl SavestatePayload for SnesSaveState {
             ("frame_count", self.frame_count),
         ]
     }
+}
+
+/// What a savestate holds after the payload: machine state the layout has
+/// no field for, each `None` when the machine holds none of it. Fields are
+/// only ever appended (`SavestateExtension::VERSION` counts the sets).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnesExtension {
+    /// An NMI on its way: armed where vertical blanking starts and not yet
+    /// delivered, with the steps left before it is delivered whether or not
+    /// the program reads `$4210` (`SnesEmulator::nmi_deliver_countdown`).
+    pub nmi_delivery: Option<u8>,
+    /// The cycle of an IRQ a `$4211` read acknowledged inside the
+    /// instruction it rose in, whose event has not run yet.
+    pub irq_read_early: Option<u64>,
+}
+
+impl retro_core::savestate::SavestateExtension for SnesExtension {
+    const VERSION: u32 = 1;
 }
 
 fn check_len(name: &str, got: usize, want: usize) -> Result<(), String> {

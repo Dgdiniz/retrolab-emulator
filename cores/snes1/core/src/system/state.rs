@@ -1,6 +1,6 @@
 //! The machine into and out of its savestate payload, whose layout is
-//! `crate::savestate`; the trait seals and opens it, and hashes it for
-//! netplay and the golden records.
+//! `crate::savestate`, and the extension after it; the trait seals and
+//! opens them, and hashes them for netplay and the golden records.
 
 #[cfg(doc)]
 use retro_core::EmulatorCore;
@@ -31,8 +31,18 @@ impl SnesEmulator {
         }
     }
 
+    /// What the machine holds that the layout has no field for (the trait's
+    /// `savestate_extension`): an NMI on its way, an IRQ read early.
+    pub(super) fn capture_extension(&self) -> crate::savestate::SnesExtension {
+        crate::savestate::SnesExtension {
+            nmi_delivery: self.nmi_deliver_armed.then_some(self.nmi_deliver_countdown),
+            irq_read_early: self.irq_read_early,
+        }
+    }
+
     /// Make the machine the payload's (the trait's `restore_savestate`),
-    /// the trait's opener having checked it.
+    /// the trait's opener having checked it; [`Self::restore_extension`]
+    /// follows.
     pub(super) fn restore_payload(&mut self, payload: crate::savestate::SnesSaveState) {
         // Restore only volatile state. The cartridge, its map plan, and
         // the page/speed tables are deliberately preserved, the ROM is
@@ -51,11 +61,7 @@ impl SnesEmulator {
         // The PPU dropped its line table with the memory it described; the
         // lines drawn next belong to the frame after the ones finished.
         self.bus.ppu_mut().set_recording_frame(self.frame_count + 1);
-        // Saves are taken at frame boundaries, where NMI delivery has
-        // already resolved (it arms and fires within a frame), so it is
-        // not part of the wire format, just clear the transient state.
-        // `SystemRegs::nmi_flag_observed` is likewise transient and
-        // re-derived the next vblank.
+        // No NMI on its way, unless the extension holds one.
         self.nmi_deliver_armed = false;
         self.nmi_deliver_countdown = 0;
         // The restored machine is not stopped at a capture boundary: if
@@ -67,11 +73,12 @@ impl SnesEmulator {
         // replaced; the history stays, it records what ran.
         self.debugger.machine_replaced();
 
-        // Host-side audio is not in the wire format: clear the ring and
-        // reset the resampler so playback resumes from the restored APU
-        // without replaying stale samples.
+        // Host-side audio is not in the wire format: the ring is emptied so
+        // no sample of the machine replaced is played, and the resampler
+        // keeps its phase and its last sample, so the host's sound goes on
+        // from what it played last instead of starting again from silence
+        // (a click on every load, a netplay rollback among them).
         self.host_audio.clear();
-        self.resampler.reset();
         self.apu_drain_buf.clear();
         self.audio_resample_buf.clear();
 
@@ -79,5 +86,18 @@ impl SnesEmulator {
         // display size (hires / overscan); resync the cached DisplayInfo
         // so the next host poll matches.
         self.sync_display_info();
+    }
+
+    /// Make the machine's state the layout lacks `extension`'s (the trait's
+    /// `restore_savestate`, after [`Self::restore_payload`]), or none: an
+    /// NMI on its way goes on to its delivery, and an IRQ read early is not
+    /// seen again. The flag a `$4210` read raises for the delivery
+    /// (`SystemRegs::nmi_flag_observed`) is taken after every step while
+    /// the delivery is armed, so between steps it is down, and the state
+    /// needs no field for it.
+    pub(super) fn restore_extension(&mut self, extension: crate::savestate::SnesExtension) {
+        self.irq_read_early = extension.irq_read_early;
+        self.nmi_deliver_armed = extension.nmi_delivery.is_some();
+        self.nmi_deliver_countdown = extension.nmi_delivery.unwrap_or(0);
     }
 }

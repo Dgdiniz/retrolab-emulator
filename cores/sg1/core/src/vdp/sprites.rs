@@ -200,6 +200,12 @@ impl SpriteCache {
             .extend(link_chain(vram, sat_base, max_sprites).map(|(_, sprite)| sprite));
     }
 
+    /// The list made `sprites`, in their order, as a savestate holds it.
+    pub fn replace(&mut self, sprites: impl IntoIterator<Item = Sprite>) {
+        self.sprites.clear();
+        self.sprites.extend(sprites);
+    }
+
     /// The slot in the sprite table of the list's sprite at `index`. The
     /// list is the link chain in the order the walk took it, which starts
     /// at slot 0 and goes on to the slot each sprite's link names, so the

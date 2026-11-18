@@ -17,13 +17,22 @@
 //! A new layout takes a new version (`SNES_SAVESTATE_VERSION`) and a reader
 //! for the old one; then `SNES1_SAVESTATE_LAYOUT_RECORD=1` writes the new
 //! version's file. It never writes over a version that already has one.
+//!
+//! The extension after the payload (`snes1_core::savestate::SnesExtension`)
+//! has a file of its own for each of its versions, `snes1-v4-ext1.state`
+//! and on, of a second program: its NMI on its way when the state was
+//! taken. The second test loads each, and reads it the way a build before
+//! the extension does, which must find the same payload and stop there.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use retro_core::savestate::RomCheck;
-use retro_core::EmulatorCore;
-use snes1_core::{SnesEmulator, SNES_SAVESTATE_VERSION};
+use retro_core::savestate::{
+    deserialize_compressed, state_hash_of, RomCheck, SavestateExtension, SavestatePayload,
+};
+use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
+use snes1_core::savestate::SnesExtension;
+use snes1_core::{snes_events, SnesEmulator, SnesSaveState, SNES_SAVESTATE_VERSION};
 
 /// Where the program's loop is (bank 0): the PC a savestate of it holds.
 const LOOP_ADDRESS: u16 = 0x8034;
@@ -132,12 +141,10 @@ fn every_savestate_layout_written_keeps_loading() {
         return;
     }
 
-    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| entry.expect("a fixture entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "state"))
+    let files: Vec<PathBuf> = fixtures(&dir)
+        .into_iter()
+        .filter(|path| !is_extension_fixture(path))
         .collect();
-    files.sort();
     assert!(
         files
             .iter()
@@ -154,5 +161,156 @@ fn every_savestate_layout_written_keeps_loading() {
         emu.load_state(&bytes, RomCheck::SameRom)
             .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
         assert_holds_the_program_state(&emu, &name);
+    }
+}
+
+/// Every savestate in the fixture folder, sorted.
+fn fixtures(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a fixture entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "state"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether a fixture is of the extension's program.
+fn is_extension_fixture(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains("-ext"))
+}
+
+/// The extension's program, a 128 KiB LoROM: the NMI on, a loop of NOPs
+/// that never reads `$4210`, and a handler that counts NMIs in WRAM $10.
+/// Its bytes are the savestate's ROM hash, so they must never change.
+fn extension_program_rom() -> Vec<u8> {
+    let mut rom = vec![0u8; 0x2_0000];
+    #[rustfmt::skip]
+    let code: [u8; 17] = [
+        0x78,             // SEI
+        0xA9, 0x80,       // LDA #$80
+        0x8D, 0x00, 0x21, // STA $2100: forced blank
+        0x64, 0x10,       // STZ $10
+        0xA9, 0x80,       // LDA #$80
+        0x8D, 0x00, 0x42, // STA $4200: NMI on
+        0xEA,             // loop: NOP
+        0xEA,             // NOP
+        0x80, 0xFC,       // BRA loop
+    ];
+    rom[..code.len()].copy_from_slice(&code);
+    // The NMI handler at $8040: INC $10 / RTI.
+    rom[0x40..0x43].copy_from_slice(&[0xE6, 0x10, 0x40]);
+    let header = 0x7FB0;
+    rom[header + 0x10..header + 0x25].copy_from_slice(b"SAVESTATE EXTENSION  ");
+    rom[header + 0x25] = 0x20; // LoROM
+    rom[header + 0x27] = 0x07; // 128 KiB
+    rom[header + 0x29] = 0x01; // USA: NTSC
+    rom[header + 0x2A] = 0x01;
+    let checksum: u16 = 0x1234;
+    rom[header + 0x2C..header + 0x2E].copy_from_slice(&(!checksum).to_le_bytes());
+    rom[header + 0x2E..header + 0x30].copy_from_slice(&checksum.to_le_bytes());
+    rom[0x7FFA..0x7FFC].copy_from_slice(&0x8040_u16.to_le_bytes());
+    rom[0x7FFC..0x7FFE].copy_from_slice(&0x8000_u16.to_le_bytes());
+    rom[0x7FFE..0x8000].copy_from_slice(&0x8040_u16.to_le_bytes());
+    rom
+}
+
+/// The NMIs the extension's program has counted.
+fn nmis(emu: &mut SnesEmulator) -> u8 {
+    emu.read_memory_debug(0x7E_0010, 1)[0]
+}
+
+/// The extension's program run 3 frames, then stopped on the NMI event:
+/// the NMI is on its way.
+fn stopped_with_an_nmi_on_its_way() -> SnesEmulator {
+    let mut emu = SnesEmulator::new();
+    emu.load_rom(&extension_program_rom())
+        .expect("the program loads");
+    emu.set_execution_mode(ExecutionMode::Running);
+    for _ in 0..3 {
+        emu.run_frame();
+    }
+    emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::NMI,
+            param: 0,
+        },
+        cpu_id: None,
+        condition: None,
+    });
+    emu.run_frame();
+    assert_eq!(
+        emu.execution_mode(),
+        ExecutionMode::Paused,
+        "stopped on the NMI"
+    );
+    emu
+}
+
+#[test]
+fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
+    let dir = fixture_dir();
+    let version = <SnesExtension as SavestateExtension>::VERSION;
+    let current = format!("snes1-v{SNES_SAVESTATE_VERSION}-ext{version}.state");
+    if std::env::var_os("SNES1_SAVESTATE_LAYOUT_RECORD").is_some() {
+        let path = dir.join(&current);
+        if !path.exists() {
+            let mut emu = stopped_with_an_nmi_on_its_way();
+            fs::write(&path, emu.save_state()).expect("the fixture is written");
+        }
+        return;
+    }
+
+    let files: Vec<PathBuf> = fixtures(&dir)
+        .into_iter()
+        .filter(|path| is_extension_fixture(path))
+        .collect();
+    assert!(
+        files.iter().any(|path| path.ends_with(&current)),
+        "no savestate of the current extension in {}: write one with \
+         SNES1_SAVESTATE_LAYOUT_RECORD=1",
+        dir.display()
+    );
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).expect("the fixture reads");
+        let (payload, extension) = SnesSaveState::open(&bytes, None, RomCheck::AnyRom)
+            .unwrap_or_else(|e| panic!("{name} no longer opens: {e}"));
+        assert!(
+            extension.nmi_delivery.is_some(),
+            "{name}: the NMI on its way, {extension:?}"
+        );
+        // A build before the extension reads the envelope alone: the same
+        // payload, the bytes after it left unread.
+        let older = deserialize_compressed::<SnesSaveState>(&bytes)
+            .unwrap_or_else(|e| panic!("{name}: a build before the extension cannot read it: {e}"));
+        let none = SnesExtension::default();
+        assert_eq!(
+            state_hash_of(&older.payload, &none),
+            state_hash_of(&payload, &none),
+            "{name}: the payload a build before the extension reads"
+        );
+
+        let mut emu = SnesEmulator::new();
+        emu.load_rom(&extension_program_rom())
+            .expect("the program loads");
+        emu.load_state(&bytes, RomCheck::SameRom)
+            .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
+        assert_eq!(
+            emu.savestate_extension(),
+            extension,
+            "{name}: what the load holds"
+        );
+        // The NMI on its way is delivered: the handler counts it.
+        let counted = nmis(&mut emu);
+        emu.set_execution_mode(ExecutionMode::Running);
+        emu.run_frame();
+        assert_eq!(
+            nmis(&mut emu),
+            counted.wrapping_add(1),
+            "{name}: the NMI delivered"
+        );
     }
 }

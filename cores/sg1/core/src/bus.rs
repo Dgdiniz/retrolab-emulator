@@ -839,6 +839,24 @@ impl AddressBus {
         self.z80_bank_bit_count = s.z80_bank_bit_count;
         self.cycles_executed = s.cycles_executed;
     }
+
+    /// The 68000 cycle the Z80's bus is granted at while a request still
+    /// waits for it at `now` (the clock), 0 when none waits: a grant at or
+    /// before `now` reads granted from every later cycle, as 0 does, and
+    /// with no request held the grant is not read at all (the next request
+    /// sets it again). The layout has no field for it.
+    pub fn z80_bus_grant(&self, now: u64) -> u64 {
+        if self.z80_bus_req && self.z80_busack_grant_cycle > now {
+            self.z80_busack_grant_cycle
+        } else {
+            0
+        }
+    }
+
+    /// Make the cycle the Z80's bus is granted at `at` (0: granted).
+    pub fn restore_z80_bus_grant(&mut self, at: u64) {
+        self.z80_busack_grant_cycle = at;
+    }
 }
 
 impl Addressable for AddressBus {

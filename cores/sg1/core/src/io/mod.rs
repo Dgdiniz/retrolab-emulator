@@ -208,6 +208,14 @@ impl GenesisIo {
         self.ports[1].set_device_button_state(port1_state);
     }
 
+    /// The buttons the two pads hold, as [`Self::sync_input`] last set them.
+    pub fn synced_input(&self) -> [u32; 2] {
+        [
+            self.ports[0].device_button_state(),
+            self.ports[1].device_button_state(),
+        ]
+    }
+
     /// Get mutable reference to a port (for connecting devices)
     pub fn port_mut(&mut self, port: usize) -> Option<&mut GenesisControllerPort> {
         if port < 3 {

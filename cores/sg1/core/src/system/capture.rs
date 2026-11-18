@@ -57,9 +57,10 @@ impl GenesisEmulator {
 ///   pixel sources and the line sprites number the frames finished, plus
 ///   one while the frame in progress is on the boundary's line or past it,
 ///   where the framebuffer shows its finished picture.
-/// - A save ([`EmulatorCore::save_state`]) finishes any frame in progress
-///   on the play tier, whatever the debugger is doing, so no breakpoint
-///   stops it.
+/// - A save ([`EmulatorCore::save_state`]) finishes a frame held at its
+///   capture boundary on the play tier, whatever the debugger is doing, so
+///   no breakpoint stops it; a frame stopped anywhere else is saved where
+///   it stands, the extension after the payload holding it.
 /// - The repaint, a layer, the pixel sources and the line sprites draw each
 ///   line the line table holds from its record (the lines below a stop part
 ///   of the way down from the frame before's) and every other line from the

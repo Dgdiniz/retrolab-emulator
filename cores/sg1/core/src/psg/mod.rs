@@ -513,7 +513,7 @@ impl Clockable for Psg {
 }
 
 // Savestate support
-use crate::savestate::{NoiseChannelState, PsgState, ToneChannelState};
+use crate::savestate::{NoiseChannelState, PsgExtension, PsgState, ToneChannelState};
 
 impl Psg {
     pub fn to_savestate(&self) -> PsgState {
@@ -584,6 +584,22 @@ impl Psg {
         self.clock_accumulator = state.clock_accumulator;
         self.internal_clock_accumulator = state.internal_clock_accumulator;
         self.frame_samples.clear();
+    }
+
+    /// What the chip holds that the layout has no field for: the samples
+    /// made so far in the frame, which the frame's end takes.
+    pub fn extension(&self) -> PsgExtension {
+        PsgExtension {
+            samples: self.frame_samples.clone(),
+        }
+    }
+
+    /// Make the frame's samples `extension`'s, after
+    /// [`Self::from_savestate`]. The samples are copied into the buffer the
+    /// chip has, which keeps its capacity across a load.
+    pub fn restore_extension(&mut self, extension: PsgExtension) {
+        self.frame_samples.clear();
+        self.frame_samples.extend_from_slice(&extension.samples);
     }
 }
 

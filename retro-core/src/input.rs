@@ -183,6 +183,13 @@ pub trait InputDevice: Send {
     /// Used by the frame loop to sync input state without needing an InputProvider reference.
     /// Default implementation does nothing; override in concrete devices.
     fn set_state_direct(&mut self, _state: u32) {}
+
+    /// The button state [`Self::set_state_direct`] set: what the device
+    /// answers with until it is set again. A device that keeps none answers
+    /// 0, as the default does.
+    fn state_direct(&self) -> u32 {
+        0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

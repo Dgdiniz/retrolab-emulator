@@ -17,15 +17,24 @@
 //! A new layout takes a new version (`SAVE_STATE_VERSION`) and a reader for
 //! the old one; then `SG1_SAVESTATE_LAYOUT_RECORD=1` writes the new version's
 //! file. It never writes over a version that already has one.
+//!
+//! The extension after the payload (`sg1_core::savestate::GenesisExtension`)
+//! has a file of its own for each of its versions, `sg1-v3-ext1.state` and
+//! on, of a second program: a fill in flight, the YM2612 busy and the
+//! frame stopped part of the way through when the state was taken. The
+//! second test loads each, and reads it the way a build before the
+//! extension does, which must find the same payload and stop there.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use retro_core::frame::run_frame_on;
-use retro_core::savestate::RomCheck;
-use retro_core::EmulatorCore;
+use retro_core::savestate::{
+    deserialize_compressed, state_hash_of, RomCheck, SavestateExtension, SavestatePayload,
+};
 use retro_core::ExecutionTier;
-use sg1_core::savestate::SAVE_STATE_VERSION;
+use retro_core::{Breakpoint, BreakpointType, DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::savestate::{GenesisExtension, SystemSaveState, SAVE_STATE_VERSION};
 use sg1_core::system::GenesisEmulator;
 
 /// Where the program's loop is: the PC a savestate of it holds.
@@ -134,12 +143,10 @@ fn every_savestate_layout_written_keeps_loading() {
         return;
     }
 
-    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| entry.expect("a fixture entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "state"))
+    let files: Vec<PathBuf> = fixtures(&dir)
+        .into_iter()
+        .filter(|path| !is_extension_fixture(path))
         .collect();
-    files.sort();
     assert!(
         files
             .iter()
@@ -156,5 +163,165 @@ fn every_savestate_layout_written_keeps_loading() {
         emu.load_state(&bytes, RomCheck::SameRom)
             .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
         assert_holds_the_program_state(&emu, &name);
+    }
+}
+
+/// Every savestate in the fixture folder, sorted.
+fn fixtures(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a fixture entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "state"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether a fixture is of the extension's program.
+fn is_extension_fixture(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains("-ext"))
+}
+
+fn put_words(rom: &mut [u8], at: usize, words: &[u16]) {
+    for (i, word) in words.iter().enumerate() {
+        rom[at + 2 * i..at + 2 * i + 2].copy_from_slice(&word.to_be_bytes());
+    }
+}
+
+/// The extension's program's stop: its loop's `ADDQ.B`, right after the
+/// write that makes the YM2612 busy.
+const STOP: u32 = 0x0000_0254;
+
+/// The extension's program: a 64 KiB VRAM fill started with the display
+/// on (it streams for about four frames), then the YM2612 written again
+/// and again. Its bytes are the savestate's ROM hash, so they must never
+/// change.
+fn extension_program_rom() -> Vec<u8> {
+    let mut rom = vec![0u8; 0x20000];
+    put_words(&mut rom, 0, &[0x00FF, 0xFE00, 0x0000, 0x0200]);
+    rom[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
+    rom[0x120..0x138].copy_from_slice(b"SAVESTATE EXTENSION     ");
+    rom[0x1A0..0x1A8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF]);
+    #[rustfmt::skip]
+    let code: &[u16] = &[
+        0x46FC, 0x2700,                 // $200 MOVE.W #$2700,SR
+        0x41F9, 0x00C0, 0x0004,         // $204 LEA $C00004,A0
+        0x30BC, 0x8154,                 // $20A register 1: display on, DMA on, mode 5
+        0x30BC, 0x8F01,                 // $20E register 15: auto-increment 1
+        0x30BC, 0x93FF,                 // $212 register 19
+        0x30BC, 0x94FF,                 // $216 register 20: length $FFFF
+        0x30BC, 0x9780,                 // $21A register 23: fill
+        0x20BC, 0x4000, 0x0080,         // $21E MOVE.L #$40000080,(A0): VRAM at 0, DMA
+        0x33FC, 0x1234, 0x00C0, 0x0000, // $224 MOVE.W #$1234,$C00000: the fill starts
+        0x33FC, 0x0100, 0x00A1, 0x1100, // $22C MOVE.W #$0100,$A11100: the Z80's bus
+        0x33FC, 0x0100, 0x00A1, 0x1200, // $234 MOVE.W #$0100,$A11200: Z80 out of reset
+        0x0839, 0x0000, 0x00A1, 0x1100, // $23C wait: BTST #0,$A11100
+        0x66F6,                         // $244 BNE.S wait
+        0x4BF9, 0x00A0, 0x4000,         // $246 LEA $A04000,A5
+        0x1ABC, 0x0030,                 // $24C loop: MOVE.B #$30,(A5)
+        0x1B40, 0x0001,                 // $250 MOVE.B D0,1(A5): the YM2612 busy
+        0x5200,                         // $254 ADDQ.B #1,D0
+        0x60F4,                         // $256 BRA.S loop
+    ];
+    put_words(&mut rom, 0x200, code);
+    rom
+}
+
+/// The extension's program after a frame, stopped at its loop's
+/// `ADDQ.B` part of the way through the next one, just after a write to
+/// the YM2612.
+fn stopped_holding_the_extension() -> GenesisEmulator {
+    let mut emu = GenesisEmulator::new();
+    emu.load_rom(&extension_program_rom())
+        .expect("the program loads");
+    emu.set_execution_mode(ExecutionMode::Running);
+    run_frame_on(&mut emu, ExecutionTier::Play);
+    emu.debugger().add_breakpoint(Breakpoint {
+        address: STOP,
+        bp_type: BreakpointType::execute(),
+        cpu_id: Some(0),
+        condition: None,
+    });
+    for _ in 0..200 {
+        emu.set_execution_mode(ExecutionMode::Running);
+        emu.run_frame();
+    }
+    assert_eq!(
+        emu.execution_mode(),
+        ExecutionMode::Paused,
+        "stopped at the loop"
+    );
+    emu
+}
+
+#[test]
+fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
+    let dir = fixture_dir();
+    let version = <GenesisExtension as SavestateExtension>::VERSION;
+    let current = format!("sg1-v{SAVE_STATE_VERSION}-ext{version}.state");
+    if std::env::var_os("SG1_SAVESTATE_LAYOUT_RECORD").is_some() {
+        let path = dir.join(&current);
+        if !path.exists() {
+            let mut emu = stopped_holding_the_extension();
+            fs::write(&path, emu.save_state()).expect("the fixture is written");
+        }
+        return;
+    }
+
+    let files: Vec<PathBuf> = fixtures(&dir)
+        .into_iter()
+        .filter(|path| is_extension_fixture(path))
+        .collect();
+    assert!(
+        files.iter().any(|path| path.ends_with(&current)),
+        "no savestate of the current extension in {}: write one with \
+         SG1_SAVESTATE_LAYOUT_RECORD=1",
+        dir.display()
+    );
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).expect("the fixture reads");
+        let (payload, extension) = SystemSaveState::open(&bytes, None, RomCheck::AnyRom)
+            .unwrap_or_else(|e| panic!("{name} no longer opens: {e}"));
+        assert!(extension.vdp.fill.is_some(), "{name}: the fill in flight");
+        assert!(extension.ym2612.busy > 0, "{name}: the YM2612 busy");
+        assert!(extension.frame.is_some(), "{name}: the frame in progress");
+        // A build before the extension reads the envelope alone: the same
+        // payload, the bytes after it left unread.
+        let older = deserialize_compressed::<SystemSaveState>(&bytes)
+            .unwrap_or_else(|e| panic!("{name}: a build before the extension cannot read it: {e}"));
+        let none = GenesisExtension::default();
+        assert_eq!(
+            state_hash_of(&older.payload, &none),
+            state_hash_of(&payload, &none),
+            "{name}: the payload a build before the extension reads"
+        );
+
+        let mut emu = GenesisEmulator::new();
+        emu.load_rom(&extension_program_rom())
+            .expect("the program loads");
+        emu.load_state(&bytes, RomCheck::SameRom)
+            .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
+        assert_eq!(
+            emu.savestate_extension(),
+            extension,
+            "{name}: what the load holds"
+        );
+        assert_eq!(emu.cpu().pc, STOP, "{name}: the stop");
+        // The frame goes on to its end, and the fill with it.
+        let frames = emu.frame_count();
+        let filled = |emu: &GenesisEmulator| {
+            emu.vdp()
+                .get_vram()
+                .iter()
+                .filter(|&&byte| byte == 0x12)
+                .count()
+        };
+        let before = filled(&emu);
+        emu.set_execution_mode(ExecutionMode::Running);
+        emu.run_frame();
+        assert_eq!(emu.frame_count(), frames + 1, "{name}: the frame ended");
+        assert!(filled(&emu) > before, "{name}: the fill went on");
     }
 }

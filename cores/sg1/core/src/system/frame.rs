@@ -261,8 +261,8 @@ impl GenesisEmulator {
         run
     }
 
-    /// Drop the frame in progress: a reset or a load starts the machine
-    /// over, and the savestate holds no frame part of the way through.
+    /// Drop the frame in progress: a reset starts the machine over, and a
+    /// load first, before it brings back the state's own.
     pub(super) fn drop_frame(&mut self) {
         self.frame_open = false;
         self.frame_line = 0;
@@ -400,12 +400,6 @@ impl FrameMachine for GenesisEmulator {
     }
 
     fn frame_in_progress(&self) -> bool {
-        self.frame_open
-    }
-
-    /// Any frame in progress: the savestate (layout 3) holds no frame part
-    /// of the way through.
-    fn frame_held(&self) -> bool {
         self.frame_open
     }
 

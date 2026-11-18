@@ -4,7 +4,7 @@ use crate::audio::{AudioDebugger, HostAudioRing};
 use crate::cartridge::CartridgeDebugger;
 use crate::debugger::DebuggerCore;
 use crate::input::GenericInputManager;
-use crate::savestate::{self, LoadStateError, PayloadUse, RomCheck, RomIdentity, SavestatePayload};
+use crate::savestate::{LoadStateError, PayloadUse, RomCheck, RomIdentity, SavestatePayload};
 use crate::types::*;
 use crate::video::VideoDebugger;
 use serde::{Deserialize, Serialize};
@@ -58,9 +58,10 @@ pub trait EmulatorCore {
     /// the default when it holds nothing of the kind.
     fn savestate_extension(&self) -> ExtensionOf<Self>;
 
-    /// Make the machine the state's, its payload and its extension: a held
-    /// frame dropped, the call stacks and the host's queued samples
-    /// emptied, the region the state's.
+    /// Make the machine the state's, its payload and its extension: the
+    /// frame in progress the state's (none for a state taken where a frame
+    /// ends), the call stacks and the host's queued samples emptied, the
+    /// region the state's.
     fn restore_savestate(&mut self, payload: Self::Savestate, extension: ExtensionOf<Self>);
 
     /// The envelope's `created_at`: 0 unless the console stamps a clock.
@@ -109,9 +110,8 @@ pub trait EmulatorCore {
     /// machine holds one, for finding where two machines differ.
     fn state_hash_parts(&self) -> Vec<(&'static str, u64)> {
         let mut parts = self.savestate_payload(PayloadUse::StateHash).hash_parts();
-        let extension = self.savestate_extension();
-        if extension != ExtensionOf::<Self>::default() {
-            parts.push(("extension", savestate::part_hash(&extension)));
+        if let Some(hash) = Self::Savestate::extension_hash(&self.savestate_extension()) {
+            parts.push(("extension", hash));
         }
         parts
     }

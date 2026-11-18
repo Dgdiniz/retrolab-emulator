@@ -1,7 +1,12 @@
-//! The VDP into and out of the savestate's layout.
+//! The VDP into and out of the savestate's layout, and into and out of the
+//! savestate's extension the state within a frame the layout has no field
+//! for.
 
-use super::{timing, Vdp};
-use crate::savestate::{VdpState, VdpTimingState};
+use super::sprites::Sprite;
+use super::{timing, FillState, Vdp};
+use crate::savestate::{
+    VdpBeamState, VdpExtension, VdpFillState, VdpSpriteState, VdpState, VdpTimingState,
+};
 
 impl Vdp {
     pub fn to_savestate(&self) -> VdpState {
@@ -85,17 +90,13 @@ impl Vdp {
         self.timing.h_counter_reload = t.h_counter_reload;
         self.timing.h_counter_current = t.h_counter_current;
 
-        // `vint_request_delay_mclks` and `first_frame_after_reset` are
-        // within-frame/boot-transient and not carried in the savestate.
-        // A savestate is only ever captured at a frame boundary, where both
-        // have reached their resolved values: the VINT-request delay has
-        // elapsed (`-1`), and the first post-reset VBLANK has long passed
-        // (`false`). Canonicalize them here so a state loaded into a FRESH
-        // emulator (whose defaults are `-1` / `true`) matches the instance
-        // that produced it. Without the `false` reset, a fresh instance keeps
-        // the default `true` and silently swallows its first VBLANK interrupt
-        // after load, a one-frame desync that breaks netplay rollback and
-        // shows as a subtle glitch on every ordinary savestate load.
+        // The layout has no field for the vertical interrupt's delay or the
+        // first frame after a reset: they take what a state with nothing
+        // after its payload holds (the delay elapsed, the first frame past),
+        // and the extension's, when it holds them (`restore_extension`).
+        // Left as the loading machine had them, a new machine, whose first
+        // frame is still ahead, would swallow the first vertical interrupt
+        // after the load.
         self.timing.vint_request_delay_mclks = -1;
         self.timing.first_frame_after_reset = false;
 
@@ -103,8 +104,8 @@ impl Vdp {
         self.dma_pending = s.dma_pending;
         self.dma_busy = s.dma_busy;
         self.dma_remaining_clocks = s.dma_remaining_clocks;
-        // Transient within-frame raster state; a freshly loaded state never
-        // carries a half-applied mid-active CRAM DMA.
+        // A CRAM transfer in active display tints the picture line by line
+        // (CRAM itself holds its end already): the picture's, not carried.
         self.progressive_cram = None;
         self.sprite_overflow = s.sprite_overflow;
         self.sprite_collision = s.sprite_collision;
@@ -127,5 +128,84 @@ impl Vdp {
         // What was recorded described the machine before the load; what is
         // armed stays armed.
         self.clear_recorded_frames();
+    }
+}
+
+impl Vdp {
+    /// What the VDP holds that the layout has no field for: a fill in
+    /// flight, the vertical interrupt held off, the first frame after a
+    /// reset, the beam part of the way through its line, the sprite list
+    /// of the frame being drawn. What is drawn into the picture, and the
+    /// tables a CRAM transfer in active display tints it with, are the
+    /// picture's, not the machine's.
+    pub fn extension(&self) -> VdpExtension {
+        let beam = VdpBeamState {
+            into_line: self.beam_cycles_into_line,
+            line_length: self.beam_cycles_per_line,
+        };
+        VdpExtension {
+            fill: self.fill_state.map(|fill| VdpFillState {
+                remaining: fill.remaining,
+                carry: fill.cell_accum,
+            }),
+            vint_delay: u32::try_from(self.timing.vint_request_delay_mclks).ok(),
+            first_frame_after_reset: self.timing.first_frame_after_reset,
+            beam: (!beam.at_line_end()).then_some(beam),
+            sprites: self.sprite_cache_valid.then(|| {
+                self.sprite_cache
+                    .sprites()
+                    .iter()
+                    .map(|sprite| VdpSpriteState {
+                        x: sprite.x,
+                        y: sprite.y,
+                        width_tiles: sprite.width_tiles,
+                        height_tiles: sprite.height_tiles,
+                        pattern_base: sprite.pattern_base,
+                        palette: sprite.palette,
+                        priority: sprite.priority,
+                        flip_h: sprite.flip_h,
+                        flip_v: sprite.flip_v,
+                        link: sprite.link,
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// Make the VDP's state within a frame `extension`'s, after
+    /// [`Self::from_savestate`]; the beam stands at `line_end` when the
+    /// extension holds none (a line's end, which the payload gives).
+    pub fn restore_extension(&mut self, extension: VdpExtension, line_end: VdpBeamState) {
+        self.fill_state = extension.fill.map(|fill| FillState {
+            remaining: fill.remaining,
+            cell_accum: fill.carry,
+        });
+        self.timing.vint_request_delay_mclks = extension
+            .vint_delay
+            .and_then(|clocks| i32::try_from(clocks).ok())
+            .unwrap_or(-1);
+        self.timing.first_frame_after_reset = extension.first_frame_after_reset;
+        let beam = extension.beam.unwrap_or(line_end);
+        self.beam_cycles_into_line = beam.into_line;
+        self.beam_cycles_per_line = beam.line_length;
+        match extension.sprites {
+            Some(sprites) => {
+                self.sprite_cache
+                    .replace(sprites.into_iter().map(|sprite| Sprite {
+                        x: sprite.x,
+                        y: sprite.y,
+                        width_tiles: sprite.width_tiles,
+                        height_tiles: sprite.height_tiles,
+                        pattern_base: sprite.pattern_base,
+                        palette: sprite.palette,
+                        priority: sprite.priority,
+                        flip_h: sprite.flip_h,
+                        flip_v: sprite.flip_v,
+                        link: sprite.link,
+                    }));
+                self.sprite_cache_valid = true;
+            }
+            None => self.sprite_cache_valid = false,
+        }
     }
 }

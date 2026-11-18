@@ -88,6 +88,14 @@ impl GenesisControllerPort {
         }
     }
 
+    /// The connected device's button state, as the last
+    /// [`Self::set_device_button_state`] set it; 0 with no device.
+    pub fn device_button_state(&self) -> u32 {
+        self.device
+            .as_ref()
+            .map_or(0, |device| device.state_direct())
+    }
+
     /// Get port ID
     pub fn port_id(&self) -> u32 {
         self.port_id

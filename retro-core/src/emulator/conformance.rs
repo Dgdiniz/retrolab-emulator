@@ -16,7 +16,16 @@
 //! the debugger armed) unless one says otherwise. Sound is compared only
 //! between machines that never loaded a state: the host's sound path is
 //! not machine state, and after a load each machine resamples from where
-//! its own last frame left it.
+//! its own last frame left it. A state taken part of the way through a
+//! frame holds the machine, not the picture drawn so far: after such a
+//! load the pictures are compared from the first frame drawn whole.
+//!
+//! [`golden_saves`] holds the same rules to a console's golden records:
+//! saves at frames' ends and at stops part of the way through, each
+//! loaded into a new machine.
+
+mod golden_saves;
+pub use golden_saves::{golden_saves, GoldenSaves, SavesReport};
 
 use crate::capture::{CaptureCore, CaptureRecording};
 use crate::frame::DebugMachine;
@@ -47,6 +56,15 @@ pub struct MachineUnderTest<E> {
     pub work_ram: (u32, u32),
     /// Seconds the drift check runs.
     pub drift_seconds: u32,
+    /// Bring a machine `build` made, the program run a while, to a moment
+    /// whose state the payload's layout has no field for (a transfer or a
+    /// chip's busy time running at a frame's end, an interrupt on its way
+    /// at a stop), and leave it there; `None` for a console whose layout
+    /// lacks nothing.
+    pub extension_moment: Option<fn(&mut E)>,
+    /// An execute breakpoint on the main CPU the program reaches many
+    /// times a frame.
+    pub mid_frame_stop: Breakpoint,
 }
 
 /// Write one test per check of the machine conformance suite in a core's
@@ -59,6 +77,8 @@ macro_rules! emulator_conformance_tests {
         $crate::emulator_conformance_tests!(@each $machine;
             two_machines_stay_identical,
             a_loaded_save_goes_on_identically,
+            a_save_at_a_moment_the_layout_lacks_goes_on_identically,
+            a_save_taken_mid_frame_goes_on_identically,
             a_rollback_resimulation_matches,
             different_input_diverges,
             the_audio_switch_is_machine_state,
@@ -119,6 +139,51 @@ fn save_pattern<E: EmulatorCore>(emu: &E) -> Vec<u8> {
         .collect()
 }
 
+/// Remove every breakpoint, watchpoint and event a machine holds.
+fn remove_breakpoints<E: EmulatorCore>(emu: &mut E) {
+    for info in emu.debugger_ref().list_breakpoints() {
+        emu.debugger().remove_breakpoint(info.id);
+    }
+}
+
+/// The main CPU's program counter, as the debugger shows it.
+fn main_pc<E: EmulatorCore>(emu: &E) -> u32 {
+    emu.debugger_ref()
+        .get_cpu_states()
+        .first()
+        .map_or(0, |cpu| cpu.pc)
+}
+
+/// The machine that saved (`a`, its breakpoints removed) and a new machine
+/// that loaded its state (`b`) run `frames` frames from frame `from`, both
+/// running, with the same input: the state equal after every frame, the
+/// picture after every frame drawn whole on both (the first frame is not
+/// when the state was taken part of the way through it).
+fn go_on_together<E: EmulatorCore + DebugMachine>(
+    m: &MachineUnderTest<E>,
+    a: &mut E,
+    b: &mut E,
+    from: u64,
+    frames: u64,
+) {
+    let mut whole = !a.frame_in_progress();
+    remove_breakpoints(a);
+    a.set_execution_mode(ExecutionMode::Running);
+    b.set_execution_mode(ExecutionMode::Running);
+    for frame in from..from + frames {
+        run(m, a, frame, 1);
+        run(m, b, frame, 1);
+        assert_eq!(a.state_hash(), b.state_hash(), "state at frame {frame}");
+        if whole {
+            assert!(
+                a.get_framebuffer().data == b.get_framebuffer().data,
+                "picture at frame {frame}"
+            );
+        }
+        whole = true;
+    }
+}
+
 /// The supported region the machine is not in, if the console has one.
 fn other_region<E: EmulatorCore>(emu: &E) -> Option<crate::types::VideoRegion> {
     emu.supported_regions()
@@ -168,6 +233,84 @@ pub fn a_loaded_save_goes_on_identically<E: EmulatorCore>(m: &MachineUnderTest<E
             "picture at frame {frame}"
         );
     }
+}
+
+/// A state saved where the machine holds what the payload's layout has no
+/// field for carries it after the payload, and a new machine loading it is
+/// that machine at once and goes on as it does.
+pub fn a_save_at_a_moment_the_layout_lacks_goes_on_identically<E: EmulatorCore + DebugMachine>(
+    m: &MachineUnderTest<E>,
+) {
+    let Some(moment) = m.extension_moment else {
+        return;
+    };
+    let mut a = (m.build)();
+    run(m, &mut a, 0, 60);
+    moment(&mut a);
+    // The frame the machine is in: the frames it counted, from its load.
+    let frame = a.frame_count();
+    let state = a.save_state();
+    let (_, extension) =
+        E::Savestate::open(&state, None, RomCheck::AnyRom).expect("the save opens");
+    assert!(
+        extension != Default::default(),
+        "the save holds what the layout has no field for"
+    );
+    let mut b = (m.build)();
+    b.load_state(&state, RomCheck::SameRom)
+        .expect("the save loads");
+    assert_eq!(b.state_hash(), a.state_hash(), "the loaded state");
+    go_on_together(m, &mut a, &mut b, frame, 120);
+}
+
+/// A state saved at a stop part of the way through a frame holds the stop:
+/// the save does not move the machine stopped there, and a new machine
+/// loading it is that machine, stopped where it stopped, and goes on as it
+/// does.
+pub fn a_save_taken_mid_frame_goes_on_identically<E: EmulatorCore + DebugMachine>(
+    m: &MachineUnderTest<E>,
+) {
+    // Into the frames the program is given buttons, so the frame stopped in
+    // reads buttons held.
+    let pressed = (60..600).find(|&f| (m.input)(f) != 0).unwrap_or(60);
+    let mut a = (m.build)();
+    run(m, &mut a, 0, pressed + 30);
+    a.debugger().add_breakpoint(m.mid_frame_stop.clone());
+    // A thousand stops at the breakpoint take the machine well into a frame.
+    let first = a.frame_count();
+    let mut stops = 0;
+    while stops < 1000 {
+        let frame = a.frame_count();
+        assert!(
+            frame < first + 60,
+            "the program reaches the breakpoint {stops} times in 60 frames"
+        );
+        a.set_execution_mode(ExecutionMode::Running);
+        run(m, &mut a, frame, 1);
+        if a.execution_mode() == ExecutionMode::Paused {
+            stops += 1;
+        }
+    }
+    assert!(
+        a.frame_in_progress(),
+        "stopped part of the way through a frame"
+    );
+    let stopped = (a.state_hash(), a.frame_count(), main_pc(&a));
+    let state = a.save_state();
+    assert_eq!(
+        (a.state_hash(), a.frame_count(), main_pc(&a)),
+        stopped,
+        "the save moved the stopped machine"
+    );
+    let mut b = (m.build)();
+    b.load_state(&state, RomCheck::SameRom)
+        .expect("the save loads");
+    assert_eq!(b.state_hash(), stopped.0, "the loaded state");
+    assert!(b.frame_in_progress(), "the frame in progress loaded");
+    b.refresh_debugger_state();
+    assert_eq!(main_pc(&b), stopped.2, "the loaded program counter");
+    let frame = a.frame_count();
+    go_on_together(m, &mut a, &mut b, frame, 120);
 }
 
 /// A rollback: saved at frame 120, run 60 frames on, loaded back and run

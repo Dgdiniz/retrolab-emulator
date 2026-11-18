@@ -230,15 +230,16 @@ fn handle_due_after_step<M: FrameMachine, H: StepHooks<M>>(
     }
 }
 
-/// Finish a frame [`FrameMachine::frame_held`] reports, before a save: its
-/// rest runs on the play tier with the debugger disarmed for its length,
-/// so no breakpoint, watchpoint or event stops it and nothing of it is
-/// traced or counted (only the main CPU's coverage, as the play tier
-/// records it). The debugger is armed again after, and the CPU states it
-/// shows are written where the frame ended. Returns whether there was a
-/// frame to finish.
+/// Finish a frame held at its capture boundary, before a save (a savestate
+/// holds any other frame in progress where it stands): its rest runs on
+/// the play tier with the debugger disarmed for its length, so no
+/// breakpoint, watchpoint or event stops it and nothing of it is traced or
+/// counted (only the main CPU's coverage, as the play tier records it).
+/// The debugger is armed again after, and the CPU states it shows are
+/// written where the frame ended. Returns whether there was a frame to
+/// finish.
 pub fn finish_held_frame<M: DebugMachine>(m: &mut M) -> bool {
-    if !m.frame_held() {
+    if !m.held_at_capture_boundary() {
         return false;
     }
     play_frame(m);

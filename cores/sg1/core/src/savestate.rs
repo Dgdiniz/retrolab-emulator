@@ -514,7 +514,7 @@ impl SavestatePayload for SystemSaveState {
         core_id: "sg1",
         version: SAVE_STATE_VERSION,
     };
-    type Extension = ();
+    type Extension = GenesisExtension;
 
     /// A newer layout and memories of the wrong size are refused.
     fn validate(&self) -> Result<(), String> {
@@ -582,6 +582,129 @@ impl SavestatePayload for SystemSaveState {
         }
         Ok(state)
     }
+}
+
+// After the payload
+
+/// What a savestate holds after the payload: machine state the layout has
+/// no field for, each part at its none when the machine holds none of it,
+/// so a state taken where a frame ends with nothing of the kind keeps the
+/// layout's bytes. Fields are only ever appended
+/// (`SavestateExtension::VERSION` counts the sets).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GenesisExtension {
+    pub vdp: VdpExtension,
+    pub ym2612: Ym2612Extension,
+    pub psg: PsgExtension,
+    /// The 68000 cycle the Z80's bus is granted at, while a request waits
+    /// for it; 0 when none waits.
+    pub z80_bus_grant: u64,
+    /// A frame stopped part of the way through: where it stands.
+    pub frame: Option<GenesisFrameState>,
+}
+
+impl retro_core::savestate::SavestateExtension for GenesisExtension {
+    const VERSION: u32 = 1;
+}
+
+/// The VDP's part of [`GenesisExtension`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VdpExtension {
+    /// A VRAM, CRAM or VSRAM fill still writing its cells.
+    pub fill: Option<VdpFillState>,
+    /// The master clocks left before the vertical interrupt is requested of
+    /// the 68000, while the request is held off into the line vertical
+    /// blanking starts on.
+    pub vint_delay: Option<u32>,
+    /// The first frame after a reset, whose vertical blank raises no
+    /// interrupt, not yet past it.
+    pub first_frame_after_reset: bool,
+    /// Where the beam stands when that is not a line's end; a load puts the
+    /// beam of an ended line back from the payload.
+    pub beam: Option<VdpBeamState>,
+    /// The sprite list read from the sprite table for the frame being drawn,
+    /// once its first line with sprites has read it.
+    pub sprites: Option<Vec<VdpSpriteState>>,
+}
+
+/// A fill in flight: the cells it has still to write, and the carry of
+/// the master clocks it has run, in cells times clocks.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VdpFillState {
+    pub remaining: u32,
+    pub carry: u64,
+}
+
+/// The beam in its line, in 68000 cycles: how far in, and the line's
+/// length.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VdpBeamState {
+    pub into_line: u32,
+    pub line_length: u32,
+}
+
+impl VdpBeamState {
+    /// Whether the beam stands at the end of its line. Every place the
+    /// beam is ended there reads it the same, whatever the two values.
+    pub fn at_line_end(&self) -> bool {
+        self.line_length > 0 && self.into_line >= self.line_length
+    }
+}
+
+/// One sprite of the sprite list, as the sprite table gave it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VdpSpriteState {
+    pub x: i16,
+    pub y: i16,
+    pub width_tiles: u8,
+    pub height_tiles: u8,
+    pub pattern_base: u16,
+    pub palette: u8,
+    pub priority: bool,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub link: u8,
+}
+
+/// The YM2612's part of [`GenesisExtension`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Ym2612Extension {
+    /// The busy time left after a write, in the chip's input clocks.
+    pub busy: u32,
+    /// The samples made so far in the frame, which its end takes.
+    pub samples: Vec<f32>,
+}
+
+/// The PSG's part of [`GenesisExtension`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PsgExtension {
+    /// The samples made so far in the frame, which its end takes.
+    pub samples: Vec<f32>,
+}
+
+/// A frame stopped part of the way through.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenesisFrameState {
+    /// The line the frame stands on, and whether that line's start ran.
+    pub line: u32,
+    pub line_started: bool,
+    /// The line's counters once its start ran (all 0 before): the clock
+    /// less the 68000 cycles the line has spent, the line's 68000 budget,
+    /// the PSG's credit and clocks given, the Z80's target, credit and
+    /// cycles run, the YM2612's clocks given.
+    pub grid: u64,
+    pub budget: u32,
+    pub psg_credit: u32,
+    pub psg_clocked: u32,
+    pub z80_target: u32,
+    pub z80_credit: u32,
+    pub z80_executed: u32,
+    pub ym_clocked: u32,
+    /// A step stopped before its instruction, the part before it run: the
+    /// cycles of the interrupt that part took.
+    pub stopped_step: Option<u32>,
+    /// The buttons each pad held when the frame started.
+    pub input: [u32; 2],
 }
 
 impl SaveStateMetadata {

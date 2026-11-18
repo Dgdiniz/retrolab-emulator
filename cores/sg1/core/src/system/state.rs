@@ -1,8 +1,10 @@
 //! The machine into and out of its savestate payload, whose layout is
-//! `crate::savestate`, and the state hash netplay and the golden records
-//! compare.
+//! `crate::savestate`, and the extension after it; the trait seals and
+//! opens them, and hashes them for netplay and the golden records.
 
+use super::frame::LineRun;
 use super::GenesisEmulator;
+use crate::savestate::{GenesisExtension, GenesisFrameState, VdpBeamState};
 use crate::timing::{GenesisTiming, VideoRegion};
 use retro_core::cartridge::Cartridge;
 use retro_core::EmulatorCore;
@@ -17,9 +19,9 @@ impl GenesisEmulator {
     /// every part restored, the region the payload's first, so the clocks
     /// the converter and the chips are restored against are the state's.
     pub(super) fn restore_payload(&mut self, state: crate::savestate::SystemSaveState) {
-        // The machine becomes the savestate's, which ends a frame: a frame
-        // in progress is dropped, and the calls the call stack holds belong
-        // to the machine replaced.
+        // The machine becomes the savestate's: a frame in progress is
+        // dropped (the extension brings the state's back), and the calls
+        // the call stack holds belong to the machine replaced.
         self.drop_frame();
         self.debugger.machine_replaced();
 
@@ -125,6 +127,104 @@ impl GenesisEmulator {
         // Clear transient buffers
         self.host_audio.clear();
         self.host_audio.reset_counters();
+    }
+
+    /// What the machine holds that the layout has no field for (the trait's
+    /// `savestate_extension`): the VDP's and the sound chips' state within
+    /// a frame, a Z80 bus request waiting for its grant, and a frame
+    /// stopped part of the way through.
+    pub(super) fn capture_extension(&self) -> GenesisExtension {
+        GenesisExtension {
+            vdp: self.bus.vdp().extension(),
+            ym2612: self.bus.ym2612().extension(),
+            psg: self.bus.psg().extension(),
+            z80_bus_grant: self.bus.z80_bus_grant(self.master_cycles),
+            frame: self.frame_open.then(|| self.frame_state()),
+        }
+    }
+
+    /// The frame in progress: the line it stands on, the line's counters,
+    /// the step stopped before its instruction, and the input it started
+    /// with. What only a line's start or a step's first part reads again is
+    /// left at 0: the counters before the line's start, the interrupt's
+    /// cycles of a step not stopped.
+    fn frame_state(&self) -> GenesisFrameState {
+        let run = if self.line_started {
+            self.line
+        } else {
+            LineRun::default()
+        };
+        GenesisFrameState {
+            line: self.frame_line,
+            line_started: self.line_started,
+            grid: run.grid,
+            budget: run.budget,
+            psg_credit: run.psg_credit,
+            psg_clocked: run.psg_clocked,
+            z80_target: run.z80_target,
+            z80_credit: run.z80_credit,
+            z80_executed: run.z80_executed,
+            ym_clocked: run.ym_clocked,
+            stopped_step: run.resume.then_some(self.interrupt_cycles),
+            input: self.bus.io().synced_input(),
+        }
+    }
+
+    /// Where the beam stands once a line has ended, from what the payload
+    /// holds: the last line's length (its 68000 budget, which the budget's
+    /// carry says) and the cycles the line ran past it.
+    fn line_end_beam(&self) -> VdpBeamState {
+        let clocks = self.region.master_clocks_per_scanline();
+        let divider = self.region.cpu_divider().max(1);
+        let base = clocks / divider;
+        let length = if self.scanline_cycle_carry < clocks % divider {
+            base + 1
+        } else {
+            base
+        };
+        VdpBeamState {
+            into_line: length + self.frame_cycle_overshoot,
+            line_length: length,
+        }
+    }
+
+    /// Make the machine's state the layout lacks `extension`'s (the trait's
+    /// `restore_savestate`, after [`Self::restore_payload`]): every part
+    /// from the extension, or at its none when the extension holds none of
+    /// it, so a state with nothing after its payload leaves no fill, no
+    /// busy time and no frame in progress, whatever the loading machine
+    /// had.
+    pub(super) fn restore_extension(&mut self, extension: GenesisExtension) {
+        let line_end = self.line_end_beam();
+        self.bus
+            .vdp_mut()
+            .restore_extension(extension.vdp, line_end);
+        self.bus.ym2612_mut().restore_extension(extension.ym2612);
+        self.bus.psg_mut().restore_extension(extension.psg);
+        self.bus.restore_z80_bus_grant(extension.z80_bus_grant);
+        if let Some(frame) = extension.frame {
+            self.frame_open = true;
+            self.frame_line = frame.line;
+            self.line_started = frame.line_started;
+            self.line = LineRun {
+                grid: frame.grid,
+                budget: frame.budget,
+                psg_credit: frame.psg_credit,
+                psg_clocked: frame.psg_clocked,
+                z80_target: frame.z80_target,
+                z80_credit: frame.z80_credit,
+                z80_executed: frame.z80_executed,
+                ym_clocked: frame.ym_clocked,
+                z80_irq: self.z80_irq_pending,
+                resume: frame.stopped_step.is_some(),
+                ..LineRun::default()
+            };
+            self.interrupt_cycles = frame.stopped_step.unwrap_or(0);
+            self.bus.io_mut().sync_input(frame.input[0], frame.input[1]);
+            self.bus
+                .vdp_mut()
+                .set_frame_being_drawn(self.frame_count + 1);
+        }
     }
 
     /// Build the full machine snapshot shared by [`EmulatorCore::save_state`]

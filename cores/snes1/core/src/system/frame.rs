@@ -630,12 +630,6 @@ impl FrameMachine for SnesEmulator {
         SnesEmulator::frame_in_progress(self)
     }
 
-    /// Only the hold at the capture boundary: a savestate holds any other
-    /// frame in progress, its queue and its base with it.
-    fn frame_held(&self) -> bool {
-        self.held_at_capture_boundary
-    }
-
     fn held_at_capture_boundary(&self) -> bool {
         self.held_at_capture_boundary
     }

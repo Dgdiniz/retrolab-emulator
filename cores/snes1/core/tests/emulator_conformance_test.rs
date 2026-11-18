@@ -4,8 +4,8 @@
 //! cartridge with battery RAM.
 
 use retro_core::emulator::conformance::MachineUnderTest;
-use retro_core::{EmulatorCore, ExecutionMode};
-use snes1_core::SnesEmulator;
+use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
+use snes1_core::{snes_events, SnesEmulator};
 
 /// Pad 1's buttons in `InputState::buttons`: A spans JOY1's low byte and
 /// Start its high byte, so pressing both moves both sums.
@@ -81,6 +81,27 @@ fn input(frame: u64) -> u32 {
     }
 }
 
+/// Stopped on the NMI event: the program never reads `$4210`, so its NMI
+/// is on its way, delivered three instructions on.
+fn an_nmi_on_its_way(emu: &mut SnesEmulator) {
+    let id = emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::NMI,
+            param: 0,
+        },
+        cpu_id: None,
+        condition: None,
+    });
+    emu.run_frame();
+    assert_eq!(
+        emu.execution_mode(),
+        ExecutionMode::Paused,
+        "stopped on the NMI"
+    );
+    emu.debugger().remove_breakpoint(id);
+}
+
 fn machine() -> MachineUnderTest<SnesEmulator> {
     MachineUnderTest {
         build,
@@ -89,6 +110,14 @@ fn machine() -> MachineUnderTest<SnesEmulator> {
         input,
         work_ram: (0x7E_0000, 16),
         drift_seconds: 30,
+        extension_moment: Some(an_nmi_on_its_way),
+        // The pad read at the top of the program's loop.
+        mid_frame_stop: Breakpoint {
+            address: 0x00_800F,
+            bp_type: BreakpointType::execute(),
+            cpu_id: Some(0),
+            condition: None,
+        },
     }
 }
 

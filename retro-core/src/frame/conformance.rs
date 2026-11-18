@@ -656,8 +656,8 @@ pub fn finishing_a_held_frame_stops_nowhere_and_counts_nothing<E: DebugMachine>(
     let mut held = (core.build)();
     run_to_capture_boundary(&mut held);
     assert!(
-        held.frame_held(),
-        "the hold at the capture boundary is a held frame"
+        held.held_at_capture_boundary(),
+        "held at the capture boundary"
     );
     arm_to_stop(&mut held);
     let traced_before = traced(&held);
@@ -666,7 +666,7 @@ pub fn finishing_a_held_frame_stops_nowhere_and_counts_nothing<E: DebugMachine>(
 
     assert!(finish_held_frame(&mut held), "there was a frame to finish");
     assert!(!paused(&held), "nothing stopped it");
-    assert!(!held.frame_held() && !held.frame_in_progress());
+    assert!(!held.held_at_capture_boundary() && !held.frame_in_progress());
     assert_eq!((core.frame_count)(&held), 1);
     assert_eq!(
         (core.state_hash)(&held),

@@ -105,12 +105,9 @@ pub trait FrameMachine: Sized {
     /// it.
     fn frame_in_progress(&self) -> bool;
 
-    /// Whether a frame is held part of the way through in a way the
-    /// core's savestate cannot hold, so that a save must finish it first
+    /// Whether the frame is held at its capture boundary: the one frame in
+    /// progress a savestate does not hold, so a save finishes it first
     /// ([`super::finish_held_frame`]).
-    fn frame_held(&self) -> bool;
-
-    /// Whether the frame is held at its capture boundary.
     fn held_at_capture_boundary(&self) -> bool;
 
     /// Ask [`Self::handle_due`] to stop in front of the capture boundary,

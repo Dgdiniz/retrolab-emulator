@@ -618,10 +618,17 @@ impl EmulatorCore for SnesEmulator {
         self.capture_save_state()
     }
 
-    fn savestate_extension(&self) {}
+    fn savestate_extension(&self) -> crate::savestate::SnesExtension {
+        self.capture_extension()
+    }
 
-    fn restore_savestate(&mut self, payload: crate::savestate::SnesSaveState, _extension: ()) {
+    fn restore_savestate(
+        &mut self,
+        payload: crate::savestate::SnesSaveState,
+        extension: crate::savestate::SnesExtension,
+    ) {
         self.restore_payload(payload);
+        self.restore_extension(extension);
     }
 
     /// The frame held at the capture boundary, finished on the play tier

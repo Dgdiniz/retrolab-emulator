@@ -1,7 +1,8 @@
-//! The YM2612 into and out of the savestate's layout.
+//! The YM2612 into and out of the savestate's layout, and its busy time
+//! and the frame's samples into and out of the extension after it.
 
 use super::Ym2612;
-use crate::savestate::Ym2612State;
+use crate::savestate::{Ym2612Extension, Ym2612State};
 
 impl Ym2612 {
     pub fn to_savestate(&self) -> Ym2612State {
@@ -61,5 +62,25 @@ impl Ym2612 {
         self.current_cpu_cycle = s.current_cpu_cycle;
         self.timers.from_savestate(&s.timer);
         self.frame_samples.clear();
+    }
+
+    /// What the chip holds that the layout has no field for: the busy time
+    /// left after a write (its status reads busy until it runs out), and
+    /// the samples made so far in the frame (the frame's end takes them,
+    /// and makes up a short count from the chip, which moves it).
+    pub fn extension(&self) -> Ym2612Extension {
+        Ym2612Extension {
+            busy: self.busy_counter,
+            samples: self.frame_samples.clone(),
+        }
+    }
+
+    /// Make the busy time and the frame's samples `extension`'s, after
+    /// [`Self::from_savestate`]. The samples are copied into the buffer the
+    /// chip has, which keeps its capacity across a load.
+    pub fn restore_extension(&mut self, extension: Ym2612Extension) {
+        self.busy_counter = extension.busy;
+        self.frame_samples.clear();
+        self.frame_samples.extend_from_slice(&extension.samples);
     }
 }

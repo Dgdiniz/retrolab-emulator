@@ -162,8 +162,9 @@ pub struct GenesisEmulator {
 
     /// A frame is in progress: a frame call that stopped part of the way
     /// through, or a host step, left it, and the next frame call or step
-    /// goes on with it. Never part of a savestate; a reset, a savestate load
-    /// and a ROM load drop it (`frame::GenesisEmulator::drop_frame`).
+    /// goes on with it. A reset and a ROM load drop it
+    /// (`frame::GenesisEmulator::drop_frame`); a savestate holds it in the
+    /// extension after its payload, and a load brings back the state's.
     frame_open: bool,
     /// The line the frame in progress is on, and whether that line's start
     /// has run.
@@ -670,10 +671,17 @@ impl EmulatorCore for GenesisEmulator {
         self.build_save_state(metadata)
     }
 
-    fn savestate_extension(&self) {}
+    fn savestate_extension(&self) -> crate::savestate::GenesisExtension {
+        self.capture_extension()
+    }
 
-    fn restore_savestate(&mut self, payload: crate::savestate::SystemSaveState, _extension: ()) {
+    fn restore_savestate(
+        &mut self,
+        payload: crate::savestate::SystemSaveState,
+        extension: crate::savestate::GenesisExtension,
+    ) {
         self.restore_payload(payload);
+        self.restore_extension(extension);
     }
 
     /// The wall clock, in seconds since 1970: the envelope's twin of the
@@ -682,8 +690,10 @@ impl EmulatorCore for GenesisEmulator {
         chrono::Utc::now().timestamp().max(0) as u64
     }
 
-    /// A frame part of the way through, finished on the play tier: the
-    /// savestate's layout holds a machine where a frame ends.
+    /// The frame held at the capture boundary, finished on the play tier
+    /// with the debugger disarmed for its length
+    /// (`retro_core::frame::finish_held_frame`); a frame stopped anywhere
+    /// else is saved where it stands, with the extension after the payload.
     fn finish_held_frame(&mut self) -> bool {
         retro_core::frame::finish_held_frame(self)
     }

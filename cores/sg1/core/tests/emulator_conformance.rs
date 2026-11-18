@@ -2,8 +2,9 @@
 //! the Mega Drive: a program that keys a PSG tone, then reads pad 1 forever
 //! and adds what it reads into work RAM, its cartridge with battery RAM.
 
+use retro_core::cpu::Addressable;
 use retro_core::emulator::conformance::MachineUnderTest;
-use retro_core::{EmulatorCore, ExecutionMode};
+use retro_core::{Breakpoint, BreakpointType, EmulatorCore, ExecutionMode};
 use sg1_core::GenesisEmulator;
 
 mod helpers;
@@ -65,6 +66,29 @@ fn input(frame: u64) -> u32 {
     }
 }
 
+/// A 64 KiB VRAM fill started through the VDP's ports with the display
+/// on, which streams for about four frames, a frame run, then a YM2612
+/// register written: the frame ends with the fill in flight and the
+/// YM2612 busy.
+fn a_fill_in_flight_and_a_busy_ym2612(emu: &mut GenesisEmulator) {
+    let bus = emu.bus_mut();
+    for register in [0x8154, 0x8F01, 0x93FF, 0x94FF, 0x9780] {
+        bus.write_word(0x00C0_0004, register);
+    }
+    bus.write_word(0x00C0_0004, 0x4000);
+    bus.write_word(0x00C0_0004, 0x0080);
+    bus.write_word(0x00C0_0000, 0x1234);
+    emu.run_frame();
+    assert!(
+        emu.vdp().is_dma_active(),
+        "the fill runs at the frame's end"
+    );
+    let ym = emu.ym2612_mut();
+    ym.write_port(0, 0x30);
+    ym.write_port(1, 0x71);
+    assert!(ym.get_status() & 0x80 != 0, "the YM2612 is busy");
+}
+
 fn machine() -> MachineUnderTest<GenesisEmulator> {
     MachineUnderTest {
         build,
@@ -73,6 +97,14 @@ fn machine() -> MachineUnderTest<GenesisEmulator> {
         input,
         work_ram: (0x00FF_0000, 16),
         drift_seconds: 30,
+        extension_moment: Some(a_fill_in_flight_and_a_busy_ym2612),
+        // The pad read at the top of the program's loop.
+        mid_frame_stop: Breakpoint {
+            address: 0x418,
+            bp_type: BreakpointType::execute(),
+            cpu_id: Some(0),
+            condition: None,
+        },
     }
 }
 

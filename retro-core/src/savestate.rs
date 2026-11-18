@@ -284,14 +284,19 @@ pub trait SavestatePayload: Serialize + DeserializeOwned {
     /// ([`state_hash_of`]). Written by
     /// [`savestate_codec!`](crate::savestate_codec).
     fn state_hash(&self, extension: &Self::Extension) -> u64;
+    /// The hash of `extension` as a part of the state ([`extension_hash`]),
+    /// `None` for the default, which a state does not hold. Written by
+    /// [`savestate_codec!`](crate::savestate_codec).
+    fn extension_hash(extension: &Self::Extension) -> Option<u64>;
 }
 
-/// Writes a payload's [`SavestatePayload::seal`], [`SavestatePayload::open`]
-/// and [`SavestatePayload::state_hash`] inside its `impl`, as calls to
-/// [`seal`], [`open`] and [`state_hash_of`].
+/// Writes a payload's [`SavestatePayload::seal`], [`SavestatePayload::open`],
+/// [`SavestatePayload::state_hash`] and [`SavestatePayload::extension_hash`]
+/// inside its `impl`, as calls to [`seal`], [`open`], [`state_hash_of`] and
+/// [`extension_hash`].
 ///
 /// They are written there, in the console's crate, so the layout's reader
-/// and writer are compiled once. A crate compiles its own copy of each
+/// and writer, and the extension's, are compiled once. A crate compiles its own copy of each
 /// generic function it calls (at release optimization no crate reuses
 /// another's), so trait methods that called these functions themselves
 /// were compiled again in every crate that saves or loads a state: each
@@ -328,6 +333,12 @@ macro_rules! savestate_codec {
             extension: &<Self as $crate::savestate::SavestatePayload>::Extension,
         ) -> u64 {
             $crate::savestate::state_hash_of(self, extension)
+        }
+
+        fn extension_hash(
+            extension: &<Self as $crate::savestate::SavestatePayload>::Extension,
+        ) -> ::core::option::Option<u64> {
+            $crate::savestate::extension_hash::<Self>(extension)
         }
     };
 }
@@ -522,6 +533,12 @@ pub fn state_hash_of<P: SavestatePayload>(payload: &P, extension: &P::Extension)
 /// The hash a part of a payload is named by in [`SavestatePayload::hash_parts`].
 pub fn part_hash<T: Serialize + ?Sized>(part: &T) -> u64 {
     crate::fnv1a64(&bincode::serialize(part).unwrap_or_default())
+}
+
+/// The hash of an extension as a part of the state ([`part_hash`]), `None`
+/// for the default, which a state does not hold.
+pub fn extension_hash<P: SavestatePayload>(extension: &P::Extension) -> Option<u64> {
+    (*extension != P::Extension::default()).then(|| part_hash(extension))
 }
 
 #[cfg(test)]

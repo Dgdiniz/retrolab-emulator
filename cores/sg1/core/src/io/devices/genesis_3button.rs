@@ -124,6 +124,10 @@ impl InputDevice for Genesis3ButtonDevice {
     fn set_state_direct(&mut self, state: u32) {
         self.state = state;
     }
+
+    fn state_direct(&self) -> u32 {
+        self.state
+    }
 }
 
 // ============================================================================

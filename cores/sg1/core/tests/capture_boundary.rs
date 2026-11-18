@@ -401,10 +401,11 @@ fn a_savestate_at_the_boundary_finishes_the_frame_first() {
     assert_eq!(emu.frame_count(), count);
 }
 
-/// Host steps open a frame, which no savestate can hold: the save runs the
-/// rest of it first, and the frame ends where it ends run whole.
+/// Host steps open a frame, which the savestate holds where it stands: the
+/// save moves nothing, a machine that loads it stands at the same step, and
+/// both end the frame where it ends run whole.
 #[test]
-fn a_savestate_after_host_steps_finishes_the_frame_first() {
+fn a_savestate_after_host_steps_holds_the_frame_where_it_stands() {
     let mut emu = emulator();
     let mut whole = emulator();
     for _ in 0..WARM_UP {
@@ -419,19 +420,32 @@ fn a_savestate_after_host_steps_finishes_the_frame_first() {
         FrameMachine::frame_in_progress(&emu),
         "the steps opened a frame"
     );
+    let stepped = (emu.state_hash(), emu.frame_count());
     let state = emu.save_state();
     assert!(!state.is_empty());
     assert!(
-        !FrameMachine::frame_in_progress(&emu),
-        "the frame was finished"
+        FrameMachine::frame_in_progress(&emu),
+        "the frame stays in progress"
     );
-    assert_eq!(emu.frame_count(), whole.frame_count());
-    assert_eq!(emu.state_hash(), whole.state_hash());
+    assert_eq!(
+        (emu.state_hash(), emu.frame_count()),
+        stepped,
+        "the save moved the machine"
+    );
 
     let mut restored = emulator();
     restored
         .load_state(&state, RomCheck::SameRom)
         .expect("the savestate loads");
+    assert!(
+        FrameMachine::frame_in_progress(&restored),
+        "the frame in progress loaded"
+    );
+    assert_eq!(restored.state_hash(), stepped.0);
+    play(&mut emu);
+    play(&mut restored);
+    assert_eq!(emu.frame_count(), whole.frame_count());
+    assert_eq!(emu.state_hash(), whole.state_hash());
     assert_eq!(restored.state_hash(), whole.state_hash());
 }
 
