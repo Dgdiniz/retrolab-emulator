@@ -14,7 +14,7 @@
 
 import type { DebugBridge } from './debug-bridge'
 import type { WebCore } from './core-resolver'
-import { traceEntrySize } from '@debugger-core/trace-spec-core'
+import { takeTrace, traceEntrySize } from '@debugger-core/trace-spec-core'
 import { traceCpuSpec, type TraceCpuSpec } from './trace-ops'
 
 export interface TracingHandle {
@@ -314,12 +314,12 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
 
     emulator.setCpuTracingEnabled(spec.cpuId, false)
 
-    if (emulator.needsCpuTraceFlush(spec.cpuId)) {
-      const flushData = emulator.getCpuTraceFlushData(spec.cpuId)
-      if (flushData.length > 0 && worker) {
-        worker.postMessage({ type: 'chunk', data: flushData }, [flushData.buffer])
-      }
-      emulator.clearCpuTraceFlushed(spec.cpuId)
+    // The core asks for its trace only when the buffer that holds it
+    // fills, so what the recording's last stretch left there is taken now,
+    // asked or not, before the file is closed.
+    const rest = takeTrace(emulator, spec)
+    if (rest.length > 0 && worker) {
+      worker.postMessage({ type: 'chunk', data: rest }, [rest.buffer])
     }
 
     if (worker) worker.postMessage({ type: 'stop' })
@@ -354,10 +354,9 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
 
     try {
       if (emulator.needsCpuTraceFlush(spec.cpuId)) {
-        const flushData = emulator.getCpuTraceFlushData(spec.cpuId)
+        const flushData = takeTrace(emulator, spec)
         if (flushData.length > 0) {
           worker.postMessage({ type: 'chunk', data: flushData }, [flushData.buffer])
-          emulator.clearCpuTraceFlushed(spec.cpuId)
         }
       }
     } catch (err) {

@@ -15,7 +15,9 @@
  * gives both debuggers' tracing one source of truth and lets the wiring be
  * unit-tested without WASM. The size of an entry is not in the table: the
  * core reports it ({@link traceEntrySize}), so a reader cuts and counts
- * entries by the size the core writes.
+ * entries by the size the core writes. {@link takeTrace} takes what a CPU's
+ * trace holds, which a host does whenever the core asks and once more when
+ * a recording stops.
  *
  *   m68k    (sg1 cpu 0)                      68K, 68k
  *   z80     (sg1 cpu 1)                      Z80, z80
@@ -74,4 +76,27 @@ export function traceEntrySize(emulator: unknown, spec: TraceCpuSpec): number {
   if (typeof read !== 'function') return 0
   const size: unknown = read.call(emulator, spec.cpuId)
   return typeof size === 'number' && Number.isInteger(size) && size > 0 ? size : 0
+}
+
+/**
+ * Take what the trace of the spec's CPU holds and clear it: a copy of the
+ * entries recorded since the trace was last taken, empty when there are
+ * none.
+ *
+ * The core asks for a trace to be taken (`needsCpuTraceFlush`) only when
+ * the buffer that holds it fills. A host takes it whenever the core asks
+ * while a recording runs, and once more when the recording stops, asked or
+ * not: what the recording's last stretch left in the buffer is there and
+ * nowhere else, and a recording too short to fill the buffer is all there.
+ */
+export function takeTrace(
+  emulator: {
+    getCpuTraceFlushData(cpuId: number): Uint8Array
+    clearCpuTraceFlushed(cpuId: number): void
+  },
+  spec: TraceCpuSpec,
+): Uint8Array {
+  const bytes = emulator.getCpuTraceFlushData(spec.cpuId)
+  emulator.clearCpuTraceFlushed(spec.cpuId)
+  return bytes
 }

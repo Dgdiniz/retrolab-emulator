@@ -147,3 +147,82 @@ describe('setupTracing - the entry count', () => {
     expect(elements['trace-stats'].textContent).toBe('')
   })
 })
+
+describe('setupTracing - taking the trace', () => {
+  beforeEach(() => {
+    FakeWorker.instances = []
+    vi.stubGlobal('document', { getElementById: () => null })
+    vi.stubGlobal('Worker', FakeWorker)
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  /**
+   * A core whose CPU `cpu` holds the trace bytes `held`, and asks for them
+   * to be taken when `asks`, as a core asks only once its buffer fills.
+   */
+  function holding(core: WebCore, cpu: number, held: number[], asks: boolean) {
+    const { emulator, bridge } = harness(core, cpu)
+    let bytes = Uint8Array.from(held)
+    emulator.needsCpuTraceFlush = vi.fn(() => asks)
+    emulator.getCpuTraceFlushData = vi.fn(() => bytes.slice())
+    emulator.clearCpuTraceFlushed = vi.fn(() => {
+      bytes = new Uint8Array(0)
+    })
+    return { emulator, bridge }
+  }
+
+  const types = (worker: FakeWorker) => worker.posted.map((m) => m.type)
+
+  it('hands the file what a recording left when it stops, though the core did not ask', () => {
+    const { emulator, bridge } = holding('sg1', 1, [1, 2, 3], false)
+    const tracing = setupTracing(bridge, 'sg1')
+    tracing.startTracing()
+    tracing.stopTracing()
+
+    const worker = FakeWorker.instances[0]
+    expect(types(worker)).toEqual(['start', 'chunk', 'stop'])
+    expect(Array.from(worker.posted[1].data)).toEqual([1, 2, 3])
+    expect(emulator.clearCpuTraceFlushed).toHaveBeenCalledWith(1)
+    // The trace is off before it is taken, so nothing is added after.
+    expect(emulator.setCpuTracingEnabled).toHaveBeenLastCalledWith(1, false)
+    const switches = emulator.setCpuTracingEnabled.mock.invocationCallOrder
+    const taken = emulator.getCpuTraceFlushData.mock.invocationCallOrder[0]
+    expect(switches[switches.length - 1]).toBeLessThan(taken)
+  })
+
+  it('hands the file nothing more when the recording left nothing', () => {
+    const { bridge } = holding('snes1', 0, [], false)
+    const tracing = setupTracing(bridge, 'snes1')
+    tracing.startTracing()
+    tracing.stopTracing()
+
+    expect(types(FakeWorker.instances[0])).toEqual(['start', 'stop'])
+  })
+
+  it('takes the trace while recording only when the core asks', () => {
+    const quiet = holding('sg1', 0, [9, 9], false)
+    const tracing = setupTracing(quiet.bridge, 'sg1')
+    tracing.startTracing()
+    tracing.checkFlush()
+
+    expect(quiet.emulator.getCpuTraceFlushData).not.toHaveBeenCalled()
+    expect(types(FakeWorker.instances[0])).toEqual(['start'])
+  })
+
+  it('hands the file the trace while recording when the core asks, and clears it', () => {
+    const full = holding('sg1', 0, [7, 8], true)
+    const tracing = setupTracing(full.bridge, 'sg1')
+    tracing.startTracing()
+    tracing.checkFlush()
+
+    const worker = FakeWorker.instances[0]
+    expect(types(worker)).toEqual(['start', 'chunk'])
+    expect(Array.from(worker.posted[1].data)).toEqual([7, 8])
+    expect(full.emulator.clearCpuTraceFlushed).toHaveBeenCalledWith(0)
+  })
+})

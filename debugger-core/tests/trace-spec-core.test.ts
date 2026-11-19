@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { resolveDebugProfile } from '../src/debug-profile-core'
-import { traceCpuSpecForKind, traceCpuSpecForSlot, traceEntrySize } from '../src/trace-spec-core'
+import {
+  takeTrace,
+  traceCpuSpecForKind,
+  traceCpuSpecForSlot,
+  traceEntrySize,
+} from '../src/trace-spec-core'
 
 describe('trace-spec-core > traceCpuSpecForKind', () => {
   it('names each kind of CPU for the tracing UI, with the id it is given', () => {
@@ -79,5 +84,30 @@ describe('trace-spec-core > traceEntrySize', () => {
     for (const size of [0, -4, 2.5, Number.NaN, '38', undefined]) {
       expect(traceEntrySize({ getCpuTraceEntrySize: () => size }, z80)).toBe(0)
     }
+  })
+})
+
+describe('trace-spec-core > takeTrace', () => {
+  it("takes the trace of the spec's CPU, then clears it, with the core as `this`", () => {
+    const calls: string[] = []
+    const core = {
+      held: [Uint8Array.from([1]), Uint8Array.from([2, 3, 4])],
+      getCpuTraceFlushData(cpuId: number): Uint8Array {
+        calls.push(`take ${cpuId}`)
+        return this.held[cpuId].slice()
+      },
+      clearCpuTraceFlushed(cpuId: number): void {
+        calls.push(`clear ${cpuId}`)
+        this.held[cpuId] = new Uint8Array(0)
+      },
+    }
+    const z80 = traceCpuSpecForKind('z80', 1)
+
+    expect(Array.from(takeTrace(core, z80))).toEqual([2, 3, 4])
+    expect(calls).toEqual(['take 1', 'clear 1'])
+    // Taken once: the next take finds nothing, and the other CPU's trace
+    // is where it was.
+    expect(takeTrace(core, z80)).toHaveLength(0)
+    expect(Array.from(core.held[0])).toEqual([1])
   })
 })
