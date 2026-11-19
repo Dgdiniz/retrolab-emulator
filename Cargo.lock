@@ -938,7 +938,6 @@ dependencies = [
  "retro-wasm",
  "serde",
  "serde-wasm-bindgen",
- "serde_json",
  "sg1-core",
  "wasm-bindgen",
  "wasm-bindgen-test",

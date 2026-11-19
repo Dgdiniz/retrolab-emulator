@@ -140,23 +140,6 @@ fn with_svp_cartridge() -> RetroEmulator {
 }
 
 #[wasm_bindgen_test]
-fn get_cartridge_manifest_is_a_plain_object() {
-    let mut emu = with_plain_cartridge();
-    let manifest = emu.get_cartridge_manifest();
-    assert_plain_object(
-        &manifest,
-        &["memoryMap", "romRegions", "sramRegions", "mapperState"],
-        "getCartridgeManifest",
-    );
-    let mapper = js_sys::Reflect::get(&manifest, &JsValue::from_str("mapperState")).unwrap();
-    assert_plain_object(
-        &mapper,
-        &["mapper_type"],
-        "getCartridgeManifest mapperState",
-    );
-}
-
-#[wasm_bindgen_test]
 fn get_coverage_stats_is_a_plain_object() {
     let emu = with_plain_cartridge();
     assert_plain_object(

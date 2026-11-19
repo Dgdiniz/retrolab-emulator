@@ -1,13 +1,16 @@
 //! [`cartridge_bindings!`], which writes the cartridge methods every binding
 //! crate exports the same way (its hash, what it declares, its battery
-//! save's flag, its mapper and chips, its map, and the manifest detection
-//! gives or a host stages), and the values they hand a host.
+//! save's flag, its mapper and chips, its map, its regions and mapper as one
+//! view, and the manifest detection gives or a host stages), and the values
+//! they hand a host.
 //!
 //! [`cartridge_bindings!`]: crate::cartridge_bindings
 
 use std::collections::HashMap;
 
-use retro_core::cartridge::{ExpansionChipState, MapRegionSummary, MapperId, MapperState};
+use retro_core::cartridge::{
+    CartridgeDebugger, ExpansionChipState, MapRegionSummary, MapperId, MapperState,
+};
 use retro_core::EmulatorCore;
 use serde::Serialize;
 use wasm_bindgen::JsValue;
@@ -83,6 +86,23 @@ pub fn memory_map_object(regions: Vec<MapRegionSummary>) -> JsValue {
     to_js(&serde_json::json!({ "regions": regions }))
 }
 
+/// `{ memoryMap, romRegions, sramRegions, mapperState }`, the cartridge as
+/// its debugger describes it, in retro-core's names, plain objects all the
+/// way down: `memoryMap` is `{ regions: [{ cpu_address_start,
+/// cpu_address_end, physical_offset, size, memory_type, access,
+/// description }] }`, `romRegions` `[{ start, end, size, description }]`,
+/// `sramRegions` `[{ start, end, size, sram_type, description }]`, and
+/// `mapperState` `{ mapper_id, registers, bank_config: { banks } }`,
+/// `undefined` for a cartridge with no mapper.
+pub fn cartridge_manifest_object(debugger: &dyn CartridgeDebugger) -> JsValue {
+    to_js(&serde_json::json!({
+        "memoryMap": debugger.get_memory_map(),
+        "romRegions": debugger.get_rom_regions(),
+        "sramRegions": debugger.get_sram_regions(),
+        "mapperState": debugger.get_mapper_state(),
+    }))
+}
+
 /// The mapper label a binding crate names, or [`default_mapper_label`].
 #[doc(hidden)]
 #[macro_export]
@@ -102,8 +122,9 @@ macro_rules! __mapper_label {
 ///   `loadRom` received, in lowercase hex, `undefined` before one;
 /// - `getCartridgeInfo()`, `getCartridgeTitle()`, `isCartridgeSramDirty()`
 ///   and `clearCartridgeSramDirty()`;
-/// - `getMapperState()`, `getChipState()`, `getChipStates()` and
-///   `getMemoryMap()`;
+/// - `getMapperState()`, `getChipState()`, `getChipStates()`,
+///   `getMemoryMap()` and `getCartridgeManifest()`
+///   ([`cartridge_manifest_object`]);
 /// - `detectManifest(data)`, `getDetectedManifest()`,
 ///   `setCartridgeManifest(json)` and `clearCartridgeManifest()`.
 ///
@@ -127,8 +148,12 @@ macro_rules! cartridge_bindings {
                 $crate::__private::retro_core::EmulatorCore::get_cartridge_hash(&self.$core)
             }
 
-            /// What the loaded ROM's header says, as `getRomInfo`; refused
-            /// with `"No cartridge loaded"` before a load.
+            /// What the cartridge plugged in declares, retro-core's
+            /// `CartridgeInfo`: `{ system, title, serial, regions,
+            /// rom_size, sram_size, sram_type, mapper_info,
+            /// expansion_chip_info, header_checksum, calculated_checksum,
+            /// rom_hash, detection_source }`; refused with `"No cartridge
+            /// loaded"` with none. `getRomInfo` is the ROM header's summary.
             #[wasm_bindgen(js_name = getCartridgeInfo)]
             pub fn get_cartridge_info(
                 &self,
@@ -136,9 +161,9 @@ macro_rules! cartridge_bindings {
                 $crate::__private::wasm_bindgen::JsValue,
                 $crate::__private::wasm_bindgen::JsValue,
             > {
-                match $crate::__private::retro_core::EmulatorCore::get_rom_info(&self.$core) {
+                match $crate::__private::retro_core::EmulatorCore::cartridge_info(&self.$core) {
                     ::core::option::Option::Some(info) => {
-                        ::core::result::Result::Ok($crate::js::to_js(&info))
+                        ::core::result::Result::Ok($crate::js::to_js(info))
                     }
                     ::core::option::Option::None => ::core::result::Result::Err(
                         $crate::__private::wasm_bindgen::JsValue::from_str("No cartridge loaded"),
@@ -239,6 +264,20 @@ macro_rules! cartridge_bindings {
                     $crate::__private::retro_core::EmulatorCore::cartridge_debugger(&mut self.$core)
                         .map_regions(),
                 ))
+            }
+
+            /// The cartridge as its debugger describes it, `{ memoryMap,
+            /// romRegions, sramRegions, mapperState }` in retro-core's
+            /// names, plain objects all the way down; `mapperState` is
+            /// `undefined` for a cartridge with no mapper, and with no
+            /// cartridge every list is empty.
+            #[wasm_bindgen(js_name = getCartridgeManifest)]
+            pub fn get_cartridge_manifest(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::cartridge::cartridge_manifest_object(
+                    &*$crate::__private::retro_core::EmulatorCore::cartridge_debugger(
+                        &mut self.$core,
+                    ),
+                )
             }
 
             /// The `cartridge-manifest-v1` detection resolves for the ROM

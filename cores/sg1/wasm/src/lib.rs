@@ -56,38 +56,6 @@ impl RetroEmulator {
         }
     }
 
-    // ===== Cartridge manifest =====
-
-    /// Cartridge manifest view derived from the installed map plan:
-    /// `{ memoryMap, romRegions, sramRegions, mapperState }`. `mapperState`
-    /// is the live `{ mapper_type, registers, banks }` from the cartridge
-    /// debugger (`mapper_type: "None"` for a plain cartridge).
-    #[wasm_bindgen(js_name = getCartridgeManifest)]
-    pub fn get_cartridge_manifest(&mut self) -> JsValue {
-        let regions = self.genesis.cartridge_debugger().map_regions();
-        let rom_regions: Vec<_> = regions
-            .iter()
-            .filter(|r| r.label == "ROM")
-            .cloned()
-            .collect();
-        let sram_regions: Vec<_> = regions
-            .iter()
-            .filter(|r| r.label == "SRAM")
-            .cloned()
-            .collect();
-        let mapper_state = self.genesis.cartridge_debugger().get_mapper_state();
-        let manifest = serde_json::json!({
-            "memoryMap": regions,
-            "romRegions": rom_regions,
-            "sramRegions": sram_regions,
-            "mapperState": retro_wasm::cartridge::mapper_state_value(
-                mapper_state,
-                genesis_mapper_type_label,
-            ),
-        });
-        to_js(&manifest)
-    }
-
     // ===== Debugger Methods =====
 
     /// Read the full ROM binary from the cartridge (for "Save ROM" feature).
@@ -200,29 +168,13 @@ impl RetroEmulator {
 impl RetroEmulator {
     // ===== Audio Debugger Methods (Generic) =====
 
-    /// Get audio chip metadata (generic for any chip).
+    /// The PSG's description, as the chip gives it.
     ///
     /// @deprecated Use `getAudioChips()[1]`, the PSG.
     #[wasm_bindgen(js_name = getAudioChipInfo)]
     pub fn get_audio_chip_info(&self) -> JsValue {
-        // Describes the PSG only; the YM2612 has calls of its own further down.
-        use retro_core::audio::AudioChipInfo;
-
-        let info = AudioChipInfo {
-            name: "SN76489 PSG",
-            manufacturer: "Texas Instruments",
-            channels: 4,
-            channel_types: vec![
-                retro_core::audio::ChannelType::Tone,
-                retro_core::audio::ChannelType::Tone,
-                retro_core::audio::ChannelType::Tone,
-                retro_core::audio::ChannelType::Noise,
-            ],
-            sample_rate: 44100,
-            stereo: false,
-        };
-
-        serde_wasm_bindgen::to_value(&info).unwrap()
+        use retro_core::audio::AudioDebugger;
+        to_js(&self.genesis.psg().chip_info())
     }
 
     /// Get number of audio channels (generic).

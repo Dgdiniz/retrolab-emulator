@@ -208,12 +208,16 @@ pub fn detected_manifest(rom: &[u8]) -> CartridgeManifest {
 
 /// Put a cartridge together: its plan and chips over `rom`, the SRAM
 /// window `sram` filled with `0xFF` when it has one, and, when it has none,
-/// the chip with a battery as the save (the EEPROM).
+/// the chip with a battery as the save (the EEPROM). `info` says the save
+/// the cartridge keeps, the window's length or the chip's battery: a
+/// header counts its range from its first address to its last, so an
+/// odd-byte range ($200001-$20FFFF, 65,535 bytes) is a byte short of the
+/// window it describes (65,536).
 fn assemble(
     rom: Arc<[u8]>,
     plan: MapPlan,
     chips: ChipSet,
-    info: CartridgeInfo,
+    mut info: CartridgeInfo,
     sram: Option<(u32, u32)>,
 ) -> Box<GenesisCartridge> {
     let board = GenesisBoard::new(rom.len(), sram);
@@ -221,6 +225,10 @@ fn assemble(
         chips.battery_id()
     } else {
         None
+    };
+    info.sram_size = match sram {
+        Some((_, len)) => len as usize,
+        None => chips.battery().map_or(0, <[u8]>::len),
     };
     let mut cart = GenesisCartridge::new(rom, plan, chips, info, board);
     if let Some((_, len)) = sram {
@@ -513,7 +521,8 @@ fn sram_window(rom_data: &[u8], header_info: &HeaderInfo) -> Option<(u32, u32)> 
 }
 
 /// What the cartridge is: the image's size and hash, the header's fields
-/// when there is a header, the mapper and chip the builder chose.
+/// when there is a header, the mapper and chip the builder chose. The size
+/// of its save is [`assemble`]'s, which knows what the cartridge keeps.
 fn make_info(
     rom_data: &[u8],
     header_info: Option<&HeaderInfo>,
@@ -521,12 +530,11 @@ fn make_info(
     expansion_chip_info: Option<ExpansionChipInfo>,
     detection_source: DetectionSource,
 ) -> CartridgeInfo {
-    let (title, serial, regions, sram_size, sram_type, header_checksum) = match header_info {
+    let (title, serial, regions, sram_type, header_checksum) = match header_info {
         Some(h) => (
             h.title.clone(),
             h.serial.clone(),
             h.regions.clone(),
-            h.sram_size,
             h.sram_type,
             h.checksum,
         ),
@@ -534,7 +542,6 @@ fn make_info(
             String::new(),
             None,
             Vec::new(),
-            0,
             retro_core::cartridge::SRAMType::None,
             None,
         ),
@@ -543,7 +550,6 @@ fn make_info(
         title,
         serial,
         regions,
-        sram_size,
         sram_type,
         mapper_info,
         expansion_chip_info,
@@ -581,6 +587,28 @@ mod tests {
             build_genesis_cartridge(rom).unwrap().sram().len(),
             len as usize
         );
+    }
+
+    /// What the cartridge declares of its save is the save it keeps: the
+    /// window the header's odd-byte range $200001-$20FFFF describes is
+    /// 65,536 bytes, where the header counts 65,535; a manifest's window is
+    /// its own size; a cartridge with no save declares none.
+    #[test]
+    fn the_cartridge_declares_the_save_it_keeps() {
+        let rom = genesis_rom(0x80000, "SAVES", true);
+        let header = GenesisHeaderParser::new().parse(&rom).unwrap();
+        assert_eq!(header.sram_size, 0xFFFF, "the header's count");
+        let cart = build_genesis_cartridge(rom.clone()).unwrap();
+        assert_eq!(cart.sram().len(), 0x10000);
+        assert_eq!(cart.info().sram_size, cart.sram().len());
+        let mut manifest = detected_manifest(&rom);
+        assert_eq!(manifest.mapping.sram_size, cart.sram().len());
+        manifest.mapping.sram_size = 0x8000;
+        let cart = build_with_manifest(rom, &manifest).unwrap();
+        assert_eq!(cart.sram().len(), 0x8000);
+        assert_eq!(cart.info().sram_size, 0x8000);
+        let none = build_genesis_cartridge(genesis_rom(0x80000, "NO SAVE", false)).unwrap();
+        assert_eq!(none.info().sram_size, 0);
     }
 
     /// Build a synthetic Genesis ROM with a valid header.
@@ -711,8 +739,10 @@ mod tests {
         }"#;
         let manifest = parse_manifest(json).unwrap();
         let cart = build_with_manifest(rom, &manifest).unwrap();
-        // The EEPROM's battery is the cartridge's `.srm`.
+        // The EEPROM's battery is the cartridge's `.srm`, and what it
+        // declares of its save.
         assert_eq!(cart.sram().len(), DEFAULT_EEPROM_SIZE);
+        assert_eq!(cart.info().sram_size, DEFAULT_EEPROM_SIZE);
     }
 
     #[test]

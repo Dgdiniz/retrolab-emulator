@@ -953,7 +953,7 @@ setCartridgeManifest, version 9.9 => throws "unsupported manifest version: 9.9"
 setCartridgeManifest => undefined
 getCartridgeManifest, staged => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 8257535, cpu_address_start: 3... (1231 chars, fnv1a64 0x86e60996c679db6f)
 getDetectedManifest => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"snes1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"43c6444aeb2784a75c664403818fdde39d7d6273c9c6b7f9c8484d8a02875051\",\"size\":131072,\"title\":\"SAVING\",\"region\":\"USA\"},\"mapping\":{\"preset\":\"lorom\",\"fastrom\":false,\"sram_size\":2048,\"slots\":[]},\"chips\":[],\"controllers\":null,\"metadata\":null}"
-getCartridgeInfo, save RAM => {checksum: 4660, mapper: "LoROM", region: "USA", size: 131072, title: "SAVING", title_confidence: "high"}
+getCartridgeInfo, save RAM => {calculated_checksum: undefined, detection_source: "Header", expansion_chip_info: undefined, header_checksum: 4660, mapper_info: {description: "", features: [], mapper_id: "SnesLoROM", name: "LoROM"}, regions: [], rom_hash: "43c6444aeb2784a75c664403818fdde39d7d6273c9c6b7f9c8484d8a02875051", rom_size: 131072, serial: undefined, sram_size: 2048, sram_type: "Battery", system: "SNES", title: "SAVING"}
 getCartridgeManifest, save RAM => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 8257535, cpu_address_start: 3... (1231 chars, fnv1a64 0x86e60996c679db6f)
 getSaveRam, save RAM => Uint8Array(len 2048, fnv1a64 0x28c31cf8df2ec325)
 getSaveRam, the program's byte => Uint8Array(len 2048, fnv1a64 0x6c26daaf60470367)
@@ -980,7 +980,7 @@ fn what_a_super_fx_cartridge_answers() {
         r#"
 detectManifest, Super FX => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"snes1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"901c7b11acc4b77d4e5fd59c5e748e0eddeca3c9f0dcf27a325fae671e892a42\",\"size\":1048576,\"title\":\"SUPER FX TRACE\",\"region\":\"USA\"},\"mapping\":{\"preset\":\"superfx\",\"fastrom\":false,\"sram_size\":32768,\"slots\":[]},\"chips\":[],\"controllers\":null,\"metadata\":null}"
 getDetectedManifest, Super FX => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"snes1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"901c7b11acc4b77d4e5fd59c5e748e0eddeca3c9f0dcf27a325fae671e892a42\",\"size\":1048576,\"title\":\"SUPER FX TRACE\",\"region\":\"USA\"},\"mapping\":{\"preset\":\"superfx\",\"fastrom\":false,\"sram_size\":32768,\"slots\":[]},\"chips\":[],\"controllers\":null,\"metadata\":null}"
-getCartridgeInfo, Super FX => {checksum: 4660, mapper: "Super FX", region: "USA", size: 1048576, title: "SUPER FX TRACE", title_confidence: "high"}
+getCartridgeInfo, Super FX => {calculated_checksum: undefined, detection_source: "Header", expansion_chip_info: {chip_type: "Super... (535 chars, fnv1a64 0xd2e31d5d61f4c060)
 getCartridgeManifest, Super FX => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 4194303, cpu_address_start: 3... (3334 chars, fnv1a64 0xe739224af9143190)
 getSaveRam, Super FX => undefined
 "#,

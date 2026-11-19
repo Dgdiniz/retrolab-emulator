@@ -495,7 +495,7 @@ fn what_the_sound_chips_readers_answer() {
     first_channels(&mut found, ", unmuted", &emu);
     found.check(
         r#"
-getAudioChipInfo => {channel_types: ["Tone", "Tone", "Tone", "Noise"], channels: 4, manufacturer: "Texas Instruments", name: "SN76489 PSG", sample_rate: 44100, stereo: false}
+getAudioChipInfo => {channel_types: ["Tone", "Tone", "Tone", "Noise"], channels: 4, manufacturer: "Texas Instruments", name: "SN76489", sample_rate: 44100, stereo: false}
 getAudioChannelCount => 4
 getYm2612ChannelCount => 6
 getAudioChannelState(0) => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
@@ -934,23 +934,23 @@ getMapperState, no cartridge => {banks: [], mapper_type: "None", registers: []}
 getChipState, no cartridge => null
 getChipStates, no cartridge => []
 getMemoryMap, no cartridge => {regions: []}
-getCartridgeManifest, no cartridge => {mapperState: {banks: [], mapper_type: "None", registers: []}, memoryMap: [], romRegions: [], sramRegions: []}
+getCartridgeManifest, no cartridge => {mapperState: {bank_config: {banks: []}, mapper_id: {Custom: ""}, registers: []}, memoryMap: {regions: []}, romRegions: [], sramRegions: []}
 getCartridgeSaveState(5), no cartridge => throws "No cartridge loaded"
 getSaveRam, no cartridge => undefined
 detectManifest => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"sg1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"3e8ea16f75fdddd05ce46ad2acda5d99b2614035778606ed807dfaed1a64a042\",\"size\":524288,\"title\":\"SAVING\",\"region\":\"Japan\"},\"mapping\":{\"preset\":\"plain\",\"sram_size\":16384,\"slots\":[]},\"chips\":[],\"metadata\":null}"
 setCartridgeManifest, not JSON => throws "invalid JSON: key must be a string at line 1 column 3"
 setCartridgeManifest, version 9.9 => throws "unsupported manifest version: 9.9"
 setCartridgeManifest => undefined
-getCartridgeManifest, staged => {mapperState: {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2097152, memory... (597 chars, fnv1a64 0xbb1acb31147f5c7b)
+getCartridgeManifest, staged => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2... (861 chars, fnv1a64 0x10fc8814668efb76)
 loadRom, a staged manifest that fails => throws "unsupported preset: bogus"
 getDetectedManifest => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"sg1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"3e8ea16f75fdddd05ce46ad2acda5d99b2614035778606ed807dfaed1a64a042\",\"size\":524288,\"title\":\"SAVING\",\"region\":\"Japan\"},\"mapping\":{\"preset\":\"plain\",\"sram_size\":16384,\"slots\":[]},\"chips\":[],\"metadata\":null}"
-getCartridgeInfo, save RAM => {checksum: 0, mapper: undefined, region: "Japan, USA, Europe", size: 524288, title: "SAVING", title_confidence: "high"}
+getCartridgeInfo, save RAM => {calculated_checksum: 47852, detection_source: "Header", expansion_chip_info: undefined, header_checksum: 0, mapper_info: undefined, regions: ["Japan", "USA", "Europe"], rom_hash: "3e8ea16f75fdddd05ce46ad2acda5d99b2614035778606ed807dfaed1a64a042", rom_size: 524288, serial: undefined, sram_size: 16384, sram_type: "Battery", system: "Genesis", title: "SAVING"}
 getCartridgeTitle, save RAM => "SAVING"
 getMapperState, save RAM => {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2097152, memory_type: "SRAM", physical_offset: 0, size: 16384}, {bank_number: 1, cpu_address_end: 4194303, cpu_address_start: 0, memory_type: "ROM", physical_offset: 0, size: 4194304}], mapper_type: "None", registers: []}
 getChipState, save RAM => null
 getChipStates, save RAM => []
 getMemoryMap, save RAM => {regions: [{detail: "", end: 2113535, label: "SRAM", start: 2097152}, {detail: "mask=0x07FFFF", end: 4194303, label: "ROM", start: 0}]}
-getCartridgeManifest, save RAM => {mapperState: {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2097152, memory... (597 chars, fnv1a64 0xbb1acb31147f5c7b)
+getCartridgeManifest, save RAM => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2... (861 chars, fnv1a64 0x10fc8814668efb76)
 getCartridgeSaveState(5), save RAM => Uint8Array(len 16400, fnv1a64 0xc48847c61fff95a5)
 getSaveRam => Uint8Array(len 16384, fnv1a64 0x0d65b7532d396325)
 isCartridgeSramDirty, loaded => false
@@ -959,13 +959,13 @@ isCartridgeSramDirty, written => true
 isCartridgeSramDirty, cleared => false
 getSaveRam, set => Uint8Array(len 16384, fnv1a64 0x041c8c104a963a61)
 isCartridgeSramDirty, set => false
-getCartridgeInfo, SVP => {checksum: 0, mapper: undefined, region: "Japan, USA, Europe", size: 524288, title: "SVP GAME", title_confidence: "high"}
+getCartridgeInfo, SVP => {calculated_checksum: 0, detection_source: "Header", expansion_chip_info: {chip_type: "SVP", descrip... (425 chars, fnv1a64 0xca0dc5889557b76c)
 getCartridgeTitle, SVP => "SVP GAME"
 getMapperState, SVP => {banks: [{bank_number: 0, cpu_address_end: 10571787, cpu_address_start: 10571776, memory_type: "Mapp... (703 chars, fnv1a64 0x6b6b053f378337ab)
 getChipState, SVP => {chip_type: "SVP", cycle_count: 0, internal_ram: "Array(len 1024, bytes fnv1a64 0x51d88627df287325)"... (676 chars, fnv1a64 0x9e08010f46ae4286)
 getChipStates, SVP => [{chipId: 0, label: "SVP", state: {chip_type: "SVP", cycle_count: 0, internal_ram: "Array(len 1024, ... (712 chars, fnv1a64 0x4cc066c62b82c2a7)
 getMemoryMap, SVP => {regions: [{detail: "base=0x100000", end: 10571787, label: "Chip 0", start: 10571776}, {detail: "", end: 3276799, label: "Chip 0", start: 3145728}, {detail: "base=0x200000", end: 3801087, label: "Chip 0", start: 3735552}, {detail: "base=0x300000", end: 3866623, label: "Chip 0", start: 3801088}, {detail: "mask=0x07FFFF", end: 2097151, label: "ROM", start: 0}]}
-getCartridgeManifest, SVP => {mapperState: {banks: [{bank_number: 0, cpu_address_end: 10571787, cpu_address_start: 10571776, memo... (1177 chars, fnv1a64 0x59ee9526036bd84b)
+getCartridgeManifest, SVP => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 10571787, cpu_address_start: ... (1695 chars, fnv1a64 0x3f43c530eff4ccd7)
 getCartridgeSaveState(5), SVP => Uint8Array(len 134342, fnv1a64 0x2fa4b8f0389c335b)
 "#,
     );

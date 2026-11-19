@@ -277,17 +277,6 @@ fn the_mode_breakdown_is_a_plain_object() {
 }
 
 #[wasm_bindgen_test]
-fn the_cartridge_manifest_is_plain_objects_all_the_way_down() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.load_rom(&synth_lorom("MANIFEST")).unwrap();
-    let manifest = emu.get_cartridge_manifest();
-    assert_plain_object(&manifest, "memoryMap");
-    assert_plain_object(&property(&manifest, "memoryMap"), "regions");
-    assert_plain_object(&property(&manifest, "mapperState"), "mapper_id");
-    assert!(js_sys::Array::is_array(&property(&manifest, "romRegions")));
-}
-
-#[wasm_bindgen_test]
 fn the_ppu_settings_are_a_plain_object() {
     let emu = RetroEmulator::new("snes").unwrap();
     let settings = emu.get_ppu_settings();

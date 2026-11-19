@@ -233,19 +233,17 @@ fn the_sound_chips_are_the_ym2612_then_the_psg() {
         field(&psg, "channels").as_f64(),
         Some(f64::from(emu.get_audio_channel_count()))
     );
-    // The older reader names the PSG by hand; every other key is the
-    // chip's own description.
+}
+
+/// The older chip reader is the PSG as the chip describes itself, the same
+/// value as `getAudioChips()[1]`: the chip's name is `"SN76489"`.
+#[wasm_bindgen_test]
+fn the_older_chip_reader_is_the_psg_as_it_describes_itself() {
+    let mut emu = running();
+    let psg = js_sys::Array::from(&emu.get_audio_chips()).get(1);
     let info = emu.get_audio_chip_info();
-    assert_eq!(field(&psg, "name").as_string().as_deref(), Some("SN76489"));
-    for key in [
-        "manufacturer",
-        "channels",
-        "sample_rate",
-        "stereo",
-        "channel_types",
-    ] {
-        assert_eq!(shape(&field(&psg, key)), shape(&field(&info, key)), "{key}");
-    }
+    assert_eq!(shape(&info), shape(&psg));
+    assert_eq!(field(&info, "name").as_string().as_deref(), Some("SN76489"));
 }
 
 #[wasm_bindgen_test]

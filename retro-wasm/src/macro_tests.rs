@@ -3,7 +3,11 @@
 //! present buffer, the load's retry and which calls refresh the picture.
 
 use js_sys::{Array, Map, Object, Reflect, Uint8Array};
-use retro_core::cartridge::{MapperId, MapperState};
+use retro_core::cartridge::{
+    AccessType, BankConfiguration, BankInfo, BreakpointId, CartridgeDebugger, ExpansionChipState,
+    MapperId, MapperRegister, MapperState, MemoryMap, MemoryMapRegion, MemoryType, RomRegionInfo,
+    SRAMType, SramRegionInfo, WatchType,
+};
 use retro_core::EmulatorCore;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
@@ -552,7 +556,7 @@ fn the_cartridge_readers_answer_before_and_after_a_load() {
         Some(format!("{:016x}", retro_core::hash::fnv1a64(&[1, 2, 3, 4])))
     );
     assert_eq!(
-        get(&emu.get_cartridge_info().unwrap(), "size").as_f64(),
+        get(&emu.get_cartridge_info().unwrap(), "rom_size").as_f64(),
         Some(4.0)
     );
     assert_eq!(emu.get_cartridge_title().as_deref(), Some("FAKE"));
@@ -561,6 +565,165 @@ fn the_cartridge_readers_answer_before_and_after_a_load() {
     assert!(emu.is_cartridge_sram_dirty());
     emu.clear_cartridge_sram_dirty();
     assert!(!emu.is_cartridge_sram_dirty());
+}
+
+/// `getCartridgeInfo` is what the cartridge declares, every field of
+/// retro-core's `CartridgeInfo` in its order, not the ROM header's summary
+/// `getRomInfo` gives.
+#[wasm_bindgen_test]
+fn the_cartridge_info_is_what_the_cartridge_declares() {
+    let mut emu = plain();
+    emu.load_rom(&[1, 2, 3, 4]).unwrap();
+    let info = emu.get_cartridge_info().unwrap();
+    assert!(!info.is_instance_of::<Map>());
+    let keys: Vec<String> = Object::keys(info.unchecked_ref())
+        .iter()
+        .filter_map(|key| key.as_string())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "system",
+            "title",
+            "serial",
+            "regions",
+            "rom_size",
+            "sram_size",
+            "sram_type",
+            "mapper_info",
+            "expansion_chip_info",
+            "header_checksum",
+            "calculated_checksum",
+            "rom_hash",
+            "detection_source",
+        ]
+    );
+    let declared = emu.core.cartridge_info().unwrap();
+    assert_eq!(shape(&info), shape(&to_js(declared)));
+    assert_eq!(
+        get(&info, "rom_hash").as_string(),
+        Some(retro_core::cartridge::rom_sha256(&[1, 2, 3, 4]))
+    );
+    assert!(get(&info, "size").is_undefined(), "not getRomInfo's");
+}
+
+/// A cartridge debugger with one ROM window, one save window and a mapper,
+/// for the manifest view's marshaller.
+struct DescribedCartridge;
+
+impl CartridgeDebugger for DescribedCartridge {
+    fn get_memory_map(&self) -> MemoryMap {
+        MemoryMap {
+            regions: vec![MemoryMapRegion {
+                cpu_address_start: 0,
+                cpu_address_end: 0x7FFF,
+                physical_offset: 0,
+                size: 0x8000,
+                memory_type: MemoryType::ROM,
+                access: AccessType::ReadOnly,
+                description: "ROM".to_string(),
+            }],
+        }
+    }
+    fn get_rom_regions(&self) -> Vec<RomRegionInfo> {
+        vec![RomRegionInfo {
+            start: 0,
+            end: 0x7FFF,
+            size: 0x8000,
+            description: "ROM".to_string(),
+        }]
+    }
+    fn get_sram_regions(&self) -> Vec<SramRegionInfo> {
+        vec![SramRegionInfo {
+            start: 0x20_0000,
+            end: 0x20_1FFF,
+            size: 0x2000,
+            sram_type: SRAMType::Battery,
+            description: "SRAM".to_string(),
+        }]
+    }
+    fn get_mapper_state(&self) -> Option<MapperState> {
+        Some(MapperState {
+            mapper_id: MapperId::Custom("banked".to_string()),
+            registers: vec![MapperRegister {
+                address: 0xA1_30F1,
+                name: "bank".to_string(),
+                value: 3,
+                description: String::new(),
+            }],
+            bank_config: BankConfiguration {
+                banks: vec![BankInfo {
+                    cpu_address_start: 0,
+                    cpu_address_end: 0x7FFF,
+                    physical_offset: 0x18000,
+                    size: 0x8000,
+                    memory_type: MemoryType::ROM,
+                    bank_number: 3,
+                }],
+            },
+        })
+    }
+    fn get_chip_state(&self) -> Option<ExpansionChipState> {
+        None
+    }
+    fn add_rom_breakpoint(&mut self, _addr: u32) -> BreakpointId {
+        unreachable!()
+    }
+    fn add_sram_watchpoint(&mut self, _addr: u32, _watch_type: WatchType) -> BreakpointId {
+        unreachable!()
+    }
+    fn remove_breakpoint(&mut self, _id: BreakpointId) {
+        unreachable!()
+    }
+}
+
+/// `getCartridgeManifest` is the cartridge debugger's view in retro-core's
+/// names, plain objects all the way down; with no cartridge every list is
+/// empty and there is no mapper.
+#[wasm_bindgen_test]
+fn the_cartridge_manifest_is_the_debuggers_view_in_plain_objects() {
+    assert_eq!(
+        shape(&plain().get_cartridge_manifest()),
+        "{mapperState: undefined, memoryMap: {regions: []}, romRegions: [], sramRegions: []}"
+    );
+    let view = crate::cartridge::cartridge_manifest_object(&DescribedCartridge);
+    let mapper = get(&view, "mapperState");
+    let banks = get(&get(&mapper, "bank_config"), "banks");
+    let memory_map = get(&view, "memoryMap");
+    for (what, value) in [
+        ("the view", view.clone()),
+        ("memoryMap", memory_map.clone()),
+        ("a region", Array::from(&get(&memory_map, "regions")).get(0)),
+        (
+            "romRegions[0]",
+            Array::from(&get(&view, "romRegions")).get(0),
+        ),
+        (
+            "sramRegions[0]",
+            Array::from(&get(&view, "sramRegions")).get(0),
+        ),
+        ("mapperState", mapper.clone()),
+        ("mapper_id", get(&mapper, "mapper_id")),
+        ("a register", Array::from(&get(&mapper, "registers")).get(0)),
+        ("bank_config", get(&mapper, "bank_config")),
+        ("a bank", Array::from(&banks).get(0)),
+    ] {
+        assert!(value.is_object(), "{what} is an object");
+        assert!(!value.is_instance_of::<Map>(), "{what} is not a Map");
+    }
+    assert_eq!(
+        shape(&view),
+        concat!(
+            "{mapperState: {bank_config: {banks: [{bank_number: 3, cpu_address_end: 32767, ",
+            "cpu_address_start: 0, memory_type: \"ROM\", physical_offset: 98304, size: 32768}]}, ",
+            "mapper_id: {Custom: \"banked\"}, registers: [{address: 10563825, description: \"\", ",
+            "name: \"bank\", value: 3}]}, memoryMap: {regions: [{access: \"ReadOnly\", ",
+            "cpu_address_end: 32767, cpu_address_start: 0, description: \"ROM\", ",
+            "memory_type: \"ROM\", physical_offset: 0, size: 32768}]}, romRegions: [{description: ",
+            "\"ROM\", end: 32767, size: 32768, start: 0}], sramRegions: [{description: \"SRAM\", ",
+            "end: 2105343, size: 8192, sram_type: \"Battery\", start: 2097152}]}"
+        )
+    );
 }
 
 #[wasm_bindgen_test]

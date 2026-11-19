@@ -7,7 +7,7 @@
 //! input code, and the generic debugger panels) can therefore drive the
 //! SNES core through the same calls it already makes against Genesis.
 //! SNES-only debug surfaces (PPU mode, Mode 7 matrix, S-DSP voices, APU
-//! mailbox, viewers, cartridge manifest) ship under their own `js_name`s.
+//! mailbox, viewers) ship under their own `js_name`s.
 //!
 //! ## Framebuffer presentation
 //!
@@ -239,21 +239,6 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = getSpriteTileSettings)]
     pub fn get_sprite_tile_settings(&self) -> JsValue {
         serde_wasm_bindgen::to_value(&self.snes.sprite_tile_settings()).unwrap()
-    }
-
-    /// Cartridge manifest: `{ memoryMap, romRegions, sramRegions,
-    /// mapperState }` derived from the installed map plan, plain objects
-    /// all the way down.
-    #[wasm_bindgen(js_name = getCartridgeManifest)]
-    pub fn get_cartridge_manifest(&mut self) -> JsValue {
-        let dbg = self.snes.cartridge_debugger();
-        let manifest = serde_json::json!({
-            "memoryMap": dbg.get_memory_map(),
-            "romRegions": dbg.get_rom_regions(),
-            "sramRegions": dbg.get_sram_regions(),
-            "mapperState": dbg.get_mapper_state(),
-        });
-        to_js(&manifest)
     }
 
     // ===== Raw debug memory views =====
