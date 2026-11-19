@@ -82,10 +82,36 @@ fn normalize_obj_x(x: u16) -> i32 {
 }
 
 /// A sprite's position in signed screen coordinates, as the sprite list
-/// and the sprite table report it: X out of its 9-bit wrap; Y the top
-/// scanline (8-bit, wraps at 256, no sign bit), left as it is.
-fn sprite_position(sprite: &SpriteAttrs) -> (i32, i32) {
-    (normalize_obj_x(sprite.x), i32::from(sprite.y))
+/// and the sprite table report it: where the renderer draws it. X comes
+/// out of its 9-bit wrap; Y is the line of the sprite's first row,
+/// counted from the first line the frame draws.
+///
+/// The renderer draws 224 lines, or 239 with the overscan bit set
+/// ([`Ppu::in_active_scanline`]), and puts a sprite on each line whose
+/// distance below the sprite's Y byte, counted with a wrap at 256, is
+/// less than the lines the sprite covers: its height, halved under OBJ
+/// interlace ([`sprite_on_scanline`](crate::ppu::sprite::sprite_on_scanline)).
+/// A sprite whose first row falls on a line past the last one drawn, and
+/// whose rows run on past line 255, therefore shows only the rows that
+/// wrap onto the top, and its Y is its Y byte less 256: its first row
+/// sits that far above the top, its other rows on the lines they are
+/// drawn on. Every other sprite keeps its Y byte: one whose first row is
+/// drawn, whether the bottom edge cuts it or it is tall enough to wrap
+/// onto the top as well, and one that no line draws.
+fn sprite_position(sprite: &SpriteAttrs, overscan: bool, obj_interlace: bool) -> (i32, i32) {
+    let lines_drawn: u16 = if overscan { 239 } else { 224 };
+    let lines_covered = u16::from(if obj_interlace {
+        sprite.height >> 1
+    } else {
+        sprite.height
+    });
+    let first_line = u16::from(sprite.y);
+    let y = if first_line >= lines_drawn && first_line + lines_covered > 256 {
+        i32::from(sprite.y) - 256
+    } else {
+        i32::from(sprite.y)
+    };
+    (normalize_obj_x(sprite.x), y)
 }
 
 /// Which VRAM character region [`Ppu::export_tile_image`] decodes.
@@ -645,7 +671,7 @@ impl VideoDebugger for Ppu {
         (0..128usize)
             .map(|idx| {
                 let s = parse_sprite(oam, idx, self.obj_base_size, self.obj_interlace);
-                let (x, y) = sprite_position(&s);
+                let (x, y) = sprite_position(&s, self.overscan, self.obj_interlace);
                 SpriteData {
                     index: idx as u32,
                     x,
@@ -995,7 +1021,7 @@ impl VideoDebugger for Ppu {
             .map(|taken| {
                 let idx = (usize::from(self.oam_first_sprite) + taken) & 0x7F;
                 let s = parse_sprite(oam, idx, self.obj_base_size, self.obj_interlace);
-                let (x, y) = sprite_position(&s);
+                let (x, y) = sprite_position(&s, self.overscan, self.obj_interlace);
                 let first_tile = sprite_tile_number(
                     self.obj_tiledata_addr,
                     self.obj_name_select,

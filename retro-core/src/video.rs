@@ -22,10 +22,11 @@ pub struct PaletteData {
 ///
 /// `x`/`y` are **normalized signed screen-space** coordinates: the core
 /// has already undone the per-console hardware bias (Genesis `-128`,
-/// SNES 9-bit X wrap) so a sprite straddling the left/top edge reports a
-/// negative coordinate and the host can place every sprite in one frame
-/// without re-deriving hardware quirks. This is the single canonical
-/// sprite list both cores expose for composite/object capture.
+/// SNES 9-bit X wrap and Y wrap past line 255) so a sprite straddling the
+/// left/top edge reports a negative coordinate and the host can place
+/// every sprite in one frame without re-deriving hardware quirks. This is
+/// the single canonical sprite list both cores expose for composite/object
+/// capture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteData {
     pub index: u32,

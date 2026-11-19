@@ -445,7 +445,7 @@ fn get_sprite_data_normalizes_obj_x_to_signed_screen_space() {
     // Sprite 0: X = 500 (x_lo = 244, high-table X bit 8 set) -> the
     // 9-bit value wraps to screen -12 (partially off the left).
     ppu.oam[0] = 244;
-    ppu.oam[1] = 30; // Y top scanline, kept verbatim
+    ppu.oam[1] = 30; // Y on a line drawn, kept
     ppu.oam[0x200] |= 0x01; // sprite 0 high bits: X bit 8 = 1
                             // Sprite 1: X = 100, no high bit -> unchanged.
     ppu.oam[4] = 100;
@@ -453,8 +453,150 @@ fn get_sprite_data_normalizes_obj_x_to_signed_screen_space() {
 
     let sprites = ppu.get_sprite_data();
     assert_eq!(sprites[0].x, -12, "9-bit X 500 normalizes to -12");
-    assert_eq!(sprites[0].y, 30, "Y stays the raw top scanline");
+    assert_eq!(sprites[0].y, 30, "a Y on a line drawn stays the Y byte");
     assert_eq!(sprites[1].x, 100, "in-range X is unchanged");
+}
+
+/// A PPU showing sprite 0 alone at `y` (x 40), a large sprite `size`
+/// pixels square (16, 32 or 64, by OBSEL's size selector), every pixel of
+/// every character colour 5. The other 127 sprites sit past the right
+/// edge, where no line draws them.
+fn sprite_0_at(y: u8, size: u8) -> Ppu {
+    let mut ppu = Ppu::new();
+    ppu.display_disable = false;
+    ppu.display_brightness = 15;
+    ppu.obj_main_enable = true;
+    ppu.obj_base_size = match size {
+        16 => 0,
+        32 => 1,
+        64 => 2,
+        _ => unreachable!("a large sprite is 16, 32 or 64 pixels square"),
+    };
+    // 4bpp: planes 0 and 2 set, 1 and 3 clear.
+    ppu.vram.fill(0x00FF);
+    for sprite in 1..128 {
+        ppu.oam[sprite * 4] = 44; // x 300 with its bit 8, set below
+    }
+    ppu.oam[0x200..].fill(0x55);
+    ppu.oam[0] = 40;
+    ppu.oam[1] = y;
+    ppu.oam[0x200] = 0x56; // sprite 0: X bit 8 clear, the size bit set
+    ppu
+}
+
+/// The rows of the picture the renderer paints sprite 0 on, drawn alone,
+/// and the picture's height.
+fn rows_sprite_0_paints(ppu: &mut Ppu) -> (Vec<i32>, u32) {
+    let mut chosen = [false; 128];
+    chosen[0] = true;
+    let image = ppu.render_sprites(&chosen);
+    let painted = (0..image.height)
+        .filter(|&row| {
+            (0..image.width).any(|x| image.rgba[((row * image.width + x) * 4 + 3) as usize] != 0)
+        })
+        .map(|row| row as i32)
+        .collect();
+    (painted, image.height)
+}
+
+/// A placement of sprite 0: its Y byte, its size, the y the sprite list
+/// and the sprite table must give, and the runs of picture rows the
+/// renderer paints, each its first and last row.
+type Placement<'a> = (u8, u8, i32, &'a [(i32, i32)]);
+
+/// Sprite 0 at each placement, on a frame of 224 lines, or 239 with
+/// `overscan` (shown whole, so a picture row is a line drawn), with or
+/// without OBJ interlace.
+fn check_placements(overscan: bool, obj_interlace: bool, placements: &[Placement<'_>]) {
+    for &(y_byte, size, y, paints) in placements {
+        let what = format!(
+            "{size}x{size} at {y_byte}, overscan {overscan}, OBJ interlace {obj_interlace}"
+        );
+        let mut ppu = sprite_0_at(y_byte, size);
+        ppu.overscan = overscan;
+        ppu.show_overscan = overscan;
+        ppu.obj_interlace = obj_interlace;
+
+        let sprites = ppu.get_sprite_data();
+        let sprite = &sprites[0];
+        assert_eq!((sprite.x, sprite.y), (40, y), "{what}: the sprite list");
+        let entry = &ppu.sprite_table()[0];
+        assert_eq!((entry.index, entry.y), (0, y), "{what}: the sprite table");
+
+        let (painted, height) = rows_sprite_0_paints(&mut ppu);
+        assert_eq!(height, if overscan { 240 } else { 224 }, "{what}");
+        let expected: Vec<i32> = paints
+            .iter()
+            .flat_map(|&(first, last)| first..=last)
+            .collect();
+        assert_eq!(painted, expected, "{what}: the rows painted");
+
+        // Every row of the sprite's box on a line drawn is painted, and
+        // every other row painted is a row of the box wrapped past line
+        // 255 onto the top.
+        let lines_drawn = if overscan { 239 } else { 224 };
+        let lines_covered = if obj_interlace {
+            sprite.height as i32 / 2
+        } else {
+            sprite.height as i32
+        };
+        let in_box = |row: i32| (y..y + lines_covered).contains(&row);
+        for row in (0..lines_drawn).filter(|&row| in_box(row)) {
+            assert!(painted.contains(&row), "{what}: row {row} of the box");
+        }
+        for &row in &painted {
+            assert!(in_box(row) || in_box(row + 256), "{what}: row {row}");
+        }
+    }
+}
+
+#[test]
+fn a_sprite_s_y_is_the_line_the_renderer_draws_its_first_row_on() {
+    // 224 lines: a sprite whose first row is past them and whose rows wrap
+    // onto the top reads its Y byte less 256; every other keeps its byte.
+    check_placements(
+        false,
+        false,
+        &[
+            (248, 16, -8, &[(0, 7)]),
+            (100, 16, 100, &[(100, 115)]),
+            (220, 16, 220, &[(220, 223)]), // cut by the bottom edge
+            (250, 16, -6, &[(0, 9)]),
+            (223, 16, 223, &[(223, 223)]), // on the last line drawn
+            (200, 32, 200, &[(200, 223)]), // cut by the bottom edge
+            (224, 16, 224, &[]),           // drawn on no line
+            (240, 16, 240, &[]),           // its last row on line 255
+            (241, 16, -15, &[(0, 0)]),     // its last row on line 0
+            (232, 32, -24, &[(0, 7)]),
+            // Taller than the 32 lines below the picture: at 220 its first
+            // rows are drawn at the bottom and its last ones on the top, at
+            // 224 only its last ones.
+            (220, 64, 220, &[(0, 27), (220, 223)]),
+            (224, 64, -32, &[(0, 31)]),
+        ],
+    );
+    // 239 lines: the first row of the sprite at 232 is drawn.
+    check_placements(
+        true,
+        false,
+        &[
+            (232, 32, 232, &[(0, 7), (232, 238)]),
+            (239, 32, -17, &[(0, 14)]), // on the first line past the picture
+            (230, 16, 230, &[(230, 238)]),
+            (250, 16, -6, &[(0, 9)]),
+        ],
+    );
+    // OBJ interlace: a field shows every other row, so 16 rows cover 8
+    // lines, and a sprite at 248 ends on line 255.
+    check_placements(
+        false,
+        true,
+        &[
+            (248, 16, 248, &[]),
+            (250, 16, -6, &[(0, 1)]),
+            (100, 16, 100, &[(100, 107)]),
+        ],
+    );
 }
 
 /// A PPU showing sprites on the main screen, every sprite parked below
