@@ -292,6 +292,41 @@ impl Ym2612 {
         }
     }
 
+    /// The input clock, in Hz.
+    pub fn clock_freq(&self) -> u32 {
+        self.clock_freq
+    }
+
+    /// Run on another input clock, as a console of another region gives it
+    /// (the Mega Drive's YM2612 runs on the 68000's clock). What the chip
+    /// works out from its clock follows: the input clocks an output sample
+    /// takes, the output samples between envelope steps, each operator's
+    /// phase increment. What it holds is kept: the registers, the phases
+    /// and envelopes, the timers (which count input clocks), the clocks
+    /// counted towards the next sample and the samples made. The same clock
+    /// changes nothing: a state loaded onto the clock it was made on keeps
+    /// the phase increments it holds, which working them out again could
+    /// move (a frequency write works its increment out before it updates
+    /// the key code the detune reads).
+    pub fn set_clock_freq(&mut self, clock_freq: u32) {
+        if clock_freq == self.clock_freq {
+            return;
+        }
+        self.clock_freq = clock_freq;
+        self.retime();
+        let sample_rate = self.sample_rate;
+        for ch in &mut self.channels {
+            ch.set_clock_freq(clock_freq, sample_rate);
+        }
+    }
+
+    /// The input clocks an output sample takes and the output samples
+    /// between envelope steps, from the clock and the sample rate.
+    fn retime(&mut self) {
+        self.clocks_per_sample = self.clock_freq as f32 / self.sample_rate as f32;
+        self.eg_samples_per_tick = self.sample_rate as f32 / (self.clock_freq as f32 / 432.0);
+    }
+
     /// Enable or disable audio rendering. When disabled (host audio off),
     /// `catch_up()` skips FM synthesis, so disabling audio saves the time
     /// synthesis takes. Timer clocking is unaffected.
@@ -1107,8 +1142,7 @@ impl AudioChip for Ym2612 {
     fn generate_samples(&mut self, output: &mut [f32], sample_rate: u32) -> usize {
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;
-            self.clocks_per_sample = self.clock_freq as f32 / sample_rate as f32;
-            self.eg_samples_per_tick = sample_rate as f32 / (self.clock_freq as f32 / 432.0);
+            self.retime();
             for ch in &mut self.channels {
                 ch.set_sample_rate(sample_rate);
             }

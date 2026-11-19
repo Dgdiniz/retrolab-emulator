@@ -148,6 +148,29 @@ impl Psg {
         }
     }
 
+    /// The input clock, in Hz.
+    pub fn clock_freq(&self) -> u32 {
+        self.clock_freq
+    }
+
+    /// Run on another input clock, as a console of another region gives it
+    /// (the Mega Drive's PSG runs on the Z80's clock): the input clocks an
+    /// output sample takes follow it, and so do the tone channels'
+    /// frequencies in Hz the debugger shows. What the chip holds is kept:
+    /// the registers, the counters, the clocks counted towards the next
+    /// sample and the samples made. The noise channel reads no clock. The
+    /// same clock changes nothing.
+    pub fn set_clock_freq(&mut self, clock_freq: u32) {
+        if clock_freq == self.clock_freq {
+            return;
+        }
+        self.clock_freq = clock_freq;
+        self.cycles_per_sample = clock_freq as f32 / self.sample_rate as f32;
+        for channel in &mut self.tone_channels {
+            channel.set_clock_freq(clock_freq);
+        }
+    }
+
     /// Begin capturing PSG byte writes (see [`PsgWrite`]), discarding any
     /// prior capture. Off by default; only the CLI sound-trace diagnostic
     /// turns it on, so normal emulation pays nothing.

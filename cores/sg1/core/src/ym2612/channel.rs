@@ -166,6 +166,13 @@ impl Channel {
         }
     }
 
+    /// Run every operator on another clock ([`Operator::set_clock_freq`]).
+    pub fn set_clock_freq(&mut self, clock_freq: u32, sample_rate: u32) {
+        for op in &mut self.operators {
+            op.set_clock_freq(clock_freq, sample_rate);
+        }
+    }
+
     /// Set channel base frequency (used for LFO PM calculation)
     /// Should be called whenever frequency registers are written
     pub fn set_base_frequency(&mut self, fnum: u16, block: u8) {

@@ -68,6 +68,11 @@ impl ToneChannel {
         self.frequency
     }
 
+    /// The PSG's input clock, which the frequency in Hz is worked out from.
+    pub fn set_clock_freq(&mut self, clock_freq: u32) {
+        self.clock_freq = clock_freq;
+    }
+
     /// Get frequency in Hz
     ///
     /// Formula: Clock / (32 * frequency_value)

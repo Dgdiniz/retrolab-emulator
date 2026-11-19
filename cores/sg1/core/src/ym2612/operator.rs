@@ -134,6 +134,13 @@ impl Operator {
         self.update_phase_increment();
     }
 
+    /// Run on another clock: the phase scale and the phase increment follow
+    /// it, as they follow the sample rate.
+    pub fn set_clock_freq(&mut self, clock_freq: u32, sample_rate: u32) {
+        self.clock_freq = clock_freq;
+        self.set_sample_rate(sample_rate);
+    }
+
     /// Calculate and update phase increment from frequency parameters
     ///
     /// YM2612 frequency formula:

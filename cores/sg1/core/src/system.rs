@@ -811,7 +811,12 @@ impl EmulatorCore for GenesisEmulator {
     /// The machine retimed for `region`: the refresh rate the host paces
     /// frames against, the audio converter (whose denominator is the
     /// region's 68000 clock) anchored again at the present cycle so no
-    /// sample is lost or doubled, and the VDP's line count and blanking.
+    /// sample is lost or doubled, the VDP's line count and blanking, and
+    /// the sound chips' clocks (`AddressBus::set_sound_clocks`; a bus
+    /// builds its chips on the clocks of the region it is built in, and a
+    /// ROM's load builds it in the region the machine had before). A ROM's
+    /// load, a region change's power cycle and a state's load all come
+    /// here.
     fn apply_region(&mut self, region: VideoRegion) {
         self.region = region;
         self.system_info.display.refresh_rate = region.frame_rate();
@@ -822,6 +827,7 @@ impl EmulatorCore for GenesisEmulator {
         converter.reset(self.master_cycles);
         self.audio_rate_converter = converter;
         self.bus.vdp_mut().set_region(region);
+        self.bus.set_sound_clocks(region);
     }
 
     fn host_audio(&self) -> &HostAudioRing {

@@ -165,9 +165,7 @@ impl AddressBus {
 
     /// Create a new address bus with a specific region.
     pub fn with_region(region: VideoRegion) -> Self {
-        // Audio clocks
-        let psg_clock = (region.master_clock() / 15) as u32; // ~3.58 MHz (same as Z80)
-        let ym2612_clock = (region.master_clock() / 7) as u32; // ~7.67 MHz (same as 68K)
+        let (psg_clock, ym2612_clock) = Self::sound_clocks(region);
         let sample_rate = 44100; // Standard audio sample rate
 
         Self {
@@ -192,6 +190,22 @@ impl AddressBus {
             watch_events: Vec::new(),
             watch_dmas: Vec::new(),
         }
+    }
+
+    /// The clocks a console of `region` gives its sound chips, in Hz: the
+    /// PSG runs on the Z80's clock (the master clock over 15), the YM2612
+    /// on the 68000's (over 7).
+    fn sound_clocks(region: VideoRegion) -> (u32, u32) {
+        let master = region.master_clock();
+        ((master / 15) as u32, (master / 7) as u32)
+    }
+
+    /// The sound chips put on the clocks of `region` (`sound_clocks`),
+    /// keeping what they hold: the machine retimed for a region.
+    pub fn set_sound_clocks(&mut self, region: VideoRegion) {
+        let (psg_clock, ym2612_clock) = Self::sound_clocks(region);
+        self.psg.set_clock_freq(psg_clock);
+        self.ym2612.set_clock_freq(ym2612_clock);
     }
 
     /// Arm or disarm recording of 68K bus accesses for memory watchpoints.
