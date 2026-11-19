@@ -15,6 +15,7 @@ use crate::fake_machine::{
     PICTURE_WIDTH, SCORES_TOO_LOW,
 };
 use crate::js::to_js;
+use crate::test_support::shape;
 
 /// Every macro on a machine with no present buffer and no hook.
 #[wasm_bindgen]
@@ -655,4 +656,123 @@ fn a_manifest_is_detected_staged_and_cleared() {
 fn a_value_the_serializer_refuses_is_undefined_and_the_module_goes_on() {
     assert!(to_js(&(1u64 << 60)).is_undefined());
     assert_eq!(to_js(&7u64).as_f64(), Some(7.0));
+}
+
+// ---- the names both consoles share: the CPUs, the sound chips, the video
+// chip's memories, palette, sprite table and layers
+
+#[wasm_bindgen_test]
+fn the_cpus_are_described_with_what_the_debugger_does_with_them() {
+    let emu = plain();
+    assert_eq!(
+        shape(&emu.get_cpus()),
+        "[{architecture: \"M68000\", id: 0, location: \"Motherboard\", name: \"Fake CPU\", \
+         records_coverage: true, steppable: true}]"
+    );
+}
+
+#[wasm_bindgen_test]
+fn the_sound_chips_are_read_by_their_index() {
+    let mut emu = plain();
+    let chips = Array::from(&emu.get_audio_chips());
+    assert_eq!(chips.length(), 2);
+    assert_eq!(
+        shape(&chips.get(1)),
+        "{channel_types: [\"Tone\", \"Tone\"], channels: 2, manufacturer: \"Nobody\", \
+         name: \"Second\", sample_rate: 1000, stereo: false}"
+    );
+    assert_eq!(Array::from(&emu.get_audio_chip_channels(0)).length(), 3);
+    emu.mute_audio_chip_channel(1, 1, true);
+    let channels = Array::from(&emu.get_audio_chip_channels(1));
+    assert_eq!(get(&channels.get(1), "muted").as_bool(), Some(true));
+    assert_eq!(get(&channels.get(0), "muted").as_bool(), Some(false));
+    assert!(emu.get_audio_chip_channels(2).is_null(), "no third chip");
+    emu.mute_audio_chip_channel(2, 0, true);
+    assert_eq!(emu.get_audio_chip_waveform(1, 1, 3), [1.0; 3]);
+    assert!(emu.get_audio_chip_waveform(2, 0, 3).is_empty());
+    assert_eq!(emu.get_audio_output_waveform(2), [0.25; 2]);
+}
+
+#[wasm_bindgen_test]
+fn the_video_memories_are_read_and_written_by_name_in_bytes() {
+    let mut emu = plain();
+    assert_eq!(
+        shape(&emu.get_video_memories()),
+        "[{address_unit: 1, id: \"vram\", little_endian: true, name: \"VRAM\", size: 32}, \
+         {address_unit: 2, id: \"palette\", little_endian: true, name: \"PAL\", size: 8}]"
+    );
+    assert_eq!(emu.read_video_memory("vram"), Some(emu.get_vram()));
+    assert_eq!(
+        emu.read_video_memory("palette"),
+        Some(vec![2, 1, 4, 3, 6, 5, 8, 7])
+    );
+    assert_eq!(
+        emu.read_video_memory("sprite_table"),
+        None,
+        "a memory the chip lacks"
+    );
+    assert_eq!(emu.read_video_memory("VRAM"), None, "a name no console has");
+    assert!(emu.write_video_memory("vram", 31, &[0xAA, 0xBB]));
+    let vram = emu.get_vram();
+    assert_eq!((vram[31], vram[0]), (0xAA, 0xBB), "the offset wraps");
+    assert!(!emu.write_video_memory("vertical_scroll", 0, &[1, 2]));
+    assert!(!emu.write_video_memory("nothing", 0, &[1, 2]));
+}
+
+#[wasm_bindgen_test]
+fn the_palette_is_its_memory_s_words_and_their_colours() {
+    let mut emu = plain();
+    assert_eq!(emu.get_palette_memory(), [0x0102, 0x0304, 0x0506, 0x0708]);
+    emu.write_palette_memory(3, &[0xFFFF, 0x0010]);
+    assert_eq!(
+        emu.get_palette_memory(),
+        [0x0010, 0x0304, 0x0506, 0x7FFF],
+        "the colour wraps, the port's bits kept"
+    );
+    assert_eq!(
+        emu.get_palette_colours(),
+        [0, 0, 0x10, 255, 0, 3, 4, 255, 0, 5, 6, 255, 0, 0x7F, 0xFF, 255]
+    );
+    // Every pixel of the fake's tile 2 is index 2: colour 1 + 2.
+    let tile = emu.get_tile_colours(0, 0, 2, 1, 2, 0, 1);
+    assert_eq!(
+        (number(&tile, "width"), number(&tile, "height")),
+        (8.0, 8.0)
+    );
+    let data = get(&tile, "data")
+        .dyn_into::<Uint8Array>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(data.len(), 8 * 8 * 4);
+    assert_eq!(&data[..4], &[0, 0x7F, 0xFF, 255]);
+    assert!(
+        emu.get_tile_colours(1, 0, 0, 1, 8, 0, 0).is_null(),
+        "a decode the chip refuses"
+    );
+    assert!(
+        emu.get_tile_colours(0, 0, 0, 1, 4, 2, 0).is_null(),
+        "no such size"
+    );
+}
+
+#[wasm_bindgen_test]
+fn the_sprite_table_the_layers_and_the_registers_answer_the_chip() {
+    let mut emu = plain();
+    let table = Array::from(&emu.get_sprite_table());
+    assert_eq!(table.length(), 2);
+    assert_eq!(number(&table.get(0), "next"), 1.0);
+    assert!(
+        get(&table.get(1), "next").is_undefined(),
+        "the last one links to none"
+    );
+    assert_eq!(get(&table.get(1), "large").as_bool(), Some(true));
+    assert_eq!(number(&table.get(1), "tile_address"), 64.0);
+    assert_eq!(
+        shape(&emu.get_layer_layout(1)),
+        "{bits_per_pixel: 2, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, \
+         id: 1, kind: \"tile_map\", map_base: 16, map_height: 2, map_width: 4, scroll_x: 0, \
+         scroll_y: 0}"
+    );
+    assert!(emu.get_layer_layout(2).is_null(), "a layer the chip lacks");
+    assert_eq!(shape(&emu.get_video_registers()), "[]");
 }

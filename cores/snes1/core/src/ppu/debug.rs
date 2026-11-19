@@ -20,8 +20,10 @@
 //! and keep the renderer's caches of VRAM in step.
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
-    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
+    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
+    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteOrderEntry, SpriteTableEntry, TileData,
+    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
+    VideoRegister,
 };
 
 use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
@@ -77,6 +79,13 @@ fn normalize_obj_x(x: u16) -> i32 {
     } else {
         i32::from(x)
     }
+}
+
+/// A sprite's position in signed screen coordinates, as the sprite list
+/// and the sprite table report it: X out of its 9-bit wrap; Y the top
+/// scanline (8-bit, wraps at 256, no sign bit), left as it is.
+fn sprite_position(sprite: &SpriteAttrs) -> (i32, i32) {
+    (normalize_obj_x(sprite.x), i32::from(sprite.y))
 }
 
 /// Which VRAM character region [`Ppu::export_tile_image`] decodes.
@@ -636,12 +645,11 @@ impl VideoDebugger for Ppu {
         (0..128usize)
             .map(|idx| {
                 let s = parse_sprite(oam, idx, self.obj_base_size, self.obj_interlace);
+                let (x, y) = sprite_position(&s);
                 SpriteData {
                     index: idx as u32,
-                    x: normalize_obj_x(s.x),
-                    // Y is already the top scanline (8-bit, wraps at 256,
-                    // no sign bit), so it is left as-is.
-                    y: i32::from(s.y),
+                    x,
+                    y,
                     width: u32::from(s.width),
                     height: u32::from(s.height),
                     tile_index: u32::from(s.character),
@@ -934,6 +942,156 @@ impl VideoDebugger for Ppu {
             pixels,
             bpp: request.bpp,
             transparent_index: Some(0),
+        })
+    }
+
+    /// VRAM (word addresses), CGRAM (colours) and OAM (bytes), each
+    /// keeping a word's low byte first, as the 65C816 reads them.
+    fn video_memories(&self) -> Vec<VideoMemoryInfo> {
+        let memory = |id, name, size: usize, address_unit| VideoMemoryInfo {
+            id,
+            name,
+            size: size as u32,
+            address_unit,
+            little_endian: true,
+        };
+        vec![
+            memory(VideoMemoryId::Vram, "VRAM", VRAM_BYTES, 2),
+            memory(VideoMemoryId::Palette, "CGRAM", CGRAM_COLOURS * 2, 2),
+            memory(VideoMemoryId::SpriteTable, "OAM", OAM_BYTES, 1),
+        ]
+    }
+
+    fn read_video_memory(&self, id: VideoMemoryId) -> Option<Vec<u8>> {
+        match id {
+            VideoMemoryId::Vram => Some(self.get_vram().to_vec()),
+            VideoMemoryId::Palette => Some(bytes_from_words(self.cgram(), true)),
+            VideoMemoryId::SpriteTable => Some(self.oam().to_vec()),
+            VideoMemoryId::VerticalScroll => None,
+        }
+    }
+
+    /// Through [`Ppu::write_vram_debug`]'s byte writer,
+    /// [`Ppu::write_cgram_debug`] and [`Ppu::write_oam_debug`]; the SNES
+    /// has no vertical scroll memory.
+    fn write_video_memory(&mut self, id: VideoMemoryId, offset: u32, bytes: &[u8]) -> bool {
+        match id {
+            VideoMemoryId::Vram => self.write_vram_bytes_debug(offset, bytes),
+            VideoMemoryId::Palette => {
+                self.write_cgram_debug(offset / 2, &words_from_bytes(bytes, true));
+            }
+            VideoMemoryId::SpriteTable => self.write_oam_debug(offset, bytes),
+            VideoMemoryId::VerticalScroll => return false,
+        }
+        true
+    }
+
+    /// The 128 entries from the one the sprite evaluation starts at (sprite
+    /// 0, or the rotation's first sprite), wrapping; the table is read in
+    /// order, so no entry links to another.
+    fn sprite_table(&self) -> Vec<SpriteTableEntry> {
+        let oam = self.oam();
+        (0..128usize)
+            .map(|taken| {
+                let idx = (usize::from(self.oam_first_sprite) + taken) & 0x7F;
+                let s = parse_sprite(oam, idx, self.obj_base_size, self.obj_interlace);
+                let (x, y) = sprite_position(&s);
+                let first_tile = sprite_tile_number(
+                    self.obj_tiledata_addr,
+                    self.obj_name_select,
+                    s.character,
+                    s.nameselect,
+                    false,
+                    8,
+                    0,
+                    0,
+                );
+                SpriteTableEntry {
+                    index: idx as u32,
+                    x,
+                    y,
+                    width: u32::from(s.width),
+                    height: u32::from(s.height),
+                    tile_index: u32::from(s.character),
+                    palette: u32::from(s.palette),
+                    priority: u32::from(s.priority),
+                    flip_h: s.hflip,
+                    flip_v: s.vflip,
+                    next: None,
+                    tile_address: u32::from(first_tile) << 5,
+                    large: s.large,
+                }
+            })
+            .collect()
+    }
+
+    /// BG1 to BG4 as [`Ppu::bg_layout`] reads their registers, and the
+    /// sprites (the first character table, 4 bits a pixel, colours from
+    /// 128). In Mode 7, BG1 (and BG2 under EXTBG, 7 bits a pixel) is an
+    /// affine map in Mode 7's own layout: a 128 by 128 map in the low byte
+    /// of each of the first 16 K words of VRAM, its 8 by 8 characters of 8
+    /// bits a pixel in the high bytes; the other backgrounds are off.
+    fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout> {
+        let id = layer_id as usize;
+        if id == LAYER_OBJ {
+            let settings = self.sprite_tile_settings();
+            return Some(LayerLayout {
+                id: layer_id,
+                kind: LayerKind::Sprites,
+                map_base: 0,
+                map_width: 0,
+                map_height: 0,
+                character_base: u32::from(settings.first_table_base_word) * 2,
+                bits_per_pixel: 4,
+                cell_width: 8,
+                cell_height: 8,
+                first_colour: 128,
+                scroll_x: 0,
+                scroll_y: 0,
+            });
+        }
+        if id >= 4 {
+            return None;
+        }
+        let bg = self.bg_layout(id);
+        let affine_bits = match (self.bgmode & 0x07, id) {
+            (7, 0) => Some(8),
+            (7, 1) if self.mode7_extbg => Some(7),
+            _ => None,
+        };
+        let cell = if bg.tile_size16 { 16 } else { 8 };
+        let layout = LayerLayout {
+            id: layer_id,
+            kind: if bg.bpp == 0 {
+                LayerKind::Off
+            } else {
+                LayerKind::TileMap
+            },
+            map_base: bg.tilemap_base_byte,
+            map_width: bg.width_cells,
+            map_height: bg.height_cells,
+            character_base: bg.char_base_byte,
+            bits_per_pixel: bg.bpp,
+            cell_width: cell,
+            cell_height: cell,
+            first_colour: u32::from(bg.palette_base),
+            scroll_x: i32::from(bg.scroll_x),
+            scroll_y: i32::from(bg.scroll_y),
+        };
+        Some(match affine_bits {
+            Some(bits_per_pixel) => LayerLayout {
+                kind: LayerKind::AffineMap,
+                map_base: 0,
+                map_width: 128,
+                map_height: 128,
+                character_base: 0,
+                bits_per_pixel,
+                cell_width: 8,
+                cell_height: 8,
+                first_colour: 0,
+                ..layout
+            },
+            None => layout,
         })
     }
 }
@@ -1241,11 +1399,18 @@ impl Ppu {
     /// the table then reports its memory as not exact. While the VRAM
     /// sources are recorded, each byte written is put down to the debugger.
     pub fn write_vram_debug(&mut self, word_address: u32, bytes: &[u8]) {
+        self.write_vram_bytes_debug((word_address % (VRAM_BYTES as u32 / 2)) * 2, bytes);
+    }
+
+    /// [`Self::write_vram_debug`] from byte `byte_address` on, which wraps
+    /// at the 64 KiB: an odd address writes the high half of its word
+    /// first.
+    fn write_vram_bytes_debug(&mut self, byte_address: u32, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.before_video_memory_edit();
-        let start = (word_address as usize % (VRAM_BYTES / 2)) * 2;
+        let start = byte_address as usize % VRAM_BYTES;
         for (offset, &value) in bytes.iter().take(VRAM_BYTES).enumerate() {
             let byte_address = (start + offset) % VRAM_BYTES;
             let word = &mut self.vram[byte_address >> 1];

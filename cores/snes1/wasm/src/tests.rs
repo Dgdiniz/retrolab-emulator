@@ -1,4 +1,5 @@
 use super::*;
+use retro_wasm::test_support::property;
 use wasm_bindgen_test::*;
 
 #[wasm_bindgen_test]
@@ -243,11 +244,6 @@ fn write_cgram_reads_back_and_shows_after_a_repaint() {
     );
 }
 
-/// A property of a JS object.
-fn property(object: &JsValue, key: &str) -> JsValue {
-    js_sys::Reflect::get(object, &JsValue::from_str(key)).unwrap()
-}
-
 /// A reader's result reaches the app as a plain object: not a `Map`,
 /// whose entries a property read does not see, and `key` one of its
 /// properties.
@@ -324,3 +320,7 @@ mod machine_baseline;
 /// the audio, an input session, the debugger's memory and disassembly, the
 /// PPU's and the S-DSP's readers, and the cartridge's.
 mod binding_baseline;
+
+/// Each name both consoles share against the older names it stands
+/// beside: the same value, or the same effect.
+mod names;

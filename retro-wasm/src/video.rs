@@ -42,7 +42,12 @@ pub fn tile_request(
 /// `EmulatorCore` in its field `$core` and its `video_debugger()`:
 /// `getVram()`, `getLayerInfo()`, `toggleLayer(layer_id, visible)`,
 /// `exportSpriteImage(index)`, `getSpriteData()`,
-/// `resolvedSpriteRenderOrder()` and `decodeTiles(...)`.
+/// `resolvedSpriteRenderOrder()` and `decodeTiles(...)`; the registers,
+/// `getVideoRegisters()`; the video memories, `getVideoMemories()`,
+/// `readVideoMemory(id)` and `writeVideoMemory(id, offset, bytes)`; the
+/// palette, `getPaletteMemory()`, `writePaletteMemory(colour_index,
+/// colours)` and `getPaletteColours()`; `getTileColours(...)`, tiles in
+/// colour; `getSpriteTable()`; and `getLayerLayout(layer_id)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -170,6 +175,170 @@ macro_rules! video_bindings {
                     ::core::result::Result::Err(_) => {
                         $crate::__private::wasm_bindgen::JsValue::NULL
                     }
+                }
+            }
+
+            /// The video chip's registers as `VideoRegister[]` (`{ index,
+            /// name, value, description }`), for a state view.
+            #[wasm_bindgen(js_name = getVideoRegisters)]
+            pub fn get_video_registers(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(
+                    &$crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                        .get_registers(),
+                )
+            }
+
+            /// The video memories the chip has, `VideoMemoryInfo[]`: each
+            /// one's `id` (the name `readVideoMemory` and `writeVideoMemory`
+            /// take: `"vram"`, `"palette"`, `"vertical_scroll"`,
+            /// `"sprite_table"`), its console's `name`, its `size` in bytes,
+            /// its `address_unit` (the bytes one address of the console's
+            /// own writer counts: `writeVram`'s is 1 on the Mega Drive and 2
+            /// on the SNES, a palette's and the vertical scroll's 2, the
+            /// SNES's sprite table's 1) and `little_endian` (a 16-bit word's
+            /// low byte first).
+            #[wasm_bindgen(js_name = getVideoMemories)]
+            pub fn get_video_memories(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(
+                    &$crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                        .video_memories(),
+                )
+            }
+
+            /// A copy of video memory `id`'s bytes, in its byte order
+            /// (`getVideoMemories`); `"vram"` is `getVram()`. `undefined` for
+            /// a memory the chip lacks or a name no console has.
+            #[wasm_bindgen(js_name = readVideoMemory)]
+            pub fn read_video_memory(
+                &mut self,
+                id: &str,
+            ) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                let id = $crate::__private::retro_core::video::VideoMemoryId::parse(id)?;
+                $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .read_video_memory(id)
+            }
+
+            /// Write `bytes` into video memory `id` from byte `offset` on,
+            /// for debugging, in the layout `readVideoMemory` returns, so
+            /// that read gives them back: straight into memory, through no
+            /// port or transfer; the timing, the CPUs and the chip's
+            /// registers are untouched. The offset counts bytes on every
+            /// memory of every console. It wraps at the memory's end, a
+            /// buffer longer than the memory is cut to it, and an empty one
+            /// writes nothing. A memory of 16-bit words (a palette, the
+            /// vertical scroll) takes whole words: an offset inside a word
+            /// starts at that word, an odd last byte is dropped, and each
+            /// word keeps only the bits its port keeps. A running game shows
+            /// the change on its next frame, a paused one after
+            /// `repaintFrame`. `false` for a memory the chip lacks or a name
+            /// no console has.
+            #[wasm_bindgen(js_name = writeVideoMemory)]
+            pub fn write_video_memory(&mut self, id: &str, offset: u32, bytes: &[u8]) -> bool {
+                let ::core::option::Option::Some(id) =
+                    $crate::__private::retro_core::video::VideoMemoryId::parse(id)
+                else {
+                    return false;
+                };
+                $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .write_video_memory(id, offset, bytes)
+            }
+
+            /// The palette's colour words, a `Uint16Array` in colour order:
+            /// the Mega Drive's 64 CRAM words (`0000 BBB0 GGG0 RRR0`), the
+            /// SNES's 256 CGRAM words (BGR555).
+            #[wasm_bindgen(js_name = getPaletteMemory)]
+            pub fn get_palette_memory(&mut self) -> ::std::vec::Vec<u16> {
+                $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .palette_memory()
+            }
+
+            /// Write palette colours for debugging, to edit a palette:
+            /// `colours` from colour `colour_index` on, in the format
+            /// `getPaletteMemory` returns (the bits the console's port drops
+            /// are dropped). Straight into memory, through no port or
+            /// transfer. The index wraps at the palette's end, a buffer
+            /// longer than the palette is cut to it, and an empty one writes
+            /// nothing. A running game shows the change on its next frame, a
+            /// paused one after `repaintFrame`.
+            #[wasm_bindgen(js_name = writePaletteMemory)]
+            pub fn write_palette_memory(&mut self, colour_index: u32, colours: &[u16]) {
+                $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .write_palette_memory(colour_index, colours);
+            }
+
+            /// Every palette colour as RGBA, a `Uint8Array` of 4 bytes a
+            /// colour in colour order: the renderer's conversion at full
+            /// brightness, alpha 255.
+            #[wasm_bindgen(js_name = getPaletteColours)]
+            pub fn get_palette_colours(&mut self) -> ::std::vec::Vec<u8> {
+                $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .palette_colours()
+            }
+
+            /// `decodeTiles` in colour: `{ width, height, data: Uint8Array }`
+            /// of RGBA, pixel index `i` coloured with palette colour
+            /// `firstColour + i` (`getPaletteColours`, wrapping at the
+            /// palette's end), the transparent index at alpha 0; `null`
+            /// where `decodeTiles` refuses.
+            #[wasm_bindgen(js_name = getTileColours)]
+            #[allow(clippy::too_many_arguments)]
+            pub fn get_tile_colours(
+                &mut self,
+                source: u32,
+                base_addr: u32,
+                first_tile: u32,
+                count: u32,
+                bpp: u8,
+                tile_size: u32,
+                first_colour: u32,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                let ::core::option::Option::Some(request) = $crate::video::tile_request(
+                    source, base_addr, first_tile, count, bpp, tile_size,
+                ) else {
+                    return $crate::__private::wasm_bindgen::JsValue::NULL;
+                };
+                match $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .tile_colours(&request, first_colour)
+                {
+                    ::core::result::Result::Ok(picture) => $crate::js::picture_object(&picture),
+                    ::core::result::Result::Err(_) => {
+                        $crate::__private::wasm_bindgen::JsValue::NULL
+                    }
+                }
+            }
+
+            /// The sprite table's entries the hardware takes, in the order
+            /// it takes them, `SpriteTableEntry[]`: the position, size,
+            /// tile, palette, priority and flips `getSpriteData` gives each
+            /// sprite, and `next` (the slot the hardware takes after it on a
+            /// table that links its entries, the Mega Drive's; `undefined`
+            /// for the last one and on the SNES), `tile_address` (the VRAM
+            /// byte of its first character) and `large` (the larger of two
+            /// sprite sizes).
+            #[wasm_bindgen(js_name = getSpriteTable)]
+            pub fn get_sprite_table(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(
+                    &$crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                        .sprite_table(),
+                )
+            }
+
+            /// Where layer `layer_id` (`getLayerInfo`'s ids) reads its map
+            /// and its characters, `LayerLayout`: `{ id, kind ("tile_map",
+            /// "window", "affine_map", "sprites" or "off"), map_base (a VRAM
+            /// byte), map_width, map_height (cells), character_base (a VRAM
+            /// byte), bits_per_pixel, cell_width, cell_height, first_colour,
+            /// scroll_x, scroll_y }`; `null` for a layer the chip lacks.
+            #[wasm_bindgen(js_name = getLayerLayout)]
+            pub fn get_layer_layout(
+                &mut self,
+                layer_id: u32,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .layer_layout(layer_id)
+                {
+                    ::core::option::Option::Some(layout) => $crate::js::to_js(&layout),
+                    ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
                 }
             }
         }

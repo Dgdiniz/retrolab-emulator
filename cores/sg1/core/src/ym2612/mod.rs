@@ -1206,6 +1206,10 @@ impl AudioChip for Ym2612 {
 }
 
 impl AudioDebugger for Ym2612 {
+    fn chip_info(&self) -> AudioChipInfo {
+        AudioChip::get_info(self)
+    }
+
     fn get_channel_count(&self) -> u32 {
         6
     }

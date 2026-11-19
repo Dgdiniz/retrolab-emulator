@@ -1,7 +1,7 @@
 //! What the binding crates' tests compare JavaScript values with: a full,
 //! deterministic description of a value's shape and contents, so that a
 //! test can record what a reader returns today and hold every later build
-//! to it.
+//! to it; and the property reader every such test needs.
 
 use std::fmt::Write;
 
@@ -31,6 +31,15 @@ pub fn shape(value: &JsValue) -> String {
     let mut out = String::new();
     describe(value, &mut out);
     out
+}
+
+/// `value[key]`, as a host reads it: `undefined` for a key the value lacks.
+///
+/// # Panics
+///
+/// When `value` is not an object a property can be read from.
+pub fn property(value: &JsValue, key: &str) -> JsValue {
+    Reflect::get(value, &JsValue::from_str(key)).unwrap()
 }
 
 /// Write the description of `value` to `out`.

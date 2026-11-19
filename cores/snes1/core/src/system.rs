@@ -767,6 +767,11 @@ impl EmulatorCore for SnesEmulator {
         }
     }
 
+    /// The S-DSP's output, its two channels mixed.
+    fn output_waveform(&self, samples: u32) -> Vec<f32> {
+        retro_core::audio::AudioDebugger::get_output_waveform(self.bus.apu(), samples)
+    }
+
     fn cartridge_debugger(&mut self) -> Box<dyn retro_core::cartridge::CartridgeDebugger + '_> {
         Box::new(self.map_plan_debugger())
     }

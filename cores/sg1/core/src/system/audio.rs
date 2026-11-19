@@ -56,9 +56,10 @@ impl GenesisEmulator {
         })
     }
 
-    /// Get the mixed waveform ring buffer for visualization.
-    /// Returns the last N mono samples of the mixed PSG+YM2612 output.
-    pub fn get_mixed_waveform(&self, samples: u32) -> Vec<f32> {
+    /// The last `samples` of the mixed PSG and YM2612 output, mono, oldest
+    /// first, zeros in front while fewer were made
+    /// ([`EmulatorCore::output_waveform`](retro_core::EmulatorCore::output_waveform)).
+    pub(super) fn mixed_waveform(&self, samples: u32) -> Vec<f32> {
         let count = (samples as usize).min(self.mixed_waveform_buffer.len());
         if count == 0 {
             return vec![0.0; samples as usize];

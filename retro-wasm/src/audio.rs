@@ -1,14 +1,47 @@
 //! [`audio_bindings!`], which writes the methods every binding crate exports
 //! the same way for the host's sound: the ring of samples a machine made
-//! and the host has not taken yet, and the switch that makes them.
+//! and the host has not taken yet, the switch that makes them, and the
+//! sound chips as the debugger sees them.
 //!
 //! [`audio_bindings!`]: crate::audio_bindings
+
+use retro_core::audio::{AudioChipInfo, ChannelState};
+use retro_core::EmulatorCore;
+
+/// Every sound chip's description, chip 0 the console's main chip.
+pub fn chips<E: EmulatorCore>(core: &mut E) -> Vec<AudioChipInfo> {
+    (0..core.audio_chip_count())
+        .filter_map(|chip| {
+            core.audio_debugger(chip)
+                .map(|debugger| debugger.chip_info())
+        })
+        .collect()
+}
+
+/// Every channel of sound chip `chip`, in channel order (`None` where a
+/// channel reports no state); `None` for a chip the console lacks.
+pub fn chip_channels<E: EmulatorCore>(
+    core: &mut E,
+    chip: usize,
+) -> Option<Vec<Option<ChannelState>>> {
+    let debugger = core.audio_debugger(chip)?;
+    Some(
+        (0..debugger.get_channel_count())
+            .map(|channel| debugger.get_channel_state(channel))
+            .collect(),
+    )
+}
 
 /// Writes the host's sound methods on `$emulator`, over the `EmulatorCore`
 /// in its field `$core`: `getAudioSamples()`, `getAudioSamplesN(n)`,
 /// `getAudioAvailable()`, `getAudioRingOverflows()`, `clearAudioBuffer()`
 /// (a no-op kept for older hosts), `discardPendingAudio()`,
-/// `getAudioInfo()`, `setAudioEnabled(enabled)` and `isAudioEnabled()`.
+/// `getAudioInfo()`, `setAudioEnabled(enabled)` and `isAudioEnabled()`;
+/// and the sound chips the debugger opens, chip 0 the console's main chip:
+/// `getAudioChips()`, `getAudioChipChannels(chip)`,
+/// `muteAudioChipChannel(chip, channel, muted)`,
+/// `getAudioChipWaveform(chip, channel, samples)` and
+/// `getAudioOutputWaveform(samples)`, the mixed sound.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -117,6 +150,68 @@ macro_rules! audio_bindings {
             #[wasm_bindgen(js_name = isAudioEnabled)]
             pub fn is_audio_enabled(&self) -> bool {
                 $crate::__private::retro_core::EmulatorCore::is_audio_enabled(&self.$core)
+            }
+
+            /// The sound chips, `AudioChipInfo[]` (`{ name, manufacturer,
+            /// channels, sample_rate, stereo, channel_types }`), chip 0 the
+            /// console's main chip: the index each other chip method takes.
+            #[wasm_bindgen(js_name = getAudioChips)]
+            pub fn get_audio_chips(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::audio::chips(&mut self.$core))
+            }
+
+            /// Every channel of sound chip `chip`, `ChannelState[]` in
+            /// channel order (`undefined` for a channel that reports no
+            /// state), or `null` for a chip the console lacks.
+            #[wasm_bindgen(js_name = getAudioChipChannels)]
+            pub fn get_audio_chip_channels(
+                &mut self,
+                chip: usize,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::audio::chip_channels(&mut self.$core, chip) {
+                    ::core::option::Option::Some(channels) => $crate::js::to_js(&channels),
+                    ::core::option::Option::None => {
+                        $crate::__private::wasm_bindgen::JsValue::NULL
+                    }
+                }
+            }
+
+            /// Mute or unmute a channel of sound chip `chip` for the
+            /// debugger, without touching the game's registers; nothing for
+            /// a chip or a channel the console lacks.
+            #[wasm_bindgen(js_name = muteAudioChipChannel)]
+            pub fn mute_audio_chip_channel(&mut self, chip: usize, channel: u32, muted: bool) {
+                if let ::core::option::Option::Some(debugger) =
+                    $crate::__private::retro_core::EmulatorCore::audio_debugger(
+                        &mut self.$core,
+                        chip,
+                    )
+                {
+                    debugger.mute_channel(channel, muted);
+                }
+            }
+
+            /// `samples` of one channel's waveform on sound chip `chip`, in
+            /// [-1, 1], for a view (as the chip approximates a channel);
+            /// empty for a chip the console lacks.
+            #[wasm_bindgen(js_name = getAudioChipWaveform)]
+            pub fn get_audio_chip_waveform(
+                &mut self,
+                chip: usize,
+                channel: u32,
+                samples: u32,
+            ) -> ::std::vec::Vec<f32> {
+                $crate::__private::retro_core::EmulatorCore::audio_debugger(&mut self.$core, chip)
+                    .map(|debugger| debugger.get_waveform(channel, samples))
+                    .unwrap_or_default()
+            }
+
+            /// The last `samples` of the console's mixed sound, mono, in
+            /// [-1, 1], oldest first, read without taking anything from the
+            /// host's ring; silence where none was made yet.
+            #[wasm_bindgen(js_name = getAudioOutputWaveform)]
+            pub fn get_audio_output_waveform(&self, samples: u32) -> ::std::vec::Vec<f32> {
+                $crate::__private::retro_core::EmulatorCore::output_waveform(&self.$core, samples)
             }
         }
     };

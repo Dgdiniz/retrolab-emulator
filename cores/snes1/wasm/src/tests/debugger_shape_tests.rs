@@ -1,5 +1,5 @@
 use super::*;
-use snes1_core::TraceEntryBinary65816;
+use snes1_core::{TraceEntryBinary65816, TraceEntryBinarySpc700};
 
 /// Bytes of one entry of each trace.
 const TRACE_ENTRY_SIZE_65816: usize = <TraceEntryBinary65816 as TraceEntry>::SIZE;

@@ -1,4 +1,6 @@
 use super::*;
+// `value[key]`: the shared reader, under the name this crate's tests use.
+use retro_wasm::test_support::property as field;
 use wasm_bindgen_test::*;
 
 #[wasm_bindgen_test]
@@ -212,11 +214,6 @@ fn place(rom: &mut [u8], address: usize, words: &[u16]) {
     }
 }
 
-/// `value[key]`.
-fn field(value: &JsValue, key: &str) -> JsValue {
-    js_sys::Reflect::get(value, &JsValue::from_str(key)).unwrap()
-}
-
 /// Hold each value of `found` to the description recorded for it. When
 /// they differ, the descriptions found are written to the console as
 /// the entries of `expected`.
@@ -253,3 +250,7 @@ mod machine_baseline;
 /// debugger's memory and disassembly, the VDP's and the sound chips'
 /// readers, and the cartridge's.
 mod binding_baseline;
+
+/// Each name both consoles share against the older names it stands
+/// beside: the same value, or the same effect.
+mod names;

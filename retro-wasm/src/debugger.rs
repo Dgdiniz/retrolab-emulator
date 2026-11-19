@@ -97,7 +97,11 @@ pub fn match_spec_from_js(spec: JsValue) -> Result<MatchSpec, JsValue> {
 /// 0): `setTracingEnabled`, `isTracingEnabled`,
 /// `needsTraceFlush` (any CPU's ring), `getTraceFlushData`,
 /// `clearTraceFlushed`, `getTraceEntrySize`, `convertTraceChunkToText` and
-/// `getTraceStats`. Their Rust names are the JavaScript names in snake case
+/// `getTraceStats`, and every CPU's trace by its id (`setCpuTracingEnabled`,
+/// `isCpuTracingEnabled`, `needsCpuTraceFlush`, `getCpuTraceFlushData`,
+/// `clearCpuTraceFlushed`, `getCpuTraceEntrySize`,
+/// `convertCpuTraceChunkToText` and `getCpuTraceStats`, each with the CPU's
+/// id first). Their Rust names are the JavaScript names in snake case
 /// (`get_cpu_states`, and `step` and `step_cpu`), which no other method of
 /// the struct may have. The crate expanding the macro depends on
 /// `wasm-bindgen` itself, as every crate declaring a `#[wasm_bindgen]`
@@ -499,6 +503,106 @@ macro_rules! debugger_bindings {
                 )
             }
 
+            /// Trace CPU `cpu_id` (`getCpus()`'s ids), or stop. While on,
+            /// each instruction it runs is appended to its own trace ring,
+            /// `getCpuTraceEntrySize(cpu_id)` bytes an entry; turning it on
+            /// starts the ring empty. A CPU that keeps no trace stays off.
+            #[wasm_bindgen(js_name = setCpuTracingEnabled)]
+            pub fn set_cpu_tracing_enabled(&mut self, cpu_id: usize, enabled: bool) {
+                $crate::__private::retro_core::DebuggerCore::set_tracing_enabled(
+                    $crate::__private::retro_core::EmulatorCore::debugger(&mut self.$core),
+                    cpu_id,
+                    enabled,
+                );
+            }
+
+            /// Whether CPU `cpu_id` is traced.
+            #[wasm_bindgen(js_name = isCpuTracingEnabled)]
+            pub fn is_cpu_tracing_enabled(&self, cpu_id: usize) -> bool {
+                $crate::__private::retro_core::DebuggerCore::is_tracing_enabled(
+                    $crate::__private::retro_core::EmulatorCore::debugger_ref(&self.$core),
+                    cpu_id,
+                )
+            }
+
+            /// Whether CPU `cpu_id`'s trace ring asks to be flushed.
+            #[wasm_bindgen(js_name = needsCpuTraceFlush)]
+            pub fn needs_cpu_trace_flush(&self, cpu_id: usize) -> bool {
+                $crate::__private::retro_core::DebuggerCore::needs_trace_flush(
+                    $crate::__private::retro_core::EmulatorCore::debugger_ref(&self.$core),
+                    cpu_id,
+                )
+            }
+
+            /// CPU `cpu_id`'s traced entries not yet cleared, a copy; empty
+            /// when there are none.
+            #[wasm_bindgen(js_name = getCpuTraceFlushData)]
+            pub fn get_cpu_trace_flush_data(&self, cpu_id: usize) -> ::std::vec::Vec<u8> {
+                $crate::__private::retro_core::DebuggerCore::get_trace_flush_data(
+                    $crate::__private::retro_core::EmulatorCore::debugger_ref(&self.$core),
+                    cpu_id,
+                )
+                .unwrap_or_default()
+            }
+
+            /// Empty CPU `cpu_id`'s trace ring, after its entries were
+            /// written out.
+            #[wasm_bindgen(js_name = clearCpuTraceFlushed)]
+            pub fn clear_cpu_trace_flushed(&mut self, cpu_id: usize) {
+                $crate::__private::retro_core::DebuggerCore::clear_trace_flushed(
+                    $crate::__private::retro_core::EmulatorCore::debugger(&mut self.$core),
+                    cpu_id,
+                );
+            }
+
+            /// The size in bytes of CPU `cpu_id`'s trace entries; 0 for a CPU
+            /// that keeps no trace.
+            #[wasm_bindgen(js_name = getCpuTraceEntrySize)]
+            pub fn get_cpu_trace_entry_size(&self, cpu_id: usize) -> usize {
+                $crate::__private::retro_core::DebuggerCore::trace_entry_size(
+                    $crate::__private::retro_core::EmulatorCore::debugger_ref(&self.$core),
+                    cpu_id,
+                )
+                .unwrap_or(0)
+            }
+
+            /// A chunk of CPU `cpu_id`'s trace as text: one line per whole
+            /// entry, each ending in a line break, in the console's own
+            /// format for that CPU; bytes past the last whole entry make no
+            /// line, and a CPU whose entries the build cannot read gives an
+            /// empty string.
+            #[wasm_bindgen(js_name = convertCpuTraceChunkToText)]
+            pub fn convert_cpu_trace_chunk_to_text(
+                &mut self,
+                cpu_id: usize,
+                data: &[u8],
+            ) -> ::std::string::String {
+                $crate::__private::retro_core::EmulatorCore::trace_to_text(
+                    &mut self.$core,
+                    cpu_id,
+                    data,
+                )
+                .unwrap_or_default()
+            }
+
+            /// `{ total_entries, flushed_entries, buffered_entries,
+            /// buffer_bytes, buffer_capacity, enabled }` of CPU `cpu_id`'s
+            /// trace ring; all 0 and `enabled` false until its tracing is
+            /// first turned on, and for a CPU that keeps no trace.
+            #[wasm_bindgen(js_name = getCpuTraceStats)]
+            pub fn get_cpu_trace_stats(
+                &self,
+                cpu_id: usize,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::debugger::debugger_value(
+                    &$crate::__private::retro_core::DebuggerCore::trace_stats(
+                        $crate::__private::retro_core::EmulatorCore::debugger_ref(&self.$core),
+                        cpu_id,
+                    )
+                    .unwrap_or_default(),
+                )
+            }
+
             /// `size` bytes of memory from `addr` on, as the debugger reads
             /// them: through no port and with no side effect on the
             /// machine.
@@ -645,13 +749,16 @@ mod binding_tests {
         }
     }
 
-    /// The main CPU: coverage, a 24-bit mask, a trace and a history.
+    /// The main CPU: coverage, a 24-bit mask, a trace and a history; it is
+    /// stepped and its coverage recorded.
     const MAIN: CpuDebugSpec = CpuDebugSpec {
         coverage_size: 0x0100_0000,
         address_mask: 0x00FF_FFFF,
         trace_entry_size: 4,
         history: true,
         checks: BreakpointChecks::ALL,
+        steppable: true,
+        records_coverage: true,
     };
 
     /// The sound CPU: 64 KiB of coverage, a 2-byte trace, no history,
@@ -666,6 +773,8 @@ mod binding_tests {
             memory: false,
             conditions: false,
         },
+        steppable: false,
+        records_coverage: false,
     };
 
     fn system() -> SystemInfo {
@@ -1206,6 +1315,54 @@ mod binding_tests {
     }
 
     #[wasm_bindgen_test]
+    fn every_cpu_s_trace_is_read_by_its_id() {
+        let mut emu = emulator();
+        assert_eq!(emu.get_cpu_trace_entry_size(0), emu.get_trace_entry_size());
+        assert_eq!(emu.get_cpu_trace_entry_size(1), 2);
+        assert_eq!(emu.get_cpu_trace_entry_size(5), 0, "no CPU there");
+        emu.set_cpu_tracing_enabled(1, true);
+        assert!(emu.is_cpu_tracing_enabled(1));
+        assert!(!emu.is_cpu_tracing_enabled(0) && !emu.is_tracing_enabled());
+        emu.step_cpu(1);
+        emu.step_cpu(0);
+        assert_eq!(emu.get_cpu_trace_flush_data(1), [0x00, 0x01]);
+        assert!(emu.get_cpu_trace_flush_data(0).is_empty());
+        assert_eq!(
+            shape(&emu.get_cpu_trace_stats(1)),
+            "{buffer_bytes: 2, buffer_capacity: 8388608, buffered_entries: 1, enabled: true, \
+             flushed_entries: 0, total_entries: 1}"
+        );
+        assert_eq!(
+            shape(&emu.get_cpu_trace_stats(0)),
+            shape(&emu.get_trace_stats())
+        );
+        assert!(!emu.needs_cpu_trace_flush(1));
+        emu.clear_cpu_trace_flushed(1);
+        assert!(emu.get_cpu_trace_flush_data(1).is_empty());
+        emu.set_cpu_tracing_enabled(1, false);
+        assert!(!emu.is_cpu_tracing_enabled(1));
+
+        emu.set_cpu_tracing_enabled(0, true);
+        emu.step_cpu(0);
+        let data = emu.get_cpu_trace_flush_data(0);
+        assert_eq!(data, emu.get_trace_flush_data());
+        assert_eq!(
+            emu.convert_cpu_trace_chunk_to_text(0, &data),
+            emu.convert_trace_chunk_to_text(&data)
+        );
+        assert_eq!(
+            emu.convert_cpu_trace_chunk_to_text(1, &data),
+            "",
+            "a CPU whose entries the core cannot read"
+        );
+        assert_eq!(
+            shape(&emu.get_cpu_trace_stats(5)),
+            "{buffer_bytes: 0, buffer_capacity: 0, buffered_entries: 0, enabled: false, \
+             flushed_entries: 0, total_entries: 0}"
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn the_flush_flag_reads_every_cpu_s_ring() {
         let mut emu = emulator();
         assert!(!emu.needs_trace_flush());
@@ -1218,6 +1375,7 @@ mod binding_tests {
             emu.needs_trace_flush(),
             "the sound CPU's ring alone asks to be flushed"
         );
+        assert!(emu.needs_cpu_trace_flush(1) && !emu.needs_cpu_trace_flush(0));
         assert!(
             emu.get_trace_flush_data().is_empty(),
             "the main CPU's is empty"

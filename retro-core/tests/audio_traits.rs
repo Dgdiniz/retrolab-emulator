@@ -74,6 +74,10 @@ impl AudioChip for DummyAudioChip {
 }
 
 impl AudioDebugger for DummyAudioChip {
+    fn chip_info(&self) -> AudioChipInfo {
+        self.get_info()
+    }
+
     fn get_channel_count(&self) -> u32 {
         self.channels
     }

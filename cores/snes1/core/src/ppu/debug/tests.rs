@@ -1000,3 +1000,109 @@ fn an_oam_write_wraps_past_the_end_and_is_cut_to_the_memory() {
     ppu.write_oam_debug(3, &[]);
     assert_eq!(*ppu.oam(), before, "an empty write changes nothing");
 }
+
+#[test]
+fn the_sprite_table_starts_at_the_first_sprite_and_links_none() {
+    let mut ppu = Ppu::new();
+    ppu.oam[4 * 3] = 40; // sprite 3's x
+    ppu.oam[4 * 3 + 2] = 0x12; // its character
+    ppu.oam[4 * 3 + 3] = 0x01; // in the second table
+    ppu.oam_first_sprite = 3;
+    let table = ppu.sprite_table();
+    assert_eq!(table.len(), 128);
+    assert_eq!(
+        (table[0].index, table[125].index, table[127].index),
+        (3, 0, 2)
+    );
+    assert!(table.iter().all(|entry| entry.next.is_none()));
+    let sprites = ppu.get_sprite_data();
+    for entry in &table {
+        let sprite = &sprites[entry.index as usize];
+        assert_eq!(
+            (
+                entry.x,
+                entry.y,
+                entry.width,
+                entry.height,
+                entry.tile_index
+            ),
+            (
+                sprite.x,
+                sprite.y,
+                sprite.width,
+                sprite.height,
+                sprite.tile_index
+            )
+        );
+    }
+    let settings = ppu.sprite_tile_settings();
+    assert_eq!(
+        table[0].tile_address,
+        (u32::from(settings.second_table_base_word) * 2 + 0x12 * 32) & 0xFFFF
+    );
+}
+
+#[test]
+fn a_background_s_layout_is_its_registers_and_mode_7_its_own() {
+    let mut ppu = Ppu::new();
+    ppu.bgmode = 1;
+    for bg in 0..4 {
+        let layout = ppu.layer_layout(bg as u32).unwrap();
+        let registers = ppu.bg_layout(bg);
+        assert_eq!(
+            (
+                layout.map_base,
+                layout.map_width,
+                layout.map_height,
+                layout.character_base,
+                layout.bits_per_pixel
+            ),
+            (
+                registers.tilemap_base_byte,
+                registers.width_cells,
+                registers.height_cells,
+                registers.char_base_byte,
+                registers.bpp
+            )
+        );
+        let kind = if registers.bpp == 0 {
+            LayerKind::Off
+        } else {
+            LayerKind::TileMap
+        };
+        assert_eq!(layout.kind, kind, "BG{}", bg + 1);
+    }
+    ppu.bgmode = 7;
+    let affine = ppu.layer_layout(0).unwrap();
+    assert_eq!(
+        (
+            affine.kind,
+            affine.map_width,
+            affine.map_height,
+            affine.bits_per_pixel
+        ),
+        (LayerKind::AffineMap, 128, 128, 8)
+    );
+    assert_eq!(ppu.layer_layout(1).unwrap().kind, LayerKind::Off);
+    ppu.mode7_extbg = true;
+    let extbg = ppu.layer_layout(1).unwrap();
+    assert_eq!(
+        (extbg.kind, extbg.bits_per_pixel),
+        (LayerKind::AffineMap, 7)
+    );
+    assert_eq!(ppu.layer_layout(4).unwrap().kind, LayerKind::Sprites);
+    assert!(ppu.layer_layout(5).is_none());
+}
+
+#[test]
+fn a_video_memory_write_counts_bytes_from_any_byte() {
+    let mut ppu = Ppu::new();
+    assert!(ppu.write_video_memory(VideoMemoryId::Vram, 0x0201, &[0xAB, 0xCD]));
+    assert_eq!(&ppu.get_vram()[0x200..0x204], &[0x00, 0xAB, 0xCD, 0x00]);
+    assert!(ppu.write_video_memory(VideoMemoryId::Vram, 0xFFFF, &[0x11, 0x22]));
+    assert_eq!((ppu.get_vram()[0xFFFF], ppu.get_vram()[0]), (0x11, 0x22));
+    assert!(ppu.write_video_memory(VideoMemoryId::Palette, 5, &[0x34, 0x92]));
+    assert_eq!(ppu.cgram()[2], 0x1234, "low byte first, bit 15 dropped");
+    assert_eq!(ppu.read_video_memory(VideoMemoryId::VerticalScroll), None);
+    assert!(!ppu.write_video_memory(VideoMemoryId::VerticalScroll, 0, &[1, 2]));
+}

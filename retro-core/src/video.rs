@@ -311,6 +311,184 @@ impl<const N: usize> LayerMask<N> {
     }
 }
 
+/// A video memory, named by what it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoMemoryId {
+    /// The video RAM: the characters, the maps and, where it lives there,
+    /// the sprite table.
+    Vram,
+    /// The palette's colour words (the Mega Drive's CRAM, the SNES's CGRAM).
+    Palette,
+    /// The vertical scroll words (the Mega Drive's VSRAM).
+    VerticalScroll,
+    /// The sprite table, where it has a memory of its own (the SNES's OAM).
+    SpriteTable,
+}
+
+impl VideoMemoryId {
+    /// Every video memory a chip can have, in this order.
+    pub const ALL: [Self; 4] = [
+        Self::Vram,
+        Self::Palette,
+        Self::VerticalScroll,
+        Self::SpriteTable,
+    ];
+
+    /// The memory a host names: `"vram"`, `"palette"`, `"vertical_scroll"`
+    /// or `"sprite_table"`; `None` for any other name.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|id| id.name() == name)
+    }
+
+    /// The memory's name, as [`Self::parse`] reads it and a host sends it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vram => "vram",
+            Self::Palette => "palette",
+            Self::VerticalScroll => "vertical_scroll",
+            Self::SpriteTable => "sprite_table",
+        }
+    }
+}
+
+/// What [`VideoDebugger::video_memories`] says of one memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoMemoryInfo {
+    /// Which memory it is.
+    pub id: VideoMemoryId,
+    /// The console's name for it (`"VRAM"`, `"CRAM"`, `"CGRAM"`, `"VSRAM"`,
+    /// `"OAM"`).
+    pub name: &'static str,
+    /// Its size in bytes.
+    pub size: u32,
+    /// The bytes one address of the console's own writer of this memory
+    /// counts: 1 where it takes a byte address, 2 where it takes the
+    /// address of a 16-bit word or a colour.
+    pub address_unit: u32,
+    /// A 16-bit word's low byte comes first in the memory's bytes.
+    pub little_endian: bool,
+}
+
+/// One entry of a chip's sprite table, as
+/// [`VideoDebugger::sprite_table`] lists it. The position, size, tile,
+/// palette, priority and flips are those [`SpriteData`] gives the sprite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SpriteTableEntry {
+    /// The sprite's slot in the table.
+    pub index: u32,
+    /// Its left column, in signed screen coordinates.
+    pub x: i32,
+    /// Its top row, in signed screen coordinates.
+    pub y: i32,
+    /// Its width in pixels.
+    pub width: u32,
+    /// Its height in pixels.
+    pub height: u32,
+    /// Its character (tile) number, as the table holds it.
+    pub tile_index: u32,
+    /// Its palette.
+    pub palette: u32,
+    /// Its priority attribute.
+    pub priority: u32,
+    /// It is drawn mirrored left to right.
+    pub flip_h: bool,
+    /// It is drawn mirrored top to bottom.
+    pub flip_v: bool,
+    /// The slot the hardware takes after this one, where the table links
+    /// its entries (the Mega Drive's link chain); `None` for the last one
+    /// taken and on a table the hardware reads in order.
+    pub next: Option<u32>,
+    /// The VRAM byte where the sprite's first (top-left) character
+    /// starts.
+    pub tile_address: u32,
+    /// The sprite takes the larger of the console's two sprite sizes;
+    /// `false` on a console with one.
+    pub large: bool,
+}
+
+/// What a layer draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerKind {
+    /// A map of characters, scrolled.
+    TileMap,
+    /// A map of characters drawn in a window of the screen, not scrolled
+    /// (the Mega Drive's window plane).
+    Window,
+    /// A map of characters turned and scaled by a matrix (the SNES's Mode
+    /// 7).
+    AffineMap,
+    /// The sprites.
+    Sprites,
+    /// Nothing, in the mode the chip is in.
+    Off,
+}
+
+/// Where a layer reads its map and its characters, as the chip's registers
+/// stand: what a host needs to draw the whole map itself from the video
+/// memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LayerLayout {
+    /// The layer's id, as [`VideoDebugger::get_layer_data`] numbers it.
+    pub id: u32,
+    /// What it draws.
+    pub kind: LayerKind,
+    /// The VRAM byte where its map starts; for the sprites, the sprite
+    /// table's first byte in the memory that holds it (VRAM on the Mega
+    /// Drive, the table's own memory on the SNES, where it is 0).
+    pub map_base: u32,
+    /// The map's width in cells; 0 for the sprites, which have no map.
+    pub map_width: u32,
+    /// The map's height in cells; 0 for the sprites.
+    pub map_height: u32,
+    /// The VRAM byte where its character 0 starts.
+    pub character_base: u32,
+    /// Bits a pixel of its characters; 0 when it draws nothing.
+    pub bits_per_pixel: u8,
+    /// A cell's width in pixels.
+    pub cell_width: u8,
+    /// A cell's height in pixels.
+    pub cell_height: u8,
+    /// The palette colour its pixel colours count from.
+    pub first_colour: u32,
+    /// Its horizontal scroll, as [`LayerData`] reports it.
+    pub scroll_x: i32,
+    /// Its vertical scroll, as [`LayerData`] reports it.
+    pub scroll_y: i32,
+}
+
+/// 16-bit words read from `bytes`, two bytes a word in the order given; an
+/// odd last byte is left out.
+pub fn words_from_bytes(bytes: &[u8], little_endian: bool) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        })
+        .collect()
+}
+
+/// The bytes of `words`, two a word in the order given.
+pub fn bytes_from_words(words: &[u16], little_endian: bool) -> Vec<u8> {
+    words
+        .iter()
+        .flat_map(|word| {
+            if little_endian {
+                word.to_le_bytes()
+            } else {
+                word.to_be_bytes()
+            }
+        })
+        .collect()
+}
+
 /// Video debugging interface for tile-based graphics systems.
 pub trait VideoDebugger {
     /// Get tile data by index.
@@ -394,6 +572,110 @@ pub trait VideoDebugger {
         let _ = request;
         Err(ExportError::Unsupported)
     }
+
+    /// The video memories the chip has, in [`VideoMemoryId::ALL`]'s order:
+    /// each one's id, name, size in bytes, the bytes one address of the
+    /// console's own writer counts, and its byte order.
+    fn video_memories(&self) -> Vec<VideoMemoryInfo>;
+
+    /// A copy of memory `id`'s bytes, in its byte order; `None` for a
+    /// memory the chip lacks.
+    fn read_video_memory(&self, id: VideoMemoryId) -> Option<Vec<u8>>;
+
+    /// Write `bytes` into memory `id` from byte `offset` on, the way a
+    /// debugger edits it: straight in, through no port or transfer, with
+    /// the side effects the console's debug writers have (the renderer's
+    /// caches follow, a line table stops being exact). The offset wraps at
+    /// the memory's end, and so does a run that crosses it; a buffer longer
+    /// than the memory is cut to it, and an empty one writes nothing. A
+    /// memory the chip keeps as 16-bit words (a palette, the vertical
+    /// scroll) takes whole words: an offset inside a word starts at that
+    /// word, an odd last byte is dropped, and each word keeps only the bits
+    /// its port keeps. `false` for a memory the chip lacks.
+    fn write_video_memory(&mut self, id: VideoMemoryId, offset: u32, bytes: &[u8]) -> bool;
+
+    /// The sprite table's entries the hardware takes, in the order it takes
+    /// them: the Mega Drive's link chain from slot 0, as far as the
+    /// renderer follows it; the SNES's 128 entries from the first sprite
+    /// its evaluation starts at.
+    fn sprite_table(&self) -> Vec<SpriteTableEntry>;
+
+    /// Where layer `layer_id` (as [`Self::get_layer_data`] numbers it)
+    /// reads its map and its characters; `None` for a layer the chip lacks.
+    fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout>;
+
+    /// The palette memory's colour words, in colour order: its bytes read
+    /// in its byte order. Empty on a chip with no palette memory.
+    fn palette_memory(&self) -> Vec<u16> {
+        match self.read_video_memory(VideoMemoryId::Palette) {
+            Some(bytes) => words_from_bytes(&bytes, palette_is_little_endian(self)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Write colour words from colour `first_colour` on, as
+    /// [`Self::write_video_memory`] writes the palette memory: the colour
+    /// wraps at the palette's end, a longer buffer is cut, and each word
+    /// keeps the bits the palette's port keeps.
+    fn write_palette_memory(&mut self, first_colour: u32, colours: &[u16]) {
+        let bytes = bytes_from_words(colours, palette_is_little_endian(self));
+        self.write_video_memory(VideoMemoryId::Palette, first_colour.wrapping_mul(2), &bytes);
+    }
+
+    /// Every palette colour as RGBA, 4 bytes a colour in colour order, as
+    /// [`Self::get_palette_data`] gives them: the renderer's conversion at
+    /// full brightness, alpha 255.
+    fn palette_colours(&self) -> Vec<u8> {
+        self.get_palette_data()
+            .iter()
+            .flat_map(|palette| palette.colors.iter())
+            .flat_map(|colour| colour.to_be_bytes())
+            .collect()
+    }
+
+    /// [`Self::decode_tiles`] in colour, `width * height * 4` bytes of
+    /// RGBA: pixel index `i` takes palette colour `first_colour + i`
+    /// ([`Self::palette_colours`]), wrapping at the palette's end as the
+    /// palette writer's colour wraps, and the transparent index keeps its
+    /// colour's RGB at alpha 0. Refused as `decode_tiles` refuses, and as
+    /// unsupported on a chip with no palette.
+    fn tile_colours(
+        &self,
+        request: &TileDecodeRequest,
+        first_colour: u32,
+    ) -> Result<PixelImage, ExportError> {
+        let image = self.decode_tiles(request)?;
+        let colours = self.palette_colours();
+        let count = (colours.len() / 4) as u64;
+        if count == 0 {
+            return Err(ExportError::Unsupported);
+        }
+        let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
+        for &index in &image.pixels {
+            let colour = ((u64::from(first_colour) + u64::from(index)) % count) as usize;
+            rgba.extend_from_slice(&colours[colour * 4..colour * 4 + 3]);
+            rgba.push(if image.transparent_index == Some(index) {
+                0
+            } else {
+                255
+            });
+        }
+        Ok(PixelImage {
+            width: image.width,
+            height: image.height,
+            rgba,
+        })
+    }
+}
+
+/// Whether `video`'s palette memory keeps a word's low byte first; `true`
+/// when the chip names no palette memory.
+fn palette_is_little_endian<V: VideoDebugger + ?Sized>(video: &V) -> bool {
+    video
+        .video_memories()
+        .iter()
+        .find(|memory| memory.id == VideoMemoryId::Palette)
+        .is_none_or(|memory| memory.little_endian)
 }
 
 #[cfg(test)]
@@ -426,6 +708,170 @@ mod tests {
         let taken = mask.take();
         assert!(taken.is_hidden(2));
         assert_eq!(mask, LayerMask::default());
+    }
+
+    #[test]
+    fn a_video_memory_is_read_by_the_name_it_gives() {
+        for id in VideoMemoryId::ALL {
+            assert_eq!(VideoMemoryId::parse(id.name()), Some(id));
+        }
+        assert_eq!(
+            VideoMemoryId::parse("vertical_scroll"),
+            Some(VideoMemoryId::VerticalScroll)
+        );
+        assert_eq!(VideoMemoryId::parse("VRAM"), None);
+        assert_eq!(VideoMemoryId::parse(""), None);
+    }
+
+    #[test]
+    fn words_and_bytes_follow_the_order_given() {
+        assert_eq!(words_from_bytes(&[1, 2, 3, 4, 5], true), [0x0201, 0x0403]);
+        assert_eq!(words_from_bytes(&[1, 2, 3, 4], false), [0x0102, 0x0304]);
+        assert_eq!(bytes_from_words(&[0x0102], true), [2, 1]);
+        assert_eq!(bytes_from_words(&[0x0102], false), [1, 2]);
+    }
+
+    /// A chip with a palette of four colours, words kept high byte first
+    /// (or low first), each keeping its low 12 bits, and one 2x1 tile whose
+    /// pixels are indices 0 and 2.
+    struct Chip {
+        palette: [u16; 4],
+        little_endian: bool,
+    }
+
+    impl VideoDebugger for Chip {
+        fn get_tile_data(&self, _index: u32) -> Option<TileData> {
+            None
+        }
+        fn get_tile_count(&self) -> u32 {
+            0
+        }
+        fn get_palette_data(&self) -> Vec<PaletteData> {
+            vec![PaletteData {
+                index: 0,
+                colors: self
+                    .palette
+                    .iter()
+                    .map(|&colour| (u32::from(colour) << 8) | 0xFF)
+                    .collect(),
+            }]
+        }
+        fn get_sprite_data(&self) -> Vec<SpriteData> {
+            Vec::new()
+        }
+        fn get_layer_data(&self, _layer_id: u32) -> Option<LayerData> {
+            None
+        }
+        fn get_layer_count(&self) -> u32 {
+            0
+        }
+        fn toggle_layer(&mut self, _layer_id: u32, _visible: bool) {}
+        fn get_vram(&self) -> &[u8] {
+            &[]
+        }
+        fn get_registers(&self) -> Vec<VideoRegister> {
+            Vec::new()
+        }
+        fn decode_tiles(&self, request: &TileDecodeRequest) -> Result<IndexedImage, ExportError> {
+            if request.first_tile != 0 {
+                return Err(ExportError::OutOfRange);
+            }
+            Ok(IndexedImage {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 2],
+                bpp: 2,
+                transparent_index: Some(0),
+            })
+        }
+        fn video_memories(&self) -> Vec<VideoMemoryInfo> {
+            vec![VideoMemoryInfo {
+                id: VideoMemoryId::Palette,
+                name: "PAL",
+                size: 8,
+                address_unit: 2,
+                little_endian: self.little_endian,
+            }]
+        }
+        fn read_video_memory(&self, id: VideoMemoryId) -> Option<Vec<u8>> {
+            (id == VideoMemoryId::Palette)
+                .then(|| bytes_from_words(&self.palette, self.little_endian))
+        }
+        fn write_video_memory(&mut self, id: VideoMemoryId, offset: u32, bytes: &[u8]) -> bool {
+            if id != VideoMemoryId::Palette {
+                return false;
+            }
+            let words = words_from_bytes(bytes, self.little_endian);
+            for (i, word) in words.iter().take(4).enumerate() {
+                self.palette[(offset as usize / 2 + i) % 4] = word & 0x0FFF;
+            }
+            true
+        }
+        fn sprite_table(&self) -> Vec<SpriteTableEntry> {
+            Vec::new()
+        }
+        fn layer_layout(&self, _layer_id: u32) -> Option<LayerLayout> {
+            None
+        }
+    }
+
+    fn request(first_tile: u32) -> TileDecodeRequest {
+        TileDecodeRequest {
+            source: TileSource::Vram,
+            base_addr: 0,
+            first_tile,
+            count: 1,
+            bpp: 2,
+            tile_size: TileSize::Px8,
+        }
+    }
+
+    #[test]
+    fn the_palette_is_read_and_written_as_words_in_the_memory_s_order() {
+        for little_endian in [false, true] {
+            let mut chip = Chip {
+                palette: [0x0111, 0x0222, 0x0333, 0x0444],
+                little_endian,
+            };
+            assert_eq!(chip.palette_memory(), [0x0111, 0x0222, 0x0333, 0x0444]);
+            chip.write_palette_memory(3, &[0xF0AB, 0x0CDE]);
+            assert_eq!(
+                chip.palette_memory(),
+                [0x0CDE, 0x0222, 0x0333, 0x00AB],
+                "the colour wraps, the port's bits kept"
+            );
+        }
+    }
+
+    #[test]
+    fn the_palette_s_colours_are_its_rgba() {
+        let chip = Chip {
+            palette: [0x0102, 0x0304, 0x0506, 0x0708],
+            little_endian: false,
+        };
+        assert_eq!(
+            chip.palette_colours(),
+            [0, 1, 2, 255, 0, 3, 4, 255, 0, 5, 6, 255, 0, 7, 8, 255]
+        );
+    }
+
+    #[test]
+    fn tiles_in_colour_take_the_palette_from_the_first_colour_given() {
+        let chip = Chip {
+            palette: [0x0102, 0x0304, 0x0506, 0x0708],
+            little_endian: true,
+        };
+        let picture = chip.tile_colours(&request(0), 1).expect("the tile");
+        assert_eq!((picture.width, picture.height), (2, 1));
+        // Index 0 is colour 1, transparent; index 2 is colour 3.
+        assert_eq!(picture.rgba, [0, 3, 4, 0, 0, 7, 8, 255]);
+        // Colour 3 + 2 wraps to colour 1.
+        let wrapped = chip.tile_colours(&request(0), 3).expect("the tile");
+        assert_eq!(wrapped.rgba, [0, 7, 8, 0, 0, 3, 4, 255]);
+        assert_eq!(
+            chip.tile_colours(&request(1), 0),
+            Err(ExportError::OutOfRange)
+        );
     }
 
     /// A framebuffer 4 pixels wide and 3 rows high, each byte its own index.

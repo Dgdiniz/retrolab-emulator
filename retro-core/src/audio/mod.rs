@@ -333,6 +333,11 @@ impl AudioMixer for SimpleMixer {
 /// It's implemented by audio chips to expose internal state for visualization
 /// and debugging in the browser.
 pub trait AudioDebugger {
+    /// What the chip is: its name and maker as the chip is known, its
+    /// channels and each one's type, its sample rate and whether it is
+    /// stereo.
+    fn chip_info(&self) -> AudioChipInfo;
+
     /// Get total number of audio channels.
     fn get_channel_count(&self) -> u32;
 

@@ -475,6 +475,10 @@ impl AudioChip for Psg {
 }
 
 impl AudioDebugger for Psg {
+    fn chip_info(&self) -> AudioChipInfo {
+        AudioChip::get_info(self)
+    }
+
     fn get_channel_count(&self) -> u32 {
         4
     }

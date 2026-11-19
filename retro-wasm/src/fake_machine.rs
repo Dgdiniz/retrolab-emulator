@@ -2,7 +2,7 @@
 //! no binding under test reaches, and [`FakeMachine`], the machine every
 //! binding macro's tests expand on.
 
-use retro_core::audio::{AudioDebugger, HostAudioRing};
+use retro_core::audio::{AudioChipInfo, AudioDebugger, ChannelState, ChannelType, HostAudioRing};
 use retro_core::cartridge::{
     CartridgeDebugger, CartridgeInfo, ConsoleSystem, MapPlan, MapPlanDebugger, MapTarget, SlotShape,
 };
@@ -11,12 +11,14 @@ use retro_core::debugger::DebuggerCore;
 use retro_core::input::{GenericInputManager, PadDefaults};
 use retro_core::savestate::{PayloadUse, RomIdentity, SavestateFormat, SavestatePayload};
 use retro_core::types::{
-    AudioInfo, DisasmRow, DisasmRowKind, DisplayInfo, Framebuffer, InputInfo, InputState,
-    Instruction, PixelFormat, RomInfo, SystemInfo, VideoRegion,
+    AudioInfo, CpuArchitecture, CpuInfo, CpuLocation, DisasmRow, DisasmRowKind, DisplayInfo,
+    Framebuffer, InputInfo, InputState, Instruction, PixelFormat, RomInfo, SystemInfo, VideoRegion,
 };
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, TileData,
-    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
+    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
+    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteTableEntry, TileData,
+    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
+    VideoRegister,
 };
 use retro_core::{EmulatorCore, StepResult};
 use serde::{Deserialize, Serialize};
@@ -104,6 +106,9 @@ macro_rules! unreachable_machine_items {
         ) -> Option<&mut dyn retro_core::audio::AudioDebugger> {
             unreachable!()
         }
+        fn output_waveform(&self, _samples: u32) -> Vec<f32> {
+            unreachable!()
+        }
         fn cartridge_debugger(&mut self) -> Box<dyn retro_core::cartridge::CartridgeDebugger + '_> {
             unreachable!()
         }
@@ -189,10 +194,65 @@ impl SavestatePayload for FakeMachineState {
     }
 }
 
-/// A video chip with a small memory, two layers and two sprites.
+/// A video chip with a small memory, a palette of four colours (words of
+/// 15 bits, low byte first), two layers and two sprites, the first linking
+/// to the second.
 pub(crate) struct FakeVideo {
     vram: Vec<u8>,
+    palette: [u16; 4],
     hidden: retro_core::video::LayerMask<2>,
+}
+
+/// A sound chip with a name and a number of channels, each of which can be
+/// muted; its waveforms are the channel's number.
+pub(crate) struct FakeSound {
+    name: &'static str,
+    muted: Vec<bool>,
+}
+
+impl AudioDebugger for FakeSound {
+    fn chip_info(&self) -> AudioChipInfo {
+        AudioChipInfo {
+            name: self.name,
+            manufacturer: "Nobody",
+            channels: self.muted.len() as u32,
+            sample_rate: 1000,
+            stereo: false,
+            channel_types: vec![ChannelType::Tone; self.muted.len()],
+        }
+    }
+    fn get_channel_count(&self) -> u32 {
+        self.muted.len() as u32
+    }
+    fn get_channel_state(&self, channel: u32) -> Option<ChannelState> {
+        let muted = *self.muted.get(channel as usize)?;
+        Some(ChannelState {
+            channel_id: channel,
+            enabled: true,
+            muted,
+            frequency: 0.0,
+            frequency_raw: 0,
+            period: 0,
+            volume: 1.0,
+            attenuation: 0,
+            pan: 0.0,
+            channel_type: ChannelType::Tone,
+            envelope: None,
+            current_output: 0.0,
+            noise_params: None,
+        })
+    }
+    fn mute_channel(&mut self, channel: u32, muted: bool) {
+        if let Some(slot) = self.muted.get_mut(channel as usize) {
+            *slot = muted;
+        }
+    }
+    fn get_waveform(&self, channel: u32, samples: u32) -> Vec<f32> {
+        vec![channel as f32; samples as usize]
+    }
+    fn get_output_waveform(&self, samples: u32) -> Vec<f32> {
+        vec![0.5; samples as usize]
+    }
 }
 
 impl VideoDebugger for FakeVideo {
@@ -203,7 +263,14 @@ impl VideoDebugger for FakeVideo {
         0
     }
     fn get_palette_data(&self) -> Vec<PaletteData> {
-        Vec::new()
+        vec![PaletteData {
+            index: 0,
+            colors: self
+                .palette
+                .iter()
+                .map(|&colour| (u32::from(colour) << 8) | 0xFF)
+                .collect(),
+        }]
     }
     fn get_sprite_data(&self) -> Vec<SpriteData> {
         (0..2)
@@ -266,6 +333,85 @@ impl VideoDebugger for FakeVideo {
             transparent_index: Some(0),
         })
     }
+    fn video_memories(&self) -> Vec<VideoMemoryInfo> {
+        vec![
+            VideoMemoryInfo {
+                id: VideoMemoryId::Vram,
+                name: "VRAM",
+                size: self.vram.len() as u32,
+                address_unit: 1,
+                little_endian: true,
+            },
+            VideoMemoryInfo {
+                id: VideoMemoryId::Palette,
+                name: "PAL",
+                size: 8,
+                address_unit: 2,
+                little_endian: true,
+            },
+        ]
+    }
+    fn read_video_memory(&self, id: VideoMemoryId) -> Option<Vec<u8>> {
+        match id {
+            VideoMemoryId::Vram => Some(self.vram.clone()),
+            VideoMemoryId::Palette => Some(bytes_from_words(&self.palette, true)),
+            _ => None,
+        }
+    }
+    fn write_video_memory(&mut self, id: VideoMemoryId, offset: u32, bytes: &[u8]) -> bool {
+        match id {
+            VideoMemoryId::Vram => {
+                let len = self.vram.len();
+                for (i, &byte) in bytes.iter().take(len).enumerate() {
+                    self.vram[(offset as usize + i) % len] = byte;
+                }
+            }
+            VideoMemoryId::Palette => {
+                let words = words_from_bytes(bytes, true);
+                for (i, &word) in words.iter().take(4).enumerate() {
+                    self.palette[(offset as usize / 2 + i) % 4] = word & 0x7FFF;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+    fn sprite_table(&self) -> Vec<SpriteTableEntry> {
+        self.get_sprite_data()
+            .into_iter()
+            .map(|sprite| SpriteTableEntry {
+                index: sprite.index,
+                x: sprite.x,
+                y: sprite.y,
+                width: sprite.width,
+                height: sprite.height,
+                tile_index: sprite.tile_index,
+                palette: sprite.palette,
+                priority: sprite.priority,
+                flip_h: sprite.flip_h,
+                flip_v: sprite.flip_v,
+                next: (sprite.index == 0).then_some(1),
+                tile_address: sprite.tile_index * 32,
+                large: sprite.index == 1,
+            })
+            .collect()
+    }
+    fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout> {
+        (layer_id < 2).then(|| LayerLayout {
+            id: layer_id,
+            kind: LayerKind::TileMap,
+            map_base: 16 * layer_id,
+            map_width: 4,
+            map_height: 2,
+            character_base: 0,
+            bits_per_pixel: 2,
+            cell_width: 8,
+            cell_height: 8,
+            first_colour: 0,
+            scroll_x: 0,
+            scroll_y: 0,
+        })
+    }
 }
 
 /// The machine every binding macro's tests expand on: a framebuffer wider
@@ -293,6 +439,7 @@ pub(crate) struct FakeMachine {
     show_overscan: bool,
     memory: Vec<u8>,
     video: FakeVideo,
+    sound: [FakeSound; 2],
     debugger: DebuggerState<1, ()>,
 }
 
@@ -304,7 +451,15 @@ impl FakeMachine {
             short_name: "fake".to_string(),
             manufacturer: "None".to_string(),
             year: 2000,
-            cpus: Vec::new(),
+            cpus: vec![CpuInfo {
+                id: 0,
+                name: "Fake CPU".to_string(),
+                architecture: CpuArchitecture::M68000,
+                clock_speed: 1,
+                registers: Vec::new(),
+                location: CpuLocation::Motherboard,
+                address_width: 8,
+            }],
             display: DisplayInfo {
                 width: PICTURE_WIDTH,
                 height: PICTURE_HEIGHT,
@@ -332,6 +487,8 @@ impl FakeMachine {
             trace_entry_size: 4,
             history: false,
             checks: BreakpointChecks::ALL,
+            steppable: true,
+            records_coverage: true,
         };
         Self {
             debugger: DebuggerState::new([spec], system_info.clone(), ()),
@@ -353,8 +510,19 @@ impl FakeMachine {
             memory: (0..=255).collect(),
             video: FakeVideo {
                 vram: (0..32).collect(),
+                palette: [0x0102, 0x0304, 0x0506, 0x0708],
                 hidden: Default::default(),
             },
+            sound: [
+                FakeSound {
+                    name: "Main",
+                    muted: vec![false; 3],
+                },
+                FakeSound {
+                    name: "Second",
+                    muted: vec![false; 2],
+                },
+            ],
         }
     }
 
@@ -436,10 +604,15 @@ impl EmulatorCore for FakeMachine {
         &mut self.video
     }
     fn audio_chip_count(&self) -> usize {
-        0
+        self.sound.len()
     }
-    fn audio_debugger(&mut self, _chip: usize) -> Option<&mut dyn AudioDebugger> {
-        None
+    fn audio_debugger(&mut self, chip: usize) -> Option<&mut dyn AudioDebugger> {
+        self.sound
+            .get_mut(chip)
+            .map(|sound| sound as &mut dyn AudioDebugger)
+    }
+    fn output_waveform(&self, samples: u32) -> Vec<f32> {
+        vec![0.25; samples as usize]
     }
     fn cartridge_debugger(&mut self) -> Box<dyn CartridgeDebugger + '_> {
         Box::new(MapPlanDebugger::new(

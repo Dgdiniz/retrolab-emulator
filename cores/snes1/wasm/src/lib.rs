@@ -21,12 +21,13 @@
 //! new frame and expose that buffer (and the active dimensions) through
 //! the framebuffer accessors.
 
-use retro_core::debug::{trace_to_text, TraceEntry};
+use retro_core::debug::TraceEntry;
+use retro_core::video::VideoMemoryId;
 use retro_core::*;
 use retro_wasm::js::{plain_object, set_property, to_js, uint16_array, uint8_array};
 use snes1_core::{
     CoprocessorMode, SnesEmulator, SnesSnapshotConsole, TileSetSource, TraceEntryBinaryCx4,
-    TraceEntryBinaryGsu, TraceEntryBinarySpc700, CARTRIDGE_CPU, SOUND_CPU,
+    TraceEntryBinaryGsu, CARTRIDGE_CPU, SOUND_CPU,
 };
 use wasm_bindgen::prelude::*;
 
@@ -79,24 +80,6 @@ impl RetroEmulator {
             EmulatorCore::get_framebuffer(&self.snes),
             EmulatorCore::get_display_info(&self.snes),
         );
-    }
-
-    /// The debug profile id the frontend should resolve for the loaded
-    /// cartridge, keyed off the architecture of the steppable secondary CPU
-    /// (debugger slot 2): `"snes-superfx"` for the Super FX GSU, `"snes-cx4"`
-    /// for the Cx4 HG51B169, `"snes-sa1"` for the SA-1's second 65816, else
-    /// `"snes"` (plain cart or a non-steppable coprocessor). The core owns
-    /// per-cartridge profile selection, it reflects the CPU roster built at
-    /// `loadRom` from the installed chip, so the frontend never re-detects the
-    /// chip. Defaults to `"snes"` before a ROM is loaded.
-    #[wasm_bindgen(js_name = getDebugProfileId)]
-    pub fn get_debug_profile_id(&self) -> String {
-        match self.snes.system_info().cpus.get(2).map(|c| c.architecture) {
-            Some(retro_core::CpuArchitecture::SuperFx) => "snes-superfx".to_string(),
-            Some(retro_core::CpuArchitecture::Hg51b) => "snes-cx4".to_string(),
-            Some(retro_core::CpuArchitecture::Mos65816) => "snes-sa1".to_string(),
-            _ => "snes".to_string(),
-        }
     }
 
     /// Stage a coprocessor firmware dump (DSP-1 family: the 8 KB
@@ -195,143 +178,8 @@ impl RetroEmulator {
     // ===== Debugger =====
     //
     // The generic debugger methods (breakpoints, execution mode, history,
-    // call stack, focus, steps, coverage and the main CPU's trace) are
+    // call stack, focus, steps, coverage and every CPU's trace) are
     // written by `retro_wasm::debugger_bindings!`, after this block.
-
-    // ===== Tracing (SPC700) =====
-
-    /// Enable or disable SPC700 execution tracing.
-    #[wasm_bindgen(js_name = setSpc700TracingEnabled)]
-    pub fn set_spc700_tracing_enabled(&mut self, enabled: bool) {
-        self.snes.debugger().set_tracing_enabled(SOUND_CPU, enabled);
-    }
-
-    /// Check if SPC700 tracing is enabled.
-    #[wasm_bindgen(js_name = isSpc700TracingEnabled)]
-    pub fn is_spc700_tracing_enabled(&mut self) -> bool {
-        self.snes.debugger_ref().is_tracing_enabled(SOUND_CPU)
-    }
-
-    /// Get SPC700 trace data ready for flushing (empty if none).
-    #[wasm_bindgen(js_name = getSpc700TraceFlushData)]
-    pub fn get_spc700_trace_flush_data(&mut self) -> Vec<u8> {
-        self.snes
-            .debugger_ref()
-            .get_trace_flush_data(SOUND_CPU)
-            .unwrap_or_default()
-    }
-
-    /// Clear flushed SPC700 trace data.
-    #[wasm_bindgen(js_name = clearSpc700TraceFlushed)]
-    pub fn clear_spc700_trace_flushed(&mut self) {
-        self.snes.debugger().clear_trace_flushed(SOUND_CPU);
-    }
-
-    /// SPC700 trace entry size in bytes.
-    #[wasm_bindgen(js_name = getSpc700TraceEntrySize)]
-    pub fn get_spc700_trace_entry_size(&self) -> usize {
-        <TraceEntryBinarySpc700 as TraceEntry>::SIZE
-    }
-
-    /// Convert a binary SPC700 trace chunk to text (one line/instruction).
-    #[wasm_bindgen(js_name = convertSpc700TraceChunkToText)]
-    pub fn convert_spc700_trace_chunk_to_text(&self, data: &[u8]) -> String {
-        trace_to_text::<TraceEntryBinarySpc700, ()>(data, &mut ())
-    }
-
-    // ===== Tracing (Super FX GSU, the cartridge's CPU) =====
-
-    /// Enable or disable Super FX GSU execution tracing. On a cartridge
-    /// whose CPU is not one that traces (a plain one, an SA-1), the switch
-    /// stays off and the frames stay on the fast loop.
-    #[wasm_bindgen(js_name = setSuperfxTracingEnabled)]
-    pub fn set_superfx_tracing_enabled(&mut self, enabled: bool) {
-        self.snes
-            .debugger()
-            .set_tracing_enabled(CARTRIDGE_CPU, enabled);
-    }
-
-    /// Check if Super FX GSU tracing is enabled.
-    #[wasm_bindgen(js_name = isSuperfxTracingEnabled)]
-    pub fn is_superfx_tracing_enabled(&mut self) -> bool {
-        self.snes.debugger_ref().is_tracing_enabled(CARTRIDGE_CPU)
-    }
-
-    /// Get Super FX GSU trace data ready for flushing (empty if none).
-    #[wasm_bindgen(js_name = getSuperfxTraceFlushData)]
-    pub fn get_superfx_trace_flush_data(&mut self) -> Vec<u8> {
-        self.snes
-            .debugger_ref()
-            .get_trace_flush_data(CARTRIDGE_CPU)
-            .unwrap_or_default()
-    }
-
-    /// Clear flushed Super FX GSU trace data.
-    #[wasm_bindgen(js_name = clearSuperfxTraceFlushed)]
-    pub fn clear_superfx_trace_flushed(&mut self) {
-        self.snes.debugger().clear_trace_flushed(CARTRIDGE_CPU);
-    }
-
-    /// Super FX GSU trace entry size in bytes.
-    #[wasm_bindgen(js_name = getSuperfxTraceEntrySize)]
-    pub fn get_superfx_trace_entry_size(&self) -> usize {
-        <TraceEntryBinaryGsu as TraceEntry>::SIZE
-    }
-
-    /// Convert a binary Super FX GSU trace chunk to text (one line/instruction).
-    /// Absent from a build without the chip.
-    #[cfg(feature = "chip-superfx")]
-    #[wasm_bindgen(js_name = convertSuperfxTraceChunkToText)]
-    pub fn convert_superfx_trace_chunk_to_text(&self, data: &[u8]) -> String {
-        trace_to_text::<TraceEntryBinaryGsu, ()>(data, &mut ())
-    }
-
-    // ===== Tracing (Cx4 HG51B169, the cartridge's CPU) =====
-
-    /// Enable or disable Cx4 HG51B169 execution tracing. On a cartridge
-    /// whose CPU is not one that traces (a plain one, an SA-1), the switch
-    /// stays off and the frames stay on the fast loop.
-    #[wasm_bindgen(js_name = setHg51bTracingEnabled)]
-    pub fn set_hg51b_tracing_enabled(&mut self, enabled: bool) {
-        self.snes
-            .debugger()
-            .set_tracing_enabled(CARTRIDGE_CPU, enabled);
-    }
-
-    /// Check if Cx4 HG51B169 tracing is enabled.
-    #[wasm_bindgen(js_name = isHg51bTracingEnabled)]
-    pub fn is_hg51b_tracing_enabled(&mut self) -> bool {
-        self.snes.debugger_ref().is_tracing_enabled(CARTRIDGE_CPU)
-    }
-
-    /// Get Cx4 HG51B169 trace data ready for flushing (empty if none).
-    #[wasm_bindgen(js_name = getHg51bTraceFlushData)]
-    pub fn get_hg51b_trace_flush_data(&mut self) -> Vec<u8> {
-        self.snes
-            .debugger_ref()
-            .get_trace_flush_data(CARTRIDGE_CPU)
-            .unwrap_or_default()
-    }
-
-    /// Clear flushed Cx4 HG51B169 trace data.
-    #[wasm_bindgen(js_name = clearHg51bTraceFlushed)]
-    pub fn clear_hg51b_trace_flushed(&mut self) {
-        self.snes.debugger().clear_trace_flushed(CARTRIDGE_CPU);
-    }
-
-    /// Cx4 HG51B169 trace entry size in bytes.
-    #[wasm_bindgen(js_name = getHg51bTraceEntrySize)]
-    pub fn get_hg51b_trace_entry_size(&self) -> usize {
-        <TraceEntryBinaryCx4 as TraceEntry>::SIZE
-    }
-
-    /// Convert a binary Cx4 HG51B169 trace chunk to text (one line/instruction).
-    /// Absent from a build without the chip.
-    #[cfg(feature = "chip-cx4")]
-    #[wasm_bindgen(js_name = convertHg51bTraceChunkToText)]
-    pub fn convert_hg51b_trace_chunk_to_text(&self, data: &[u8]) -> String {
-        trace_to_text::<TraceEntryBinaryCx4, ()>(data, &mut ())
-    }
 
     // ===== SNES-specific debug surfaces =====
 
@@ -375,64 +223,10 @@ impl RetroEmulator {
         snes1_core::ppu::tile::mode7_sample(ppu.vram(), px, py, ppu.mode7_repeat())
     }
 
-    /// State of all 8 S-DSP voices (`ChannelState[]`, `null` per voice if
-    /// unavailable).
-    #[wasm_bindgen(js_name = getDspVoiceStates)]
-    pub fn get_dsp_voice_states(&mut self) -> JsValue {
-        let voices: Vec<_> = (0..8)
-            .map(|i| self.snes.audio_debugger(0).unwrap().get_channel_state(i))
-            .collect();
-        serde_wasm_bindgen::to_value(&voices).unwrap()
-    }
-
     /// The four SPC700 -> main-CPU mailbox port values (`$2140-$2143`).
     #[wasm_bindgen(js_name = getApuPortValues)]
     pub fn get_apu_port_values(&self) -> JsValue {
         serde_wasm_bindgen::to_value(&self.snes.bus().apu().output_ports()).unwrap()
-    }
-
-    /// 256-colour CGRAM rendered as a 256x256 RGBA8888 swatch grid.
-    #[wasm_bindgen(js_name = exportPaletteImage)]
-    pub fn export_palette_image(&self) -> Vec<u8> {
-        self.snes.export_palette_image()
-    }
-
-    /// A 16x16 tile sheet decoded from a VRAM character base.
-    /// `source`: 0 = background base, 1 = OBJ base. Returns
-    /// `{ width, height, rgba }`.
-    #[wasm_bindgen(js_name = exportTileImage)]
-    pub fn export_tile_image(&self, source: u8, palette: u8) -> JsValue {
-        let src = if source == 0 {
-            TileSetSource::Bg
-        } else {
-            TileSetSource::Obj
-        };
-        serde_wasm_bindgen::to_value(&self.snes.export_tile_image(src, palette)).unwrap()
-    }
-
-    /// Background `bg` (`0..=3`) tilemap rendered to an RGBA image
-    /// (`{ width, height, rgba }`).
-    #[wasm_bindgen(js_name = exportTilemapImage)]
-    pub fn export_tilemap_image(&self, bg: usize) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.snes.export_tilemap_image(bg)).unwrap()
-    }
-
-    /// All 128 OAM sprites flattened into `SpriteDescriptor[]`.
-    #[wasm_bindgen(js_name = exportOamSprites)]
-    pub fn export_oam_sprites(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.snes.export_oam_sprites()).unwrap()
-    }
-
-    /// Per-background addressing + format snapshot (`BgLayout`) for the
-    /// host's raw-layer (full-map) assembler, in the core's own field
-    /// names: `{ bg, bg_mode, tilemap_base_byte, char_base_byte,
-    /// screen_size, width_cells, height_cells, bpp, tile_size16,
-    /// palette_base, scroll_x, scroll_y }`. `bpp` is `0` when the BG does
-    /// not draw under the current mode (host falls back to the viewport).
-    /// `bg` is clamped to `0..=3`.
-    #[wasm_bindgen(js_name = getBgLayout)]
-    pub fn get_bg_layout(&self, bg: usize) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.snes.bg_layout(bg)).unwrap()
     }
 
     /// Where the renderer finds the sprites' tiles, and the two sprite
@@ -462,14 +256,7 @@ impl RetroEmulator {
         to_js(&manifest)
     }
 
-    // ===== Raw debug memory views (parity with sg1's getVram/getCram) =====
-
-    /// The 256-entry CGRAM as raw BGR15 words (one per colour). A palette
-    /// viewer decodes these into RGBA swatches.
-    #[wasm_bindgen(js_name = getCgram)]
-    pub fn get_cgram(&self) -> Vec<u16> {
-        self.snes.ppu().cgram().to_vec()
-    }
+    // ===== Raw debug memory views =====
 
     /// The 544-byte OAM (sprite attribute table) as raw bytes.
     #[wasm_bindgen(js_name = getOam)]
@@ -487,21 +274,15 @@ impl RetroEmulator {
     /// empty one writes nothing. The renderer's cached tilemap rows and
     /// sprite tiles follow the write. A running game shows the change on
     /// its next frame, a paused one after `repaintFrame`.
+    /// `writeVideoMemory("vram", ...)` writes the same way from a byte
+    /// address: this is it at byte `2 * word_address`.
     #[wasm_bindgen(js_name = writeVram)]
     pub fn write_vram(&mut self, word_address: u32, bytes: &[u8]) {
-        self.snes.write_vram_debug(word_address, bytes);
-    }
-
-    /// Write CGRAM for debugging, to edit a palette: `colours` from colour
-    /// `colour_index` (0-255) on, BGR555 words as `getCgram` returns them
-    /// (bit 15 is dropped, as the port drops it). Straight into memory,
-    /// through no port. The index wraps at 256, a buffer longer than CGRAM
-    /// is cut to its 256 colours, and an empty one writes nothing. A
-    /// running game shows the change on its next frame, a paused one after
-    /// `repaintFrame`.
-    #[wasm_bindgen(js_name = writeCgram)]
-    pub fn write_cgram(&mut self, colour_index: u32, colours: &[u16]) {
-        self.snes.write_cgram_debug(colour_index, colours);
+        self.snes.video_debugger().write_video_memory(
+            VideoMemoryId::Vram,
+            (word_address & 0x7FFF) * 2,
+            bytes,
+        );
     }
 
     /// Write OAM for debugging, to edit sprites: `bytes` from byte
@@ -523,44 +304,311 @@ impl RetroEmulator {
     pub fn get_aram(&self) -> Vec<u8> {
         self.snes.bus().apu().aram().to_vec()
     }
+}
 
-    /// PPU register snapshot (`VideoRegister[]`: BGMODE, TM/TS, Mode 7
-    /// matrix + centre, BG1 scroll) for the PPU state panel.
-    #[wasm_bindgen(js_name = getPpuRegisters)]
-    pub fn get_ppu_registers(&mut self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self.snes.video_debugger().get_registers()).unwrap()
+/// The older names of methods both consoles now export under one name each,
+/// kept answering as they did: each is a call of its new name where the two
+/// give the same value, else its own body. Each names its new name.
+#[wasm_bindgen]
+impl RetroEmulator {
+    /// The debug profile id the frontend should resolve for the loaded
+    /// cartridge, keyed off the architecture of the steppable secondary CPU
+    /// (debugger slot 2): `"snes-superfx"` for the Super FX GSU, `"snes-cx4"`
+    /// for the Cx4 HG51B169, `"snes-sa1"` for the SA-1's second 65816, else
+    /// `"snes"` (plain cart or a non-steppable coprocessor). The core owns
+    /// per-cartridge profile selection, it reflects the CPU roster built at
+    /// `loadRom` from the installed chip, so the frontend never re-detects the
+    /// chip. Defaults to `"snes"` before a ROM is loaded.
+    ///
+    /// @deprecated Use `getCpus()`: CPU 2's architecture names the profile.
+    #[wasm_bindgen(js_name = getDebugProfileId)]
+    pub fn get_debug_profile_id(&self) -> String {
+        match self.snes.system_info().cpus.get(2).map(|c| c.architecture) {
+            Some(retro_core::CpuArchitecture::SuperFx) => "snes-superfx".to_string(),
+            Some(retro_core::CpuArchitecture::Hg51b) => "snes-cx4".to_string(),
+            Some(retro_core::CpuArchitecture::Mos65816) => "snes-sa1".to_string(),
+            _ => "snes".to_string(),
+        }
+    }
+
+    /// Enable or disable SPC700 execution tracing.
+    ///
+    /// @deprecated Use `setCpuTracingEnabled(1, enabled)`.
+    #[wasm_bindgen(js_name = setSpc700TracingEnabled)]
+    pub fn set_spc700_tracing_enabled(&mut self, enabled: bool) {
+        self.set_cpu_tracing_enabled(SOUND_CPU, enabled);
+    }
+
+    /// Check if SPC700 tracing is enabled.
+    ///
+    /// @deprecated Use `isCpuTracingEnabled(1)`.
+    #[wasm_bindgen(js_name = isSpc700TracingEnabled)]
+    pub fn is_spc700_tracing_enabled(&mut self) -> bool {
+        self.is_cpu_tracing_enabled(SOUND_CPU)
+    }
+
+    /// Get SPC700 trace data ready for flushing (empty if none).
+    ///
+    /// @deprecated Use `getCpuTraceFlushData(1)`.
+    #[wasm_bindgen(js_name = getSpc700TraceFlushData)]
+    pub fn get_spc700_trace_flush_data(&mut self) -> Vec<u8> {
+        self.get_cpu_trace_flush_data(SOUND_CPU)
+    }
+
+    /// Clear flushed SPC700 trace data.
+    ///
+    /// @deprecated Use `clearCpuTraceFlushed(1)`.
+    #[wasm_bindgen(js_name = clearSpc700TraceFlushed)]
+    pub fn clear_spc700_trace_flushed(&mut self) {
+        self.clear_cpu_trace_flushed(SOUND_CPU);
+    }
+
+    /// SPC700 trace entry size in bytes.
+    ///
+    /// @deprecated Use `getCpuTraceEntrySize(1)`.
+    #[wasm_bindgen(js_name = getSpc700TraceEntrySize)]
+    pub fn get_spc700_trace_entry_size(&self) -> usize {
+        self.get_cpu_trace_entry_size(SOUND_CPU)
+    }
+
+    /// Convert a binary SPC700 trace chunk to text (one line/instruction).
+    ///
+    /// @deprecated Use `convertCpuTraceChunkToText(1, data)`.
+    #[wasm_bindgen(js_name = convertSpc700TraceChunkToText)]
+    pub fn convert_spc700_trace_chunk_to_text(&mut self, data: &[u8]) -> String {
+        self.convert_cpu_trace_chunk_to_text(SOUND_CPU, data)
+    }
+
+    /// Enable or disable Super FX GSU execution tracing. On a cartridge
+    /// whose CPU is not one that traces (a plain one, an SA-1), the switch
+    /// stays off and the frames stay on the fast loop.
+    ///
+    /// @deprecated Use `setCpuTracingEnabled(2, enabled)`.
+    #[wasm_bindgen(js_name = setSuperfxTracingEnabled)]
+    pub fn set_superfx_tracing_enabled(&mut self, enabled: bool) {
+        self.set_cpu_tracing_enabled(CARTRIDGE_CPU, enabled);
+    }
+
+    /// Check if Super FX GSU tracing is enabled.
+    ///
+    /// @deprecated Use `isCpuTracingEnabled(2)`.
+    #[wasm_bindgen(js_name = isSuperfxTracingEnabled)]
+    pub fn is_superfx_tracing_enabled(&mut self) -> bool {
+        self.is_cpu_tracing_enabled(CARTRIDGE_CPU)
+    }
+
+    /// Get Super FX GSU trace data ready for flushing (empty if none).
+    ///
+    /// @deprecated Use `getCpuTraceFlushData(2)`.
+    #[wasm_bindgen(js_name = getSuperfxTraceFlushData)]
+    pub fn get_superfx_trace_flush_data(&mut self) -> Vec<u8> {
+        self.get_cpu_trace_flush_data(CARTRIDGE_CPU)
+    }
+
+    /// Clear flushed Super FX GSU trace data.
+    ///
+    /// @deprecated Use `clearCpuTraceFlushed(2)`.
+    #[wasm_bindgen(js_name = clearSuperfxTraceFlushed)]
+    pub fn clear_superfx_trace_flushed(&mut self) {
+        self.clear_cpu_trace_flushed(CARTRIDGE_CPU);
+    }
+
+    /// Super FX GSU trace entry size in bytes.
+    ///
+    /// @deprecated Use `getCpuTraceEntrySize(2)` on a cartridge whose CPU 2 is
+    /// the Super FX.
+    #[wasm_bindgen(js_name = getSuperfxTraceEntrySize)]
+    pub fn get_superfx_trace_entry_size(&self) -> usize {
+        <TraceEntryBinaryGsu as TraceEntry>::SIZE
+    }
+
+    /// Convert a binary Super FX GSU trace chunk to text (one line/instruction).
+    /// Absent from a build without the chip.
+    ///
+    /// @deprecated Use `convertCpuTraceChunkToText(2, data)` on a cartridge
+    /// whose CPU 2 is the Super FX.
+    #[cfg(feature = "chip-superfx")]
+    #[wasm_bindgen(js_name = convertSuperfxTraceChunkToText)]
+    pub fn convert_superfx_trace_chunk_to_text(&self, data: &[u8]) -> String {
+        retro_core::debug::trace_to_text::<TraceEntryBinaryGsu, ()>(data, &mut ())
+    }
+
+    /// Enable or disable Cx4 HG51B169 execution tracing. On a cartridge
+    /// whose CPU is not one that traces (a plain one, an SA-1), the switch
+    /// stays off and the frames stay on the fast loop.
+    ///
+    /// @deprecated Use `setCpuTracingEnabled(2, enabled)`.
+    #[wasm_bindgen(js_name = setHg51bTracingEnabled)]
+    pub fn set_hg51b_tracing_enabled(&mut self, enabled: bool) {
+        self.set_cpu_tracing_enabled(CARTRIDGE_CPU, enabled);
+    }
+
+    /// Check if Cx4 HG51B169 tracing is enabled.
+    ///
+    /// @deprecated Use `isCpuTracingEnabled(2)`.
+    #[wasm_bindgen(js_name = isHg51bTracingEnabled)]
+    pub fn is_hg51b_tracing_enabled(&mut self) -> bool {
+        self.is_cpu_tracing_enabled(CARTRIDGE_CPU)
+    }
+
+    /// Get Cx4 HG51B169 trace data ready for flushing (empty if none).
+    ///
+    /// @deprecated Use `getCpuTraceFlushData(2)`.
+    #[wasm_bindgen(js_name = getHg51bTraceFlushData)]
+    pub fn get_hg51b_trace_flush_data(&mut self) -> Vec<u8> {
+        self.get_cpu_trace_flush_data(CARTRIDGE_CPU)
+    }
+
+    /// Clear flushed Cx4 HG51B169 trace data.
+    ///
+    /// @deprecated Use `clearCpuTraceFlushed(2)`.
+    #[wasm_bindgen(js_name = clearHg51bTraceFlushed)]
+    pub fn clear_hg51b_trace_flushed(&mut self) {
+        self.clear_cpu_trace_flushed(CARTRIDGE_CPU);
+    }
+
+    /// Cx4 HG51B169 trace entry size in bytes.
+    ///
+    /// @deprecated Use `getCpuTraceEntrySize(2)` on a cartridge whose CPU 2 is
+    /// the Cx4.
+    #[wasm_bindgen(js_name = getHg51bTraceEntrySize)]
+    pub fn get_hg51b_trace_entry_size(&self) -> usize {
+        <TraceEntryBinaryCx4 as TraceEntry>::SIZE
+    }
+
+    /// Convert a binary Cx4 HG51B169 trace chunk to text (one line/instruction).
+    /// Absent from a build without the chip.
+    ///
+    /// @deprecated Use `convertCpuTraceChunkToText(2, data)` on a cartridge
+    /// whose CPU 2 is the Cx4.
+    #[cfg(feature = "chip-cx4")]
+    #[wasm_bindgen(js_name = convertHg51bTraceChunkToText)]
+    pub fn convert_hg51b_trace_chunk_to_text(&self, data: &[u8]) -> String {
+        retro_core::debug::trace_to_text::<TraceEntryBinaryCx4, ()>(data, &mut ())
+    }
+
+    /// State of all 8 S-DSP voices (`ChannelState[]`, `null` per voice if
+    /// unavailable).
+    ///
+    /// @deprecated Use `getAudioChipChannels(0)`.
+    #[wasm_bindgen(js_name = getDspVoiceStates)]
+    pub fn get_dsp_voice_states(&mut self) -> JsValue {
+        self.get_audio_chip_channels(0)
     }
 
     /// Mute/unmute one S-DSP voice (0-7) in the debugger without altering
     /// the game's key-on state.
+    ///
+    /// @deprecated Use `muteAudioChipChannel(0, channel, muted)`.
     #[wasm_bindgen(js_name = muteDspChannel)]
     pub fn mute_dsp_channel(&mut self, channel: u32, muted: bool) {
-        self.snes
-            .audio_debugger(0)
-            .unwrap()
-            .mute_channel(channel, muted);
-    }
-
-    /// `samples` of the mixed S-DSP output as mono f32 in [-1, 1] for the
-    /// waveform / spectrum views. Peeks the audio ring without draining
-    /// it, so the host's normal audio pull is unaffected.
-    #[wasm_bindgen(js_name = getDspMixedWaveform)]
-    pub fn get_dsp_mixed_waveform(&mut self, samples: u32) -> Vec<f32> {
-        self.snes
-            .audio_debugger(0)
-            .unwrap()
-            .get_output_waveform(samples)
+        self.mute_audio_chip_channel(0, channel, muted);
     }
 
     /// `samples` of one S-DSP voice's approximated waveform (the mixed
     /// output scaled by that voice's instantaneous amplitude; silence
     /// when the voice is muted or keyed off).
+    ///
+    /// @deprecated Use `getAudioChipWaveform(0, channel, samples)`.
     #[wasm_bindgen(js_name = getDspWaveform)]
     pub fn get_dsp_waveform(&mut self, channel: u32, samples: u32) -> Vec<f32> {
-        self.snes
-            .audio_debugger(0)
-            .unwrap()
-            .get_waveform(channel, samples)
+        self.get_audio_chip_waveform(0, channel, samples)
+    }
+
+    /// `samples` of the mixed S-DSP output as mono f32 in [-1, 1] for the
+    /// waveform / spectrum views. Peeks the audio ring without draining
+    /// it, so the host's normal audio pull is unaffected.
+    ///
+    /// @deprecated Use `getAudioOutputWaveform(samples)`.
+    #[wasm_bindgen(js_name = getDspMixedWaveform)]
+    pub fn get_dsp_mixed_waveform(&mut self, samples: u32) -> Vec<f32> {
+        self.get_audio_output_waveform(samples)
+    }
+
+    /// The 256-entry CGRAM as raw BGR15 words (one per colour). A palette
+    /// viewer decodes these into RGBA swatches.
+    ///
+    /// @deprecated Use `getPaletteMemory()`.
+    #[wasm_bindgen(js_name = getCgram)]
+    pub fn get_cgram(&mut self) -> Vec<u16> {
+        self.get_palette_memory()
+    }
+
+    /// Write CGRAM for debugging, to edit a palette: `colours` from colour
+    /// `colour_index` (0-255) on, BGR555 words as `getCgram` returns them
+    /// (bit 15 is dropped, as the port drops it). Straight into memory,
+    /// through no port. The index wraps at 256, a buffer longer than CGRAM
+    /// is cut to its 256 colours, and an empty one writes nothing. A
+    /// running game shows the change on its next frame, a paused one after
+    /// `repaintFrame`.
+    ///
+    /// @deprecated Use `writePaletteMemory(colour_index, colours)`.
+    #[wasm_bindgen(js_name = writeCgram)]
+    pub fn write_cgram(&mut self, colour_index: u32, colours: &[u16]) {
+        self.write_palette_memory(colour_index, colours);
+    }
+
+    /// PPU register snapshot (`VideoRegister[]`: BGMODE, TM/TS, Mode 7
+    /// matrix + centre, BG1 scroll) for the PPU state panel.
+    ///
+    /// @deprecated Use `getVideoRegisters()`.
+    #[wasm_bindgen(js_name = getPpuRegisters)]
+    pub fn get_ppu_registers(&mut self) -> JsValue {
+        self.get_video_registers()
+    }
+
+    /// 256-colour CGRAM rendered as a 256x256 RGBA8888 swatch grid.
+    ///
+    /// @deprecated Use `getPaletteColours()`, each colour's RGBA once.
+    #[wasm_bindgen(js_name = exportPaletteImage)]
+    pub fn export_palette_image(&self) -> Vec<u8> {
+        self.snes.export_palette_image()
+    }
+
+    /// A 16x16 tile sheet decoded from a VRAM character base.
+    /// `source`: 0 = background base, 1 = OBJ base. Returns
+    /// `{ width, height, rgba }`.
+    ///
+    /// @deprecated Use `getTileColours`.
+    #[wasm_bindgen(js_name = exportTileImage)]
+    pub fn export_tile_image(&self, source: u8, palette: u8) -> JsValue {
+        let src = if source == 0 {
+            TileSetSource::Bg
+        } else {
+            TileSetSource::Obj
+        };
+        serde_wasm_bindgen::to_value(&self.snes.export_tile_image(src, palette)).unwrap()
+    }
+
+    /// Background `bg` (`0..=3`) tilemap rendered to an RGBA image
+    /// (`{ width, height, rgba }`).
+    ///
+    /// @deprecated Use `getLayerLayout(bg)` with `getTileColours`.
+    #[wasm_bindgen(js_name = exportTilemapImage)]
+    pub fn export_tilemap_image(&self, bg: usize) -> JsValue {
+        serde_wasm_bindgen::to_value(&self.snes.export_tilemap_image(bg)).unwrap()
+    }
+
+    /// All 128 OAM sprites flattened into `SpriteDescriptor[]`.
+    ///
+    /// @deprecated Use `getSpriteTable()`.
+    #[wasm_bindgen(js_name = exportOamSprites)]
+    pub fn export_oam_sprites(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(&self.snes.export_oam_sprites()).unwrap()
+    }
+
+    /// Per-background addressing + format snapshot (`BgLayout`) for the
+    /// host's raw-layer (full-map) assembler, in the core's own field
+    /// names: `{ bg, bg_mode, tilemap_base_byte, char_base_byte,
+    /// screen_size, width_cells, height_cells, bpp, tile_size16,
+    /// palette_base, scroll_x, scroll_y }`. `bpp` is `0` when the BG does
+    /// not draw under the current mode (host falls back to the viewport).
+    /// `bg` is clamped to `0..=3`.
+    ///
+    /// @deprecated Use `getLayerLayout(bg)`, field for field.
+    #[wasm_bindgen(js_name = getBgLayout)]
+    pub fn get_bg_layout(&self, bg: usize) -> JsValue {
+        serde_wasm_bindgen::to_value(&self.snes.bg_layout(bg)).unwrap()
     }
 }
 

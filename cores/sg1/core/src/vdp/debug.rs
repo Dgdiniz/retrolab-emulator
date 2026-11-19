@@ -22,8 +22,10 @@
 use std::ops::Range;
 
 use retro_core::video::{
-    ExportError, IndexedImage, LayerData, PaletteData, PixelImage, SpriteData, SpriteOrderEntry,
-    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoRegister,
+    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
+    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteOrderEntry, SpriteTableEntry, TileData,
+    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
+    VideoRegister,
 };
 
 use super::sprites::{link_chain, Sprite};
@@ -111,6 +113,20 @@ impl Vdp {
     /// renderer stops it ([`link_chain`]).
     pub fn sprite_table_chain(&self) -> Vec<(u8, Sprite)> {
         link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).collect()
+    }
+
+    /// Planes A and B's size in cells, from the plane-size register (16).
+    fn plane_size_cells(&self) -> (u32, u32) {
+        match self.registers[16] & 0x33 {
+            0x00 => (32, 32),
+            0x01 => (64, 32),
+            0x03 => (128, 32),
+            0x10 => (32, 64),
+            0x11 => (64, 64),
+            0x20 => (32, 32), // invalid horizontal size -> rows repeat
+            0x30 => (32, 128),
+            _ => (64, 64),
+        }
     }
 
     /// Write `bytes` into VRAM from `byte_address` on, the way a debugger
@@ -297,17 +313,7 @@ impl VideoDebugger for Vdp {
         if id >= LAYER_COUNT {
             return None;
         }
-        // Playfield pixel dimensions from the plane-size register (reg 16).
-        let (cols, rows) = match self.registers[16] & 0x33 {
-            0x00 => (32u32, 32u32),
-            0x01 => (64, 32),
-            0x03 => (128, 32),
-            0x10 => (32, 64),
-            0x11 => (64, 64),
-            0x20 => (32, 32), // invalid horizontal size -> rows repeat
-            0x30 => (32, 128),
-            _ => (64, 64),
-        };
+        let (cols, rows) = self.plane_size_cells();
         // The checkbox mirrors the debugger's per-layer hide toggle only,
         // NOT the game's display-enable bit (reg1 bit6). A blanked screen is
         // the game's own choice and is already visible on the canvas; folding
@@ -491,6 +497,112 @@ impl VideoDebugger for Vdp {
             pixels,
             bpp: 4,
             transparent_index: Some(0),
+        })
+    }
+
+    /// VRAM (byte addresses), CRAM (colours) and VSRAM (words), each
+    /// keeping a word's high byte first, as the 68000 reads them.
+    fn video_memories(&self) -> Vec<VideoMemoryInfo> {
+        let memory = |id, name, size: usize, address_unit| VideoMemoryInfo {
+            id,
+            name,
+            size: size as u32,
+            address_unit,
+            little_endian: false,
+        };
+        vec![
+            memory(VideoMemoryId::Vram, "VRAM", VRAM_BYTES, 1),
+            memory(VideoMemoryId::Palette, "CRAM", CRAM_COLOURS * 2, 2),
+            memory(VideoMemoryId::VerticalScroll, "VSRAM", VSRAM_WORDS * 2, 2),
+        ]
+    }
+
+    fn read_video_memory(&self, id: VideoMemoryId) -> Option<Vec<u8>> {
+        match id {
+            VideoMemoryId::Vram => Some(self.vram.clone()),
+            VideoMemoryId::Palette => Some(bytes_from_words(&self.cram, false)),
+            VideoMemoryId::VerticalScroll => Some(bytes_from_words(&self.vsram, false)),
+            VideoMemoryId::SpriteTable => None,
+        }
+    }
+
+    /// Through [`Vdp::write_vram_debug`], [`Vdp::write_cram_debug`] and
+    /// [`Vdp::write_vsram_debug`]; the sprite table lives in VRAM.
+    fn write_video_memory(&mut self, id: VideoMemoryId, offset: u32, bytes: &[u8]) -> bool {
+        match id {
+            VideoMemoryId::Vram => self.write_vram_debug(offset, bytes),
+            VideoMemoryId::Palette => {
+                self.write_cram_debug(offset / 2, &words_from_bytes(bytes, false));
+            }
+            VideoMemoryId::VerticalScroll => {
+                self.write_vsram_debug(offset / 2, &words_from_bytes(bytes, false));
+            }
+            VideoMemoryId::SpriteTable => return false,
+        }
+        true
+    }
+
+    /// The link chain the renderer walks ([`Vdp::sprite_table_chain`]),
+    /// each entry linking to the one after it; one size of sprite.
+    fn sprite_table(&self) -> Vec<SpriteTableEntry> {
+        let chain = self.sprite_table_chain();
+        chain
+            .iter()
+            .enumerate()
+            .map(|(position, (slot, sprite))| SpriteTableEntry {
+                index: u32::from(*slot),
+                x: i32::from(sprite.x),
+                y: i32::from(sprite.y),
+                width: u32::from(sprite.width_tiles) * 8,
+                height: u32::from(sprite.height_tiles) * 8,
+                tile_index: u32::from(sprite.pattern_base),
+                palette: u32::from(sprite.palette),
+                priority: u32::from(sprite.priority),
+                flip_h: sprite.flip_h,
+                flip_v: sprite.flip_v,
+                next: chain.get(position + 1).map(|(next, _)| u32::from(*next)),
+                tile_address: u32::from(sprite.pattern_base) * 32,
+                large: false,
+            })
+            .collect()
+    }
+
+    /// Planes A and B, the window and the sprites: 4 bits a pixel in 8 by
+    /// 8 cells from VRAM byte 0, each cell naming its own palette; the
+    /// scroll as the layer list reports it (0: it is set per line and per
+    /// column).
+    fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout> {
+        let (cols, rows) = self.plane_size_cells();
+        let window_cols = if (self.registers[12] & 0x01) != 0 {
+            64
+        } else {
+            32
+        };
+        let (kind, map_base, map_width, map_height) = match layer_id as usize {
+            LAYER_PLANE_A => (LayerKind::TileMap, self.get_plane_a_nametable(), cols, rows),
+            LAYER_PLANE_B => (LayerKind::TileMap, self.get_plane_b_nametable(), cols, rows),
+            LAYER_WINDOW => (
+                LayerKind::Window,
+                self.get_window_nametable(),
+                window_cols,
+                32,
+            ),
+            LAYER_SPRITES => (LayerKind::Sprites, self.sat_base(), 0, 0),
+            _ => return None,
+        };
+        Some(LayerLayout {
+            id: layer_id,
+            kind,
+            map_base: u32::from(map_base),
+            map_width,
+            map_height,
+            character_base: 0,
+            bits_per_pixel: 4,
+            cell_width: 8,
+            cell_height: 8,
+            first_colour: 0,
+            scroll_x: 0,
+            scroll_y: 0,
         })
     }
 }
@@ -703,6 +815,105 @@ mod tests {
         vdp.vram[3] = 1;
         vdp.vram[8 + 3] = 1; // slot 1 links to itself
         assert_eq!(vdp.sprite_table_chain().len(), 64);
+    }
+
+    #[test]
+    fn the_sprite_table_is_the_chain_each_entry_linking_to_the_next() {
+        let mut vdp = Vdp::new();
+        vdp.registers[5] = 0; // SAT base 0
+        vdp.registers[12] = 0x81; // 40 cells
+        vdp.vram[3] = 70; // slot 0 links to 70
+        vdp.vram[70 * 8 + 3] = 5; // slot 70 links to 5
+        vdp.vram[70 * 8 + 4] = 0x80 | 0x20 | 0x01; // priority, palette 1, pattern 0x100
+        vdp.vram[5 * 8 + 3] = 0; // slot 5 ends the chain
+
+        let table = vdp.sprite_table();
+        let chain = vdp.sprite_table_chain();
+        assert_eq!(
+            table.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+            [0, 70, 5]
+        );
+        assert_eq!(
+            table.iter().map(|entry| entry.next).collect::<Vec<_>>(),
+            [Some(70), Some(5), None]
+        );
+        let sprites = vdp.get_sprite_data();
+        for (entry, (slot, sprite)) in table.iter().zip(&chain) {
+            let data = sprites
+                .iter()
+                .find(|s| s.index == u32::from(*slot))
+                .unwrap();
+            assert_eq!(
+                (
+                    entry.x,
+                    entry.y,
+                    entry.width,
+                    entry.height,
+                    entry.tile_index
+                ),
+                (data.x, data.y, data.width, data.height, data.tile_index)
+            );
+            assert_eq!(entry.tile_address, u32::from(sprite.pattern_base) * 32);
+            assert!(!entry.large);
+        }
+        assert_eq!((table[1].palette, table[1].priority), (1, 1));
+        assert_eq!(table[1].tile_address, 0x100 * 32);
+    }
+
+    #[test]
+    fn the_layers_read_their_maps_where_the_registers_say() {
+        let mut vdp = Vdp::new();
+        vdp.registers[2] = 0x30; // plane A at $C000
+        vdp.registers[4] = 0x07; // plane B at $E000
+        vdp.registers[3] = 0x2C; // window at $B000
+        vdp.registers[5] = 0x7E; // the sprite table at $FC00
+        vdp.registers[12] = 0x81; // 40 cells
+        vdp.registers[16] = 0x01; // planes of 64 by 32 cells
+        let layout = |id| vdp.layer_layout(id).unwrap();
+        assert_eq!(
+            (layout(0).kind, layout(0).map_base, layout(0).map_width),
+            (LayerKind::TileMap, 0xC000, 64)
+        );
+        assert_eq!(layout(1).map_base, u32::from(vdp.get_plane_b_nametable()));
+        assert_eq!(
+            (layout(2).kind, layout(2).map_base, layout(2).map_width),
+            (LayerKind::Window, 0xB000, 64)
+        );
+        assert_eq!(
+            (layout(3).kind, layout(3).map_base, layout(3).map_width),
+            (LayerKind::Sprites, u32::from(vdp.sat_base()), 0)
+        );
+        assert!(vdp.layer_layout(4).is_none());
+    }
+
+    #[test]
+    fn the_word_memories_are_read_and_written_high_byte_first() {
+        let mut vdp = Vdp::new();
+        assert!(vdp.write_video_memory(VideoMemoryId::Palette, 3, &[0x0E, 0x24, 0xFF]));
+        assert_eq!(vdp.get_cram()[1], 0x0E24, "from the word the offset is in");
+        assert_eq!(
+            vdp.read_video_memory(VideoMemoryId::Palette).unwrap()[2..4],
+            [0x0E, 0x24]
+        );
+        assert!(vdp.write_video_memory(
+            VideoMemoryId::VerticalScroll,
+            126,
+            &[0xFF, 0xFF, 0x01, 0x23]
+        ));
+        assert_eq!((vdp.get_vsram()[63], vdp.get_vsram()[0]), (0x07FF, 0x0123));
+        assert_eq!(vdp.read_video_memory(VideoMemoryId::SpriteTable), None);
+        assert!(!vdp.write_video_memory(VideoMemoryId::SpriteTable, 0, &[1]));
+        assert_eq!(
+            vdp.video_memories()
+                .iter()
+                .map(|memory| (memory.id, memory.size, memory.address_unit))
+                .collect::<Vec<_>>(),
+            [
+                (VideoMemoryId::Vram, 0x1_0000, 1),
+                (VideoMemoryId::Palette, 128, 2),
+                (VideoMemoryId::VerticalScroll, 128, 2)
+            ]
+        );
     }
 
     #[test]

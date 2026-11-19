@@ -805,6 +805,11 @@ impl EmulatorCore for GenesisEmulator {
         }
     }
 
+    /// The PSG and the YM2612 mixed.
+    fn output_waveform(&self, samples: u32) -> Vec<f32> {
+        self.mixed_waveform(samples)
+    }
+
     fn cartridge_debugger(&mut self) -> Box<dyn retro_core::cartridge::CartridgeDebugger + '_> {
         Box::new(self.map_plan_debugger())
     }

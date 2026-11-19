@@ -56,39 +56,49 @@ pub const SOUND_CPU: usize = 1;
 pub const CARTRIDGE_CPU: usize = 2;
 
 /// The 65C816's slot: coverage over its 24-bit space, a trace, an
-/// instruction history and a call stack, and every breakpoint check.
+/// instruction history and a call stack, and every breakpoint check. A host
+/// steps it, and its coverage is recorded as it runs.
 const MAIN_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
     coverage_size: 0x0100_0000,
     address_mask: 0x00FF_FFFF,
     trace_entry_size: <TraceEntryBinary65816 as TraceEntry>::SIZE,
     history: true,
     checks: BreakpointChecks::ALL,
+    steppable: true,
+    records_coverage: true,
 };
 
 /// The SPC700's slot: coverage over its 16-bit space and a trace. Its
 /// breakpoints are not checked: it runs inside the APU's catch-up, between
 /// two of the 65C816's instructions, where no loop of the emulator stops.
+/// For the same reason a host cannot step it, and nothing records its
+/// coverage, which stays empty.
 const SOUND_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
     coverage_size: 0x0001_0000,
     address_mask: 0xFFFF,
     trace_entry_size: <TraceEntryBinarySpc700 as TraceEntry>::SIZE,
     history: false,
     checks: BreakpointChecks::NONE,
+    steppable: false,
+    records_coverage: false,
 };
 
 /// The slot of the cartridge's own CPU, by the architecture it reports: the
 /// Super FX's GSU and the Cx4 keep a trace, the SA-1's second 65816 does
 /// not, and a cartridge with no CPU of its own (`None`) leaves the slot
-/// empty. None keeps coverage or a history, and none has its breakpoints
-/// checked: each runs inside its chip's catch-up.
+/// empty. A host steps each of the three; none keeps coverage or a
+/// history, and none has its breakpoints checked: each runs inside its
+/// chip's catch-up.
 pub fn cartridge_cpu_spec(architecture: Option<CpuArchitecture>) -> CpuDebugSpec {
     let trace_entry_size = match architecture {
         Some(CpuArchitecture::SuperFx) => <TraceEntryBinaryGsu as TraceEntry>::SIZE,
         Some(CpuArchitecture::Hg51b) => <TraceEntryBinaryCx4 as TraceEntry>::SIZE,
+        Some(CpuArchitecture::Mos65816) => 0,
         _ => return CpuDebugSpec::NO_CPU,
     };
     CpuDebugSpec {
         trace_entry_size,
+        steppable: true,
         ..CpuDebugSpec::NO_CPU
     }
 }
@@ -957,11 +967,11 @@ mod tests {
             cx4.trace_entry_size,
             <TraceEntryBinaryCx4 as TraceEntry>::SIZE
         );
-        assert_eq!(
-            cartridge_cpu_spec(Some(CpuArchitecture::Mos65816)),
-            CpuDebugSpec::NO_CPU,
-            "the SA-1's 65816 keeps no trace"
-        );
+        let sa1 = cartridge_cpu_spec(Some(CpuArchitecture::Mos65816));
+        assert_eq!(sa1.trace_entry_size, 0, "the SA-1's 65816 keeps no trace");
+        for spec in [gsu, cx4, sa1] {
+            assert!(spec.steppable && !spec.records_coverage);
+        }
         assert_eq!(cartridge_cpu_spec(None), CpuDebugSpec::NO_CPU);
     }
 

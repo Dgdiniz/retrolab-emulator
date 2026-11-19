@@ -119,4 +119,12 @@ pub trait DebuggerCore {
 
     /// What a CPU's breakpoints are checked for.
     fn breakpoint_checks(&self, cpu_id: usize) -> BreakpointChecks;
+
+    /// Whether a host can step CPU `cpu_id` an instruction at a time;
+    /// `false` past the CPUs.
+    fn cpu_steppable(&self, cpu_id: usize) -> bool;
+
+    /// Whether the emulator records CPU `cpu_id`'s coverage as it runs;
+    /// `false` past the CPUs.
+    fn cpu_records_coverage(&self, cpu_id: usize) -> bool;
 }

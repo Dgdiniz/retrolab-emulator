@@ -10,7 +10,9 @@
 //! `None` (the debugger struct doesn't own the APU); the host reaches
 //! this view through `SnesEmulator::audio_debugger()` instead.
 
-use retro_core::audio::{AudioDebugger, ChannelState, ChannelType, EnvelopePhase, EnvelopeState};
+use retro_core::audio::{
+    AudioChipInfo, AudioDebugger, ChannelState, ChannelType, EnvelopePhase, EnvelopeState,
+};
 
 use super::Apu;
 
@@ -20,6 +22,18 @@ const DSP_OUTPUT_RATE_HZ: f32 = 32_000.0;
 const VOICE_COUNT: u32 = 8;
 
 impl AudioDebugger for Apu {
+    /// The S-DSP: eight voices of samples, stereo at its 32 kHz rate.
+    fn chip_info(&self) -> AudioChipInfo {
+        AudioChipInfo {
+            name: "S-DSP",
+            manufacturer: "Sony",
+            channels: VOICE_COUNT,
+            sample_rate: DSP_OUTPUT_RATE_HZ as u32,
+            stereo: true,
+            channel_types: vec![ChannelType::Sample; VOICE_COUNT as usize],
+        }
+    }
+
     fn get_channel_count(&self) -> u32 {
         VOICE_COUNT
     }
@@ -243,5 +257,16 @@ mod tests {
         assert_eq!(wf.len(), 64);
         assert!(wf.iter().all(|&s| s == 0.0), "fresh ring is silent");
         assert!(apu.get_output_waveform(0).is_empty());
+    }
+
+    #[test]
+    fn the_s_dsp_describes_itself() {
+        let info = Apu::new().chip_info();
+        assert_eq!((info.name, info.manufacturer), ("S-DSP", "Sony"));
+        assert_eq!(
+            (info.channels, info.sample_rate, info.stereo),
+            (8, 32_000, true)
+        );
+        assert_eq!(info.channel_types, vec![ChannelType::Sample; 8]);
     }
 }

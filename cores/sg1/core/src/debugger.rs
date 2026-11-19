@@ -32,23 +32,29 @@ pub const SOUND_CPU: usize = 1;
 /// How the debugger keeps the 68000: coverage over its whole 24-bit address
 /// space (a PC with high bits set lands on the address it mirrors), its
 /// trace entries, a history and a call stack, and every breakpoint checked.
+/// A host steps it, and its coverage is recorded as it runs.
 const MAIN_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
     coverage_size: 0x0100_0000,
     address_mask: 0x00FF_FFFF,
     trace_entry_size: TRACE_ENTRY_SIZE,
     history: true,
     checks: BreakpointChecks::ALL,
+    steppable: true,
+    records_coverage: true,
 };
 
 /// How the debugger keeps the Z80: coverage over its 64 KiB, its trace
 /// entries and a history (nothing pushes onto its call stack). No frame
-/// loop checks its breakpoints, so none is offered for it.
+/// loop checks its breakpoints, so none is offered for it. A host steps it,
+/// and its coverage is recorded on every tier.
 const SOUND_CPU_SPEC: CpuDebugSpec = CpuDebugSpec {
     coverage_size: 0x1_0000,
     address_mask: 0xFFFF,
     trace_entry_size: Z80_TRACE_ENTRY_SIZE,
     history: true,
     checks: BreakpointChecks::NONE,
+    steppable: true,
+    records_coverage: true,
 };
 
 /// The Mega Drive's debugger: the 68000 in slot [`MAIN_CPU`], the Z80 in

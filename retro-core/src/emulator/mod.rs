@@ -246,6 +246,11 @@ pub trait EmulatorCore {
     /// Sound chip `chip`, `None` past [`Self::audio_chip_count`].
     fn audio_debugger(&mut self, chip: usize) -> Option<&mut dyn AudioDebugger>;
 
+    /// The last `samples` of the console's mixed sound, mono, in
+    /// [-1.0, 1.0], oldest first, read without taking them from the host's
+    /// ring: `samples` values, silence where none was made yet.
+    fn output_waveform(&self, samples: u32) -> Vec<f32>;
+
     /// The cartridge's map, chips and breakpoints; an empty plan with no
     /// cartridge.
     fn cartridge_debugger(&mut self) -> Box<dyn CartridgeDebugger + '_>;

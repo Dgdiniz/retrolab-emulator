@@ -77,17 +77,25 @@ pub struct CpuDebugSpec {
     pub history: bool,
     /// What its breakpoints are checked for.
     pub checks: BreakpointChecks,
+    /// A host can step the CPU an instruction at a time
+    /// ([`crate::EmulatorCore::step_cpu`]).
+    pub steppable: bool,
+    /// The emulator records the CPU's coverage as it runs; a CPU it does
+    /// not record keeps its coverage empty.
+    pub records_coverage: bool,
 }
 
 impl CpuDebugSpec {
     /// A slot with no CPU in it: no coverage, no trace, no history, nothing
-    /// checked.
+    /// checked, nothing stepped or recorded.
     pub const NO_CPU: Self = Self {
         coverage_size: 0,
         address_mask: 0,
         trace_entry_size: 0,
         history: false,
         checks: BreakpointChecks::NONE,
+        steppable: false,
+        records_coverage: false,
     };
 }
 
@@ -759,6 +767,18 @@ impl<const N: usize, C: ConsoleDebug> DebuggerCore for DebuggerState<N, C> {
             .get(cpu_id)
             .map_or(BreakpointChecks::NONE, |slot| slot.spec.checks)
     }
+
+    fn cpu_steppable(&self, cpu_id: usize) -> bool {
+        self.cpus
+            .get(cpu_id)
+            .is_some_and(|slot| slot.spec.steppable)
+    }
+
+    fn cpu_records_coverage(&self, cpu_id: usize) -> bool {
+        self.cpus
+            .get(cpu_id)
+            .is_some_and(|slot| slot.spec.records_coverage)
+    }
 }
 
 #[cfg(test)]
@@ -772,17 +792,19 @@ mod tests {
     };
 
     /// A main CPU: 16 MiB of coverage, a 24-bit mask, 4-byte trace entries,
-    /// a history, everything checked.
+    /// a history, everything checked, stepped and its coverage recorded.
     const MAIN: CpuDebugSpec = CpuDebugSpec {
         coverage_size: 0x0100_0000,
         address_mask: 0x00FF_FFFF,
         trace_entry_size: 4,
         history: true,
         checks: BreakpointChecks::ALL,
+        steppable: true,
+        records_coverage: true,
     };
 
-    /// A sound CPU: 64 KiB of coverage, 2-byte trace entries, no history,
-    /// execute breakpoints only.
+    /// A sound CPU: 64 KiB of coverage, recorded, 2-byte trace entries, no
+    /// history, execute breakpoints only, and no step of its own.
     const SOUND: CpuDebugSpec = CpuDebugSpec {
         coverage_size: 0x1_0000,
         address_mask: 0xFFFF,
@@ -793,6 +815,8 @@ mod tests {
             memory: false,
             conditions: false,
         },
+        steppable: false,
+        records_coverage: true,
     };
 
     fn system(cpus: usize) -> SystemInfo {
@@ -1005,6 +1029,15 @@ mod tests {
         assert_eq!(state.breakpoint_checks(1), SOUND.checks);
         assert_eq!(state.breakpoint_checks(2), BreakpointChecks::NONE);
         assert_eq!(state.breakpoint_checks(9), BreakpointChecks::NONE);
+    }
+
+    #[test]
+    fn whether_a_cpu_steps_and_records_coverage_is_its_own() {
+        let state = state();
+        assert!(state.cpu_steppable(0) && state.cpu_records_coverage(0));
+        assert!(!state.cpu_steppable(1) && state.cpu_records_coverage(1));
+        assert!(!state.cpu_steppable(2) && !state.cpu_records_coverage(2));
+        assert!(!state.cpu_steppable(9) && !state.cpu_records_coverage(9));
     }
 
     // -- Traces ---------------------------------------------------------

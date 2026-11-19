@@ -4,7 +4,9 @@
 //!
 //! [`machine_bindings!`]: crate::machine_bindings
 
+use retro_core::types::{CpuArchitecture, CpuLocation};
 use retro_core::EmulatorCore;
+use serde::Serialize;
 use wasm_bindgen::JsValue;
 
 use crate::js::unsupported_chip_error;
@@ -69,6 +71,42 @@ pub fn core_id<E: EmulatorCore>(_core: &E) -> &'static str {
     E::CORE_ID
 }
 
+/// One CPU of the machine as `getCpus` describes it: what the system
+/// information says of it, and what the debugger does with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CpuDescription {
+    /// Its id, the one every per-CPU method takes.
+    pub id: usize,
+    /// Its name.
+    pub name: String,
+    /// Its architecture.
+    pub architecture: CpuArchitecture,
+    /// Where it is: on the console's board or in the cartridge.
+    pub location: CpuLocation,
+    /// A host can step it an instruction at a time.
+    pub steppable: bool,
+    /// The emulator records its coverage as it runs.
+    pub records_coverage: bool,
+}
+
+/// The machine's CPUs, in the system information's order, each with the
+/// debugger's two answers.
+pub fn cpus<E: EmulatorCore>(core: &E) -> Vec<CpuDescription> {
+    let debugger = core.debugger_ref();
+    core.system_info()
+        .cpus
+        .iter()
+        .map(|cpu| CpuDescription {
+            id: cpu.id,
+            name: cpu.name.clone(),
+            architecture: cpu.architecture,
+            location: cpu.location,
+            steppable: debugger.cpu_steppable(cpu.id),
+            records_coverage: debugger.cpu_records_coverage(cpu.id),
+        })
+        .collect()
+}
+
 /// `false`, or the value given: what an optional `true`/`false` argument of
 /// a binding macro reads as when it is left out.
 #[doc(hidden)]
@@ -98,7 +136,8 @@ macro_rules! __flag_or_false {
 /// - `saveState()`, `loadState(data)` and `loadStateAnyRom(data)` (a state
 ///   of another ROM refused as an `Error` named `SaveStateOtherRom`);
 /// - `getSaveRam()` and `setSaveRam(data)`, the battery save;
-/// - `setShowOverscan(show)` and `isShowOverscanEnabled()`.
+/// - `setShowOverscan(show)` and `isShowOverscanEnabled()`;
+/// - `getCpus()`, the machine's CPUs ([`cpus`](crate::machine::cpus)).
 ///
 /// `after_frame = m` names a method of `$emulator` run after each call that
 /// can change the picture (`reset`, `hardReset`, `powerOnReset`,
@@ -359,6 +398,17 @@ macro_rules! machine_bindings {
             #[wasm_bindgen(js_name = isShowOverscanEnabled)]
             pub fn is_show_overscan_enabled(&self) -> bool {
                 $crate::__private::retro_core::EmulatorCore::show_overscan_enabled(&self.$core)
+            }
+
+            /// The machine's CPUs, `CpuDescription[]`: `{ id, name,
+            /// architecture, location, steppable, records_coverage }` each,
+            /// in the order and with the ids every per-CPU method takes.
+            /// `steppable` says whether `stepCpu(id)` steps it,
+            /// `records_coverage` whether its coverage fills as it runs. A
+            /// cartridge with a CPU of its own adds it at its load.
+            #[wasm_bindgen(js_name = getCpus)]
+            pub fn get_cpus(&self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::machine::cpus(&self.$core))
             }
         }
     };
