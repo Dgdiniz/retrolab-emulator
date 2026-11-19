@@ -47,7 +47,7 @@ fn debugger_shapes_rom() -> Vec<u8> {
 fn stopped_at_count() -> RetroEmulator {
     let mut emu = RetroEmulator::new("genesis").unwrap();
     emu.load_rom(&debugger_shapes_rom()).unwrap();
-    emu.set_z80_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     emu.set_execution_mode("Running".to_string());
     emu.run_frame();
     emu.add_breakpoint(COUNT, "execute".to_string(), None);
@@ -79,11 +79,11 @@ fn stepped() -> (RetroEmulator, Vec<JsValue>) {
 fn with_the_z80_ring_full() -> RetroEmulator {
     let mut emu = RetroEmulator::new("genesis").unwrap();
     emu.load_rom(&debugger_shapes_rom()).unwrap();
-    emu.set_z80_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     emu.set_execution_mode("Running".to_string());
     for _ in 0..60 {
         emu.run_frame();
-        if emu.needs_z80_trace_flush() {
+        if emu.needs_cpu_trace_flush(1) {
             return emu;
         }
     }
@@ -561,11 +561,11 @@ fn what_the_z80_trace_flush_flag_reads() {
         &[
             (
                 "after the steps",
-                JsValue::from_bool(emu.needs_z80_trace_flush()),
+                JsValue::from_bool(emu.needs_cpu_trace_flush(1)),
             ),
             (
                 "with only the Z80's ring full",
-                JsValue::from_bool(full.needs_z80_trace_flush()),
+                JsValue::from_bool(full.needs_cpu_trace_flush(1)),
             ),
         ],
         &[
@@ -836,26 +836,26 @@ fn what_turning_z80_tracing_on_and_off_does() {
     emu.load_rom(&debugger_shapes_rom()).unwrap();
     emu.set_execution_mode("Running".to_string());
     let mut found: Vec<(&str, JsValue)> = Vec::new();
-    emu.set_z80_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     emu.run_frame();
     found.push((
         "on, a frame run: bytes",
-        JsValue::from(emu.get_z80_trace_flush_data().len() as u32),
+        JsValue::from(emu.get_cpu_trace_flush_data(1).len() as u32),
     ));
-    emu.set_z80_tracing_enabled(false);
+    emu.set_cpu_tracing_enabled(1, false);
     emu.run_frame();
     found.push((
         "off, a frame run: bytes",
-        JsValue::from(emu.get_z80_trace_flush_data().len() as u32),
+        JsValue::from(emu.get_cpu_trace_flush_data(1).len() as u32),
     ));
-    emu.set_z80_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     found.push((
         "on again: bytes",
-        JsValue::from(emu.get_z80_trace_flush_data().len() as u32),
+        JsValue::from(emu.get_cpu_trace_flush_data(1).len() as u32),
     ));
     found.push((
         "on again: flag",
-        JsValue::from_bool(emu.is_z80_tracing_enabled()),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(1)),
     ));
     assert_shapes(
         &found,
@@ -876,11 +876,11 @@ fn what_the_z80_tracing_flag_reads() {
         &[
             (
                 "on a new emulator",
-                JsValue::from_bool(fresh.is_z80_tracing_enabled()),
+                JsValue::from_bool(fresh.is_cpu_tracing_enabled(1)),
             ),
             (
                 "after the steps",
-                JsValue::from_bool(emu.is_z80_tracing_enabled()),
+                JsValue::from_bool(emu.is_cpu_tracing_enabled(1)),
             ),
         ],
         &[("on a new emulator", "false"), ("after the steps", "true")],
@@ -892,7 +892,7 @@ fn what_the_z80_tracing_flag_reads() {
 #[wasm_bindgen_test]
 fn what_the_z80_trace_flush_data_holds() {
     let (emu, _) = stepped();
-    let data = emu.get_z80_trace_flush_data();
+    let data = emu.get_cpu_trace_flush_data(1);
     assert_shapes(
         &chunk_head(&data, sg1_core::debugger::Z80_TRACE_ENTRY_SIZE),
         &[
@@ -909,21 +909,21 @@ fn what_the_z80_trace_flush_data_holds() {
 fn what_clearing_the_flushed_z80_trace_does() {
     let (mut emu, _) = stepped();
     let mut full = with_the_z80_ring_full();
-    emu.clear_z80_trace_flushed();
-    full.clear_z80_trace_flushed();
+    emu.clear_cpu_trace_flushed(1);
+    full.clear_cpu_trace_flushed(1);
     assert_shapes(
         &[
             (
                 "after the steps: bytes",
-                JsValue::from(emu.get_z80_trace_flush_data().len() as u32),
+                JsValue::from(emu.get_cpu_trace_flush_data(1).len() as u32),
             ),
             (
                 "with the ring full: bytes",
-                JsValue::from(full.get_z80_trace_flush_data().len() as u32),
+                JsValue::from(full.get_cpu_trace_flush_data(1).len() as u32),
             ),
             (
                 "with the ring full: flag",
-                JsValue::from_bool(full.needs_z80_trace_flush()),
+                JsValue::from_bool(full.needs_cpu_trace_flush(1)),
             ),
         ],
         &[
@@ -938,7 +938,10 @@ fn what_clearing_the_flushed_z80_trace_does() {
 fn what_the_z80_trace_entry_size_reads() {
     let emu = RetroEmulator::new("genesis").unwrap();
     assert_shapes(
-        &[("size", JsValue::from(emu.get_z80_trace_entry_size() as u32))],
+        &[(
+            "size",
+            JsValue::from(emu.get_cpu_trace_entry_size(1) as u32),
+        )],
         &[("size", "38")],
     );
 }
@@ -954,16 +957,16 @@ const FIXED_Z80_ENTRIES: [&str; 3] = [
 /// test holds for the same entries.
 #[wasm_bindgen_test]
 fn what_a_z80_trace_chunk_reads_as_text() {
-    let (emu, _) = stepped();
-    let data = emu.get_z80_trace_flush_data();
+    let (mut emu, _) = stepped();
+    let data = emu.get_cpu_trace_flush_data(1);
     let head = sg1_core::debugger::Z80_TRACE_ENTRY_SIZE * 2;
-    let traced = emu.convert_z80_trace_chunk_to_text(&data[..head]);
+    let traced = emu.convert_cpu_trace_chunk_to_text(1, &data[..head]);
     let mut chunk: Vec<u8> = FIXED_Z80_ENTRIES
         .iter()
         .flat_map(|entry| from_hex(entry))
         .collect();
     chunk.extend_from_slice(&[0xAA; 10]);
-    let fixed_text = emu.convert_z80_trace_chunk_to_text(&chunk);
+    let fixed_text = emu.convert_cpu_trace_chunk_to_text(1, &chunk);
 
     let mut found: Vec<(String, JsValue)> = lines_of(&traced)
         .into_iter()
@@ -1110,10 +1113,10 @@ fn a_step_of_the_z80_writes_the_cpu_states() {
 #[wasm_bindgen_test]
 fn the_trace_flush_flag_reads_every_cpus_ring() {
     let full = with_the_z80_ring_full();
-    assert!(full.needs_z80_trace_flush());
+    assert!(full.needs_cpu_trace_flush(1));
     assert!(full.needs_trace_flush());
     let (stepped, _) = stepped();
-    assert!(!stepped.needs_z80_trace_flush());
+    assert!(!stepped.needs_cpu_trace_flush(1));
     assert!(!stepped.needs_trace_flush());
 }
 

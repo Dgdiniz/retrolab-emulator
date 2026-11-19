@@ -75,10 +75,10 @@ export interface VideoRegisterRow {
 }
 
 /**
- * Parse the raw `getVdpRegisters()` / `getPpuRegisters()` payload (a
- * serialised `VideoRegister[]`) into display rows with a pre-formatted
- * hex string. Values are masked to the width implied by their
- * magnitude: <= 0xFF renders as two digits, otherwise four.
+ * Parse the raw `getVideoRegisters()` payload (a serialised
+ * `VideoRegister[]`) into display rows with a pre-formatted hex string.
+ * Values are masked to the width implied by their magnitude: <= 0xFF
+ * renders as two digits, otherwise four.
  */
 export function parseVideoRegisters(raw: unknown): VideoRegisterRow[] {
   if (!Array.isArray(raw)) return []

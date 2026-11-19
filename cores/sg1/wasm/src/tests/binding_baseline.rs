@@ -453,17 +453,27 @@ getAudioSamplesN(100000) => Float32Array(len 1472, fnv1a64 0x55fe11027220521d)
     );
 }
 
+/// Entry `index` of the array `value`.
+fn entry(value: &JsValue, index: u32) -> JsValue {
+    Array::from(value).get(index)
+}
+
+/// The length of the array `value`.
+fn length(value: &JsValue) -> u32 {
+    Array::from(value).length()
+}
+
 /// Channel 0 of the PSG and of the YM2612, its waveform and the mix, each
 /// named after `what`.
-fn first_channels(found: &mut Found, what: &str, emu: &RetroEmulator) {
-    let tone = emu.get_audio_channel_state(0);
-    found.value(format!("getAudioChannelState(0){what}"), tone);
-    let wave = emu.get_audio_waveform(0, 32);
-    found.value(format!("getAudioWaveform(0, 32){what}"), wave);
-    let fm = emu.get_ym2612_channel_state(0);
-    found.value(format!("getYm2612ChannelState(0){what}"), fm);
-    let mixed = emu.get_mixed_waveform(32);
-    found.value(format!("getMixedWaveform(32){what}"), mixed);
+fn first_channels(found: &mut Found, what: &str, emu: &mut RetroEmulator) {
+    let tone = entry(&emu.get_audio_chip_channels(1), 0);
+    found.value(format!("getAudioChipChannels(1)[0]{what}"), tone);
+    let wave = emu.get_audio_chip_waveform(1, 0, 32);
+    found.value(format!("getAudioChipWaveform(1, 0, 32){what}"), wave);
+    let fm = entry(&emu.get_audio_chip_channels(0), 0);
+    found.value(format!("getAudioChipChannels(0)[0]{what}"), fm);
+    let mixed = emu.get_audio_output_waveform(32);
+    found.value(format!("getAudioOutputWaveform(32){what}"), mixed);
 }
 
 /// The PSG's and the YM2612's readers on the sounding program after three
@@ -472,50 +482,63 @@ fn first_channels(found: &mut Found, what: &str, emu: &RetroEmulator) {
 fn what_the_sound_chips_readers_answer() {
     let mut found = Found::default();
     let mut emu = RetroEmulator::new("genesis").unwrap();
-    found.value("getAudioChipInfo", emu.get_audio_chip_info());
-    found.value("getAudioChannelCount", emu.get_audio_channel_count());
-    found.value("getYm2612ChannelCount", emu.get_ym2612_channel_count());
+    let chips = emu.get_audio_chips();
+    found.value("getAudioChips()[1]", entry(&chips, 1));
+    let psg = field(&entry(&chips, 1), "channels");
+    found.value("getAudioChips()[1].channels", psg);
+    let fm = field(&entry(&chips, 0), "channels");
+    found.value("getAudioChips()[0].channels", fm);
     emu.load_rom(&sounding_rom()).unwrap();
     for _ in 0..3 {
         emu.run_frame();
     }
-    first_channels(&mut found, "", &emu);
-    found.value("getAudioChannelState(3)", emu.get_audio_channel_state(3));
-    found.value("getAudioChannelState(4)", emu.get_audio_channel_state(4));
-    found.value("getAudioWaveform(4, 8)", emu.get_audio_waveform(4, 8));
-    found.value("getYm2612ChannelState(5)", emu.get_ym2612_channel_state(5));
-    found.value("getYm2612ChannelState(6)", emu.get_ym2612_channel_state(6));
-    found.value("getMixedWaveform(0)", emu.get_mixed_waveform(0));
-    emu.mute_audio_channel(0, true);
-    emu.mute_ym2612_channel(0, true);
+    first_channels(&mut found, "", &mut emu);
+    let noise = entry(&emu.get_audio_chip_channels(1), 3);
+    found.value("getAudioChipChannels(1)[3]", noise);
+    let psg = length(&emu.get_audio_chip_channels(1));
+    found.value("getAudioChipChannels(1).length", psg);
+    found.value("getAudioChipChannels(2)", emu.get_audio_chip_channels(2));
+    let past = emu.get_audio_chip_waveform(1, 4, 8);
+    found.value("getAudioChipWaveform(1, 4, 8)", past);
+    let last = entry(&emu.get_audio_chip_channels(0), 5);
+    found.value("getAudioChipChannels(0)[5]", last);
+    let fm = length(&emu.get_audio_chip_channels(0));
+    found.value("getAudioChipChannels(0).length", fm);
+    found.value(
+        "getAudioOutputWaveform(0)",
+        emu.get_audio_output_waveform(0),
+    );
+    emu.mute_audio_chip_channel(1, 0, true);
+    emu.mute_audio_chip_channel(0, 0, true);
     emu.run_frame();
-    first_channels(&mut found, ", muted", &emu);
-    emu.mute_audio_channel(0, false);
-    emu.mute_ym2612_channel(0, false);
-    first_channels(&mut found, ", unmuted", &emu);
+    first_channels(&mut found, ", muted", &mut emu);
+    emu.mute_audio_chip_channel(1, 0, false);
+    emu.mute_audio_chip_channel(0, 0, false);
+    first_channels(&mut found, ", unmuted", &mut emu);
     found.check(
         r#"
-getAudioChipInfo => {channel_types: ["Tone", "Tone", "Tone", "Noise"], channels: 4, manufacturer: "Texas Instruments", name: "SN76489", sample_rate: 44100, stereo: false}
-getAudioChannelCount => 4
-getYm2612ChannelCount => 6
-getAudioChannelState(0) => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
-getAudioWaveform(0, 32) => Float32Array(len 32, fnv1a64 0x01c2efe12ab5bb25)
-getYm2612ChannelState(0) => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.0762939453125, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
-getMixedWaveform(32) => Float32Array(len 32, fnv1a64 0x6a928f8f825d14bf)
-getAudioChannelState(3) => {attenuation: 15, channel_id: 3, channel_type: "Noise", current_output: -0, enabled: false, envelope: undefined, frequency: 0, frequency_raw: 0, muted: false, noise_params: {lfsr_state: 32, mode: "Periodic", shift_rate: "N512"}, pan: 0, period: 512, volume: 0}
-getAudioChannelState(4) => null
-getAudioWaveform(4, 8) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
-getYm2612ChannelState(5) => {attenuation: 127, channel_id: 5, channel_type: "FM", current_output: 0, enabled: false, envelope: {attack: 1, current_phase: "Off", decay: 0, release: 0.46666666865348816, sustain: 1}, frequency: 0, frequency_raw: 0, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 0}
-getYm2612ChannelState(6) => null
-getMixedWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
-getAudioChannelState(0), muted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 0, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: true, noise_params: undefined, pan: 0, period: 8128, volume: 1}
-getAudioWaveform(0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getYm2612ChannelState(0), muted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: true, noise_params: undefined, pan: 0, period: 0, volume: 1}
-getMixedWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getAudioChannelState(0), unmuted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: -1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
-getAudioWaveform(0, 32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getYm2612ChannelState(0), unmuted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
-getMixedWaveform(32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChips()[1] => {channel_types: ["Tone", "Tone", "Tone", "Noise"], channels: 4, manufacturer: "Texas Instruments", name: "SN76489", sample_rate: 44100, stereo: false}
+getAudioChips()[1].channels => 4
+getAudioChips()[0].channels => 6
+getAudioChipChannels(1)[0] => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
+getAudioChipWaveform(1, 0, 32) => Float32Array(len 32, fnv1a64 0x01c2efe12ab5bb25)
+getAudioChipChannels(0)[0] => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.0762939453125, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
+getAudioOutputWaveform(32) => Float32Array(len 32, fnv1a64 0x6a928f8f825d14bf)
+getAudioChipChannels(1)[3] => {attenuation: 15, channel_id: 3, channel_type: "Noise", current_output: -0, enabled: false, envelope: undefined, frequency: 0, frequency_raw: 0, muted: false, noise_params: {lfsr_state: 32, mode: "Periodic", shift_rate: "N512"}, pan: 0, period: 512, volume: 0}
+getAudioChipChannels(1).length => 4
+getAudioChipChannels(2) => null
+getAudioChipWaveform(1, 4, 8) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
+getAudioChipChannels(0)[5] => {attenuation: 127, channel_id: 5, channel_type: "FM", current_output: 0, enabled: false, envelope: {attack: 1, current_phase: "Off", decay: 0, release: 0.46666666865348816, sustain: 1}, frequency: 0, frequency_raw: 0, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 0}
+getAudioChipChannels(0).length => 6
+getAudioOutputWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
+getAudioChipChannels(1)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 0, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: true, noise_params: undefined, pan: 0, period: 8128, volume: 1}
+getAudioChipWaveform(1, 0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChipChannels(0)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: true, noise_params: undefined, pan: 0, period: 0, volume: 1}
+getAudioOutputWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChipChannels(1)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: -1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
+getAudioChipWaveform(1, 0, 32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChipChannels(0)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
+getAudioOutputWaveform(32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 "#,
     );
 }
@@ -768,9 +791,10 @@ disassembleWindow(2, 0x0, 1, 2) => [{address: 0, bytes: [], comment: undefined, 
 
 /// The VDP's readers on the capture program after six frames: video memory,
 /// the colours and the vertical scroll (each written once by the debugger),
-/// tiles and palettes as pixels, the plane and sprite tables, the registers
-/// and the status, the layers (one hidden), single sprites as images, and
-/// runs of tiles decoded, with the requests the VDP refuses.
+/// tiles and palettes as pixels, the layouts of the planes and the window,
+/// the sprite table, the registers and the status, the layers (one hidden),
+/// single sprites as images, and runs of tiles decoded, with the requests
+/// the VDP refuses.
 #[wasm_bindgen_test]
 fn what_the_vdp_readers_answer() {
     let mut found = Found::default();
@@ -780,22 +804,31 @@ fn what_the_vdp_readers_answer() {
         emu.run_frame();
     }
     found.value("getVram", emu.get_vram());
-    found.value("getCram", emu.get_cram());
+    found.value("getPaletteMemory", emu.get_palette_memory());
     found.value("getVsram", emu.get_vsram());
-    emu.write_cram(1, &[0x0EEE, 0x0E0E]);
-    found.value("getCram, colours 1 and 2 written", emu.get_cram());
+    emu.write_palette_memory(1, &[0x0EEE, 0x0E0E]);
+    let written = emu.get_palette_memory();
+    found.value("getPaletteMemory, colours 1 and 2 written", written);
     emu.write_vsram(0, &[0x0123]);
     found.value("getVsram, word 0 written", emu.get_vsram());
-    for (tile, palette) in [(1, 0), (20, 3), (4096, 0)] {
-        let pixels = emu.get_tile_rgba(tile, palette);
-        found.value(format!("getTileRgba({tile}, {palette})"), pixels);
+    for (tile, first_colour) in [(1, 0), (20, 48)] {
+        let picture = emu.get_tile_colours(0, 0, tile, 1, 4, 0, first_colour);
+        let what = format!("getTileColours(0, 0, {tile}, 1, 4, 0, {first_colour}).data");
+        found.value(what, field(&picture, "data"));
     }
-    found.value("getAllPalettesRgba", emu.get_all_palettes_rgba());
-    found.value("getPlaneAddresses", emu.get_plane_addresses());
-    found.value("getSpriteAttrTable", emu.get_sprite_attr_table());
-    found.value("getSpriteCount", emu.get_sprite_count());
+    let past = emu.get_tile_colours(0, 0, 4096, 1, 4, 0, 0);
+    found.value("getTileColours(0, 0, 4096, 1, 4, 0, 0)", past);
+    found.value("getPaletteColours", emu.get_palette_colours());
+    for layer in 0..3 {
+        let layout = emu.get_layer_layout(layer);
+        found.value(format!("getLayerLayout({layer})"), layout);
+    }
+    let table = emu.get_sprite_table();
+    let count = length(&table);
+    found.value("getSpriteTable", table);
+    found.value("getSpriteTable().length", count);
     found.value("getSpriteData", emu.get_sprite_data());
-    found.value("getVdpRegisters", emu.get_vdp_registers());
+    found.value("getVideoRegisters", emu.get_video_registers());
     found.value("getVdpStatus", emu.get_vdp_status());
     found.value("getLayerInfo", emu.get_layer_info());
     emu.toggle_layer(1, false);
@@ -824,19 +857,21 @@ fn what_the_vdp_readers_answer() {
     found.check(
         r#"
 getVram => Uint8Array(len 65536, fnv1a64 0x1c28c67504e3498b)
-getCram => Uint16Array(len 64, fnv1a64 0x80a6cbe3ccc7196f)
+getPaletteMemory => Uint16Array(len 64, fnv1a64 0x80a6cbe3ccc7196f)
 getVsram => Uint16Array(len 64, fnv1a64 0xbb0bb9ec6512e521)
-getCram, colours 1 and 2 written => Uint16Array(len 64, fnv1a64 0x0f2a23eab6051b01)
+getPaletteMemory, colours 1 and 2 written => Uint16Array(len 64, fnv1a64 0x0f2a23eab6051b01)
 getVsram, word 0 written => Uint16Array(len 64, fnv1a64 0x1240cb3fe0a43a81)
-getTileRgba(1, 0) => Uint8Array(len 256, fnv1a64 0xe0ebd3888c0a6a8e)
-getTileRgba(20, 3) => Uint8Array(len 256, fnv1a64 0xe6e17db534277b25)
-getTileRgba(4096, 0) => Uint8Array(len 256, fnv1a64 0xd80ac658736bb725)
-getAllPalettesRgba => Uint8Array(len 256, fnv1a64 0x04a222ae447406c7)
-getPlaneAddresses => {plane_a: 49152, plane_b: 57344, window: 0}
-getSpriteAttrTable => [{h_flip: false, h_tiles: 1, index: 0, link: 1, palette: 0, priority: false, tile: 1, v_flip: false,... (6217 chars, fnv1a64 0xd01af32f42c66e5d)
-getSpriteCount => 48
+getTileColours(0, 0, 1, 1, 4, 0, 0).data => Uint8Array(len 256, fnv1a64 0xe0ebd3888c0a6a8e)
+getTileColours(0, 0, 20, 1, 4, 0, 48).data => Uint8Array(len 256, fnv1a64 0xe6e17db534277b25)
+getTileColours(0, 0, 4096, 1, 4, 0, 0) => null
+getPaletteColours => Uint8Array(len 256, fnv1a64 0x04a222ae447406c7)
+getLayerLayout(0) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 0, kind: "tile_map", map_base: 49152, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
+getLayerLayout(1) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 1, kind: "tile_map", map_base: 57344, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
+getLayerLayout(2) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 2, kind: "window", map_base: 0, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
+getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: 1, palette: 0, priority: 0,... (7802 chars, fnv1a64 0x175170bfd925c33d)
+getSpriteTable().length => 48
 getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, priority: 0, tile_index: 1, width: ... (9653 chars, fnv1a64 0x545889a0580deee1)
-getVdpRegisters => [{description: "", index: 0, name: "Mode Register 1", value: 20}, {description: "", index: 1, name: ... (1576 chars, fnv1a64 0xbef5942b44db4bf4)
+getVideoRegisters => [{description: "", index: 0, name: "Mode Register 1", value: 20}, {description: "", index: 1, name: ... (1576 chars, fnv1a64 0xbef5942b44db4bf4)
 getVdpStatus => 13932
 getLayerInfo => [{enabled: true, height: 256, id: 0, name: "Plane A", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: true, height: 256, id: 1, name: "Plane B", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: true, height: 224, id: 2, name: "Window", scroll_x: 0, scroll_y: 0, width: 320}, {enabled: true, height: 224, id: 3, name: "Sprites", scroll_x: 0, scroll_y: 0, width: 320}]
 getLayerInfo, plane B hidden => [{enabled: true, height: 256, id: 0, name: "Plane A", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: false, height: 256, id: 1, name: "Plane B", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: true, height: 224, id: 2, name: "Window", scroll_x: 0, scroll_y: 0, width: 320}, {enabled: true, height: 224, id: 3, name: "Sprites", scroll_x: 0, scroll_y: 0, width: 320}]
@@ -870,8 +905,6 @@ fn cartridge_readers(found: &mut Found, what: &str, emu: &mut RetroEmulator) {
     found.outcome(format!("getMemoryMap, {what}"), emu.get_memory_map());
     let manifest = emu.get_cartridge_manifest();
     found.value(format!("getCartridgeManifest, {what}"), manifest);
-    let state = emu.get_cartridge_save_state(5).map(JsValue::from);
-    found.outcome(format!("getCartridgeSaveState(5), {what}"), state);
 }
 
 /// The cartridge's readers with no cartridge, on a cartridge with save RAM
@@ -935,7 +968,6 @@ getChipState, no cartridge => null
 getChipStates, no cartridge => []
 getMemoryMap, no cartridge => {regions: []}
 getCartridgeManifest, no cartridge => {mapperState: {bank_config: {banks: []}, mapper_id: {Custom: ""}, registers: []}, memoryMap: {regions: []}, romRegions: [], sramRegions: []}
-getCartridgeSaveState(5), no cartridge => throws "No cartridge loaded"
 getSaveRam, no cartridge => undefined
 detectManifest => "{\"$schema\":\"cartridge-manifest-v1\",\"core\":\"sg1\",\"version\":\"1.0\",\"rom\":{\"sha256\":\"3e8ea16f75fdddd05ce46ad2acda5d99b2614035778606ed807dfaed1a64a042\",\"size\":524288,\"title\":\"SAVING\",\"region\":\"Japan\"},\"mapping\":{\"preset\":\"plain\",\"sram_size\":16384,\"slots\":[]},\"chips\":[],\"metadata\":null}"
 setCartridgeManifest, not JSON => throws "invalid JSON: key must be a string at line 1 column 3"
@@ -951,7 +983,6 @@ getChipState, save RAM => null
 getChipStates, save RAM => []
 getMemoryMap, save RAM => {regions: [{detail: "", end: 2113535, label: "SRAM", start: 2097152}, {detail: "mask=0x07FFFF", end: 4194303, label: "ROM", start: 0}]}
 getCartridgeManifest, save RAM => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 2113535, cpu_address_start: 2... (861 chars, fnv1a64 0x10fc8814668efb76)
-getCartridgeSaveState(5), save RAM => Uint8Array(len 16400, fnv1a64 0xc48847c61fff95a5)
 getSaveRam => Uint8Array(len 16384, fnv1a64 0x0d65b7532d396325)
 isCartridgeSramDirty, loaded => false
 getSaveRam, the program's byte => Uint8Array(len 16384, fnv1a64 0x2240852aae1cdd9e)
@@ -966,7 +997,6 @@ getChipState, SVP => {chip_type: "SVP", cycle_count: 0, internal_ram: "Array(len
 getChipStates, SVP => [{chipId: 0, label: "SVP", state: {chip_type: "SVP", cycle_count: 0, internal_ram: "Array(len 1024, ... (712 chars, fnv1a64 0x4cc066c62b82c2a7)
 getMemoryMap, SVP => {regions: [{detail: "base=0x100000", end: 10571787, label: "Chip 0", start: 10571776}, {detail: "", end: 3276799, label: "Chip 0", start: 3145728}, {detail: "base=0x200000", end: 3801087, label: "Chip 0", start: 3735552}, {detail: "base=0x300000", end: 3866623, label: "Chip 0", start: 3801088}, {detail: "mask=0x07FFFF", end: 2097151, label: "ROM", start: 0}]}
 getCartridgeManifest, SVP => {mapperState: {bank_config: {banks: [{bank_number: 0, cpu_address_end: 10571787, cpu_address_start: ... (1695 chars, fnv1a64 0x3f43c530eff4ccd7)
-getCartridgeSaveState(5), SVP => Uint8Array(len 134342, fnv1a64 0x2fa4b8f0389c335b)
 "#,
     );
 }

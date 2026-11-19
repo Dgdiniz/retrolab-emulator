@@ -169,8 +169,6 @@ export function initDisassemblyPanel(bridge: DebugBridge): PanelHandle {
         // `kind: 'code' | 'unknown'` so the renderer below can show
         // `....` for never-executed regions instead of fake `ori`s.
         instructions = emulator.disassembleWindow(focusedCpu, pc, before, after) || []
-      } else if (focusedCpu === 0) {
-        instructions = emulator.disassembleAroundPc(pc, before, after) || []
       } else if (emulator.disassembleCpu) {
         instructions = emulator.disassembleCpu(focusedCpu, pc, before + after)
       } else {

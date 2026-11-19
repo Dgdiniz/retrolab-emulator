@@ -69,10 +69,10 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
   let active = false
   let opfsAvailable = false
   let cpuId = 0
-  // Trace bindings for the CPU being recorded, and the size of its
-  // entries as the core reports it. Resolved afresh at record-start (the
-  // focus selector can move between runs) and held through export so the
-  // post-stop convert path uses the same CPU's entry size + converter.
+  // The CPU being recorded (its id and its trace's labels), and the size
+  // of its entries as the core reports it. Resolved afresh at record-start
+  // (the focus selector can move between runs) and held through export so
+  // the post-stop convert path uses the same CPU's entry size + converter.
   // The worker gets the same entry size with `start`, so the export
   // chunks it cuts hold whole entries of this CPU, and the live stats
   // count entries with it.
@@ -140,7 +140,7 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
         const emulator = bridge.getEmulator()
         if (!emulator) return
         try {
-          const text = emulator[spec.convertChunkToText](new Uint8Array(data))
+          const text = emulator.convertCpuTraceChunkToText(spec.cpuId, new Uint8Array(data))
           downloadAsFile(text, `trace_${spec.fileLabel}.txt`, 'text/plain')
           console.log('Trace exported successfully')
         } catch (err) {
@@ -233,7 +233,7 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
       await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
       const startTime = performance.now()
-      const text = emulator[spec.convertChunkToText](new Uint8Array(data))
+      const text = emulator.convertCpuTraceChunkToText(spec.cpuId, new Uint8Array(data))
       const elapsed = performance.now() - startTime
 
       exportChunks.push(text)
@@ -302,7 +302,7 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
       entrySize,
     })
 
-    emulator[spec.setEnabled](true)
+    emulator.setCpuTracingEnabled(spec.cpuId, true)
     setActive(true)
     updateUI()
     console.log(`Tracing started for ${spec.uiLabel} (cpu_id=${cpuId})`)
@@ -312,14 +312,14 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
     const emulator = bridge.getEmulator()
     if (!emulator) return
 
-    emulator[spec.setEnabled](false)
+    emulator.setCpuTracingEnabled(spec.cpuId, false)
 
-    if (emulator[spec.needsFlush]()) {
-      const flushData = emulator[spec.getFlushData]()
+    if (emulator.needsCpuTraceFlush(spec.cpuId)) {
+      const flushData = emulator.getCpuTraceFlushData(spec.cpuId)
       if (flushData.length > 0 && worker) {
         worker.postMessage({ type: 'chunk', data: flushData }, [flushData.buffer])
       }
-      emulator[spec.clearFlushed]()
+      emulator.clearCpuTraceFlushed(spec.cpuId)
     }
 
     if (worker) worker.postMessage({ type: 'stop' })
@@ -353,11 +353,11 @@ export function setupTracing(bridge: DebugBridge, core: WebCore): TracingHandle 
     if (!emulator) return
 
     try {
-      if (emulator[spec.needsFlush]()) {
-        const flushData = emulator[spec.getFlushData]()
+      if (emulator.needsCpuTraceFlush(spec.cpuId)) {
+        const flushData = emulator.getCpuTraceFlushData(spec.cpuId)
         if (flushData.length > 0) {
           worker.postMessage({ type: 'chunk', data: flushData }, [flushData.buffer])
-          emulator[spec.clearFlushed]()
+          emulator.clearCpuTraceFlushed(spec.cpuId)
         }
       }
     } catch (err) {

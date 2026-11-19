@@ -1,10 +1,16 @@
-//! Each name both consoles share against the older names it stands beside
-//! on the SNES: the two give the same value, or have the same effect, on the
-//! same machine.
+//! Each name both consoles share against what the SNES's core gives for
+//! it, read through the core's own accessors: the two give the same value,
+//! or have the same effect, on the same machine.
 
 use super::capture::capture_program_rom;
 use super::*;
+use retro_core::debug::{trace_to_text, TraceEntry};
+use retro_core::EmulatorCore;
+use retro_wasm::js::to_js;
 use retro_wasm::test_support::shape;
+#[cfg(feature = "chip-superfx")]
+use snes1_core::TraceEntryBinaryGsu;
+use snes1_core::TraceEntryBinarySpc700;
 
 /// The capture program after a few frames, sound on and the SPC700 traced.
 fn running() -> RetroEmulator {
@@ -40,12 +46,11 @@ fn the_cpus_are_the_65c816_stepped_and_the_spc700_not() {
          id: 1, location: \"Motherboard\", name: \"Sony SPC700\", records_coverage: false, \
          steppable: false}]"
     );
-    assert_eq!(emu.get_debug_profile_id(), "snes");
 }
 
 #[cfg(feature = "chip-superfx")]
 #[wasm_bindgen_test]
-fn the_cartridge_s_cpu_is_the_third_and_names_the_profile() {
+fn the_cartridge_s_cpu_is_the_third_and_traces_by_its_id() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&super::debugger_shape_tests::super_fx_rom())
         .unwrap();
@@ -56,37 +61,33 @@ fn the_cartridge_s_cpu_is_the_third_and_names_the_profile() {
         "{architecture: \"SuperFx\", id: 2, location: \"Cartridge\", name: \"Super FX GSU\", \
          records_coverage: false, steppable: true}"
     );
-    assert_eq!(emu.get_debug_profile_id(), "snes-superfx");
 
     assert_eq!(
         emu.get_cpu_trace_entry_size(2),
-        emu.get_superfx_trace_entry_size()
+        <TraceEntryBinaryGsu as TraceEntry>::SIZE
     );
     emu.set_cpu_tracing_enabled(2, true);
-    assert!(emu.is_superfx_tracing_enabled());
+    assert!(emu.is_cpu_tracing_enabled(2));
     for _ in 0..2 {
         emu.run_frame();
     }
     let data = emu.get_cpu_trace_flush_data(2);
     assert!(!data.is_empty());
-    assert_eq!(data, emu.get_superfx_trace_flush_data());
     assert_eq!(
         emu.convert_cpu_trace_chunk_to_text(2, &data),
-        emu.convert_superfx_trace_chunk_to_text(&data)
+        trace_to_text::<TraceEntryBinaryGsu, ()>(&data, &mut ())
     );
-    emu.clear_superfx_trace_flushed();
+    emu.clear_cpu_trace_flushed(2);
     assert!(emu.get_cpu_trace_flush_data(2).is_empty());
-    emu.set_superfx_tracing_enabled(false);
+    emu.set_cpu_tracing_enabled(2, false);
     assert!(!emu.is_cpu_tracing_enabled(2));
 }
 
 #[wasm_bindgen_test]
 fn the_video_registers_are_the_ppu_s() {
     let mut emu = running();
-    assert_eq!(
-        shape(&emu.get_video_registers()),
-        shape(&emu.get_ppu_registers())
-    );
+    let registers = emu.snes.video_debugger().get_registers();
+    assert_eq!(shape(&emu.get_video_registers()), shape(&to_js(&registers)));
 }
 
 #[wasm_bindgen_test]
@@ -101,7 +102,7 @@ fn the_video_memories_are_vram_cgram_and_oam_low_byte_first() {
     );
     assert_eq!(emu.read_video_memory("vram"), Some(emu.get_vram()));
     let cgram = emu.read_video_memory("palette").unwrap();
-    assert_eq!(little_endian_words(&cgram), emu.get_cgram());
+    assert_eq!(little_endian_words(&cgram), emu.get_palette_memory());
     assert_eq!(emu.read_video_memory("sprite_table"), Some(emu.get_oam()));
     assert_eq!(emu.read_video_memory("vertical_scroll"), None);
     assert!(!emu.write_video_memory("vertical_scroll", 0, &[1, 2]));
@@ -110,12 +111,12 @@ fn the_video_memories_are_vram_cgram_and_oam_low_byte_first() {
 #[wasm_bindgen_test]
 fn the_palette_memory_is_cgram() {
     let mut emu = running();
-    assert_eq!(emu.get_palette_memory(), emu.get_cgram());
+    assert_eq!(emu.get_palette_memory(), emu.snes.ppu().cgram());
     let colours = emu.get_palette_colours();
     assert_eq!(colours.len(), 256 * 4);
-    // Each colour is the swatch the palette image draws for it, 16 pixels
-    // square, 16 to a row of the 256-pixel image.
-    let image = emu.export_palette_image();
+    // Each colour is the swatch the core's palette image draws for it, 16
+    // pixels square, 16 to a row of the 256-pixel image.
+    let image = emu.snes.export_palette_image();
     for colour in [0usize, 1, 2, 17, 255] {
         let (x, y) = ((colour % 16) * 16, (colour / 16) * 16);
         let at = (y * 256 + x) * 4;
@@ -126,13 +127,10 @@ fn the_palette_memory_is_cgram() {
         );
     }
 
-    let mut old = running();
-    let mut new = running();
-    old.write_cgram(255, &[0xFFFF, 0x1234]);
-    new.write_palette_memory(255, &[0xFFFF, 0x1234]);
-    assert_eq!(new.get_cgram(), old.get_cgram());
+    emu.write_palette_memory(255, &[0xFFFF, 0x1234]);
+    assert_eq!(emu.get_palette_memory(), emu.snes.ppu().cgram());
     assert_eq!(
-        (new.get_cgram()[255], new.get_cgram()[0]),
+        (emu.get_palette_memory()[255], emu.get_palette_memory()[0]),
         (0x7FFF, 0x1234),
         "the index wraps, bit 15 dropped"
     );
@@ -158,11 +156,11 @@ fn a_write_counts_bytes_where_write_vram_counts_words() {
     assert!(new.write_video_memory("sprite_table", 543, &[0x77, 0x66]));
     assert_eq!(new.get_oam(), old.get_oam());
 
-    old.write_cgram(3, &[0x0246]);
+    old.write_palette_memory(3, &[0x0246]);
     assert!(new.write_video_memory("palette", 7, &[0x46, 0x02, 0x99]));
     assert_eq!(
-        new.get_cgram(),
-        old.get_cgram(),
+        new.get_palette_memory(),
+        old.get_palette_memory(),
         "an offset inside a word starts at it, an odd last byte is dropped"
     );
 }
@@ -171,7 +169,7 @@ fn a_write_counts_bytes_where_write_vram_counts_words() {
 fn the_sprite_table_is_oam_from_the_first_sprite() {
     let mut emu = running();
     let table = js_sys::Array::from(&emu.get_sprite_table());
-    let descriptors = js_sys::Array::from(&emu.export_oam_sprites());
+    let descriptors = emu.snes.ppu().export_oam_sprites();
     let sprites = js_sys::Array::from(&emu.get_sprite_data());
     let settings = emu.get_sprite_tile_settings();
     let oam = emu.get_oam();
@@ -180,7 +178,7 @@ fn the_sprite_table_is_oam_from_the_first_sprite() {
         let entry = table.get(taken);
         let index = number(&entry, "index") as u32;
         assert_eq!(index, taken, "sprite 0 first: no rotation");
-        let descriptor = descriptors.get(index);
+        let descriptor = &descriptors[index as usize];
         let sprite = sprites.get(index);
         for key in [
             "x",
@@ -199,11 +197,8 @@ fn the_sprite_table_is_oam_from_the_first_sprite() {
                 "{key} of sprite {index}"
             );
         }
-        assert_eq!(number(&entry, "tile_index"), number(&descriptor, "tile"));
-        assert_eq!(
-            property(&entry, "large").as_bool(),
-            property(&descriptor, "large").as_bool()
-        );
+        assert_eq!(number(&entry, "tile_index"), f64::from(descriptor.tile));
+        assert_eq!(property(&entry, "large").as_bool(), Some(descriptor.large));
         assert!(property(&entry, "next").is_undefined());
         let table_base = if oam[index as usize * 4 + 3] & 1 == 0 {
             number(&settings, "first_table_base_word")
@@ -224,32 +219,28 @@ fn the_layers_are_the_backgrounds_field_for_field() {
     let mut emu = running();
     for bg in 0..4 {
         let layout = emu.get_layer_layout(bg);
-        let old = emu.get_bg_layout(bg as usize);
-        let cell = if property(&old, "tile_size16").as_bool().unwrap() {
-            16.0
-        } else {
-            8.0
-        };
-        for (new_key, old_key) in [
-            ("map_base", "tilemap_base_byte"),
-            ("map_width", "width_cells"),
-            ("map_height", "height_cells"),
-            ("character_base", "char_base_byte"),
-            ("bits_per_pixel", "bpp"),
-            ("first_colour", "palette_base"),
-            ("scroll_x", "scroll_x"),
-            ("scroll_y", "scroll_y"),
+        let registers = emu.snes.bg_layout(bg as usize);
+        let cell = if registers.tile_size16 { 16.0 } else { 8.0 };
+        for (key, value) in [
+            ("map_base", registers.tilemap_base_byte),
+            ("map_width", registers.width_cells),
+            ("map_height", registers.height_cells),
+            ("character_base", registers.char_base_byte),
+            ("bits_per_pixel", u32::from(registers.bpp)),
+            ("first_colour", u32::from(registers.palette_base)),
+            ("scroll_x", u32::from(registers.scroll_x)),
+            ("scroll_y", u32::from(registers.scroll_y)),
         ] {
             assert_eq!(
-                number(&layout, new_key),
-                number(&old, old_key),
-                "{new_key} of BG{}",
+                number(&layout, key),
+                f64::from(value),
+                "{key} of BG{}",
                 bg + 1
             );
         }
         assert_eq!(number(&layout, "cell_width"), cell);
         assert_eq!(number(&layout, "cell_height"), cell);
-        let kind = if number(&old, "bpp") == 0.0 {
+        let kind = if registers.bpp == 0 {
             "off"
         } else {
             "tile_map"
@@ -277,51 +268,50 @@ fn the_sound_chip_is_the_s_dsp_and_its_voices() {
          \"Sample\", \"Sample\", \"Sample\"], channels: 8, manufacturer: \"Sony\", name: \
          \"S-DSP\", sample_rate: 32000, stereo: true}]"
     );
+    let voices: Vec<_> = (0..8)
+        .map(|voice| {
+            let dsp = emu.snes.audio_debugger(0).unwrap();
+            dsp.get_channel_state(voice)
+        })
+        .collect();
     assert_eq!(
         shape(&emu.get_audio_chip_channels(0)),
-        shape(&emu.get_dsp_voice_states())
+        shape(&to_js(&voices))
     );
     assert!(emu.get_audio_chip_channels(1).is_null());
-    assert_eq!(
-        emu.get_audio_chip_waveform(0, 0, 64),
-        emu.get_dsp_waveform(0, 64)
-    );
-    assert_eq!(
-        emu.get_audio_output_waveform(64),
-        emu.get_dsp_mixed_waveform(64)
-    );
+    let dsp = emu.snes.audio_debugger(0).unwrap();
+    let (voice, mixed) = (dsp.get_waveform(0, 64), dsp.get_output_waveform(64));
+    assert_eq!(emu.get_audio_chip_waveform(0, 0, 64), voice);
+    assert_eq!(emu.get_audio_output_waveform(64), mixed);
 
-    let mut old = running();
-    let mut new = running();
-    old.mute_dsp_channel(2, true);
-    new.mute_audio_chip_channel(0, 2, true);
-    old.run_frame();
-    new.run_frame();
+    emu.mute_audio_chip_channel(0, 2, true);
+    emu.run_frame();
+    let voices = js_sys::Array::from(&emu.get_audio_chip_channels(0));
+    assert_eq!(property(&voices.get(2), "muted").as_bool(), Some(true));
+    assert_eq!(property(&voices.get(1), "muted").as_bool(), Some(false));
+    let dsp = emu.snes.audio_debugger(0).unwrap();
     assert_eq!(
-        shape(&new.get_dsp_voice_states()),
-        shape(&old.get_dsp_voice_states())
+        dsp.get_channel_state(2).map(|state| state.muted),
+        Some(true)
     );
-    assert_eq!(new.get_audio_samples(), old.get_audio_samples());
 }
 
 #[wasm_bindgen_test]
 fn the_spc700_s_trace_is_cpu_1_s() {
     let mut emu = running();
-    assert!(emu.is_cpu_tracing_enabled(1) && emu.is_spc700_tracing_enabled());
-    assert_eq!(
-        emu.get_cpu_trace_entry_size(1),
-        emu.get_spc700_trace_entry_size()
-    );
+    assert!(emu.is_cpu_tracing_enabled(1));
+    let size = <TraceEntryBinarySpc700 as TraceEntry>::SIZE;
+    assert_eq!(emu.get_cpu_trace_entry_size(1), size);
     let data = emu.get_cpu_trace_flush_data(1);
     assert!(!data.is_empty());
-    assert_eq!(data, emu.get_spc700_trace_flush_data());
-    let head = &data[..emu.get_spc700_trace_entry_size() * 4];
+    assert_eq!(data.len() % size, 0);
+    let head = &data[..size * 4];
     assert_eq!(
         emu.convert_cpu_trace_chunk_to_text(1, head),
-        emu.convert_spc700_trace_chunk_to_text(head)
+        trace_to_text::<TraceEntryBinarySpc700, ()>(head, &mut ())
     );
-    emu.clear_spc700_trace_flushed();
+    emu.clear_cpu_trace_flushed(1);
     assert!(emu.get_cpu_trace_flush_data(1).is_empty());
-    emu.set_spc700_tracing_enabled(false);
+    emu.set_cpu_tracing_enabled(1, false);
     assert!(!emu.is_cpu_tracing_enabled(1));
 }

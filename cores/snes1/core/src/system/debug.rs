@@ -48,11 +48,6 @@ impl SnesEmulator {
         self.bus.ppu().export_tilemap_image(bg)
     }
 
-    /// All 128 OAM sprites flattened into [`crate::ppu::SpriteDescriptor`]s.
-    pub fn export_oam_sprites(&self) -> Vec<crate::ppu::SpriteDescriptor> {
-        self.bus.ppu().export_oam_sprites()
-    }
-
     /// Per-background addressing + format snapshot ([`crate::ppu::BgLayout`])
     /// for the host's raw-layer (full-map) assembler.
     pub fn bg_layout(&self, bg: usize) -> crate::ppu::BgLayout {

@@ -3,73 +3,39 @@ import { traceCpuSpecForKind } from '@debugger-core/trace-spec-core'
 import { traceCpuSpec, cpuSelectorLabels } from '../src/trace-ops'
 
 describe('traceCpuSpec - sg1', () => {
-  it('cpu0 -> 68000 generic trace bindings', () => {
-    const s = traceCpuSpec('sg1', 0)
-    expect(s.setEnabled).toBe('setTracingEnabled')
-    expect(s.getFlushData).toBe('getTraceFlushData')
-    expect(s.convertChunkToText).toBe('convertTraceChunkToText')
-    expect(s.getEntrySize).toBe('getTraceEntrySize')
-    expect(s.uiLabel).toBe('68K')
-    expect(s.fileLabel).toBe('68k')
+  it('cpu0 -> the 68000, CPU 0', () => {
+    expect(traceCpuSpec('sg1', 0)).toEqual({ cpuId: 0, uiLabel: '68K', fileLabel: '68k' })
   })
 
-  it('cpu1 -> Z80 bindings', () => {
-    const s = traceCpuSpec('sg1', 1)
-    expect(s.setEnabled).toBe('setZ80TracingEnabled')
-    expect(s.needsFlush).toBe('needsZ80TraceFlush')
-    expect(s.getFlushData).toBe('getZ80TraceFlushData')
-    expect(s.clearFlushed).toBe('clearZ80TraceFlushed')
-    expect(s.convertChunkToText).toBe('convertZ80TraceChunkToText')
-    expect(s.getEntrySize).toBe('getZ80TraceEntrySize')
-    expect(s.uiLabel).toBe('Z80')
-    expect(s.fileLabel).toBe('z80')
+  it('cpu1 -> the Z80, CPU 1', () => {
+    expect(traceCpuSpec('sg1', 1)).toEqual({ cpuId: 1, uiLabel: 'Z80', fileLabel: 'z80' })
   })
 })
 
 describe('traceCpuSpec - snes1', () => {
-  it('cpu0 -> 65C816 reuses the generic primary bindings (same names as sg1 68K)', () => {
-    const s = traceCpuSpec('snes1', 0)
-    expect(s.setEnabled).toBe('setTracingEnabled')
-    expect(s.needsFlush).toBe('needsTraceFlush')
-    expect(s.getFlushData).toBe('getTraceFlushData')
-    expect(s.clearFlushed).toBe('clearTraceFlushed')
-    expect(s.convertChunkToText).toBe('convertTraceChunkToText')
-    expect(s.getEntrySize).toBe('getTraceEntrySize')
-    expect(s.uiLabel).toBe('65816')
-    expect(s.fileLabel).toBe('65816')
+  it('cpu0 -> the 65C816, CPU 0', () => {
+    expect(traceCpuSpec('snes1', 0)).toEqual({ cpuId: 0, uiLabel: '65816', fileLabel: '65816' })
   })
 
-  it('cpu1 -> SPC700 bindings (shared needsTraceFlush, dedicated flush/convert)', () => {
-    const s = traceCpuSpec('snes1', 1)
-    expect(s.setEnabled).toBe('setSpc700TracingEnabled')
-    expect(s.needsFlush).toBe('needsTraceFlush')
-    expect(s.getFlushData).toBe('getSpc700TraceFlushData')
-    expect(s.clearFlushed).toBe('clearSpc700TraceFlushed')
-    expect(s.convertChunkToText).toBe('convertSpc700TraceChunkToText')
-    expect(s.getEntrySize).toBe('getSpc700TraceEntrySize')
-    expect(s.uiLabel).toBe('SPC700')
-    expect(s.fileLabel).toBe('spc700')
+  it('cpu1 -> the SPC700, CPU 1', () => {
+    expect(traceCpuSpec('snes1', 1)).toEqual({ cpuId: 1, uiLabel: 'SPC700', fileLabel: 'spc700' })
   })
 })
 
 describe('traceCpuSpec - one table for both debugger UIs', () => {
   it('takes every selector slot spec from trace-spec-core, by CPU kind', () => {
-    expect(traceCpuSpec('sg1', 0)).toBe(traceCpuSpecForKind('m68k'))
-    expect(traceCpuSpec('sg1', 1)).toBe(traceCpuSpecForKind('z80'))
-    expect(traceCpuSpec('snes1', 0)).toBe(traceCpuSpecForKind('w65816'))
-    expect(traceCpuSpec('snes1', 1)).toBe(traceCpuSpecForKind('spc700'))
-  })
-
-  it("asks each secondary CPU's own binding for its entry size", () => {
-    expect(traceCpuSpec('snes1', 1).getEntrySize).not.toBe(traceCpuSpec('sg1', 1).getEntrySize)
+    expect(traceCpuSpec('sg1', 0)).toEqual(traceCpuSpecForKind('m68k', 0))
+    expect(traceCpuSpec('sg1', 1)).toEqual(traceCpuSpecForKind('z80', 1))
+    expect(traceCpuSpec('snes1', 0)).toEqual(traceCpuSpecForKind('w65816', 0))
+    expect(traceCpuSpec('snes1', 1)).toEqual(traceCpuSpecForKind('spc700', 1))
   })
 })
 
 describe('traceCpuSpec - cpu id normalisation', () => {
-  it('treats any non-1 cpu id as the primary CPU', () => {
+  it('treats any non-1 cpu id as the primary CPU, CPU 0', () => {
     expect(traceCpuSpec('sg1', 0).uiLabel).toBe('68K')
-    expect(traceCpuSpec('sg1', 2).uiLabel).toBe('68K')
-    expect(traceCpuSpec('snes1', 99).uiLabel).toBe('65816')
+    expect(traceCpuSpec('sg1', 2)).toEqual(traceCpuSpec('sg1', 0))
+    expect(traceCpuSpec('snes1', 99)).toEqual(traceCpuSpec('snes1', 0))
   })
 })
 

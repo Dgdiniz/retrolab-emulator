@@ -7,10 +7,13 @@ import {
   cpuKindForSlot,
   cpuLabelForSlot,
   cpuSteppableForSlot,
+  debugProfileIdForCpus,
   infoTabLabel,
   isSnesFamilyProfile,
   resolveDebugProfile,
   slotForCpuKind,
+  withCoreSteppable,
+  type CoreCpu,
   type DebugInfoTabId,
   type DebugProfile,
 } from '../src/debug-profile-core'
@@ -244,5 +247,102 @@ describe('debug-profile-core > multi-console seam', () => {
     expect(nesLike.infoTabs.map(infoTabLabel)).toEqual([
       'Breakpoints', 'History', 'Call Stack', 'Input',
     ])
+  })
+})
+
+// The CPUs each core's `getCpus()` reports, the fields the profiles read.
+const GENESIS_CPUS: CoreCpu[] = [
+  { id: 0, architecture: 'M68000', steppable: true },
+  { id: 1, architecture: 'Z80', steppable: true },
+]
+const SNES_CPUS: CoreCpu[] = [
+  { id: 0, architecture: 'Mos65816', steppable: true },
+  { id: 1, architecture: 'Spc700', steppable: false },
+]
+const withCartridgeCpu = (architecture: string): CoreCpu[] => [
+  ...SNES_CPUS,
+  { id: 2, architecture, steppable: true },
+]
+
+describe('debug-profile-core > debugProfileIdForCpus', () => {
+  it('keeps the core\'s profile with no CPU at slot 2', () => {
+    expect(debugProfileIdForCpus('genesis', GENESIS_CPUS)).toBe('genesis')
+    expect(debugProfileIdForCpus('snes', SNES_CPUS)).toBe('snes')
+  })
+
+  it('takes the profile of the cartridge CPU at slot 2', () => {
+    expect(debugProfileIdForCpus('snes', withCartridgeCpu('Mos65816'))).toBe('snes-sa1')
+    expect(debugProfileIdForCpus('snes', withCartridgeCpu('SuperFx'))).toBe('snes-superfx')
+    expect(debugProfileIdForCpus('snes', withCartridgeCpu('Hg51b'))).toBe('snes-cx4')
+  })
+
+  it('keeps the core\'s profile for a CPU it has no profile for', () => {
+    expect(debugProfileIdForCpus('snes', withCartridgeCpu('R3000'))).toBe('snes')
+    expect(debugProfileIdForCpus('snes', withCartridgeCpu('constructor'))).toBe('snes')
+    expect(debugProfileIdForCpus('genesis', withCartridgeCpu('SuperFx'))).toBe('genesis')
+    expect(debugProfileIdForCpus('constructor', withCartridgeCpu('SuperFx'))).toBe('constructor')
+  })
+
+  it('keeps the core\'s profile when the core reports no CPUs', () => {
+    expect(debugProfileIdForCpus('snes', null)).toBe('snes')
+    expect(debugProfileIdForCpus('snes', undefined)).toBe('snes')
+    expect(debugProfileIdForCpus('snes', [])).toBe('snes')
+  })
+
+  it('names profiles that resolve', () => {
+    for (const architecture of ['Mos65816', 'SuperFx', 'Hg51b']) {
+      const id = debugProfileIdForCpus('snes', withCartridgeCpu(architecture))
+      expect(resolveDebugProfile(id).id).toBe(id)
+      expect(cpuForSlot(resolveDebugProfile(id), 2).id).toBe(2)
+    }
+  })
+})
+
+describe('debug-profile-core > withCoreSteppable', () => {
+  it('takes each CPU\'s steppable from the core, matched by id', () => {
+    const snes = resolveDebugProfile('snes')
+    const steppingAll = withCoreSteppable(snes, [
+      { id: 0, architecture: 'Mos65816', steppable: false },
+      { id: 1, architecture: 'Spc700', steppable: true },
+    ])
+    expect(cpuSteppableForSlot(steppingAll, 0)).toBe(false)
+    expect(cpuSteppableForSlot(steppingAll, 1)).toBe(true)
+    expect(steppingAll.id).toBe('snes')
+    expect(steppingAll.infoTabs).toBe(snes.infoTabs)
+    expect(steppingAll.cpus.map((cpu) => [cpu.id, cpu.label, cpu.kind])).toEqual([
+      [0, '65816', 'w65816'],
+      [1, 'SPC700', 'spc700'],
+    ])
+  })
+
+  it('reads the same as the profile for the cores as they are', () => {
+    for (const [id, cpus] of [
+      ['genesis', GENESIS_CPUS],
+      ['snes', SNES_CPUS],
+      ['snes-superfx', withCartridgeCpu('SuperFx')],
+    ] as const) {
+      const profile = resolveDebugProfile(id)
+      const running = withCoreSteppable(profile, cpus)
+      for (const cpu of profile.cpus) {
+        expect(cpuSteppableForSlot(running, cpu.id)).toBe(cpuSteppableForSlot(profile, cpu.id))
+      }
+    }
+  })
+
+  it('keeps the profile\'s value for a CPU the core does not describe', () => {
+    const superfx = resolveDebugProfile('snes-superfx')
+    const running = withCoreSteppable(superfx, [{ id: 1, architecture: 'Spc700', steppable: true }])
+    expect(running.cpus[0]).toBe(superfx.cpus[0])
+    expect(running.cpus[2]).toBe(superfx.cpus[2])
+    expect(cpuSteppableForSlot(running, 1)).toBe(true)
+  })
+
+  it('leaves the profile as it is', () => {
+    const snes = resolveDebugProfile('snes')
+    withCoreSteppable(snes, [{ id: 1, architecture: 'Spc700', steppable: true }])
+    expect(cpuSteppableForSlot(resolveDebugProfile('snes'), 1)).toBe(false)
+    expect(withCoreSteppable(snes, null)).toBe(snes)
+    expect(withCoreSteppable(snes, undefined)).toBe(snes)
+    expect(withCoreSteppable(snes, [])).toBe(snes)
   })
 })

@@ -288,22 +288,15 @@ impl GenesisEmulator {
         instructions
     }
 
-    /// Get known instruction boundaries before an address.
-    /// Returns addresses in ascending order (oldest to newest).
-    pub fn get_boundaries_before(&self, addr: u32, count: usize) -> Vec<u32> {
-        self.debugger.console().get_boundaries_before(addr, count)
-    }
-
     /// Disassemble using known instruction boundaries (bsnes-style).
     /// For addresses that are known boundaries, disassemble the actual instruction.
     /// For addresses between known boundaries, show DC.W with the raw bytes.
     /// `before_count`: how many instructions to show before `pc`
     /// `after_count`: how many instructions to show after (including) `pc`
     ///
-    /// Deprecated in favour of `disassemble_window`, which uses the
+    /// `disassemble_window` is the debugger's reader: it uses the
     /// in-memory coverage bitmap instead of a global HashSet of
-    /// observed instruction starts. Kept for the `disassembleAroundPc`
-    /// WASM binding.
+    /// observed instruction starts.
     pub fn disassemble_around_pc(
         &mut self,
         pc: u32,

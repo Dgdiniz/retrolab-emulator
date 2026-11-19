@@ -1,145 +1,77 @@
 /**
- * Per-CPU trace binding specs, keyed by {@link CpuKind}.
+ * The trace of each CPU, keyed by {@link CpuKind}.
  *
- * Each CPU's trace ring is driven by parallel-but-differently-named
- * `RetroEmulator` methods. The tracing UI
- * resolves a {@link TraceCpuSpec} for the focused CPU and then calls
- * `emulator[spec.<fn>](...)` dynamically, so it never branches on core/CPU
- * inline. Keeping the name table here (pure data) gives both debuggers'
- * tracing one source of truth and lets the wiring be unit-tested without
- * WASM. The size of an entry is not in the table: the core reports it
- * ({@link traceEntrySize}), so a reader cuts and counts entries by the
- * size the core writes.
+ * Every core traces each of its CPUs through the same `RetroEmulator`
+ * methods, which take the CPU's id first (the id `getCpus()` gives, the
+ * debugger's CPU slot): `setCpuTracingEnabled(cpuId, enabled)`,
+ * `isCpuTracingEnabled(cpuId)`, `needsCpuTraceFlush(cpuId)`,
+ * `getCpuTraceFlushData(cpuId)`, `clearCpuTraceFlushed(cpuId)`,
+ * `getCpuTraceEntrySize(cpuId)` and `convertCpuTraceChunkToText(cpuId, data)`.
+ * What differs from one CPU to another is only what the tracing UI calls
+ * it: a label for the record button and the stats, and a token for the
+ * exported file's name. The tracing UI resolves a {@link TraceCpuSpec} for
+ * the CPU it records and calls those methods with the spec's `cpuId`, so it
+ * never branches on core or CPU inline; keeping the table here (pure data)
+ * gives both debuggers' tracing one source of truth and lets the wiring be
+ * unit-tested without WASM. The size of an entry is not in the table: the
+ * core reports it ({@link traceEntrySize}), so a reader cuts and counts
+ * entries by the size the core writes.
  *
- *   m68k   (sg1 cpu0)  setTracingEnabled / getTraceFlushData / ...
- *   z80    (sg1 cpu1)  setZ80TracingEnabled / getZ80TraceFlushData / ...
- *   w65816 (snes1 cpu0) setTracingEnabled / getTraceFlushData / ... (same names as the primary sg1 channel)
- *   spc700 (snes1 cpu1) setSpc700TracingEnabled / getSpc700TraceFlushData / ...
- *   superfx (snes1 cpu2, a Super FX cartridge) setSuperfxTracingEnabled / getSuperfxTraceFlushData / ...
- *   hg51b  (snes1 cpu2, a Cx4 cartridge) setHg51bTracingEnabled / getHg51bTraceFlushData / ...
+ *   m68k    (sg1 cpu 0)                      68K, 68k
+ *   z80     (sg1 cpu 1)                      Z80, z80
+ *   w65816  (snes1 cpu 0; an SA-1's, cpu 2)  65816, 65816
+ *   spc700  (snes1 cpu 1)                    SPC700, spc700
+ *   superfx (snes1 cpu 2, a Super FX cartridge) GSU, gsu
+ *   hg51b   (snes1 cpu 2, a Cx4 cartridge)   Cx4, cx4
  */
 
 import type { CpuKind } from './cpu-flags-core'
+import { cpuForSlot, type DebugProfile } from './debug-profile-core'
 
 export interface TraceCpuSpec {
-  /** `RetroEmulator` method: enable/disable this CPU's trace ring. */
-  setEnabled: string
-  /** Method: does a trace ring need flushing to the worker? */
-  needsFlush: string
-  /** Method: drain the trace ring as a `Uint8Array`. */
-  getFlushData: string
-  /** Method: mark the drained bytes as consumed. */
-  clearFlushed: string
-  /** Method: turn a binary chunk into human-readable trace text. */
-  convertChunkToText: string
-  /**
-   * Method: the size in bytes of one of this CPU's trace entries. An export
-   * is cut into whole entries of this size, and the live stats count
-   * entries with it.
-   */
-  getEntrySize: string
+  /** The CPU's id, the first argument of every by-CPU trace method. */
+  cpuId: number
   /** UI label for the record button / stats (`68K`, `Z80`, `65816`, `SPC700`, `GSU`, `Cx4`). */
   uiLabel: string
   /** Filename token for the exported trace (`68k`, `z80`, `65816`, `spc700`, `gsu`, `cx4`). */
   fileLabel: string
 }
 
-const M68K: TraceCpuSpec = {
-  // `needsTraceFlush()` asks about every CPU's ring; a debugger that
-  // traces one CPU at a time reads it as that CPU's.
-  setEnabled: 'setTracingEnabled',
-  needsFlush: 'needsTraceFlush',
-  getFlushData: 'getTraceFlushData',
-  clearFlushed: 'clearTraceFlushed',
-  convertChunkToText: 'convertTraceChunkToText',
-  getEntrySize: 'getTraceEntrySize',
-  uiLabel: '68K',
-  fileLabel: '68k',
+/** What the tracing UI calls the trace of each kind of CPU. */
+const TRACE_LABELS: Record<CpuKind, Pick<TraceCpuSpec, 'uiLabel' | 'fileLabel'>> = {
+  m68k: { uiLabel: '68K', fileLabel: '68k' },
+  z80: { uiLabel: 'Z80', fileLabel: 'z80' },
+  w65816: { uiLabel: '65816', fileLabel: '65816' },
+  spc700: { uiLabel: 'SPC700', fileLabel: 'spc700' },
+  superfx: { uiLabel: 'GSU', fileLabel: 'gsu' },
+  hg51b: { uiLabel: 'Cx4', fileLabel: 'cx4' },
 }
 
-const Z80: TraceCpuSpec = {
-  setEnabled: 'setZ80TracingEnabled',
-  needsFlush: 'needsZ80TraceFlush',
-  getFlushData: 'getZ80TraceFlushData',
-  clearFlushed: 'clearZ80TraceFlushed',
-  convertChunkToText: 'convertZ80TraceChunkToText',
-  getEntrySize: 'getZ80TraceEntrySize',
-  uiLabel: 'Z80',
-  fileLabel: 'z80',
+/** The trace spec of CPU `cpuId`, a CPU of kind `kind`. */
+export function traceCpuSpecForKind(kind: CpuKind, cpuId: number): TraceCpuSpec {
+  return { cpuId, ...TRACE_LABELS[kind] }
 }
 
-const W65816: TraceCpuSpec = {
-  // snes1's primary CPU shares the generic trace binding names with sg1.
-  setEnabled: 'setTracingEnabled',
-  needsFlush: 'needsTraceFlush',
-  getFlushData: 'getTraceFlushData',
-  clearFlushed: 'clearTraceFlushed',
-  convertChunkToText: 'convertTraceChunkToText',
-  getEntrySize: 'getTraceEntrySize',
-  uiLabel: '65816',
-  fileLabel: '65816',
-}
-
-const SPC700: TraceCpuSpec = {
-  setEnabled: 'setSpc700TracingEnabled',
-  // snes1 exposes a single shared `needsTraceFlush()` (any-CPU), not a
-  // per-CPU variant, reuse it for the SPC700.
-  needsFlush: 'needsTraceFlush',
-  getFlushData: 'getSpc700TraceFlushData',
-  clearFlushed: 'clearSpc700TraceFlushed',
-  convertChunkToText: 'convertSpc700TraceChunkToText',
-  getEntrySize: 'getSpc700TraceEntrySize',
-  uiLabel: 'SPC700',
-  fileLabel: 'spc700',
-}
-
-const SUPERFX: TraceCpuSpec = {
-  setEnabled: 'setSuperfxTracingEnabled',
-  // Same shared any-CPU `needsTraceFlush()` as the SPC700 channel.
-  needsFlush: 'needsTraceFlush',
-  getFlushData: 'getSuperfxTraceFlushData',
-  clearFlushed: 'clearSuperfxTraceFlushed',
-  convertChunkToText: 'convertSuperfxTraceChunkToText',
-  getEntrySize: 'getSuperfxTraceEntrySize',
-  uiLabel: 'GSU',
-  fileLabel: 'gsu',
-}
-
-const HG51B: TraceCpuSpec = {
-  setEnabled: 'setHg51bTracingEnabled',
-  // Same shared any-CPU `needsTraceFlush()` as the SPC700/GSU channels.
-  needsFlush: 'needsTraceFlush',
-  getFlushData: 'getHg51bTraceFlushData',
-  clearFlushed: 'clearHg51bTraceFlushed',
-  convertChunkToText: 'convertHg51bTraceChunkToText',
-  getEntrySize: 'getHg51bTraceEntrySize',
-  uiLabel: 'Cx4',
-  fileLabel: 'cx4',
-}
-
-const TRACE_SPECS: Record<CpuKind, TraceCpuSpec> = {
-  m68k: M68K,
-  z80: Z80,
-  w65816: W65816,
-  spc700: SPC700,
-  superfx: SUPERFX,
-  hg51b: HG51B,
-}
-
-/** Trace binding spec for a CPU kind. */
-export function traceCpuSpecForKind(kind: CpuKind): TraceCpuSpec {
-  return TRACE_SPECS[kind]
+/**
+ * The trace spec of the CPU at slot `slot` of `profile`: its kind's labels
+ * and its id. A slot the profile lacks resolves to the primary CPU, as
+ * {@link cpuForSlot} does.
+ */
+export function traceCpuSpecForSlot(profile: DebugProfile, slot: number): TraceCpuSpec {
+  const cpu = cpuForSlot(profile, slot)
+  return traceCpuSpecForKind(cpu.kind, cpu.id)
 }
 
 /**
  * The size in bytes of one entry of a CPU's trace, as the core reports it
- * through the spec's `getEntrySize` method; 0 when the emulator has no
- * such method or reports no positive whole number.
+ * through `getCpuTraceEntrySize(spec.cpuId)`; 0 when the emulator has no
+ * such method or reports no positive whole number (a CPU that keeps no
+ * trace).
  */
 export function traceEntrySize(emulator: unknown, spec: TraceCpuSpec): number {
   if (typeof emulator !== 'object' || emulator === null) return 0
-  const read = (emulator as Record<string, unknown>)[spec.getEntrySize]
+  const read = (emulator as Record<string, unknown>).getCpuTraceEntrySize
   if (typeof read !== 'function') return 0
-  const size: unknown = read.call(emulator)
+  const size: unknown = read.call(emulator, spec.cpuId)
   return typeof size === 'number' && Number.isInteger(size) && size > 0 ? size : 0
 }

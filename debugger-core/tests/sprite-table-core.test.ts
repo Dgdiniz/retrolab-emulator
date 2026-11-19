@@ -7,8 +7,10 @@ import {
   formatSpritePos,
   formatSpriteSize,
   formatSpriteTile,
+  spriteAttrFromTableEntry,
   spriteGuideTargetId,
   type SpriteAttrInput,
+  type SpriteTableEntryInput,
 } from '../src/sprite-table-core'
 
 function attr(overrides: Partial<SpriteAttrInput> = {}): SpriteAttrInput {
@@ -141,6 +143,50 @@ describe('sprite-table-core > buildSpriteTable', () => {
       'vdp.sprites.entry.0',
       'vdp.sprites.entry.1',
       'vdp.sprites.entry.5',
+    ])
+  })
+})
+
+describe('sprite-table-core > spriteAttrFromTableEntry', () => {
+  // The first two entries of the Mega Drive's `getSpriteTable()` on the
+  // capture test program, the second the last of a short chain.
+  const linked: SpriteTableEntryInput = {
+    index: 0, x: 37, y: 24, width: 8, height: 8, tile_index: 1, palette: 0, priority: 0,
+    flip_h: false, flip_v: false, next: 1, tile_address: 32, large: false,
+  }
+  const last: SpriteTableEntryInput = {
+    index: 1, x: -3, y: 100, width: 32, height: 16, tile_index: 0x7ff, palette: 3, priority: 1,
+    flip_h: true, flip_v: false, tile_address: 0xffe0, large: false,
+  }
+
+  it('reads each field as the SAT entry holds it', () => {
+    expect(spriteAttrFromTableEntry(linked)).toEqual(
+      attr({ index: 0, x: 37, y: 24, h_tiles: 1, v_tiles: 1, tile: 1, link: 1 }),
+    )
+    expect(spriteAttrFromTableEntry(last)).toEqual(
+      attr({
+        index: 1, x: -3, y: 100, h_tiles: 4, v_tiles: 2, tile: 0x7ff, palette: 3,
+        priority: true, h_flip: true,
+      }),
+    )
+  })
+
+  it('links the last entry with the null link that ends a chain', () => {
+    expect(spriteAttrFromTableEntry(last).link).toBe(0)
+    expect(spriteAttrFromTableEntry({ ...last, next: undefined }).link).toBe(0)
+  })
+
+  it('builds the rows the SAT entries build', () => {
+    const rows = buildSpriteTable([linked, last].map(spriteAttrFromTableEntry))
+    expect(rows.map((row) => row.columns)).toEqual([
+      {
+        index: '00', pos: '(37, 24)', size: '1x1', tile: '$0001', palette: 'P0',
+        priority: 'low', flips: '-', link: '01',
+      },
+      {
+        index: '01', pos: '(-3, 100)', size: '4x2', tile: '$07FF', palette: 'P3',
+        priority: 'high', flips: 'H', link: '00',
+      },
     ])
   })
 })

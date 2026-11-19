@@ -9,7 +9,8 @@
 import type { DebugBridge, PanelHandle } from '../../debug-bridge'
 import {
   buildSpriteTable,
-  type SpriteAttrInput,
+  spriteAttrFromTableEntry,
+  type SpriteTableEntryInput,
   type SpriteTableRow,
 } from '@debugger-core/sprite-table-core'
 
@@ -70,12 +71,12 @@ export function initSpriteTableViewer(bridge: DebugBridge): PanelHandle {
     }
 
     try {
-      const entries = emulator.getSpriteAttrTable() as SpriteAttrInput[] | undefined
+      const entries = emulator.getSpriteTable() as SpriteTableEntryInput[] | undefined
       if (!entries || entries.length === 0) {
         renderEmpty('No sprites linked from SAT slot 0.')
         return
       }
-      renderRows(buildSpriteTable(entries))
+      renderRows(buildSpriteTable(entries.map(spriteAttrFromTableEntry)))
     } catch (err) {
       console.error('Failed to refresh sprite-table viewer:', err)
       renderEmpty('Failed to read sprite attribute table.')

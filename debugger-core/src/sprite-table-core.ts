@@ -10,11 +10,13 @@
  */
 
 /**
- * Input contract: a single Sprite Attribute Table entry as returned by
- * the WASM emulator's `getSpriteAttrTable()` walker. The shape mirrors
- * what `Sprite::from_sat` in `cores/sg1/core/src/vdp/sprites.rs` produces; we
- * redeclare it here (rather than import from a WASM types file) so this
- * module stays in the pure-core layer.
+ * Input contract: a single Sprite Attribute Table entry, the shape a
+ * lesson's snapshot stores its sprites in, and the one
+ * {@link spriteAttrFromTableEntry} makes of an entry of the WASM emulator's
+ * `getSpriteTable()`. The shape mirrors what `Sprite::from_sat` in
+ * `cores/sg1/core/src/vdp/sprites.rs` produces; we redeclare it here (rather
+ * than import from a WASM types file) so this module stays in the pure-core
+ * layer.
  *
  * `x` / `y` are screen-space (raw SAT word minus 128, matching the
  * `Sprite::from_sat` decoder).
@@ -32,6 +34,51 @@ export interface SpriteAttrInput {
   h_flip: boolean
   v_flip: boolean
   link: number
+}
+
+/**
+ * Input contract: one entry of the WASM emulator's `getSpriteTable()`, the
+ * sprite table in the order the hardware takes it (`SpriteTableEntry` in
+ * `retro-core/src/video.rs`): the position, the size in pixels, the tile,
+ * the palette, the priority, the flips, and the slot the hardware takes
+ * after it (`next`, absent for the last one and on a table whose entries do
+ * not link).
+ */
+export interface SpriteTableEntryInput {
+  index: number
+  x: number
+  y: number
+  width: number
+  height: number
+  tile_index: number
+  palette: number
+  priority: number
+  flip_h: boolean
+  flip_v: boolean
+  next?: number
+  tile_address: number
+  large: boolean
+}
+
+/**
+ * The SAT entry a `getSpriteTable()` entry describes: the size in tiles of 8
+ * pixels, the tile, the priority as a flag, and the link the slot taken
+ * after it, 0 (the null link that ends a chain) for the last one.
+ */
+export function spriteAttrFromTableEntry(entry: SpriteTableEntryInput): SpriteAttrInput {
+  return {
+    index: entry.index,
+    x: entry.x,
+    y: entry.y,
+    h_tiles: entry.width / 8,
+    v_tiles: entry.height / 8,
+    tile: entry.tile_index,
+    palette: entry.palette,
+    priority: entry.priority !== 0,
+    h_flip: entry.flip_h,
+    v_flip: entry.flip_v,
+    link: entry.next ?? 0,
+  }
 }
 
 export interface SpriteTableRow {

@@ -129,42 +129,6 @@ fn test_clear_sram_dirty() {
 }
 
 #[wasm_bindgen_test]
-fn test_cartridge_save_state() {
-    let mut emulator = RetroEmulator::new("genesis").expect("Failed to create emulator");
-    let rom = create_test_rom();
-
-    emulator.load_rom(&rom).expect("Failed to load ROM");
-
-    // Get save state
-    let state = emulator.get_cartridge_save_state(100);
-
-    // Should succeed
-    assert!(state.is_ok());
-
-    let state_data = state.unwrap();
-    assert!(!state_data.is_empty());
-}
-
-#[wasm_bindgen_test]
-fn test_load_cartridge_save_state_roundtrip() {
-    let mut emulator = RetroEmulator::new("genesis").expect("Failed to create emulator");
-    let rom = create_test_rom();
-
-    emulator.load_rom(&rom).expect("Failed to load ROM");
-
-    // Save state
-    let state_data = emulator
-        .get_cartridge_save_state(100)
-        .expect("Failed to get state");
-
-    // Load state back
-    let result = emulator.load_cartridge_save_state(&state_data);
-
-    // Should succeed
-    assert!(result.is_ok());
-}
-
-#[wasm_bindgen_test]
 fn test_multiple_rom_loads() {
     let mut emulator = RetroEmulator::new("genesis").expect("Failed to create emulator");
 

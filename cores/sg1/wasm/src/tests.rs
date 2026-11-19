@@ -85,9 +85,9 @@ fn the_cartridge_hash_is_the_sha256_of_the_file_loaded() {
 }
 
 #[wasm_bindgen_test]
-fn test_vdp_registers_and_layers() {
+fn test_video_registers_and_layers() {
     let mut emu = RetroEmulator::new("genesis").unwrap();
-    assert!(!emu.get_vdp_registers().is_null());
+    assert!(!emu.get_video_registers().is_null());
     assert!(!emu.get_layer_info().is_null());
     // Toggling a layer must not panic and must be idempotent on read.
     emu.toggle_layer(0, false);
@@ -219,7 +219,7 @@ fn assert_shapes<S: AsRef<str>>(found: &[(S, JsValue)], expected: &[(&str, &str)
 
 mod capture;
 
-/// What the debugger's readers, the steps and the Z80's trace methods
+/// What the debugger's readers, the steps and the trace of each CPU
 /// return, each held to a description recorded from the bindings, on a
 /// program with an execute breakpoint, a write watch, an event
 /// breakpoint, a stepped history and a chunk of trace on both CPUs.
@@ -234,6 +234,6 @@ mod machine_baseline;
 /// readers, and the cartridge's.
 mod binding_baseline;
 
-/// Each name both consoles share against the older names it stands
-/// beside: the same value, or the same effect.
+/// Each name both consoles share against what the core gives for it: the
+/// same value, or the same effect.
 mod names;

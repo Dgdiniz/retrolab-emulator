@@ -7,11 +7,14 @@
  * from the active core instead of branching on `'sg1'`.
  *
  * Each native core references a profile by id (its core definition's `debugProfile`),
- * and the host resolves it with {@link resolveDebugProfile}. Adding a new
+ * and the host resolves it with {@link resolveDebugProfile}. Once a core runs,
+ * its `getCpus()` refines that: the CPU a cartridge adds selects the
+ * cartridge's profile ({@link debugProfileIdForCpus}), and each CPU steps as
+ * the core says ({@link withCoreSteppable}). Adding a new
  * console's debugger is then purely additive: register one profile here,
  * add its CPU kind(s) + flag/register tables (`cpu-flags-core.ts` /
- * `registers-core.ts`) and trace specs (`trace-spec-core.ts`). No
- * component needs editing.
+ * `registers-core.ts`) and the labels of their traces
+ * (`trace-spec-core.ts`). No component needs editing.
  */
 
 import type { CpuKind } from './cpu-flags-core'
@@ -32,8 +35,23 @@ export interface CpuDescriptor {
    * lazy mailbox catch-up, not as a debugger-driven single-step target,
    * so the core's `stepCpu(1)` is a no-op. The toolbar disables Step
    * (and the F11 shortcut no-ops) while a non-steppable CPU is focused.
+   * A running core reports it for each CPU in `getCpus()`, which
+   * {@link withCoreSteppable} reads; the profile's value stands until then.
    */
   steppable?: boolean
+}
+
+/**
+ * A CPU as a running core describes it in `getCpus()`: the fields the
+ * profiles read.
+ */
+export interface CoreCpu {
+  /** Its id, the debugger's CPU slot. */
+  id: number
+  /** Its architecture as the core names it (`M68000`, `Mos65816`, `SuperFx`, ...). */
+  architecture: string
+  /** Whether the core's `stepCpu(id)` steps it. */
+  steppable: boolean
 }
 
 /**
@@ -119,8 +137,9 @@ const SNES_PROFILE: DebugProfile = {
 
 // SNES with an SA-1 cartridge: the same console as `snes` plus the SA-1's
 // second 65816 as a steppable slot-2 CPU (same register/flag/trace layout as
-// the 5A22, so `kind: 'w65816'`). The core selects this profile per-cartridge
-// via `getDebugProfileId()`; the info tabs are identical to `snes`.
+// the 5A22, so `kind: 'w65816'`). The core's `getCpus()` selects this profile
+// per cartridge (`debugProfileIdForCpus`); the info tabs are identical to
+// `snes`.
 const SNES_SA1_PROFILE: DebugProfile = {
   id: 'snes-sa1',
   cpus: [
@@ -134,8 +153,8 @@ const SNES_SA1_PROFILE: DebugProfile = {
 // SNES with a Super FX cartridge: the same console as `snes` plus the GSU as a
 // steppable slot-2 CPU (its own `superfx` register/flag/trace layout). Unlike
 // the SPC700 the GSU *is* single-steppable (`stepCpu(2)` -> the chip's
-// `step_secondary_cpu`). The core selects this profile per-cartridge via
-// `getDebugProfileId()`; the info tabs are identical to `snes`.
+// `step_secondary_cpu`). The core's `getCpus()` selects this profile per
+// cartridge (`debugProfileIdForCpus`); the info tabs are identical to `snes`.
 const SNES_SUPERFX_PROFILE: DebugProfile = {
   id: 'snes-superfx',
   cpus: [
@@ -149,8 +168,9 @@ const SNES_SUPERFX_PROFILE: DebugProfile = {
 // SNES with a Cx4 cartridge (Mega Man X2/X3): the same console as `snes` plus
 // the Hitachi HG51B169 DSP as a steppable slot-2 CPU (its own `hg51b`
 // register/flag/trace layout). Like the GSU it *is* single-steppable
-// (`stepCpu(2)` -> the chip's `step_secondary_cpu`). The core selects this
-// profile per-cartridge via `getDebugProfileId()`; the info tabs match `snes`.
+// (`stepCpu(2)` -> the chip's `step_secondary_cpu`). The core's `getCpus()`
+// selects this profile per cartridge (`debugProfileIdForCpus`); the info tabs
+// match `snes`.
 const SNES_CX4_PROFILE: DebugProfile = {
   id: 'snes-cx4',
   cpus: [
@@ -195,6 +215,60 @@ export const SNES_FAMILY_PROFILE_IDS: readonly string[] = [
  */
 export function isSnesFamilyProfile(id: string | null | undefined): boolean {
   return id != null && SNES_FAMILY_PROFILE_IDS.includes(id)
+}
+
+/**
+ * The profile each architecture of a cartridge's own CPU selects, keyed by
+ * the profile the core names: the SNES with an SA-1's second 65816, a
+ * Super FX GSU or a Cx4 HG51B169 at slot 2.
+ */
+const CARTRIDGE_CPU_PROFILES: ReadonlyMap<string, ReadonlyMap<string, string>> = new Map([
+  [
+    'snes',
+    new Map([
+      ['Mos65816', 'snes-sa1'],
+      ['SuperFx', 'snes-superfx'],
+      ['Hg51b', 'snes-cx4'],
+    ]),
+  ],
+])
+
+/** The slot of the CPU a cartridge adds to its console's. */
+const CARTRIDGE_CPU_SLOT = 2
+
+/**
+ * The profile id for a running core: `baseId` is the profile its core
+ * definition names, `cpus` the CPUs the core reports (`getCpus()`). The
+ * cartridge's CPU at slot 2 selects the profile `baseId` has for its
+ * architecture; with none (no such CPU, or one `baseId` has no profile
+ * for) the id is `baseId`.
+ */
+export function debugProfileIdForCpus(
+  baseId: string,
+  cpus: readonly CoreCpu[] | null | undefined,
+): string {
+  const cartridge = cpus?.find((cpu) => cpu.id === CARTRIDGE_CPU_SLOT)
+  if (!cartridge) return baseId
+  return CARTRIDGE_CPU_PROFILES.get(baseId)?.get(cartridge.architecture) ?? baseId
+}
+
+/**
+ * `profile` with each CPU's `steppable` as the running core reports it in
+ * `getCpus()`, matched by id; a CPU the core does not describe keeps the
+ * profile's. The profile given is left as it is.
+ */
+export function withCoreSteppable(
+  profile: DebugProfile,
+  cpus: readonly CoreCpu[] | null | undefined,
+): DebugProfile {
+  if (!cpus || cpus.length === 0) return profile
+  return {
+    ...profile,
+    cpus: profile.cpus.map((cpu) => {
+      const described = cpus.find((core) => core.id === cpu.id)
+      return described ? { ...cpu, steppable: described.steppable } : cpu
+    }),
+  }
 }
 
 /**

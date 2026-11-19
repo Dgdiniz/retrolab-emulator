@@ -252,10 +252,12 @@ async function initEmulator(): Promise<void> {
     bridge.registerPanel('callstack', initCallStackPanel(bridge))
     bridge.registerPanel('input', initInputPanel(bridge))
 
-    // The VDP / Audio / Cartridge panels are Genesis-specific (they read
-    // sg1-only VRAM/CRAM, the YM2612/PSG multi-chip view, and the Sega
-    // mapper/manifest editor). Register them only for sg1 and hide their
-    // info-tabs on other cores. snes1 gets its own cartridge/manifest
+    // The VDP / Audio / Cartridge panels are Genesis-specific (they lay
+    // out the Mega Drive's VDP: four palettes of 16 colours, 2048 tiles
+    // of VRAM, the sprite link chain; the YM2612/PSG multi-chip view; and
+    // the Sega mapper/manifest editor), though they read names both cores
+    // export. Register them only for sg1 and hide their info-tabs on other
+    // cores. snes1 gets its own cartridge/manifest
     // panel (LoROM/HiROM presets, mirrored SRAM, FastROM); both cores
     // carry a "Cartridge" tab but only one is wired per page load.
     if (isGenesisCore) {

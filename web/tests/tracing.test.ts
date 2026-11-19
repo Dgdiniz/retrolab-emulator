@@ -22,20 +22,18 @@ class FakeWorker {
   }
 }
 
-/** Each core's trace entry sizes, as its bindings report them. */
-const SIZES: Record<WebCore, Record<string, number>> = {
-  sg1: { getTraceEntrySize: 84, getZ80TraceEntrySize: 38 },
-  snes1: { getTraceEntrySize: 44, getSpc700TraceEntrySize: 24 },
+/** Each core's trace entry sizes by CPU, as its bindings report them. */
+const SIZES: Record<WebCore, number[]> = {
+  sg1: [84, 38],
+  snes1: [44, 24],
 }
 
 function harness(core: WebCore, focusedCpu: number) {
   const emulator: Record<string, any> = {
-    setTracingEnabled: vi.fn(),
-    setZ80TracingEnabled: vi.fn(),
-    setSpc700TracingEnabled: vi.fn(),
+    setCpuTracingEnabled: vi.fn(),
+    getCpuTraceEntrySize: vi.fn((cpu: number) => SIZES[core][cpu] ?? 0),
     getTraceStats: vi.fn(() => ({ total_entries: 1234 })),
   }
-  for (const [method, size] of Object.entries(SIZES[core])) emulator[method] = vi.fn(() => size)
   const bridge = {
     getEmulator: () => emulator,
     isRomLoaded: () => true,
@@ -78,14 +76,14 @@ describe('setupTracing - the start message', () => {
     vi.restoreAllMocks()
   })
 
-  const cases: Array<[WebCore, number, number, string]> = [
-    ['sg1', 0, 84, 'setTracingEnabled'],
-    ['sg1', 1, 38, 'setZ80TracingEnabled'],
-    ['snes1', 0, 44, 'setTracingEnabled'],
-    ['snes1', 1, 24, 'setSpc700TracingEnabled'],
+  const cases: Array<[WebCore, number, number]> = [
+    ['sg1', 0, 84],
+    ['sg1', 1, 38],
+    ['snes1', 0, 44],
+    ['snes1', 1, 24],
   ]
 
-  for (const [core, cpu, size, binding] of cases) {
+  for (const [core, cpu, size] of cases) {
     it(`${core} cpu${cpu}: hands the worker the entry size the core reports (${size})`, () => {
       const { emulator, bridge } = harness(core, cpu)
       setupTracing(bridge, core).startTracing()
@@ -94,18 +92,19 @@ describe('setupTracing - the start message', () => {
       const start = worker.posted.find((m) => m.type === 'start')
       expect(start).toBeDefined()
       expect(start.entrySize).toBe(size)
-      expect(emulator[binding]).toHaveBeenCalledWith(true)
+      expect(emulator.getCpuTraceEntrySize).toHaveBeenCalledWith(cpu)
+      expect(emulator.setCpuTracingEnabled).toHaveBeenCalledWith(cpu, true)
     })
   }
 
   it('does not start a trace whose entry size the core does not report', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { emulator, bridge } = harness('sg1', 1)
-    delete emulator.getZ80TraceEntrySize
+    emulator.getCpuTraceEntrySize = vi.fn(() => 0)
     setupTracing(bridge, 'sg1').startTracing()
 
     expect(FakeWorker.instances[0].posted.find((m) => m.type === 'start')).toBeUndefined()
-    expect(emulator.setZ80TracingEnabled).not.toHaveBeenCalled()
+    expect(emulator.setCpuTracingEnabled).not.toHaveBeenCalled()
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('Z80'))
   })
 })

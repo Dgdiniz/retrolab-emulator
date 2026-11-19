@@ -7,6 +7,11 @@
  * - Spectrum: Spectrum analyzer (future)
  */
 
+// The sound chips' indices in the emulator's `getAudioChips()`: chip 0 is
+// the console's main chip, the YM2612, and the PSG comes after it.
+const YM2612_CHIP = 0;
+const PSG_CHIP = 1;
+
 export class AudioDebuggerMultiChip {
     constructor(emulator, containerId) {
         this.emulator = emulator;
@@ -301,7 +306,8 @@ export class AudioDebuggerMultiChip {
         if (!container) return;
 
         // Get channel count
-        const channelCount = this.emulator.getAudioChannelCount();
+        const channels = this.emulator.getAudioChipChannels(PSG_CHIP) || [];
+        const channelCount = channels.length;
 
         // Clear if first time
         if (container.children.length === 0) {
@@ -314,7 +320,7 @@ export class AudioDebuggerMultiChip {
         // Update each channel
         for (let i = 0; i < channelCount; i++) {
             try {
-                const state = this.emulator.getAudioChannelState(i);
+                const state = channels[i];
                 if (state) {
                     this.updateChannelCard('psg', i, state);
                 }
@@ -331,7 +337,8 @@ export class AudioDebuggerMultiChip {
         const container = this.container.querySelector('#ym2612-channels');
         if (!container) return;
 
-        const channelCount = this.emulator.getYm2612ChannelCount();
+        const channels = this.emulator.getAudioChipChannels(YM2612_CHIP) || [];
+        const channelCount = channels.length;
 
         // Clear if first time
         if (container.children.length === 0) {
@@ -344,7 +351,7 @@ export class AudioDebuggerMultiChip {
         // Update each channel
         for (let i = 0; i < channelCount; i++) {
             try {
-                const state = this.emulator.getYm2612ChannelState(i);
+                const state = channels[i];
                 if (state) {
                     this.updateChannelCard('ym2612', i, state);
                 }
@@ -470,9 +477,9 @@ export class AudioDebuggerMultiChip {
     handleMuteToggle(chip, channel, mute) {
         try {
             if (chip === 'psg') {
-                this.emulator.muteAudioChannel(channel, mute);
+                this.emulator.muteAudioChipChannel(PSG_CHIP, channel, mute);
             } else if (chip === 'ym2612') {
-                this.emulator.muteYm2612Channel(channel, mute);
+                this.emulator.muteAudioChipChannel(YM2612_CHIP, channel, mute);
             }
         } catch (err) {
             console.error(`Error toggling mute for ${chip} CH${channel}:`, err);
@@ -499,10 +506,10 @@ export class AudioDebuggerMultiChip {
         let waveform = [];
         try {
             if (this.waveformChip === 'mixed') {
-                waveform = this.emulator.getMixedWaveform(this.waveformSamples);
+                waveform = this.emulator.getAudioOutputWaveform(this.waveformSamples);
             } else if (this.waveformChip === 'psg') {
                 // Get PSG output waveform
-                waveform = this.emulator.getMixedWaveform(this.waveformSamples); // TODO: PSG-only waveform
+                waveform = this.emulator.getAudioOutputWaveform(this.waveformSamples); // TODO: PSG-only waveform
             }
         } catch (err) {
             console.error('Error getting waveform:', err);

@@ -109,9 +109,7 @@ fn test_snes_specific_surfaces() {
     // Mode 7 sampler reads live VRAM (zeroed at reset -> index 0).
     assert_eq!(emu.mode7_sample(0, 0), Some(0));
     assert!(!emu.get_apu_port_values().is_null());
-    assert!(!emu.get_dsp_voice_states().is_null());
     assert!(!emu.get_cartridge_manifest().is_null());
-    assert!(!emu.export_oam_sprites().is_null());
 }
 
 #[wasm_bindgen_test]
@@ -145,7 +143,7 @@ fn test_raw_memory_views_have_expected_sizes() {
     // VRAM = 0x8000 words = 0x10000 bytes; CGRAM = 256 colours;
     // OAM = 0x220 bytes; ARAM = 64 KiB.
     assert_eq!(emu.get_vram().len(), 0x10000);
-    assert_eq!(emu.get_cgram().len(), 0x100);
+    assert_eq!(emu.get_palette_memory().len(), 0x100);
     assert_eq!(emu.get_oam().len(), 0x220);
     assert_eq!(emu.get_aram().len(), 0x10000);
 }
@@ -173,9 +171,9 @@ fn test_sprite_tile_settings_carry_the_core_names() {
 }
 
 #[wasm_bindgen_test]
-fn test_ppu_registers_and_layers() {
+fn test_video_registers_and_layers() {
     let mut emu = RetroEmulator::new("snes").unwrap();
-    assert!(!emu.get_ppu_registers().is_null());
+    assert!(!emu.get_video_registers().is_null());
     assert!(!emu.get_layer_info().is_null());
     // Toggling a layer must not panic and must be idempotent on read.
     emu.toggle_layer(0, false);
@@ -185,12 +183,12 @@ fn test_ppu_registers_and_layers() {
 #[wasm_bindgen_test]
 fn test_dsp_mute_and_waveforms() {
     let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.mute_dsp_channel(0, true);
-    emu.mute_dsp_channel(0, false);
+    emu.mute_audio_chip_channel(0, 0, true);
+    emu.mute_audio_chip_channel(0, 0, false);
     // A muted/keyed-off voice reads as `samples` of silence; the mixed
     // waveform peek returns the requested length.
-    assert_eq!(emu.get_dsp_waveform(0, 64).len(), 64);
-    assert_eq!(emu.get_dsp_mixed_waveform(64).len(), 64);
+    assert_eq!(emu.get_audio_chip_waveform(0, 0, 64).len(), 64);
+    assert_eq!(emu.get_audio_output_waveform(64).len(), 64);
 }
 
 /// A pad's map as the host sends it: a plain object, whose keys
@@ -226,11 +224,11 @@ fn write_vram_reads_back_through_get_vram_wrapping_at_the_end() {
 }
 
 #[wasm_bindgen_test]
-fn write_cgram_reads_back_and_shows_after_a_repaint() {
+fn the_palette_written_reads_back_and_shows_after_a_repaint() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     // Colour 255, then on round to colour 0; bit 15 is dropped.
-    emu.write_cgram(255, &[0xFFFF, 0x001F]);
-    let cgram = emu.get_cgram();
+    emu.write_palette_memory(255, &[0xFFFF, 0x001F]);
+    let cgram = emu.get_palette_memory();
     assert_eq!(cgram[255], 0x7FFF);
     assert_eq!(cgram[0], 0x001F);
 
@@ -310,6 +308,6 @@ mod machine_baseline;
 /// PPU's and the S-DSP's readers, and the cartridge's.
 mod binding_baseline;
 
-/// Each name both consoles share against the older names it stands
-/// beside: the same value, or the same effect.
+/// Each name both consoles share against what the core gives for it: the
+/// same value, or the same effect.
 mod names;

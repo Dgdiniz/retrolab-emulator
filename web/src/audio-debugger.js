@@ -8,9 +8,14 @@
 import { ChannelPanel } from './audio-channel.js';
 
 export class AudioDebugger {
-    constructor(emulator, containerId) {
+    /**
+     * `chip` is the sound chip shown, its index in the emulator's
+     * `getAudioChips()`: 1 by default, the Mega Drive's PSG.
+     */
+    constructor(emulator, containerId, chip = 1) {
         this.emulator = emulator;
         this.container = document.getElementById(containerId);
+        this.chip = chip;
         this.chipInfo = null;
         this.channels = [];
         this.updateInterval = null;
@@ -31,7 +36,7 @@ export class AudioDebugger {
 
         try {
             // Get chip metadata (generic)
-            this.chipInfo = this.emulator.getAudioChipInfo();
+            this.chipInfo = this.emulator.getAudioChips()[this.chip];
             console.log('Audio chip detected:', this.chipInfo);
 
             // Create UI based on chip metadata
@@ -61,10 +66,11 @@ export class AudioDebugger {
         this.container.appendChild(grid);
 
         // Create channel panels (data-driven)
-        const channelCount = this.emulator.getAudioChannelCount();
+        const states = this.emulator.getAudioChipChannels(this.chip) || [];
+        const channelCount = states.length;
         for (let i = 0; i < channelCount; i++) {
             try {
-                const state = this.emulator.getAudioChannelState(i);
+                const state = states[i];
                 if (state) {
                     const panel = new ChannelPanel(i, state);
                     panel.onMuteChange = (ch, muted) => this.handleMuteChange(ch, muted);
@@ -129,7 +135,7 @@ export class AudioDebugger {
      */
     handleMuteChange(channel, muted) {
         try {
-            this.emulator.muteAudioChannel(channel, muted);
+            this.emulator.muteAudioChipChannel(this.chip, channel, muted);
             console.log(`Channel ${channel} ${muted ? 'muted' : 'unmuted'}`);
         } catch (err) {
             console.error(`Failed to mute channel ${channel}:`, err);
@@ -171,8 +177,9 @@ export class AudioDebugger {
 
         try {
             // Update each channel panel
+            const states = this.emulator.getAudioChipChannels(this.chip) || [];
             for (const panel of this.channels) {
-                const state = this.emulator.getAudioChannelState(panel.id);
+                const state = states[panel.id];
                 if (state) {
                     panel.update(state);
                 }
@@ -193,7 +200,7 @@ export class AudioDebugger {
 
         try {
             // Get mixed waveform data (generic)
-            const data = this.emulator.getMixedWaveform(800); // Match canvas width
+            const data = this.emulator.getAudioOutputWaveform(800); // Match canvas width
 
             if (!data || data.length === 0) {
                 this.drawSilence();

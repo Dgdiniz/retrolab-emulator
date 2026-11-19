@@ -485,10 +485,10 @@ getAudioSamplesN(100000) => Float32Array(len 1466, fnv1a64 0x8c5b1fbb20de3fed)
 
 /// Voice 0's waveform and the mix, each named after `what`.
 fn waveforms(found: &mut Found, what: &str, emu: &mut RetroEmulator) {
-    let voice = emu.get_dsp_waveform(0, 32);
-    found.value(format!("getDspWaveform(0, 32){what}"), voice);
-    let mixed = emu.get_dsp_mixed_waveform(32);
-    found.value(format!("getDspMixedWaveform(32){what}"), mixed);
+    let voice = emu.get_audio_chip_waveform(0, 0, 32);
+    found.value(format!("getAudioChipWaveform(0, 0, 32){what}"), voice);
+    let mixed = emu.get_audio_output_waveform(32);
+    found.value(format!("getAudioOutputWaveform(32){what}"), mixed);
 }
 
 /// The S-DSP's readers with voice 0 sounding for three frames, then muted
@@ -502,33 +502,40 @@ fn what_the_dsp_readers_answer() {
     for _ in 0..3 {
         emu.run_frame();
     }
-    found.value("getDspVoiceStates", emu.get_dsp_voice_states());
+    found.value("getAudioChipChannels(0)", emu.get_audio_chip_channels(0));
     waveforms(&mut found, "", &mut emu);
-    found.value("getDspWaveform(7, 8)", emu.get_dsp_waveform(7, 8));
-    found.value("getDspWaveform(8, 8)", emu.get_dsp_waveform(8, 8));
-    found.value("getDspMixedWaveform(0)", emu.get_dsp_mixed_waveform(0));
-    emu.mute_dsp_channel(0, true);
+    let last = emu.get_audio_chip_waveform(0, 7, 8);
+    found.value("getAudioChipWaveform(0, 7, 8)", last);
+    let past = emu.get_audio_chip_waveform(0, 8, 8);
+    found.value("getAudioChipWaveform(0, 8, 8)", past);
+    found.value(
+        "getAudioOutputWaveform(0)",
+        emu.get_audio_output_waveform(0),
+    );
+    emu.mute_audio_chip_channel(0, 0, true);
     emu.run_frame();
-    found.value("getDspVoiceStates, muted", emu.get_dsp_voice_states());
+    let muted = emu.get_audio_chip_channels(0);
+    found.value("getAudioChipChannels(0), muted", muted);
     waveforms(&mut found, ", muted", &mut emu);
-    emu.mute_dsp_channel(0, false);
-    found.value("getDspVoiceStates, unmuted", emu.get_dsp_voice_states());
+    emu.mute_audio_chip_channel(0, 0, false);
+    let unmuted = emu.get_audio_chip_channels(0);
+    found.value("getAudioChipChannels(0), unmuted", unmuted);
     emu.run_frame_headless();
     waveforms(&mut found, ", a headless frame", &mut emu);
     found.check(
         r#"
-getDspVoiceStates => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: 0.4296875, enabled: true,... (2195 chars, fnv1a64 0xde6753957e414906)
-getDspWaveform(0, 32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getDspMixedWaveform(32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getDspWaveform(7, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
-getDspWaveform(8, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
-getDspMixedWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
-getDspVoiceStates, muted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2192 chars, fnv1a64 0x19d2277ebbd3cd60)
-getDspWaveform(0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getDspMixedWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getDspVoiceStates, unmuted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2193 chars, fnv1a64 0x8ea1edf393a14155)
-getDspWaveform(0, 32), a headless frame => Float32Array(len 32, fnv1a64 0x1f8009ad9343ee95)
-getDspMixedWaveform(32), a headless frame => Float32Array(len 32, fnv1a64 0xcec7f8f42777d7c5)
+getAudioChipChannels(0) => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: 0.4296875, enabled: true,... (2195 chars, fnv1a64 0xde6753957e414906)
+getAudioChipWaveform(0, 0, 32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioOutputWaveform(32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChipWaveform(0, 7, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
+getAudioChipWaveform(0, 8, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
+getAudioOutputWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
+getAudioChipChannels(0), muted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2192 chars, fnv1a64 0x19d2277ebbd3cd60)
+getAudioChipWaveform(0, 0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioOutputWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
+getAudioChipChannels(0), unmuted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2193 chars, fnv1a64 0x8ea1edf393a14155)
+getAudioChipWaveform(0, 0, 32), a headless frame => Float32Array(len 32, fnv1a64 0x1f8009ad9343ee95)
+getAudioOutputWaveform(32), a headless frame => Float32Array(len 32, fnv1a64 0xcec7f8f42777d7c5)
 "#,
     );
 }
@@ -784,10 +791,10 @@ disassembleWindow(2, 0x0, 1, 1) => [{address: 0, bytes: [], comment: undefined, 
 /// The PPU's readers on the capture program after three frames: video
 /// memory, the palette and the sprite table (each written once by the
 /// debugger), the sound processor's memory, the registers, the backgrounds'
-/// layouts, the viewers' images, the sprite tile settings and the PPU's
-/// settings, the sprites as the picker and the exporter read them, the
-/// layers (one hidden), single sprites as images, and runs of tiles decoded,
-/// with the requests the PPU refuses.
+/// layouts, the palette and the tiles in colour, the sprite table, the
+/// sprite tile settings and the PPU's settings, the sprites as the picker
+/// reads them, the layers (one hidden), single sprites as images, and runs
+/// of tiles decoded, with the requests the PPU refuses.
 #[wasm_bindgen_test]
 fn what_the_ppu_readers_answer() {
     let mut found = Found::default();
@@ -797,23 +804,26 @@ fn what_the_ppu_readers_answer() {
         emu.run_frame();
     }
     found.value("getVram", emu.get_vram());
-    found.value("getCgram", emu.get_cgram());
+    found.value("getPaletteMemory", emu.get_palette_memory());
     found.value("getOam", emu.get_oam());
     found.value("getAram", emu.get_aram());
-    emu.write_cgram(3, &[0x7C00, 0x03E0]);
-    found.value("getCgram, colours 3 and 4 written", emu.get_cgram());
+    emu.write_palette_memory(3, &[0x7C00, 0x03E0]);
+    let written = emu.get_palette_memory();
+    found.value("getPaletteMemory, colours 3 and 4 written", written);
     emu.write_oam(4, &[100, 60]);
     found.value("getOam, sprite 1 moved", emu.get_oam());
-    found.value("getPpuRegisters", emu.get_ppu_registers());
-    for bg in [0, 1, 3, 7] {
-        found.value(format!("getBgLayout({bg})"), emu.get_bg_layout(bg));
+    found.value("getVideoRegisters", emu.get_video_registers());
+    for layer in [0, 1, 3, 7] {
+        let layout = emu.get_layer_layout(layer);
+        found.value(format!("getLayerLayout({layer})"), layout);
     }
-    found.value("exportPaletteImage", emu.export_palette_image());
-    found.value("exportTileImage(0, 0)", emu.export_tile_image(0, 0));
-    found.value("exportTileImage(1, 8)", emu.export_tile_image(1, 8));
-    found.value("exportTilemapImage(0)", emu.export_tilemap_image(0));
-    found.value("exportTilemapImage(9)", emu.export_tilemap_image(9));
-    found.value("exportOamSprites", emu.export_oam_sprites());
+    found.value("getPaletteColours", emu.get_palette_colours());
+    for first_colour in [0, 128] {
+        let tiles = emu.get_tile_colours(0, 0, 0, 256, 4, 0, first_colour);
+        let what = format!("getTileColours(0, 0, 0, 256, 4, 0, {first_colour})");
+        found.value(what, tiles);
+    }
+    found.value("getSpriteTable", emu.get_sprite_table());
     found.value("getSpriteTileSettings", emu.get_sprite_tile_settings());
     found.value("getPpuSettings", emu.get_ppu_settings());
     found.value("getSpriteData", emu.get_sprite_data());
@@ -848,22 +858,20 @@ fn what_the_ppu_readers_answer() {
     found.check(
         r#"
 getVram => Uint8Array(len 65536, fnv1a64 0xa0dc97483dd7b329)
-getCgram => Uint16Array(len 256, fnv1a64 0xe0a864bf30509cc5)
+getPaletteMemory => Uint16Array(len 256, fnv1a64 0xe0a864bf30509cc5)
 getOam => Uint8Array(len 544, fnv1a64 0x2efc84e0437cba8f)
 getAram => Uint8Array(len 65536, fnv1a64 0xeb05052ea5b62325)
-getCgram, colours 3 and 4 written => Uint16Array(len 256, fnv1a64 0xbd185e8e6a49cf3a)
+getPaletteMemory, colours 3 and 4 written => Uint16Array(len 256, fnv1a64 0xbd185e8e6a49cf3a)
 getOam, sprite 1 moved => Uint8Array(len 544, fnv1a64 0x9ea89672fa00393f)
-getPpuRegisters => [{description: "BG mode + tile size", index: 8453, name: "BGMODE", value: 1}, {description: "Main sc... (882 chars, fnv1a64 0xfdb84b369804f8c8)
-getBgLayout(0) => {bg: 0, bg_mode: 1, bpp: 4, char_base_byte: 0, height_cells: 32, palette_base: 0, screen_size: 0, scroll_x: 30, scroll_y: 0, tile_size16: false, tilemap_base_byte: 2048, width_cells: 32}
-getBgLayout(1) => {bg: 1, bg_mode: 1, bpp: 4, char_base_byte: 0, height_cells: 32, palette_base: 0, screen_size: 0, scroll_x: 0, scroll_y: 0, tile_size16: false, tilemap_base_byte: 0, width_cells: 32}
-getBgLayout(3) => {bg: 3, bg_mode: 1, bpp: 0, char_base_byte: 0, height_cells: 32, palette_base: 0, screen_size: 0, scroll_x: 0, scroll_y: 0, tile_size16: false, tilemap_base_byte: 0, width_cells: 32}
-getBgLayout(7) => {bg: 3, bg_mode: 1, bpp: 0, char_base_byte: 0, height_cells: 32, palette_base: 0, screen_size: 0, scroll_x: 0, scroll_y: 0, tile_size16: false, tilemap_base_byte: 0, width_cells: 32}
-exportPaletteImage => Uint8Array(len 262144, fnv1a64 0xc4419d660b0a0725)
-exportTileImage(0, 0) => {height: 128, rgba: "Array(len 65536, bytes fnv1a64 0x58e63c9d3fc9cd89)", width: 128}
-exportTileImage(1, 8) => {height: 128, rgba: "Array(len 65536, bytes fnv1a64 0x0b4a3e7598cd9f19)", width: 128}
-exportTilemapImage(0) => {height: 256, rgba: "Array(len 262144, bytes fnv1a64 0x3bad226e920af505)", width: 256}
-exportTilemapImage(9) => {height: 256, rgba: "Array(len 262144, bytes fnv1a64 0x0603e87c4b98de25)", width: 256}
-exportOamSprites => [{height: 8, hflip: false, index: 0, large: false, palette: 0, priority: 3, tile: 1, vflip: false, w... (15638 chars, fnv1a64 0x1cf67b34a2fe4750)
+getVideoRegisters => [{description: "BG mode + tile size", index: 8453, name: "BGMODE", value: 1}, {description: "Main sc... (882 chars, fnv1a64 0xfdb84b369804f8c8)
+getLayerLayout(0) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 0, kind: "tile_map", map_base: 2048, map_height: 32, map_width: 32, scroll_x: 30, scroll_y: 0}
+getLayerLayout(1) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 1, kind: "tile_map", map_base: 0, map_height: 32, map_width: 32, scroll_x: 0, scroll_y: 0}
+getLayerLayout(3) => {bits_per_pixel: 0, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 3, kind: "off", map_base: 0, map_height: 32, map_width: 32, scroll_x: 0, scroll_y: 0}
+getLayerLayout(7) => null
+getPaletteColours => Uint8Array(len 1024, fnv1a64 0x5d511455216071f5)
+getTileColours(0, 0, 0, 256, 4, 0, 0) => {data: Uint8Array(len 65536, fnv1a64 0x02921180a32eed05), height: 2048, width: 8}
+getTileColours(0, 0, 0, 256, 4, 0, 128) => {data: Uint8Array(len 65536, fnv1a64 0xa39e25b8d8271f55), height: 2048, width: 8}
+getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: undefined, palette: 0, prio... (21015 chars, fnv1a64 0xbfe5ab50ce3e3153)
 getSpriteTileSettings => {first_table_base_word: 0, large_height: 16, large_width: 16, second_table_base_word: 4096, small_height: 8, small_width: 8}
 getPpuSettings => {addsub_mode: false, bg3_priority: false, bg_main_enable: [true, false, false, false], bg_main_windo... (1786 chars, fnv1a64 0x9abb0ff1dbc4e28b)
 getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, priority: 3, tile_index: 1, width: ... (14870 chars, fnv1a64 0x94cfb7197b8e9f20)

@@ -47,11 +47,18 @@ export function initTileViewer(bridge: DebugBridge): PanelHandle {
 
       const scaledTileSize = TILE_PX * SCALE
 
+      // Every tile of VRAM in the chosen palette's colours, read at once:
+      // the 4bpp tiles from VRAM byte 0 in a column 8 pixels wide, tile i
+      // the 256 bytes of RGBA from i * 256.
+      const sheet = emulator.getTileColours(0, 0, 0, TILE_COUNT, 4, 0, currentPalette * 16)
+      const tileBytes = TILE_PX * TILE_PX * 4
+      if (!sheet) return
+
       // Each tile is drawn at 8x8 into a scratch canvas then drawn back
       // into the grid at the scaled size. Done per-tile to avoid the
       // extra allocation cost of a single 16x128*32 ImageData buffer.
       for (let i = 0; i < TILE_COUNT; i++) {
-        const tileRgba: Uint8Array = emulator.getTileRgba(i, currentPalette)
+        const tileRgba: Uint8Array = sheet.data.subarray(i * tileBytes, (i + 1) * tileBytes)
         const imageData = ctx.createImageData(TILE_PX, TILE_PX)
         imageData.data.set(tileRgba)
 

@@ -99,7 +99,7 @@ export function initVdpStateViewer(bridge: DebugBridge): PanelHandle {
 
     try {
       const layers = parseLayerRows(emulator.getLayerInfo?.())
-      const registers = parseVideoRegisters(emulator.getVdpRegisters?.())
+      const registers = parseVideoRegisters(emulator.getVideoRegisters?.())
       render(layers, registers)
     } catch (err) {
       console.error('Failed to refresh VDP state viewer:', err)

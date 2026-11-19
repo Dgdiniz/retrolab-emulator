@@ -363,10 +363,7 @@ fn the_sprite_table_stops_where_the_renderer_stops() {
     // 40 cells and the table at 0, the VDP's state after a reset: slot 0
     // links to slot 100, past the table's 80 slots.
     emu.write_vram(3, &[100]);
-    assert_eq!(
-        js_sys::Array::from(&emu.get_sprite_attr_table()).length(),
-        1
-    );
+    assert_eq!(js_sys::Array::from(&emu.get_sprite_table()).length(), 1);
 }
 
 #[wasm_bindgen_test]
@@ -386,11 +383,11 @@ fn write_vram_reads_back_through_get_vram_wrapping_at_the_end() {
 }
 
 #[wasm_bindgen_test]
-fn write_cram_reads_back_and_shows_after_a_repaint() {
+fn the_palette_written_reads_back_and_shows_after_a_repaint() {
     let mut emu = RetroEmulator::new("genesis").unwrap();
     // Colour 63, then on round to colour 0, keeping only the colour bits.
-    emu.write_cram(63, &[0xFFFF, 0x000E]);
-    let cram = emu.get_cram();
+    emu.write_palette_memory(63, &[0xFFFF, 0x000E]);
+    let cram = emu.get_palette_memory();
     assert_eq!(cram[63], 0x0EEE);
     assert_eq!(cram[0], 0x000E);
 

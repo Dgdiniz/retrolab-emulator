@@ -18,7 +18,7 @@ export function initPaletteViewer(bridge: DebugBridge): PanelHandle {
     if (!emulator) return
 
     try {
-      const palettes: Uint8Array = emulator.getAllPalettesRgba()
+      const palettes: Uint8Array = emulator.getPaletteColours()
 
       let html = ''
       for (let p = 0; p < 4; p++) {

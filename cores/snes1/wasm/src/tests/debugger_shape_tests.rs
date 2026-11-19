@@ -1,4 +1,9 @@
 use super::*;
+use retro_core::debug::TraceEntry;
+#[cfg(feature = "chip-cx4")]
+use snes1_core::TraceEntryBinaryCx4;
+#[cfg(feature = "chip-superfx")]
+use snes1_core::TraceEntryBinaryGsu;
 use snes1_core::{TraceEntryBinary65816, TraceEntryBinarySpc700};
 
 /// Bytes of one entry of each trace.
@@ -434,7 +439,7 @@ fn the_trace_switch_reads_as_before() {
     let mut switch = vec![JsValue::from_bool(emu.is_tracing_enabled())];
     emu.set_tracing_enabled(true);
     switch.push(JsValue::from_bool(emu.is_tracing_enabled()));
-    switch.push(JsValue::from_bool(emu.is_spc700_tracing_enabled()));
+    switch.push(JsValue::from_bool(emu.is_cpu_tracing_enabled(1)));
     emu.set_tracing_enabled(false);
     switch.push(JsValue::from_bool(emu.is_tracing_enabled()));
     let expected = ["false", "true", "false", "false"];
@@ -529,7 +534,7 @@ fn a_step_returns_as_before() {
 fn spc700_traced() -> RetroEmulator {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&debugger_program_rom()).unwrap();
-    emu.set_spc700_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     emu.run_frame();
     emu
 }
@@ -539,13 +544,13 @@ fn spc700_traced() -> RetroEmulator {
 #[wasm_bindgen_test]
 fn setting_the_spc700_trace_reads_as_before() {
     let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.set_spc700_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(1, true);
     let mut switch = vec![
-        JsValue::from_bool(emu.is_spc700_tracing_enabled()),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(1)),
         JsValue::from_bool(emu.is_tracing_enabled()),
     ];
-    emu.set_spc700_tracing_enabled(false);
-    switch.push(JsValue::from_bool(emu.is_spc700_tracing_enabled()));
+    emu.set_cpu_tracing_enabled(1, false);
+    switch.push(JsValue::from_bool(emu.is_cpu_tracing_enabled(1)));
     let expected = ["true", "false", "false"];
     assert_eq!(shapes(&switch), expected);
 }
@@ -553,10 +558,10 @@ fn setting_the_spc700_trace_reads_as_before() {
 /// Off at first, and on in a run with it set.
 #[wasm_bindgen_test]
 fn the_spc700_trace_switch_reads_as_before() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
+    let emu = RetroEmulator::new("snes").unwrap();
     let switch = [
-        JsValue::from_bool(emu.is_spc700_tracing_enabled()),
-        JsValue::from_bool(spc700_traced().is_spc700_tracing_enabled()),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(1)),
+        JsValue::from_bool(spc700_traced().is_cpu_tracing_enabled(1)),
     ];
     let expected = ["false", "true"];
     assert_eq!(shapes(&switch), expected);
@@ -566,8 +571,8 @@ fn the_spc700_trace_switch_reads_as_before() {
 /// CPU's, empty: its trace is off.
 #[wasm_bindgen_test]
 fn the_spc700_trace_data_reads_as_before() {
-    let mut emu = spc700_traced();
-    let mut data = chunk(&emu.get_spc700_trace_flush_data(), TRACE_ENTRY_SIZE_SPC700);
+    let emu = spc700_traced();
+    let mut data = chunk(&emu.get_cpu_trace_flush_data(1), TRACE_ENTRY_SIZE_SPC700);
     data.push(byte_array(&emu.get_trace_flush_data()));
     let expected = [
         "95376",
@@ -582,10 +587,10 @@ fn the_spc700_trace_data_reads_as_before() {
 #[wasm_bindgen_test]
 fn clearing_the_spc700_trace_reads_as_before() {
     let mut emu = spc700_traced();
-    emu.clear_spc700_trace_flushed();
+    emu.clear_cpu_trace_flushed(1);
     let data = [
-        byte_array(&emu.get_spc700_trace_flush_data()),
-        JsValue::from_bool(emu.is_spc700_tracing_enabled()),
+        byte_array(&emu.get_cpu_trace_flush_data(1)),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(1)),
     ];
     let expected = ["Uint8Array(len 0, fnv1a64 0xcbf29ce484222325)", "true"];
     assert_eq!(shapes(&data), expected);
@@ -595,7 +600,7 @@ fn clearing_the_spc700_trace_reads_as_before() {
 #[wasm_bindgen_test]
 fn the_spc700_trace_entry_size_reads_as_before() {
     let emu = RetroEmulator::new("snes").unwrap();
-    let size = [number(emu.get_spc700_trace_entry_size())];
+    let size = [number(emu.get_cpu_trace_entry_size(1))];
     let expected = ["24"];
     assert_eq!(shapes(&size), expected);
 }
@@ -605,12 +610,12 @@ fn the_spc700_trace_entry_size_reads_as_before() {
 #[wasm_bindgen_test]
 fn the_spc700_trace_text_reads_as_before() {
     let mut emu = spc700_traced();
-    let data = emu.get_spc700_trace_flush_data();
+    let data = emu.get_cpu_trace_flush_data(1);
     let three = &data[..3 * TRACE_ENTRY_SIZE_SPC700];
     let longer = &data[..3 * TRACE_ENTRY_SIZE_SPC700 + 10];
     let texts: Vec<JsValue> = [three, longer, &[]]
         .iter()
-        .map(|chunk| JsValue::from_str(&emu.convert_spc700_trace_chunk_to_text(chunk)))
+        .map(|chunk| JsValue::from_str(&emu.convert_cpu_trace_chunk_to_text(1, chunk)))
         .collect();
     let expected = [
         concat!(
@@ -664,36 +669,36 @@ pub(super) fn super_fx_rom() -> Vec<u8> {
 fn super_fx_traced() -> RetroEmulator {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&super_fx_rom()).unwrap();
-    emu.set_superfx_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(2, true);
     for _ in 0..3 {
         emu.run_frame();
     }
     emu
 }
 
-/// The switch on the program, which has no cartridge CPU: set, it stays
-/// off under both names of the cartridge CPU's trace; then cleared.
+/// The switch of CPU 2 on the program, which has no cartridge CPU: set, it
+/// stays off; then cleared.
 #[wasm_bindgen_test]
-fn setting_the_super_fx_trace_reads_as_before() {
+fn setting_the_cartridge_cpu_trace_reads_as_before() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&debugger_program_rom()).unwrap();
-    emu.set_superfx_tracing_enabled(true);
-    let mut switch = vec![
-        JsValue::from_bool(emu.is_superfx_tracing_enabled()),
-        JsValue::from_bool(emu.is_hg51b_tracing_enabled()),
-    ];
-    emu.set_superfx_tracing_enabled(false);
-    switch.push(JsValue::from_bool(emu.is_superfx_tracing_enabled()));
-    let expected = ["false", "false", "false"];
+    emu.set_cpu_tracing_enabled(2, true);
+    let mut switch = vec![JsValue::from_bool(emu.is_cpu_tracing_enabled(2))];
+    emu.set_cpu_tracing_enabled(2, false);
+    switch.push(JsValue::from_bool(emu.is_cpu_tracing_enabled(2)));
+    let expected = ["false", "false"];
     assert_eq!(shapes(&switch), expected);
 }
 
-/// Off at first.
+/// Off at first, and no entry size with no cartridge CPU.
 #[wasm_bindgen_test]
-fn the_super_fx_trace_switch_reads_as_before() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    let switch = [JsValue::from_bool(emu.is_superfx_tracing_enabled())];
-    let expected = ["false"];
+fn the_cartridge_cpu_trace_switch_reads_as_before() {
+    let emu = RetroEmulator::new("snes").unwrap();
+    let switch = [
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(2)),
+        number(emu.get_cpu_trace_entry_size(2)),
+    ];
+    let expected = ["false", "0"];
     assert_eq!(shapes(&switch), expected);
 }
 
@@ -702,13 +707,13 @@ fn the_super_fx_trace_switch_reads_as_before() {
 #[cfg(feature = "chip-superfx")]
 #[wasm_bindgen_test]
 fn the_super_fx_trace_data_reads_as_before() {
-    let mut emu = super_fx_traced();
-    let mut data = chunk(&emu.get_superfx_trace_flush_data(), TRACE_ENTRY_SIZE_GSU);
+    let emu = super_fx_traced();
+    let mut data = chunk(&emu.get_cpu_trace_flush_data(2), TRACE_ENTRY_SIZE_GSU);
     let mut plain = RetroEmulator::new("snes").unwrap();
     plain.load_rom(&debugger_program_rom()).unwrap();
-    plain.set_superfx_tracing_enabled(true);
+    plain.set_cpu_tracing_enabled(2, true);
     plain.run_frame();
-    data.push(byte_array(&plain.get_superfx_trace_flush_data()));
+    data.push(byte_array(&plain.get_cpu_trace_flush_data(2)));
     let expected = [
         "208",
         "Uint8Array(len 52, fnv1a64 0xfa42a3a7c400d865)",
@@ -723,20 +728,22 @@ fn the_super_fx_trace_data_reads_as_before() {
 #[wasm_bindgen_test]
 fn clearing_the_super_fx_trace_reads_as_before() {
     let mut emu = super_fx_traced();
-    emu.clear_superfx_trace_flushed();
+    emu.clear_cpu_trace_flushed(2);
     let data = [
-        byte_array(&emu.get_superfx_trace_flush_data()),
-        JsValue::from_bool(emu.is_superfx_tracing_enabled()),
+        byte_array(&emu.get_cpu_trace_flush_data(2)),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(2)),
     ];
     let expected = ["Uint8Array(len 0, fnv1a64 0xcbf29ce484222325)", "true"];
     assert_eq!(shapes(&data), expected);
 }
 
-/// The Super FX's entry size in bytes.
+/// The Super FX's entry size in bytes, CPU 2's on its cartridge.
+#[cfg(feature = "chip-superfx")]
 #[wasm_bindgen_test]
 fn the_super_fx_trace_entry_size_reads_as_before() {
-    let emu = RetroEmulator::new("snes").unwrap();
-    let size = [number(emu.get_superfx_trace_entry_size())];
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&super_fx_rom()).unwrap();
+    let size = [number(emu.get_cpu_trace_entry_size(2))];
     let expected = ["52"];
     assert_eq!(shapes(&size), expected);
 }
@@ -774,10 +781,11 @@ fn the_super_fx_trace_text_reads_as_before() {
     data.extend_from_slice(&second.to_bytes());
     let mut longer = data.clone();
     longer.extend_from_slice(&data[..10]);
-    let emu = RetroEmulator::new("snes").unwrap();
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&super_fx_rom()).unwrap();
     let texts: Vec<JsValue> = [&data[..], &longer[..], &[]]
         .iter()
-        .map(|chunk| JsValue::from_str(&emu.convert_superfx_trace_chunk_to_text(chunk)))
+        .map(|chunk| JsValue::from_str(&emu.convert_cpu_trace_chunk_to_text(2, chunk)))
         .collect();
     let expected = [
         concat!(
@@ -837,37 +845,11 @@ fn cx4_rom() -> Vec<u8> {
 fn cx4_traced() -> RetroEmulator {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&cx4_rom()).unwrap();
-    emu.set_hg51b_tracing_enabled(true);
+    emu.set_cpu_tracing_enabled(2, true);
     for _ in 0..2 {
         emu.run_frame();
     }
     emu
-}
-
-/// The switch on the program, which has no cartridge CPU: set, it stays
-/// off under both names of the cartridge CPU's trace; then cleared.
-#[wasm_bindgen_test]
-fn setting_the_hg51b_trace_reads_as_before() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.load_rom(&debugger_program_rom()).unwrap();
-    emu.set_hg51b_tracing_enabled(true);
-    let mut switch = vec![
-        JsValue::from_bool(emu.is_hg51b_tracing_enabled()),
-        JsValue::from_bool(emu.is_superfx_tracing_enabled()),
-    ];
-    emu.set_hg51b_tracing_enabled(false);
-    switch.push(JsValue::from_bool(emu.is_hg51b_tracing_enabled()));
-    let expected = ["false", "false", "false"];
-    assert_eq!(shapes(&switch), expected);
-}
-
-/// Off at first.
-#[wasm_bindgen_test]
-fn the_hg51b_trace_switch_reads_as_before() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    let switch = [JsValue::from_bool(emu.is_hg51b_tracing_enabled())];
-    let expected = ["false"];
-    assert_eq!(shapes(&switch), expected);
 }
 
 /// What the Cx4 cartridge's chip traced, the chip running as it runs
@@ -876,13 +858,13 @@ fn the_hg51b_trace_switch_reads_as_before() {
 #[cfg(feature = "chip-cx4")]
 #[wasm_bindgen_test]
 fn the_hg51b_trace_data_reads_as_before() {
-    let mut emu = cx4_traced();
-    let mut data = chunk(&emu.get_hg51b_trace_flush_data(), TRACE_ENTRY_SIZE_CX4);
+    let emu = cx4_traced();
+    let mut data = chunk(&emu.get_cpu_trace_flush_data(2), TRACE_ENTRY_SIZE_CX4);
     let mut plain = RetroEmulator::new("snes").unwrap();
     plain.load_rom(&debugger_program_rom()).unwrap();
-    plain.set_hg51b_tracing_enabled(true);
+    plain.set_cpu_tracing_enabled(2, true);
     plain.run_frame();
-    data.push(byte_array(&plain.get_hg51b_trace_flush_data()));
+    data.push(byte_array(&plain.get_cpu_trace_flush_data(2)));
     let expected = [
         "372",
         "Uint8Array(len 93, fnv1a64 0xfd09fdf8879cc4b8)",
@@ -897,20 +879,22 @@ fn the_hg51b_trace_data_reads_as_before() {
 #[wasm_bindgen_test]
 fn clearing_the_hg51b_trace_reads_as_before() {
     let mut emu = cx4_traced();
-    emu.clear_hg51b_trace_flushed();
+    emu.clear_cpu_trace_flushed(2);
     let data = [
-        byte_array(&emu.get_hg51b_trace_flush_data()),
-        JsValue::from_bool(emu.is_hg51b_tracing_enabled()),
+        byte_array(&emu.get_cpu_trace_flush_data(2)),
+        JsValue::from_bool(emu.is_cpu_tracing_enabled(2)),
     ];
     let expected = ["Uint8Array(len 0, fnv1a64 0xcbf29ce484222325)", "true"];
     assert_eq!(shapes(&data), expected);
 }
 
-/// The Cx4's entry size in bytes.
+/// The Cx4's entry size in bytes, CPU 2's on its cartridge.
+#[cfg(feature = "chip-cx4")]
 #[wasm_bindgen_test]
 fn the_hg51b_trace_entry_size_reads_as_before() {
-    let emu = RetroEmulator::new("snes").unwrap();
-    let size = [number(emu.get_hg51b_trace_entry_size())];
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&cx4_rom()).unwrap();
+    let size = [number(emu.get_cpu_trace_entry_size(2))];
     let expected = ["93"];
     assert_eq!(shapes(&size), expected);
 }
@@ -947,10 +931,11 @@ fn the_hg51b_trace_text_reads_as_before() {
     data.extend_from_slice(&second.to_bytes());
     let mut longer = data.clone();
     longer.extend_from_slice(&data[..10]);
-    let emu = RetroEmulator::new("snes").unwrap();
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&cx4_rom()).unwrap();
     let texts: Vec<JsValue> = [&data[..], &longer[..], &[]]
         .iter()
-        .map(|chunk| JsValue::from_str(&emu.convert_hg51b_trace_chunk_to_text(chunk)))
+        .map(|chunk| JsValue::from_str(&emu.convert_cpu_trace_chunk_to_text(2, chunk)))
         .collect();
     let expected = [
         concat!(
@@ -1055,16 +1040,13 @@ fn the_sprite_table_and_the_palette_are_named_by_kind() {
 }
 
 /// On the program, which has no cartridge CPU, the cartridge CPU's
-/// trace switches stay off under both names, and a frame runs on
-/// the fast loop.
+/// trace switch stays off, and a frame runs on the fast loop.
 #[wasm_bindgen_test]
-fn a_cartridge_without_a_cpu_that_traces_keeps_its_switches_off() {
+fn a_cartridge_without_a_cpu_that_traces_keeps_its_switch_off() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&debugger_program_rom()).unwrap();
-    emu.set_superfx_tracing_enabled(true);
-    emu.set_hg51b_tracing_enabled(true);
-    assert!(!emu.is_superfx_tracing_enabled());
-    assert!(!emu.is_hg51b_tracing_enabled());
+    emu.set_cpu_tracing_enabled(2, true);
+    assert!(!emu.is_cpu_tracing_enabled(2));
     emu.run_frame();
     let tier = emu.snes.debugger_ref().execution_tier();
     assert_eq!(tier, retro_core::ExecutionTier::Play);
@@ -1074,8 +1056,8 @@ fn a_cartridge_without_a_cpu_that_traces_keeps_its_switches_off() {
 #[cfg(feature = "chip-superfx")]
 #[wasm_bindgen_test]
 fn a_super_fx_cartridge_takes_the_cartridge_cpu_trace() {
-    let mut emu = super_fx_traced();
-    assert!(emu.is_superfx_tracing_enabled());
+    let emu = super_fx_traced();
+    assert!(emu.is_cpu_tracing_enabled(2));
 }
 
 /// A traced Cx4 runs as an untraced one: the machine after the two

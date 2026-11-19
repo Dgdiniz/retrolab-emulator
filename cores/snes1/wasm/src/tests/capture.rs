@@ -51,7 +51,7 @@ fn a_layer_render_keys_what_the_layer_does_not_cover() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     // Display on over a red backdrop, and no layer drawn anywhere: the
     // composite is red, every layer image empty.
-    emu.write_cgram(0, &[0x001F]);
+    emu.write_palette_memory(0, &[0x001F]);
     emu.write_memory_debug(0x2100, &[0x0F]);
     emu.repaint_frame();
     let image = emu.render_layer(0);
@@ -122,7 +122,7 @@ fn recording_a_red_screen() -> RetroEmulator {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&synth_lorom("LINE STATES")).unwrap();
     emu.set_capture_recording(recording_options(&[("lineStates", true)]));
-    emu.write_cgram(0, &[0x001F]);
+    emu.write_palette_memory(0, &[0x001F]);
     emu.write_memory_debug(0x2100, &[0x0F]);
     emu.run_to_capture_boundary();
     emu.run_to_capture_boundary();
@@ -311,8 +311,8 @@ fn recording_sprites() -> RetroEmulator {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&synth_lorom("LINE SPRITES")).unwrap();
     emu.set_capture_recording(recording_options(&[("lineStates", true)]));
-    emu.write_cgram(0, &[0x001F]);
-    emu.write_cgram(129, &[0x03E0]);
+    emu.write_palette_memory(0, &[0x001F]);
+    emu.write_palette_memory(129, &[0x03E0]);
     // Character 0, 4bpp: plane 0 set on every row, the rest clear.
     emu.write_vram(0, &[0x00FF; 8]);
     emu.write_memory_debug(0x212C, &[0x10]);
