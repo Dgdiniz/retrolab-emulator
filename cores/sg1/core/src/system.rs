@@ -314,39 +314,6 @@ impl GenesisEmulator {
         }
     }
 
-    /// Stage a cartridge manifest applied on the next [`Self::load_rom`],
-    /// overriding heuristic detection. `None` reverts to pure detection.
-    /// Does not disturb an already-installed cartridge: reload the ROM to apply it.
-    pub fn set_cartridge_manifest_override(&mut self, manifest: Option<CartridgeManifest>) {
-        self.cartridge_manifest_override = manifest;
-    }
-
-    /// The staged manifest override, if any.
-    pub fn cartridge_manifest_override(&self) -> Option<&CartridgeManifest> {
-        self.cartridge_manifest_override.as_ref()
-    }
-
-    /// The editable `cartridge-manifest-v1` the heuristic detector resolves
-    /// for `rom`, with no override applied. Side-effect-free.
-    pub fn detected_manifest(&self, rom: &[u8]) -> CartridgeManifest {
-        crate::cartridge::detected_manifest(rom)
-    }
-
-    /// The raw bytes of the currently loaded ROM (empty when none loaded),
-    /// so the host can re-detect the manifest for the live game.
-    pub fn last_rom(&self) -> &[u8] {
-        &self.last_rom
-    }
-
-    /// The installed cartridge's map-plan regions, for the cartridge
-    /// debugger's memory-map view. Empty when no cartridge is loaded.
-    pub fn cartridge_map_regions(&self) -> Vec<retro_core::cartridge::MapRegionSummary> {
-        self.bus
-            .cartridge()
-            .map(|cart| retro_core::cartridge::describe_map_plan(cart.map_plan()))
-            .unwrap_or_default()
-    }
-
     /// Get VDP reference for debugging.
     pub fn vdp(&self) -> &crate::vdp::Vdp {
         self.bus.vdp()
@@ -535,31 +502,6 @@ impl GenesisEmulator {
     /// Get mutable reference to the bus.
     pub fn bus_mut(&mut self) -> &mut AddressBus {
         &mut self.bus
-    }
-
-    /// The SHA-256 of the ROM file the last successful
-    /// [`EmulatorCore::load_rom`] received, in lowercase hex; `None` before
-    /// one. A Mega Drive cartridge's image is the file as given, so this is
-    /// also the image's hash, the one a savestate names.
-    pub fn get_cartridge_hash(&self) -> Option<String> {
-        self.cartridge_hash.clone()
-    }
-
-    /// Get cartridge title
-    pub fn get_cartridge_title(&self) -> Option<String> {
-        self.bus.cartridge().map(|c| c.info().title.clone())
-    }
-
-    /// Check if cartridge SRAM is dirty
-    pub fn is_cartridge_sram_dirty(&self) -> bool {
-        self.bus.cartridge().is_some_and(|c| c.is_sram_dirty())
-    }
-
-    /// Clear cartridge SRAM dirty flag
-    pub fn clear_cartridge_sram_dirty(&mut self) {
-        if let Some(cart) = self.bus.cartridge_mut() {
-            cart.clear_sram_dirty();
-        }
     }
 }
 
@@ -1070,6 +1012,52 @@ impl EmulatorCore for GenesisEmulator {
                 title_confidence: confidence.to_string(),
             }
         })
+    }
+
+    type Manifest = CartridgeManifest;
+
+    fn parse_manifest(json: &str) -> Result<CartridgeManifest, String> {
+        crate::cartridge::parse_manifest(json).map_err(|e| e.to_string())
+    }
+
+    /// The editable `cartridge-manifest-v1` the heuristic detector resolves
+    /// for `rom`, with no override applied. Side-effect-free.
+    fn detected_manifest(&self, rom: &[u8]) -> CartridgeManifest {
+        crate::cartridge::detected_manifest(rom)
+    }
+
+    fn cartridge_manifest_override(&self) -> Option<&CartridgeManifest> {
+        self.cartridge_manifest_override.as_ref()
+    }
+
+    /// Does not disturb an already-installed cartridge: reload the ROM to
+    /// apply it.
+    fn set_cartridge_manifest_override(&mut self, manifest: Option<CartridgeManifest>) {
+        self.cartridge_manifest_override = manifest;
+    }
+
+    fn last_rom(&self) -> &[u8] {
+        &self.last_rom
+    }
+
+    /// A Mega Drive cartridge's image is the file as given, so this is also
+    /// the image's hash, the one a savestate names.
+    fn get_cartridge_hash(&self) -> Option<String> {
+        self.cartridge_hash.clone()
+    }
+
+    fn cartridge_info(&self) -> Option<&retro_core::cartridge::CartridgeInfo> {
+        self.bus.cartridge().map(|cart| cart.info())
+    }
+
+    fn is_cartridge_sram_dirty(&self) -> bool {
+        self.bus.cartridge().is_some_and(|c| c.is_sram_dirty())
+    }
+
+    fn clear_cartridge_sram_dirty(&mut self) {
+        if let Some(cart) = self.bus.cartridge_mut() {
+            cart.clear_sram_dirty();
+        }
     }
 
     fn get_framebuffer(&self) -> &Framebuffer {

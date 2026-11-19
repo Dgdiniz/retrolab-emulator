@@ -8,7 +8,7 @@ use retro_core::types::{BreakpointType, ExecutionMode, MatchSpec};
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 
-use crate::js::{map_as_object, plain_object};
+use crate::js::{plain_object, to_js};
 
 /// The execution mode a host names: `"Running"`, `"Paused"`, `"StepInto"`,
 /// `"StepOver"` or `"StepOut"`; any other name is `Running`.
@@ -58,7 +58,7 @@ pub fn coverage_stats_object(total: u32, covered: u32) -> JsValue {
 /// A value of the debugger as a host reads it: structs as plain objects,
 /// lists as arrays, an absent value as `undefined`.
 pub fn debugger_value<T: Serialize + ?Sized>(value: &T) -> JsValue {
-    map_as_object(value)
+    to_js(value)
 }
 
 /// The match conditions a host sends: a plain object whose keys are
@@ -91,8 +91,10 @@ pub fn match_spec_from_js(spec: JsValue) -> Result<MatchSpec, JsValue> {
 /// `listBreakpoints`, `getExecutionMode`, `setExecutionMode`,
 /// `getMemoryRegions`, `getInstructionHistory`, `getCallStack`,
 /// `getFocusedCpu`, `setFocusedCpu`, `step`, `stepCpu`, `isCovered`,
-/// `getCoverageStats`, `clearCoverage`, `getBreakpointChecks`, and the main
-/// CPU's trace (CPU 0): `setTracingEnabled`, `isTracingEnabled`,
+/// `getCoverageStats`, `clearCoverage`, `getBreakpointChecks`, the memory
+/// and disassembly readers `readMemory`, `writeMemoryDebug`, `disassembleAt`,
+/// `disassembleCpu` and `disassembleWindow`, and the main CPU's trace (CPU
+/// 0): `setTracingEnabled`, `isTracingEnabled`,
 /// `needsTraceFlush` (any CPU's ring), `getTraceFlushData`,
 /// `clearTraceFlushed`, `getTraceEntrySize`, `convertTraceChunkToText` and
 /// `getTraceStats`. Their Rust names are the JavaScript names in snake case
@@ -495,6 +497,79 @@ macro_rules! debugger_bindings {
                     )
                     .unwrap_or_default(),
                 )
+            }
+
+            /// `size` bytes of memory from `addr` on, as the debugger reads
+            /// them: through no port and with no side effect on the
+            /// machine.
+            #[wasm_bindgen(js_name = readMemory)]
+            pub fn read_memory(&mut self, addr: u32, size: u32) -> ::std::vec::Vec<u8> {
+                $crate::__private::retro_core::EmulatorCore::read_memory_debug(
+                    &mut self.$core,
+                    addr,
+                    size,
+                )
+            }
+
+            /// Write `data` from `addr` on, as the debugger edits memory:
+            /// straight in, around the bus's normal logic.
+            #[wasm_bindgen(js_name = writeMemoryDebug)]
+            pub fn write_memory_debug(&mut self, addr: u32, data: &[u8]) {
+                $crate::__private::retro_core::EmulatorCore::write_memory_debug(
+                    &mut self.$core,
+                    addr,
+                    data,
+                );
+            }
+
+            /// `count` instructions of the main CPU from `addr` on
+            /// (`Instruction[]`).
+            #[wasm_bindgen(js_name = disassembleAt)]
+            pub fn disassemble_at(&mut self, addr: u32, count: u32) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::__private::retro_core::EmulatorCore::disassemble_at(
+                    &mut self.$core,
+                    addr,
+                    count,
+                ))
+            }
+
+            /// `count` instructions of CPU `cpu_id` from `addr` on
+            /// (`Instruction[]`).
+            #[wasm_bindgen(js_name = disassembleCpu)]
+            pub fn disassemble_cpu(
+                &mut self,
+                cpu_id: usize,
+                addr: u32,
+                count: u32,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::__private::retro_core::EmulatorCore::disassemble_cpu(
+                    &mut self.$core,
+                    cpu_id,
+                    addr,
+                    count,
+                ))
+            }
+
+            /// A window of disassembly around `pc` (`DisasmRow[]`), each row
+            /// tagged `kind: "code"` or `"unknown"`. The rows before `pc`
+            /// are walked back through the CPU's coverage, so they are the
+            /// instructions that really lead to it; a row past a hole in
+            /// the code reads `unknown` rather than a made-up instruction.
+            #[wasm_bindgen(js_name = disassembleWindow)]
+            pub fn disassemble_window(
+                &mut self,
+                cpu_id: usize,
+                pc: u32,
+                before_count: u32,
+                after_count: u32,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::__private::retro_core::EmulatorCore::disassemble_window(
+                    &mut self.$core,
+                    cpu_id,
+                    pc,
+                    before_count as usize,
+                    after_count as usize,
+                ))
             }
         }
     };

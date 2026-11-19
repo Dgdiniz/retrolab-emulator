@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "WebAssembly bindings the console cores' WASM crates share"
+build = "build.rs"
 
 [features]
 # `test_support::shape`, which the binding crates' tests compare JavaScript
@@ -18,6 +19,8 @@ wasm-bindgen = "0.2"
 js-sys = "0.3"
 serde = { workspace = true }
 serde-wasm-bindgen = "0.6"
+serde_json = { workspace = true }
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

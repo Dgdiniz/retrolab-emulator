@@ -812,10 +812,12 @@ dependencies = [
 name = "retro-wasm"
 version = "0.1.0"
 dependencies = [
+ "console_error_panic_hook",
  "js-sys",
  "retro-core",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-test",
 ]
@@ -931,7 +933,6 @@ dependencies = [
 name = "sg1-wasm"
 version = "0.1.0"
 dependencies = [
- "console_error_panic_hook",
  "js-sys",
  "retro-core",
  "retro-wasm",
@@ -1003,7 +1004,6 @@ dependencies = [
 name = "snes1-wasm"
 version = "0.1.0"
 dependencies = [
- "console_error_panic_hook",
  "js-sys",
  "retro-core",
  "retro-wasm",

@@ -20,54 +20,6 @@ fn test_get_system_info() {
     assert!(!emu.get_system_info().is_null());
 }
 
-#[wasm_bindgen_test]
-fn test_display_info() {
-    let emu = RetroEmulator::new("snes").unwrap();
-    let info = emu.get_display_info();
-    assert!(!info.is_null());
-    assert!(!info.is_undefined());
-}
-
-#[wasm_bindgen_test]
-fn test_framebuffer_packed_after_reset() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.reset();
-    let w = emu.get_framebuffer_width();
-    let h = emu.get_framebuffer_height();
-    let len = emu.get_framebuffer_len();
-    // The packed buffer must satisfy len == w * h * 4 so the renderer
-    // can upload it straight as a w x h RGBA texture.
-    assert!(w > 0 && h > 0, "expected a non-empty active rectangle");
-    assert_eq!(len, w * h * 4, "framebuffer must be tightly packed");
-}
-
-#[wasm_bindgen_test]
-fn test_run_frame_keeps_framebuffer_packed() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.run_frame();
-    let w = emu.get_framebuffer_width();
-    let h = emu.get_framebuffer_height();
-    assert_eq!(emu.get_framebuffer_len(), w * h * 4);
-}
-
-#[wasm_bindgen_test]
-fn test_audio_drain_bounded() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.set_audio_enabled(true);
-    emu.run_frame();
-    let available = emu.get_audio_available();
-    let pulled = emu.get_audio_samples_n(available + 1024);
-    // Never returns more than was queued (no over-drain).
-    assert!(pulled.len() <= available);
-}
-
-#[wasm_bindgen_test]
-fn test_input_round_trip() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.set_input(0, 0x01);
-    assert_eq!(emu.get_port_state(0), 0x01);
-}
-
 /// A 128 KiB LoROM that loops at `$00:8000`, named by `title`, so two
 /// titles make two ROMs with different hashes.
 fn synth_lorom(title: &str) -> Vec<u8> {
@@ -109,58 +61,12 @@ fn the_cartridge_hash_is_the_sha256_of_the_file_loaded_its_copier_header_include
 }
 
 #[wasm_bindgen_test]
-fn a_savestate_from_another_rom_is_refused_by_name_and_loads_when_asked() {
-    let mut first = RetroEmulator::new("snes").unwrap();
-    first.load_rom(&synth_lorom("FIRST BUILD")).unwrap();
-    first.run_frame();
-    let state = first.save_state();
-
-    let mut second = RetroEmulator::new("snes").unwrap();
-    second.load_rom(&synth_lorom("SECOND BUILD")).unwrap();
-    let refusal: js_sys::Error = second
-        .load_state(&state)
-        .unwrap_err()
-        .dyn_into()
-        .expect("a refusal over the ROM is a JS Error");
-    assert_eq!(String::from(refusal.name()), "SaveStateOtherRom");
-    assert!(second.load_state_any_rom(&state).is_ok());
-
-    // Its own ROM loads it, and bytes that are no savestate are refused
-    // as text, as before.
-    assert!(first.load_state(&state).is_ok());
-    assert!(second
-        .load_state(&[1, 2, 3])
-        .unwrap_err()
-        .as_string()
-        .is_some());
-}
-
-#[wasm_bindgen_test]
 fn test_breakpoint_add_list() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     let id = emu.add_breakpoint(0x008000, "execute".to_string(), None);
     let list = emu.list_breakpoints();
     assert!(!list.is_null());
     emu.remove_breakpoint(id);
-}
-
-#[wasm_bindgen_test]
-fn test_match_spec_round_trips_through_js() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    let id = emu.add_breakpoint(0x7E0000, "write".to_string(), None);
-    let spec = MatchSpec {
-        value: Some(0x42),
-        hit_skip: 3,
-        one_shot: true,
-        ..Default::default()
-    };
-    let spec_js = serde_wasm_bindgen::to_value(&spec).unwrap();
-    emu.set_breakpoint_match_spec(id, spec_js).unwrap();
-    let list: Vec<BreakpointInfo> = serde_wasm_bindgen::from_value(emu.list_breakpoints()).unwrap();
-    let info = list.into_iter().find(|b| b.id == id).unwrap();
-    assert_eq!(info.match_spec.value, Some(0x42));
-    assert_eq!(info.match_spec.hit_skip, 3);
-    assert!(info.match_spec.one_shot);
 }
 
 #[wasm_bindgen_test]
@@ -233,43 +139,6 @@ fn test_manifest_detect_set_clear() {
 }
 
 #[wasm_bindgen_test]
-fn test_load_low_confidence_rom_auto_falls_back() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    // A 32 KiB all-zero buffer scores below the detector's
-    // confidence floor, so a plain detection load fails with
-    // "no mapping...". loadRom must transparently retry with the
-    // vector-implied LoROM mapping and succeed instead of bubbling
-    // the error up to the console.
-    let rom = vec![0u8; 0x8000];
-    assert!(
-        emu.load_rom(&rom).is_ok(),
-        "low-confidence ROM should auto-load via the fallback"
-    );
-
-    // The fallback override is transient: a second load of the same
-    // low-confidence ROM still works (it isn't relying on a leaked
-    // staged override).
-    assert!(emu.load_rom(&rom).is_ok(), "second auto-load still works");
-
-    // A user-staged manifest stays authoritative: its failure is
-    // surfaced verbatim, never replaced by the fallback. An invalid
-    // preset passes JSON staging (parse_manifest only checks the
-    // version) but is rejected at build time, and because a
-    // manifest is staged, loadRom must NOT fall back, so the error
-    // propagates.
-    let bad = r#"{"core":"snes1","version":"1.0","rom":{"sha256":"","size":0},"mapping":{"preset":"bogus"}}"#;
-    emu.set_cartridge_manifest(bad).unwrap();
-    assert!(
-        emu.load_rom(&rom).is_err(),
-        "a staged manifest's failure must not be papered over by the fallback"
-    );
-    emu.clear_cartridge_manifest();
-
-    // With the bad manifest cleared, the fallback is back in charge.
-    assert!(emu.load_rom(&rom).is_ok(), "fallback resumes after clear");
-}
-
-#[wasm_bindgen_test]
 fn test_raw_memory_views_have_expected_sizes() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     // VRAM = 0x8000 words = 0x10000 bytes; CGRAM = 256 colours;
@@ -323,10 +192,8 @@ fn test_dsp_mute_and_waveforms() {
     assert_eq!(emu.get_dsp_mixed_waveform(64).len(), 64);
 }
 
-// The host sends a pad's map as a plain object, whose keys JavaScript
-// holds as text. Read as no map at all, it would silence the pad on
-// every port when the controller settings are saved. SNES B is bit 5,
-// A is bit 4.
+/// A pad's map as the host sends it: a plain object, whose keys
+/// JavaScript holds as text. SNES B is bit 5, A is bit 4.
 fn plain_gamepad_map(pairs: &[(u32, u32)]) -> JsValue {
     let obj = js_sys::Object::new();
     for (button, bit) in pairs {
@@ -338,59 +205,6 @@ fn plain_gamepad_map(pairs: &[(u32, u32)]) -> JsValue {
         .unwrap();
     }
     obj.into()
-}
-
-#[wasm_bindgen_test]
-fn gamepad_map_sent_as_a_plain_object_is_applied() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.gamepad_button("gamepad-0".to_string(), 0, true);
-    assert_eq!(
-        emu.get_port_state(0),
-        1 << 5,
-        "the default map presses B on player 1"
-    );
-    assert!(emu.set_gamepad_mapping("gamepad-0".to_string(), plain_gamepad_map(&[(0, 4)])));
-    assert_eq!(emu.get_port_state(0), 1 << 4, "button 0 must now press A");
-}
-
-#[wasm_bindgen_test]
-fn a_malformed_gamepad_map_keeps_the_current_one() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.gamepad_button("gamepad-0".to_string(), 0, true);
-    assert!(!emu.set_gamepad_mapping("gamepad-0".to_string(), JsValue::from_str("nope")));
-    assert_eq!(emu.get_port_state(0), 1 << 5);
-}
-
-// Reading a pad's map must not panic: a panic leaves the emulator
-// refusing every later call, and netplay reads the map on every frame.
-#[wasm_bindgen_test]
-fn reading_a_gamepad_map_keeps_the_emulator_working() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.gamepad_button("gamepad-0".to_string(), 0, true);
-    let map = emu.get_gamepad_mapping("gamepad-0".to_string());
-    let b = js_sys::Reflect::get(&map, &JsValue::from_str("0")).unwrap();
-    assert_eq!(b.as_f64(), Some(5.0), "button 0 reads back as SNES B");
-    emu.set_input(0, 1);
-    emu.key_down("ArrowUp".to_string());
-    emu.run_frame();
-}
-
-#[wasm_bindgen_test]
-fn a_gamepad_plays_player_one_beside_the_keyboard_and_can_move_to_player_two() {
-    let mut emu = RetroEmulator::new("snes").unwrap();
-    emu.gamepad_button("gamepad-0".to_string(), 0, true);
-    assert_eq!(emu.get_provider_port("gamepad-0".to_string()), 0);
-    emu.set_provider_port("gamepad-0".to_string(), 1);
-    assert_eq!(emu.get_port_state(0), 0);
-    assert_eq!(emu.get_port_state(1), 1 << 5);
-    emu.swap_port_assignments();
-    assert_eq!(
-        emu.get_port_state(0),
-        1 << 5,
-        "the swap brings the pad back to player 1"
-    );
-    assert!(emu.add_gamepad("gamepad-1".to_string()));
-    assert_eq!(js_sys::Array::from(&emu.get_port_providers(1)).length(), 1);
 }
 
 #[wasm_bindgen_test]
@@ -504,3 +318,9 @@ mod debugger_shape_tests;
 
 /// What the bindings answer about the machine, recorded.
 mod machine_baseline;
+
+/// What the bindings answer, method by method, recorded: the machine and
+/// what each call leaves, the display after each call that makes a frame,
+/// the audio, an input session, the debugger's memory and disassembly, the
+/// PPU's and the S-DSP's readers, and the cartridge's.
+mod binding_baseline;

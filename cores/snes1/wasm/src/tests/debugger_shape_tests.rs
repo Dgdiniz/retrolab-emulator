@@ -634,7 +634,7 @@ fn the_spc700_trace_text_reads_as_before() {
 /// starts the GSU on `IWT R0,#$1234`, `IWT R1,#$5678`, `STOP` at
 /// `$0100`, then waits in a loop.
 #[cfg(feature = "chip-superfx")]
-fn super_fx_rom() -> Vec<u8> {
+pub(super) fn super_fx_rom() -> Vec<u8> {
     let mut rom = vec![0u8; 0x10_0000];
     let start: [u8; 18] = [
         0xA9, 0x80, 0x8D, 0x37, 0x30, // LDA #$80, STA $3037: mask the interrupt

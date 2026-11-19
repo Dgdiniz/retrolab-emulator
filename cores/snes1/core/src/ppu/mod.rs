@@ -654,7 +654,7 @@ pub struct Ppu {
     /// the renderer drops that layer from the composite so the debugger
     /// can isolate what each plane contributes. Always all-`false`
     /// during normal play; toggled via [`Ppu::set_layer_debug_disabled`].
-    debug_layer_disable: [bool; LAYER_COUNT],
+    debug_layer_disable: retro_core::video::LayerMask<LAYER_COUNT>,
 
     /// The one layer a [`render::Ppu::render_layer`] pass draws, by the
     /// debug layer index (`0..=3` BG1-4, `4` OBJ); `None` the rest of the
@@ -817,7 +817,7 @@ impl Ppu {
             bg_tilemap_row_cache,
             vram_generation: 0,
             sprite_tile_cache,
-            debug_layer_disable: [false; LAYER_COUNT],
+            debug_layer_disable: Default::default(),
             isolated_layer: None,
             frame_hires: false,
             render_interlace: false,
@@ -1215,18 +1215,13 @@ impl Ppu {
     /// plane's contribution; this is debugger-only state and is never
     /// persisted in a savestate.
     pub fn set_layer_debug_disabled(&mut self, layer: usize, disabled: bool) {
-        if layer < LAYER_COUNT {
-            self.debug_layer_disable[layer] = disabled;
-        }
+        self.debug_layer_disable.set_hidden(layer, disabled);
     }
 
     /// Whether debug layer `layer` (`0..=3` = BG1-4, `4` = OBJ) is
     /// currently force-disabled by the debugger.
     pub fn layer_debug_disabled(&self, layer: usize) -> bool {
-        self.debug_layer_disable
-            .get(layer)
-            .copied()
-            .unwrap_or(false)
+        self.debug_layer_disable.is_hidden(layer)
     }
 
     /// Whether the display is in forced blank (`$2100` bit 7).

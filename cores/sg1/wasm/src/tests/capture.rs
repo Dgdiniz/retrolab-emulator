@@ -502,7 +502,7 @@ fn the_writes_to_video_memory_are_plain_objects_of_copies() {
 /// on lines 120 to 127, run out of dots on lines 160 to 167, meet the
 /// sprite mask on lines 200 to 207 and lie off screen on lines 60 to
 /// 67.
-fn capture_shapes_rom() -> Vec<u8> {
+pub(super) fn capture_shapes_rom() -> Vec<u8> {
     let mut rom = synth_genesis_rom("CAPTURE SHAPES");
     place(&mut rom, 0x00, &[0x00FF, 0xFE00]); // the stack
     place(&mut rom, 0x70, &[0x0000, 0x0700]); // level 4: the horizontal interrupt

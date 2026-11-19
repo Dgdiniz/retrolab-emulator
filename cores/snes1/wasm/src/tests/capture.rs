@@ -656,7 +656,7 @@ const PROGRAM_SCROLLS: u16 = 0x90A0;
 /// then 16 lines at 0, 2, ..., 30). In each vertical blank it counts a
 /// frame in work RAM and, through the ports, moves sprite 0 to that x,
 /// writes the count into the map entry at word `$0420` and into colour 2.
-fn capture_program_rom() -> Vec<u8> {
+pub(super) fn capture_program_rom() -> Vec<u8> {
     let mut code = Code::default();
     code.op(&[0x78]); // SEI
     code.zero(0x2121).store(0x4300, 0x00).store(0x4301, 0x22);

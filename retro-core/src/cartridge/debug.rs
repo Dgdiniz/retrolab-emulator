@@ -112,6 +112,8 @@ pub struct MapPlanDebugger<'a, S> {
     registers: Vec<MapperRegister>,
     /// Every chip's state, keyed by `chip_id`; empty with no chip.
     chip_states: Vec<(u8, ExpansionChipState)>,
+    /// Every chip's label, keyed by `chip_id`; empty with no chip.
+    chip_labels: Vec<(u8, String)>,
     breakpoints: &'a mut BreakpointList,
 }
 
@@ -133,6 +135,7 @@ impl<'a, S: SlotShape<Target = MapTarget>> MapPlanDebugger<'a, S> {
             mapper_id,
             registers: Vec::new(),
             chip_states,
+            chip_labels: Vec::new(),
             breakpoints,
         }
     }
@@ -140,6 +143,13 @@ impl<'a, S: SlotShape<Target = MapTarget>> MapPlanDebugger<'a, S> {
     /// The mapper's registers, reported with its state.
     pub fn with_mapper_registers(mut self, registers: Vec<MapperRegister>) -> Self {
         self.registers = registers;
+        self
+    }
+
+    /// The chips' labels, keyed by `chip_id`, reported by
+    /// [`CartridgeDebugger::get_chip_labels`].
+    pub fn with_chip_labels(mut self, labels: Vec<(u8, String)>) -> Self {
+        self.chip_labels = labels;
         self
     }
 
@@ -259,6 +269,14 @@ impl<S: SlotShape<Target = MapTarget>> CartridgeDebugger for MapPlanDebugger<'_,
 
     fn get_chip_states(&self) -> Vec<(u8, ExpansionChipState)> {
         self.chip_states.clone()
+    }
+
+    fn map_regions(&self) -> Vec<MapRegionSummary> {
+        describe_map_plan(&self.plan)
+    }
+
+    fn get_chip_labels(&self) -> Vec<(u8, String)> {
+        self.chip_labels.clone()
     }
 
     fn add_rom_breakpoint(&mut self, addr: u32) -> BreakpointId {

@@ -346,7 +346,7 @@ pub struct Vdp {
     // Sprites). A set bit suppresses that layer from composition so the
     // debugger can isolate each plane's contribution, without touching the
     // game's real VDP registers. Always all-`false` during normal play.
-    debug_layer_disable: [bool; LAYER_COUNT],
+    debug_layer_disable: retro_core::video::LayerMask<LAYER_COUNT>,
 
     // A 68k-bus CRAM DMA that was triggered while the beam is in active display
     // (a "raster" palette/backdrop effect, e.g. Direct Color DMA). Such a
@@ -628,7 +628,7 @@ impl Vdp {
             watch_vram: None,
             debug_pixel: None,
             render_layer_mode: RenderLayerMode::Normal,
-            debug_layer_disable: [false; LAYER_COUNT],
+            debug_layer_disable: Default::default(),
             frame_being_drawn: 0,
             recording: None,
             port_origin: 0,
@@ -729,18 +729,13 @@ impl Vdp {
     /// real VDP registers; this is debugger-only state and is never
     /// persisted in a savestate. Out-of-range indices are ignored.
     pub fn set_layer_debug_disabled(&mut self, layer: usize, disabled: bool) {
-        if layer < LAYER_COUNT {
-            self.debug_layer_disable[layer] = disabled;
-        }
+        self.debug_layer_disable.set_hidden(layer, disabled);
     }
 
     /// Whether debug layer `layer` is currently force-disabled by the
     /// debugger. Out-of-range indices read back `false`.
     pub fn layer_debug_disabled(&self, layer: usize) -> bool {
-        self.debug_layer_disable
-            .get(layer)
-            .copied()
-            .unwrap_or(false)
+        self.debug_layer_disable.is_hidden(layer)
     }
 
     /// The first line of vertical blanking: the line whose start raises
@@ -2103,10 +2098,10 @@ impl Vdp {
         let bd_idx = self.backdrop_index().min(63) as u8;
 
         // Debugger per-layer force-disable mask (read once per line).
-        let dis_plane_a = self.debug_layer_disable[LAYER_PLANE_A];
-        let dis_plane_b = self.debug_layer_disable[LAYER_PLANE_B];
-        let dis_window = self.debug_layer_disable[LAYER_WINDOW];
-        let dis_sprites = self.debug_layer_disable[LAYER_SPRITES];
+        let dis_plane_a = self.debug_layer_disable.is_hidden(LAYER_PLANE_A);
+        let dis_plane_b = self.debug_layer_disable.is_hidden(LAYER_PLANE_B);
+        let dis_window = self.debug_layer_disable.is_hidden(LAYER_WINDOW);
+        let dis_sprites = self.debug_layer_disable.is_hidden(LAYER_SPRITES);
 
         // Render sprites for this scanline into the line buffer (ONCE)
         self.render_sprite_line(line, trace);

@@ -63,8 +63,7 @@
 use super::recording::{LineKind, LineRecord};
 use super::sprites::Sprite;
 use super::{
-    DrawState, Vdp, FRAMEBUFFER_WIDTH, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES,
-    LAYER_WINDOW,
+    DrawState, Vdp, FRAMEBUFFER_WIDTH, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
 };
 use retro_core::capture::{
     drawn_by, layer, line_flags, planes, tile_value, LineSprites, PixelSources, PixelTrace,
@@ -680,7 +679,7 @@ impl Vdp {
         let height = self.drawn_height() as usize;
         let mut rgba = vec![0u8; width * height * 4];
         let kept = DrawState::keep(self);
-        let hidden = std::mem::replace(&mut self.debug_layer_disable, [false; LAYER_COUNT]);
+        let hidden = self.debug_layer_disable.take();
         let debug_pixel = self.debug_pixel.take();
         let mut trace = LineTrace::new();
         let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {

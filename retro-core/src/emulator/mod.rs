@@ -1,7 +1,7 @@
 //! Core emulator trait that all console emulators must implement.
 
 use crate::audio::{AudioDebugger, HostAudioRing};
-use crate::cartridge::CartridgeDebugger;
+use crate::cartridge::{CartridgeDebugger, CartridgeInfo};
 use crate::debugger::DebuggerCore;
 use crate::input::GenericInputManager;
 use crate::savestate::{LoadStateError, PayloadUse, RomCheck, RomIdentity, SavestatePayload};
@@ -305,6 +305,64 @@ pub trait EmulatorCore {
 
     /// Get information about the loaded ROM.
     fn get_rom_info(&self) -> Option<RomInfo>;
+
+    // ---- the cartridge plugged in
+
+    /// The console's cartridge manifest: `cartridge-manifest-v1` with the
+    /// console's own keys.
+    type Manifest: Serialize;
+
+    /// Read and check a manifest a host stages; the error says what is
+    /// wrong with it.
+    fn parse_manifest(json: &str) -> Result<Self::Manifest, String>;
+
+    /// The manifest detection gives a file's bytes, with no staged manifest
+    /// applied; builds and installs nothing.
+    fn detected_manifest(&self, rom: &[u8]) -> Self::Manifest;
+
+    /// The manifest the next [`Self::load_rom`] applies in place of
+    /// detection, `None` while detection decides.
+    fn cartridge_manifest_override(&self) -> Option<&Self::Manifest>;
+
+    /// Stage a manifest for the next [`Self::load_rom`], or `None` for
+    /// detection; the cartridge plugged in now is left as it is.
+    fn set_cartridge_manifest_override(&mut self, manifest: Option<Self::Manifest>);
+
+    /// The file the last successful [`Self::load_rom`] received; empty
+    /// before one.
+    fn last_rom(&self) -> &[u8];
+
+    /// The SHA-256 of that file, in lowercase hex; `None` before a load.
+    fn get_cartridge_hash(&self) -> Option<String>;
+
+    /// What the cartridge plugged in declares; `None` with none.
+    fn cartridge_info(&self) -> Option<&CartridgeInfo>;
+
+    /// The game wrote its battery save since the flag was last cleared.
+    fn is_cartridge_sram_dirty(&self) -> bool;
+
+    /// Clear the battery save's dirty flag.
+    fn clear_cartridge_sram_dirty(&mut self);
+
+    /// The chip a refused [`Self::load_rom`] needed and this build has no
+    /// module for; `None` on a console whose builds carry every chip.
+    fn last_unsupported_chip(&self) -> Option<&'static str> {
+        None
+    }
+
+    // ---- the picture
+
+    /// Show the lines a console draws past its picture's usual height (a
+    /// host's display preference, never part of a savestate); a console
+    /// that draws none keeps the default, which changes nothing.
+    fn set_show_overscan(&mut self, show: bool) {
+        let _ = show;
+    }
+
+    /// Whether those lines are shown; `false` on a console that draws none.
+    fn show_overscan_enabled(&self) -> bool {
+        false
+    }
 
     /// Get the current framebuffer for display.
     fn get_framebuffer(&self) -> &Framebuffer;

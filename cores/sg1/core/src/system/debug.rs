@@ -125,14 +125,21 @@ impl GenesisEmulator {
     pub fn map_plan_debugger(
         &mut self,
     ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
-        let (plan, rom_size, sram_size, chip_states) = match self.bus.cartridge() {
+        let (plan, rom_size, sram_size, chip_states, chip_labels) = match self.bus.cartridge() {
             Some(cart) => (
                 cart.map_plan().clone(),
                 cart.info().rom_size as u32,
                 cart.sram().len() as u32,
                 cart.coprocessors_debug_state(),
+                cart.coprocessor_labels(),
             ),
-            None => (crate::cartridge::MapPlan::default(), 0, 0, Vec::new()),
+            None => (
+                crate::cartridge::MapPlan::default(),
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+            ),
         };
         let mapper_id = MapperId::Custom(plan.name.clone());
         retro_core::cartridge::MapPlanDebugger::new(
@@ -143,6 +150,7 @@ impl GenesisEmulator {
             chip_states,
             self.debugger.breakpoints_mut(),
         )
+        .with_chip_labels(chip_labels)
     }
 
     /// Human-readable label of the primary (lowest-id) coprocessor (e.g.

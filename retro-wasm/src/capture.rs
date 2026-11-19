@@ -11,11 +11,12 @@ use retro_core::capture::{
     CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites, PixelSources,
     RenderedLayer, VideoMemorySources, WORDS_PER_RECORD,
 };
-use retro_core::video::{LineStateTable, PixelImage};
+use retro_core::video::LineStateTable;
 use wasm_bindgen::JsValue;
 
 use crate::js::{
-    int16_array, map_as_object, plain_object, set_property, uint16_array, uint32_array, uint8_array,
+    int16_array, picture_object, plain_object, set_property, to_js, uint16_array, uint32_array,
+    uint8_array,
 };
 
 /// The property names of [`CaptureRecording`]'s fields, as a host writes and
@@ -93,18 +94,8 @@ pub fn frame_snapshot_object<C>(
     set_property(&obj, "vram", &uint8_array(&snapshot.vram));
     set_property(&obj, "palette", &uint16_array(&snapshot.palette));
     console(&snapshot.console, &obj);
-    set_property(&obj, "registers", &map_as_object(&snapshot.registers));
+    set_property(&obj, "registers", &to_js(&snapshot.registers));
     obj.into()
-}
-
-/// `{ width, height, data: Uint8Array }` for an RGBA picture, its bytes
-/// copied.
-pub fn picture_object(picture: &PixelImage) -> JsValue {
-    plain_object(&[
-        ("width", JsValue::from_f64(f64::from(picture.width))),
-        ("height", JsValue::from_f64(f64::from(picture.height))),
-        ("data", uint8_array(&picture.rgba)),
-    ])
 }
 
 /// `{ width, height, data: Uint8Array, fromLineStates }`: the layer's
@@ -466,7 +457,7 @@ macro_rules! capture_bindings {
                     &mut self.$core,
                 ) {
                     ::core::option::Option::Some(picture) => {
-                        $crate::capture::picture_object(&picture)
+                        $crate::js::picture_object(&picture)
                     }
                     ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
                 }
@@ -684,6 +675,7 @@ mod tests {
     use retro_core::debugger::DebuggerCore;
     use retro_core::emulator::{EmulatorCore, StepResult};
     use retro_core::hash::fnv1a64;
+    use retro_core::video::PixelImage;
     use retro_core::video::VideoRegister;
     use retro_core::{
         AudioInfo, DisplayInfo, Framebuffer, InputInfo, InputState, Instruction, RomInfo,
@@ -1133,9 +1125,9 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         map.insert("only".to_string(), 1u32);
-        assert_eq!(shape(&map_as_object(&map)), "{only: 1}");
+        assert_eq!(shape(&to_js(&map)), "{only: 1}");
         let refused = std::collections::HashMap::from([((1u32, 2u32), 3u32)]);
-        assert_eq!(shape(&map_as_object(&refused)), "undefined");
+        assert_eq!(shape(&to_js(&refused)), "undefined");
     }
 
     // ===== The bindings the macro writes, on a core that answers each call

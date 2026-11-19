@@ -274,6 +274,43 @@ pub fn equals_cropped_rgba(
             .all(|(y, row)| row == &source[y * stride..y * stride + row_bytes])
 }
 
+/// Which of a chip's `N` layers the debugger hides from the picture: a
+/// hidden layer is left out of the composite without touching the game's
+/// registers, so the debugger can show what each one contributes. Every
+/// layer is shown by default. A host setting, never part of a savestate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerMask<const N: usize> {
+    hidden: [bool; N],
+}
+
+impl<const N: usize> Default for LayerMask<N> {
+    fn default() -> Self {
+        Self { hidden: [false; N] }
+    }
+}
+
+impl<const N: usize> LayerMask<N> {
+    /// Hide (`true`) or show (`false`) layer `layer`; a layer past the
+    /// mask's `N` is ignored.
+    pub fn set_hidden(&mut self, layer: usize, hidden: bool) {
+        if let Some(slot) = self.hidden.get_mut(layer) {
+            *slot = hidden;
+        }
+    }
+
+    /// Whether layer `layer` is hidden; `false` past the mask's `N`.
+    #[inline]
+    pub fn is_hidden(&self, layer: usize) -> bool {
+        self.hidden.get(layer).copied().unwrap_or(false)
+    }
+
+    /// The mask as it stands, every layer shown in its place: what a
+    /// redraw that must draw every layer sets aside and puts back.
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
 /// Video debugging interface for tile-based graphics systems.
 pub trait VideoDebugger {
     /// Get tile data by index.
@@ -362,6 +399,34 @@ pub trait VideoDebugger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_mask_shows_every_layer_until_one_is_hidden() {
+        let mut mask = LayerMask::<4>::default();
+        assert!((0..4).all(|layer| !mask.is_hidden(layer)));
+        mask.set_hidden(1, true);
+        assert!(mask.is_hidden(1));
+        assert!(!mask.is_hidden(0) && !mask.is_hidden(2) && !mask.is_hidden(3));
+        mask.set_hidden(1, false);
+        assert_eq!(mask, LayerMask::default());
+    }
+
+    #[test]
+    fn a_layer_past_the_mask_is_ignored_and_reads_shown() {
+        let mut mask = LayerMask::<2>::default();
+        mask.set_hidden(5, true);
+        assert_eq!(mask, LayerMask::default());
+        assert!(!mask.is_hidden(5));
+    }
+
+    #[test]
+    fn taking_the_mask_leaves_every_layer_shown() {
+        let mut mask = LayerMask::<3>::default();
+        mask.set_hidden(2, true);
+        let taken = mask.take();
+        assert!(taken.is_hidden(2));
+        assert_eq!(mask, LayerMask::default());
+    }
 
     /// A framebuffer 4 pixels wide and 3 rows high, each byte its own index.
     fn framebuffer() -> Vec<u8> {

@@ -112,7 +112,7 @@ impl Vdp {
         let height = self.drawn_height() as usize;
         let mut rgba = vec![0u8; width * height * 4];
         let kept = DrawState::keep(self);
-        let hidden = std::mem::replace(&mut self.debug_layer_disable, [false; LAYER_COUNT]);
+        let hidden = self.debug_layer_disable.take();
         let debug_pixel = self.debug_pixel.take();
         let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
             let start = usize::from(line) * width * 4;

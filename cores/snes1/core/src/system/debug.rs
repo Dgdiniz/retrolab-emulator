@@ -114,13 +114,13 @@ impl SnesEmulator {
         let rom_size = self.rom_size as u32;
         let sram_size = self.bus.cartridge_sram().map(<[u8]>::len).unwrap_or(0) as u32;
         let mapper_id = self.preset_kind.map(|kind| kind.mapper_id(&plan.name));
-        // Snapshot every coprocessor's state up front (owned), so the
-        // immutable cartridge borrow ends before we borrow the breakpoint
-        // list mutably below.
-        let chip_states = self
+        // Snapshot every coprocessor's state and label up front (owned), so
+        // the immutable cartridge borrow ends before we borrow the
+        // breakpoint list mutably below.
+        let (chip_states, chip_labels) = self
             .bus
             .cartridge()
-            .map(|c| c.coprocessors_debug_state())
+            .map(|c| (c.coprocessors_debug_state(), c.coprocessor_labels()))
             .unwrap_or_default();
         retro_core::cartridge::MapPlanDebugger::new(
             plan,
@@ -130,6 +130,7 @@ impl SnesEmulator {
             chip_states,
             self.debugger.breakpoints_mut(),
         )
+        .with_chip_labels(chip_labels)
     }
 
     /// Human-readable label of the primary (lowest-id) coprocessor (e.g.

@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Args;
 use retro_core::cartridge::ExpansionChipState;
+use retro_core::EmulatorCore;
 use snes1_core::{CoprocessorMode, SnesEmulator};
 
 /// Open a buffered writer for an optional output path, falling back to

@@ -1,8 +1,9 @@
-//! Injects a compile-time git short hash so the WASM build can report a
-//! `getBuildId()` identity string (`sg1@<version>+<githash>`). Two
-//! netplay peers compare this string in the session handshake and
-//! refuse to connect on a mismatch, since a different build can diverge
-//! deterministically. Falls back to `unknown` outside a git checkout.
+//! Injects a compile-time git short hash so every binding crate's WASM build
+//! can report a `getBuildId()` identity string (`<core>@<version>+<githash>`,
+//! made by `build_id`). Two netplay peers compare this string in the
+//! session handshake and refuse to connect on a mismatch, since a different
+//! build can diverge deterministically. Falls back to `unknown` outside a
+//! git checkout.
 
 use std::path::Path;
 use std::process::Command;

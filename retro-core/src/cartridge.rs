@@ -934,6 +934,19 @@ pub trait CartridgeDebugger {
             .unwrap_or_default()
     }
 
+    /// Every region of the cartridge's address space, in the order
+    /// addresses resolve through them ([`describe_map_plan`]); empty for a
+    /// debugger that holds no map plan.
+    fn map_regions(&self) -> Vec<MapRegionSummary> {
+        Vec::new()
+    }
+
+    /// Every expansion chip's label, keyed by `chip_id` (e.g. `[(0, "SVP")]`);
+    /// empty for a cartridge with no chip.
+    fn get_chip_labels(&self) -> Vec<(u8, String)> {
+        Vec::new()
+    }
+
     /// Set breakpoint on ROM address
     fn add_rom_breakpoint(&mut self, addr: u32) -> BreakpointId;
 

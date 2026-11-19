@@ -386,57 +386,6 @@ impl SnesEmulator {
         self.coprocessor_mode = mode;
     }
 
-    /// The chip the last [`EmulatorCore::load_rom`] refused because this
-    /// build has no module for it (`"SA-1"`, `"Super FX"`, `"Cx4"`), or
-    /// `None`. See [`crate::unsupported_chip`].
-    pub fn last_unsupported_chip(&self) -> Option<&'static str> {
-        self.last_unsupported_chip
-    }
-
-    /// Host display preference: when `false` (default) overscan frames
-    /// are cropped to the 224-line NTSC TV window (matching bsnes-plus /
-    /// snes9x default output); when `true` the full 240-line frame is
-    /// exposed. Applies immediately and survives reset / savestate
-    /// restore, it is a UI toggle, not emulated state.
-    pub fn set_show_overscan(&mut self, show: bool) {
-        self.show_overscan = show;
-        self.bus.ppu_mut().set_show_overscan(show);
-        self.sync_display_info();
-    }
-
-    /// Whether the full overscan frame is exposed (vs cropped to 224).
-    pub fn show_overscan_enabled(&self) -> bool {
-        self.show_overscan
-    }
-
-    /// Stage a cartridge manifest applied on the next
-    /// [`EmulatorCore::load_rom`], overriding heuristic detection. Pass
-    /// `None` to revert to pure auto-detection. The override does not
-    /// affect the *currently* installed cartridge, the host must
-    /// reload the ROM for it to take effect (mirroring the firmware /
-    /// mode staging contract).
-    pub fn set_cartridge_manifest_override(&mut self, manifest: Option<CartridgeManifest>) {
-        self.cartridge_manifest_override = manifest;
-    }
-
-    /// The manifest currently staged via
-    /// [`Self::set_cartridge_manifest_override`], or `None` when the
-    /// next `load_rom` will run pure auto-detection. Lets a host
-    /// distinguish "the user picked a mapping" from "detection is in
-    /// charge", e.g. to decide whether a low-confidence ROM should
-    /// fall back to its vector-implied mapping or surface the failure.
-    pub fn cartridge_manifest_override(&self) -> Option<&CartridgeManifest> {
-        self.cartridge_manifest_override.as_ref()
-    }
-
-    /// The `cartridge-manifest-v1` the builder's heuristics resolve for
-    /// `rom`, with no override applied. Lets the host show the detected
-    /// mapping before the user edits it. Pure, does not touch the
-    /// loaded cartridge or any staged override.
-    pub fn detected_manifest(&self, rom: &[u8]) -> CartridgeManifest {
-        detected_manifest(rom)
-    }
-
     /// Start (or stop) capturing the host<->coprocessor register stream
     /// (`(is_write, offset, byte)` per DR/SR access). Enabling clears any
     /// previously captured log. Off by default. It lets a real game's
@@ -527,23 +476,10 @@ impl SnesEmulator {
         self.timing
     }
 
-    /// The raw bytes of the currently loaded ROM (empty when none is), so
-    /// a host can detect the live game's manifest again.
-    pub fn last_rom(&self) -> &[u8] {
-        &self.last_rom
-    }
-
     /// Parsed SNES header for the currently loaded ROM, or `None`
     /// if no ROM has been loaded.
     pub fn header(&self) -> Option<&SnesHeader> {
         self.header.as_ref()
-    }
-
-    /// The SHA-256 of the ROM file the last successful
-    /// [`EmulatorCore::load_rom`] received, in lowercase hex, its copier
-    /// header included; `None` before one.
-    pub fn get_cartridge_hash(&self) -> Option<String> {
-        self.cartridge_hash.clone()
     }
 
     /// Detected/forced mapper kind for the currently loaded ROM.
@@ -1083,6 +1019,78 @@ impl EmulatorCore for SnesEmulator {
             mapper: self.preset_kind.map(preset_kind_name),
             title_confidence: "high".to_string(),
         })
+    }
+
+    type Manifest = CartridgeManifest;
+
+    fn parse_manifest(json: &str) -> Result<CartridgeManifest, String> {
+        crate::cartridge::parse_manifest(json).map_err(|e| e.to_string())
+    }
+
+    /// The `cartridge-manifest-v1` the builder's heuristics resolve for
+    /// `rom`, with no override applied. Lets the host show the detected
+    /// mapping before the user edits it. Pure, does not touch the
+    /// loaded cartridge or any staged override.
+    fn detected_manifest(&self, rom: &[u8]) -> CartridgeManifest {
+        detected_manifest(rom)
+    }
+
+    /// Lets a host distinguish "the user picked a mapping" from "detection
+    /// is in charge", e.g. to decide whether a low-confidence ROM should
+    /// fall back to its vector-implied mapping or surface the failure.
+    fn cartridge_manifest_override(&self) -> Option<&CartridgeManifest> {
+        self.cartridge_manifest_override.as_ref()
+    }
+
+    /// The override does not affect the *currently* installed cartridge:
+    /// the host must reload the ROM for it to take effect (mirroring the
+    /// firmware / mode staging contract).
+    fn set_cartridge_manifest_override(&mut self, manifest: Option<CartridgeManifest>) {
+        self.cartridge_manifest_override = manifest;
+    }
+
+    fn last_rom(&self) -> &[u8] {
+        &self.last_rom
+    }
+
+    /// Its copier header included.
+    fn get_cartridge_hash(&self) -> Option<String> {
+        self.cartridge_hash.clone()
+    }
+
+    fn cartridge_info(&self) -> Option<&retro_core::cartridge::CartridgeInfo> {
+        self.bus.cartridge().map(|cart| cart.info())
+    }
+
+    fn is_cartridge_sram_dirty(&self) -> bool {
+        self.bus
+            .cartridge()
+            .is_some_and(|cart| cart.is_sram_dirty())
+    }
+
+    fn clear_cartridge_sram_dirty(&mut self) {
+        if let Some(cart) = self.bus.cartridge_mut() {
+            cart.clear_sram_dirty();
+        }
+    }
+
+    /// `"SA-1"`, `"Super FX"` or `"Cx4"`; see [`crate::unsupported_chip`].
+    fn last_unsupported_chip(&self) -> Option<&'static str> {
+        self.last_unsupported_chip
+    }
+
+    /// When `false` (default) overscan frames are cropped to the 224-line
+    /// NTSC TV window (matching bsnes-plus / snes9x default output); when
+    /// `true` the full 240-line frame is exposed. Applies immediately and
+    /// survives reset / savestate restore.
+    fn set_show_overscan(&mut self, show: bool) {
+        self.show_overscan = show;
+        self.bus.ppu_mut().set_show_overscan(show);
+        self.sync_display_info();
+    }
+
+    fn show_overscan_enabled(&self) -> bool {
+        self.show_overscan
     }
 
     fn get_framebuffer(&self) -> &Framebuffer {

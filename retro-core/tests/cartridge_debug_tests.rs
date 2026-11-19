@@ -272,6 +272,34 @@ fn the_chips_states_are_the_primary_first() {
 }
 
 #[test]
+fn the_map_regions_are_the_plans_and_the_labels_those_given() {
+    let mut breakpoints = BreakpointList::new();
+    let debugger = MapPlanDebugger::new(
+        plan(),
+        0,
+        0,
+        None,
+        vec![(0, chip_state())],
+        &mut breakpoints,
+    )
+    .with_chip_labels(vec![(0, "SVP".to_string())]);
+    assert_eq!(debugger.map_regions(), describe_map_plan(&plan()));
+    assert_eq!(debugger.get_chip_labels(), vec![(0, "SVP".to_string())]);
+
+    let mut breakpoints = BreakpointList::new();
+    let empty = MapPlanDebugger::new(
+        MapPlan::<Linear>::default(),
+        0,
+        0,
+        None,
+        Vec::new(),
+        &mut breakpoints,
+    );
+    assert!(empty.map_regions().is_empty());
+    assert!(empty.get_chip_labels().is_empty());
+}
+
+#[test]
 fn breakpoints_land_in_the_emulators_list() {
     let mut breakpoints = BreakpointList::new();
     {
