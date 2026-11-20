@@ -31,9 +31,10 @@ pub struct FingerprintArgs<B: clap::Args> {
     /// Region length in bytes (hex); by default the whole work RAM.
     #[arg(long, value_parser = parse_hex_u32)]
     pub len: Option<u32>,
-    /// Number of frames to run and fingerprint.
-    #[arg(long, default_value_t = 2400)]
-    pub frames: u64,
+    /// Number of frames to run and fingerprint, e.g. `2400` (40 s at 60
+    /// fps).
+    #[arg(long)]
+    pub frames: Option<u64>,
     #[command(flatten)]
     pub input: InputArgs,
     /// Write the listing to a file instead of stdout.
@@ -42,6 +43,9 @@ pub struct FingerprintArgs<B: clap::Args> {
 }
 
 pub fn run<C: Console>(args: FingerprintArgs<C::BootArgs>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
     let (work_ram, work_ram_size) = C::WORK_RAM;
     let addr = args.addr.unwrap_or(work_ram);
     let len = args.len.unwrap_or(work_ram_size);
@@ -59,7 +63,7 @@ pub fn run<C: Console>(args: FingerprintArgs<C::BootArgs>) -> Result<()> {
         addr.wrapping_add(len),
         len
     )?;
-    for frame in 0..args.frames {
+    for frame in 0..frames {
         input.before_frame(&mut emu, frame);
         emu.run_frame();
         let crc = crc32(&emu.read_memory_debug(addr, len));

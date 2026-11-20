@@ -30,15 +30,16 @@ use retro_core::EmulatorCore;
 
 use crate::console::Console;
 use crate::input::InputArgs;
-use crate::rom::{load_image, read_rom, RomArgs};
+use crate::rom::{load_image, read_manifest, read_rom, ManifestFile, RomArgs};
 
 #[derive(clap::Args, Debug)]
 pub struct DeterminismCheckArgs<B: clap::Args> {
     #[command(flatten)]
     pub rom: RomArgs<B>,
-    /// Number of frames to replay and compare.
-    #[arg(long, default_value_t = 3600)]
-    pub frames: u64,
+    /// Number of frames to replay and compare, e.g. `3600` (1 minute at 60
+    /// fps).
+    #[arg(long)]
+    pub frames: Option<u64>,
     #[command(flatten)]
     pub input: InputArgs,
     /// Force the video region (`ntsc` | `pal`) before running; default keeps
@@ -61,9 +62,15 @@ fn is_resync_frame(frame: u64, interval: u64) -> bool {
     interval != 0 && (frame + 1).is_multiple_of(interval)
 }
 
-/// A machine booted on `rom`, its region forced when one is given.
-fn start<C: Console>(rom: &[u8], boot: &C::BootArgs, region: Option<&str>) -> Result<C::Emulator> {
-    let mut emu = load_image::<C>(rom, boot)?;
+/// A machine booted on `rom` (with `manifest`, when one is given), its
+/// region forced when one is given.
+fn start<C: Console>(
+    rom: &[u8],
+    boot: &C::BootArgs,
+    manifest: Option<&ManifestFile>,
+    region: Option<&str>,
+) -> Result<C::Emulator> {
+    let mut emu = load_image::<C>(rom, boot, manifest)?;
     if let Some(region) = region {
         emu.set_region_str(region)
             .map_err(|e| anyhow::anyhow!("invalid --region: {e}"))?;
@@ -72,17 +79,22 @@ fn start<C: Console>(rom: &[u8], boot: &C::BootArgs, region: Option<&str>) -> Re
 }
 
 pub fn run<C: Console>(args: DeterminismCheckArgs<C::BootArgs>) -> Result<()> {
-    if args.frames == 0 {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    if frames == 0 {
         anyhow::bail!("--frames must be > 0");
     }
     let input = args.input.plan::<C::Emulator>()?;
     let path = &args.rom.path;
     let rom = read_rom(path)?;
+    let manifest = read_manifest(args.rom.manifest.as_deref())?;
+    let manifest = manifest.as_ref();
     let boot = &args.rom.boot;
     let region = args.region.as_deref();
 
-    let mut a = start::<C>(&rom, boot, region)?;
-    let mut b = start::<C>(&rom, boot, region)?;
+    let mut a = start::<C>(&rom, boot, manifest, region)?;
+    let mut b = start::<C>(&rom, boot, manifest, region)?;
 
     let mode = if args.rollback_interval > 0 {
         format!("rollback (resync every {} frames)", args.rollback_interval)
@@ -96,7 +108,7 @@ pub fn run<C: Console>(args: DeterminismCheckArgs<C::BootArgs>) -> Result<()> {
         a.region_str(),
     );
 
-    for frame in 0..args.frames {
+    for frame in 0..frames {
         input.before_frame(&mut a, frame);
         input.before_frame(&mut b, frame);
         a.run_frame_headless();
@@ -112,7 +124,7 @@ pub fn run<C: Console>(args: DeterminismCheckArgs<C::BootArgs>) -> Result<()> {
             let state = a.save_state();
             // The shadow is booted as the reference was, the region forced
             // again, before the state loads over it.
-            b = start::<C>(&rom, boot, region)?;
+            b = start::<C>(&rom, boot, manifest, region)?;
             b.load_state(&state, RomCheck::SameRom)
                 .map_err(|e| anyhow::anyhow!("failed to load savestate: {e}"))?;
             // A rebuilt shadow that does not land on the reference's state
@@ -128,17 +140,13 @@ pub fn run<C: Console>(args: DeterminismCheckArgs<C::BootArgs>) -> Result<()> {
         }
 
         if args.progress != 0 && (frame + 1).is_multiple_of(args.progress) {
-            println!(
-                "  frame {:>7}/{:<7} ok  hash={ha:016x}",
-                frame + 1,
-                args.frames
-            );
+            println!("  frame {:>7}/{:<7} ok  hash={ha:016x}", frame + 1, frames);
         }
     }
 
     println!(
         "determinism check PASSED: {} frames bit-identical (final hash {:016x})",
-        args.frames,
+        frames,
         a.state_hash()
     );
     Ok(())

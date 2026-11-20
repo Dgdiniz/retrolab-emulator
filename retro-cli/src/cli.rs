@@ -14,9 +14,11 @@ use crate::cmd::compare_trace::CompareTraceArgs;
 use crate::cmd::determinism_check::DeterminismCheckArgs;
 use crate::cmd::disasm::DisasmArgs;
 use crate::cmd::fingerprint::FingerprintArgs;
+use crate::cmd::golden::{GoldenArgs, GoldenCompareArgs, GoldenSetArgs};
 use crate::cmd::info::InfoArgs;
+use crate::cmd::manifest::ManifestArgs;
 use crate::cmd::memory::MemoryArgs;
-use crate::cmd::profile::{ProfileArgs, WARMUP_FRAMES};
+use crate::cmd::profile::ProfileArgs;
 use crate::cmd::run::RunArgs;
 use crate::cmd::savestate::SavestateArgs;
 use crate::cmd::screenshot::ScreenshotArgs;
@@ -87,6 +89,16 @@ pub enum SharedCommand<B: clap::Args, S: clap::Args> {
     Savestate(SavestateArgs<B>),
     /// Dump or seed a game's battery-backed SRAM.
     Sram(SramArgs<B>),
+    /// Record a ROM's output frame by frame (state, picture and audio
+    /// hashes, PNGs at chosen frames) into a folder.
+    Golden(GoldenArgs<B>),
+    /// Record every ROM of a manifest into a folder.
+    GoldenSet(GoldenSetArgs),
+    /// Compare two golden folders: first differing frame and pixel diffs.
+    GoldenCompare(GoldenCompareArgs),
+    /// Write the cartridge manifest the core detects for a ROM, or check
+    /// one.
+    Manifest(ManifestArgs<B>),
 }
 
 /// The tool's clap command: the tool's name, about line and version, the
@@ -345,34 +357,40 @@ pub fn command<C: Console>() -> clap::Command {
         .mut_subcommand("benchmark", |s| {
             s.mut_arg("mode", |a| a.value_parser(benchmark_modes(main.label)))
         })
-        .mut_subcommand("profile", |s| {
-            s.mut_arg("frames", |a| {
-                a.help(format!(
-                    "Number of frames to profile, after {WARMUP_FRAMES} frames of warm-up, e.g. \
-                     `300` (5 s at 60 fps)"
-                ))
+        .mut_subcommand("manifest", |s| {
+            s.mut_subcommand("validate", |s| {
+                s.mut_arg("rom", |a| {
+                    a.help(format!(
+                        "Load this ROM ({}) with the manifest, the core's builder run on it, \
+                         chips included, and hold the manifest's `rom.sha256` to the ROM image",
+                        C::ROM_FILES
+                    ))
+                })
             })
         });
 
-    // The shared commands' ROM names the console's files, their input flags
-    // name its buttons, and their start-up flags come after their own
-    // options, in their own subcommands too; the tool's own commands keep
-    // their texts and their order.
+    // Every command's ROM names the console's files, its input flags name
+    // the console's buttons, and its start-up flags and `--manifest` come
+    // after its own options, in its own subcommands too: the shared
+    // commands' and the tool's own alike.
     let input_help = InputHelp {
         buttons: button_names(<C::Emulator as GoldenConsole>::BUTTONS),
         buttons_note: C::BUTTONS_NOTE,
         press_example: C::PRESS_EXAMPLE,
         reset_example: C::RESET_EXAMPLE,
     };
-    let boot: Vec<String> = <C::BootArgs as clap::Args>::augment_args(clap::Command::new("boot"))
-        .get_arguments()
-        .map(|arg| arg.get_id().to_string())
+    let boot: Vec<String> = std::iter::once("manifest".to_string())
+        .chain(
+            <C::BootArgs as clap::Args>::augment_args(clap::Command::new("boot"))
+                .get_arguments()
+                .map(|arg| arg.get_id().to_string()),
+        )
         .collect();
-    let shared =
-        <SharedCommand<C::BootArgs, C::ScreenshotArgs> as clap::Subcommand>::augment_subcommands(
-            clap::Command::new("shared"),
-        );
-    for name in shared.get_subcommands().map(|s| s.get_name().to_string()) {
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in names {
         cmd = cmd.mut_subcommand(&name, |s| shared_edits(s, &rom_help, &input_help, &boot));
     }
     cmd = cmd
@@ -446,9 +464,9 @@ fn benchmark_modes(main: &str) -> impl TypedValueParser<Value = Mode> {
     PossibleValuesParser::new(values).map(|name| Mode::from_str(&name, false).unwrap_or(Mode::All))
 }
 
-/// The edits every shared command gets, and each of its own subcommands:
-/// the help of its ROM and of its input flags, and its start-up flags after
-/// its own options.
+/// The edits every command gets, and each of its own subcommands: the help
+/// of its ROM and of its input flags, and its start-up flags (and
+/// `--manifest`) after its own options.
 fn shared_edits(
     mut s: clap::Command,
     rom_help: &str,
@@ -465,7 +483,10 @@ fn shared_edits(
         s = with_input_help(s, input, &note);
     }
     for (i, id) in boot.iter().enumerate() {
-        if has_arg(&s, id) {
+        let is_flag = s
+            .get_arguments()
+            .any(|arg| arg.get_id() == id.as_str() && !arg.is_positional());
+        if is_flag {
             s = s.mut_arg(id, |a| a.display_order(BOOT_DISPLAY_ORDER + i));
         }
     }
@@ -504,7 +525,7 @@ fn has_arg(cmd: &clap::Command, id: &str) -> bool {
 /// about the runs it makes a step at a time: they have no frame boundary
 /// to apply the input at. Empty for a command that only runs frames.
 fn input_note(cmd: &clap::Command) -> String {
-    if has_arg(cmd, "warmup_frames") {
+    if has_arg(cmd, "warmup_frames") && has_arg(cmd, "max_steps") {
         return ". Applied to the `--warmup-frames` only: the single-stepped window has no frame \
                 boundary to apply it at"
             .to_string();
@@ -687,5 +708,9 @@ fn run_shared<C: Console>(command: SharedCommand<C::BootArgs, C::ScreenshotArgs>
         SharedCommand::AudioDump(args) => crate::cmd::audio_dump::run::<C>(args),
         SharedCommand::Savestate(args) => crate::cmd::savestate::run::<C>(args),
         SharedCommand::Sram(args) => crate::cmd::sram::run::<C>(args),
+        SharedCommand::Golden(args) => crate::cmd::golden::run::<C>(args),
+        SharedCommand::GoldenSet(args) => crate::cmd::golden::run_set::<C>(args),
+        SharedCommand::GoldenCompare(args) => crate::cmd::golden::run_compare::<C>(args),
+        SharedCommand::Manifest(args) => crate::cmd::manifest::run::<C>(args),
     }
 }

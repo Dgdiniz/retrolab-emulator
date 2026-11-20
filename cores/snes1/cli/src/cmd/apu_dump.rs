@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use retro_cli::rom::{load, RomArgs};
 use retro_core::audio::{ChannelState, EnvelopePhase};
 use retro_core::EmulatorCore;
-use snes1_core::SnesEmulator;
+
+use crate::console::{Snes, SnesBoot};
 
 // S-DSP global register indices (the per-voice block uses the low
 // nibble `0x_0..0x_9` of each high-nibble group; these are the chip-wide
@@ -33,12 +35,12 @@ const DSP_PMON: usize = 0x2D;
 const DSP_DIR: usize = 0x5D;
 
 #[derive(Args, Debug)]
-pub struct ApuDumpArgs {
-    /// Path to the ROM file (`.sfc` / `.smc`).
-    pub rom: PathBuf,
-    /// Run this many frames before dumping.
-    #[arg(long, default_value_t = 300)]
-    pub frames: u64,
+pub struct ApuDumpArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Run this many frames before dumping, e.g. `300` (5 s at 60 fps).
+    #[arg(long)]
+    pub frames: Option<u64>,
     /// Dump raw ARAM (64 KiB) to this file.
     #[arg(long)]
     pub aram: Option<PathBuf>,
@@ -50,13 +52,13 @@ pub struct ApuDumpArgs {
     pub output: Option<PathBuf>,
 }
 
-pub fn run(args: ApuDumpArgs) -> Result<()> {
-    let rom = super::read_rom(&args.rom)?;
-    let mut emu = SnesEmulator::new();
-    emu.load_rom(&rom)
-        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
+pub fn run(args: ApuDumpArgs<SnesBoot>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    let (_, mut emu) = load::<Snes>(&args.rom)?;
 
-    for _ in 0..args.frames {
+    for _ in 0..frames {
         emu.run_frame();
     }
 
@@ -78,7 +80,7 @@ pub fn run(args: ApuDumpArgs) -> Result<()> {
     }
 
     let mut out = super::open_output(args.output.as_ref())?;
-    writeln!(out, "APU state after {} frame(s):", args.frames)?;
+    writeln!(out, "APU state after {frames} frame(s):")?;
     writeln!(
         out,
         "  {:<6} {:<7} {:<7} {:>10} {:>6} {:>7} {:<8} {:>6}",

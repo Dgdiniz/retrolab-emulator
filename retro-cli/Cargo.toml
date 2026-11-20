@@ -13,6 +13,8 @@ retro-core = { path = "../retro-core", features = ["singlestep"] }
 # `string`: the help texts and defaults a console's facts make at run time.
 clap = { version = "4", features = ["derive", "string"] }
 anyhow = "1.0"
+# `manifest`: the JSON of a cartridge manifest, written and read.
+serde_json = { workspace = true }
 indicatif = "0.17"
 # PNG only: the screenshots and the layers a command writes.
 image = { version = "0.25", default-features = false, features = ["png"] }

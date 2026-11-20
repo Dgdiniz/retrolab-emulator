@@ -13,6 +13,7 @@ use retro_cli::report::human_bytes;
 use retro_cli::{CliCpu, Console, ProfileLine};
 use retro_core::debug::ByteOrder;
 use retro_core::{CpuArchitecture, EmulatorCore};
+use snes1_core::golden::FORCE_DETECT;
 use snes1_core::{CoprocessorMode, PresetKind, SnesEmulator, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU};
 
 use crate::trace_ref;
@@ -143,6 +144,7 @@ impl Console for Snes {
         "golden",
         "golden-set",
         "golden-compare",
+        "manifest",
     ];
     const WORK_RAM: (u32, u32) = (0x7E_0000, 0x2_0000);
     const CHIP_ACTIVITY: &'static str = "S-DD1 `DECOMPS > 0`";
@@ -200,11 +202,25 @@ impl Console for Snes {
     const RESET_EXAMPLE: &'static str = "the SPC7110 A/B self-test (press A -> reset -> press B \
         -> reset -> the game boots)";
 
-    /// The DSP-1's emulation and firmware, then the forced mapping.
-    fn stage(emu: &mut SnesEmulator, rom: &[u8], boot: &SnesBoot) -> Result<()> {
+    /// The DSP-1's emulation and firmware, then the forced mapping, which a
+    /// manifest the command stages would replace.
+    fn stage(emu: &mut SnesEmulator, rom: &[u8], boot: &SnesBoot, manifest: bool) -> Result<()> {
+        if boot.force_detect && manifest {
+            anyhow::bail!(
+                "--force-detect and a cartridge manifest both choose the mapping; give one"
+            );
+        }
         boot.coprocessor.apply(emu)?;
         apply_force_detect(emu, rom, boot.force_detect);
         Ok(())
+    }
+
+    /// `--force-detect` is the golden manifests' `force-detect`.
+    fn golden_flags(boot: &SnesBoot) -> Vec<&'static str> {
+        match boot.force_detect {
+            true => vec![FORCE_DETECT],
+            false => Vec::new(),
+        }
     }
 
     /// The file and its size, then the header: its title and how sure the
@@ -619,6 +635,20 @@ mod tests {
         assert_eq!(number(&parsed, "A"), Some(0x12));
         assert_eq!(number(&parsed, "P"), Some(1));
         assert_eq!(number(&parsed, "R1"), Some(0xab));
+    }
+
+    #[test]
+    fn a_forced_mapping_is_refused_beside_a_manifest() {
+        let boot = SnesBoot {
+            force_detect: true,
+            ..SnesBoot::default()
+        };
+        let mut emu = SnesEmulator::new();
+        let err = Snes::stage(&mut emu, &[], &boot, true).unwrap_err();
+        assert!(err.to_string().contains("both choose the mapping"), "{err}");
+        assert!(Snes::stage(&mut emu, &[], &boot, false).is_ok());
+        assert_eq!(Snes::golden_flags(&boot), vec![FORCE_DETECT]);
+        assert!(Snes::golden_flags(&SnesBoot::default()).is_empty());
     }
 
     #[test]

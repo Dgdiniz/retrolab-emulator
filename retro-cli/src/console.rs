@@ -102,13 +102,26 @@ pub trait Console: Sized + 'static {
     const RESET_EXAMPLE: &'static str;
 
     /// Set the boot flags on a new machine, before its ROM loads.
-    fn stage(emu: &mut Self::Emulator, rom: &[u8], boot: &Self::BootArgs) -> Result<()>;
+    /// `manifest` says whether the command stages a cartridge manifest too
+    /// (`--manifest`, or the one `manifest validate` checks), which a flag
+    /// that chooses the mapping itself cannot go with.
+    fn stage(
+        emu: &mut Self::Emulator,
+        rom: &[u8],
+        boot: &Self::BootArgs,
+        manifest: bool,
+    ) -> Result<()>;
 
     /// Set what the boot flags change once the ROM loaded.
     fn after_load(emu: &mut Self::Emulator, boot: &Self::BootArgs) -> Result<()> {
         let _ = (emu, boot);
         Ok(())
     }
+
+    /// The flags of the console's golden manifests ([`GoldenConsole::FLAGS`])
+    /// the boot flags amount to, which `golden` writes in its record's
+    /// header.
+    fn golden_flags(boot: &Self::BootArgs) -> Vec<&'static str>;
 
     /// What `info` prints about the ROM file at `path` and its header,
     /// before the chips and the memory map.

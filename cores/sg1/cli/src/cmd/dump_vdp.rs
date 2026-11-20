@@ -7,27 +7,24 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Args;
+use retro_cli::rom::{load, RomArgs};
+use retro_cli::InputArgs;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
 use sg1_core::vdp::window::WindowArea;
 use sg1_core::vdp::TRANSPARENT_RGB;
 use sg1_core::GenesisEmulator;
 
+use crate::console::{Genesis, GenesisBoot};
+
 #[derive(Args, Debug)]
-pub struct DumpVdpArgs {
-    /// Path to the ROM file (`.bin` / `.md` / `.gen`).
-    pub rom: PathBuf,
-    /// Number of frames to run before dumping.
-    #[arg(short, long, default_value_t = 1)]
-    pub frames: u64,
-    /// Frame-scheduled player-1 input, same format as `screenshot`:
-    /// `"F:buttons;F:buttons"` (e.g. `"180:start;186:;240:a+c"`). Each
-    /// set-point holds its mask from frame `F` until the next; an empty
-    /// list releases.
-    #[arg(long)]
-    pub press_at: Option<String>,
-    /// Connect 6-button pads so `x`/`y`/`z`/`mode` reach the game.
-    #[arg(long)]
-    pub six_button: bool,
+pub struct DumpVdpArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Number of frames to run before dumping, e.g. `1`.
+    #[arg(short, long)]
+    pub frames: Option<u64>,
+    #[command(flatten)]
+    pub input: InputArgs,
     /// Also save a screenshot alongside the dump.
     #[arg(long)]
     pub screenshot: Option<PathBuf>,
@@ -54,19 +51,18 @@ pub struct DumpVdpArgs {
     pub tilemap_png: Option<PathBuf>,
 }
 
-pub fn run(args: DumpVdpArgs) -> Result<()> {
-    let (_, mut emu) = super::load_rom(&args.rom)?;
+pub fn run(args: DumpVdpArgs<GenesisBoot>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    let input = args.input.plan::<GenesisEmulator>()?;
+    let (_, mut emu) = load::<Genesis>(&args.rom)?;
     super::print_rom_title(&emu);
 
-    if args.six_button {
-        super::connect_controllers(&mut emu, true);
-    }
-    let schedule = super::parse_press_schedule(args.press_at.as_deref())?;
-
     emu.debugger().set_execution_mode(ExecutionMode::Running);
-    println!("Running {} frames...", args.frames);
-    for frame in 0..args.frames {
-        super::apply_press(&mut emu, schedule.as_ref(), frame);
+    println!("Running {frames} frames...");
+    for frame in 0..frames {
+        input.before_frame(&mut emu, frame);
         emu.run_frame();
     }
 

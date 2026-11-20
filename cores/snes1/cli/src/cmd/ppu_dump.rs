@@ -13,16 +13,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use retro_core::{EmulatorCore, InputState};
+use retro_cli::parse::parse_hex_u32;
+use retro_cli::rom::{load, RomArgs};
+use retro_cli::InputArgs;
+use retro_core::EmulatorCore;
 use snes1_core::{IoAccess, SnesEmulator};
 
+use crate::console::{Snes, SnesBoot};
+
 #[derive(Args, Debug)]
-pub struct PpuDumpArgs {
-    /// Path to the ROM file (`.sfc` / `.smc`).
-    pub rom: PathBuf,
-    /// Run this many frames before dumping.
-    #[arg(long, default_value_t = 300)]
-    pub frames: u64,
+pub struct PpuDumpArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Run this many frames before dumping, e.g. `300` (5 s at 60 fps).
+    #[arg(long)]
+    pub frames: Option<u64>,
     /// Dump raw VRAM (64 KiB, little-endian words) to this file.
     #[arg(long)]
     pub vram: Option<PathBuf>,
@@ -85,23 +90,22 @@ pub struct PpuDumpArgs {
     /// when VRAM/CGRAM/OAM already match a reference.
     #[arg(long)]
     pub compositing: bool,
-    /// Frame-scheduled player-1 input: `"F:buttons;F:buttons"` (e.g.
-    /// `"250:start;262:"`). Reaches an input-gated test screen before the
-    /// dump. Same grammar as `trace`/`screenshot --press-at`.
-    #[arg(long)]
-    pub press_at: Option<String>,
-    /// Load low-confidence ROMs (blank title / bad checksum) by forcing
-    /// the vector-implied mapping instead of failing the detector gate.
-    #[arg(long)]
-    pub force_detect: bool,
+    #[command(flatten)]
+    pub input: InputArgs,
 }
 
-pub fn run(args: PpuDumpArgs) -> Result<()> {
-    let rom = super::read_rom(&args.rom)?;
-    let mut emu = SnesEmulator::new();
-    super::apply_force_detect(&mut emu, &rom, args.force_detect);
-    emu.load_rom(&rom)
-        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
+pub fn run(args: PpuDumpArgs<SnesBoot>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    let input = args.input.plan::<SnesEmulator>()?;
+    let watch_addr = args
+        .watch_addr
+        .as_deref()
+        .map(parse_hex_u32)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let (_, mut emu) = load::<Snes>(&args.rom)?;
 
     if args.io_trace {
         emu.enable_io_trace(args.io_trace_cap);
@@ -109,18 +113,12 @@ pub fn run(args: PpuDumpArgs) -> Result<()> {
     if args.pc_trace {
         emu.enable_pc_trace(args.pc_trace_cap);
     }
-    let watch_addr = args.watch_addr.as_deref().map(parse_hex_u32).transpose()?;
     if let Some(addr) = watch_addr {
         emu.enable_addr_watch(addr, args.watch_addr_cap);
     }
 
-    let schedule = super::parse_press_schedule(args.press_at.as_deref())?;
-    for i in 0..args.frames {
-        if let Some(sched) = &schedule {
-            if let Some(buttons) = sched.mask_at(i) {
-                emu.set_input(0, InputState { buttons });
-            }
-        }
+    for frame in 0..frames {
+        input.before_frame(&mut emu, frame);
         emu.run_frame();
     }
 
@@ -174,7 +172,7 @@ pub fn run(args: PpuDumpArgs) -> Result<()> {
     };
 
     let mut out = super::open_output(args.output.as_ref())?;
-    writeln!(out, "PPU state after {} frame(s):", args.frames)?;
+    writeln!(out, "PPU state after {frames} frame(s):")?;
     writeln!(out, "  BG mode:           {bgmode}")?;
     writeln!(out, "  Forced blank:      {blank}")?;
     writeln!(out, "  Master brightness: {brightness}/15")?;
@@ -230,16 +228,6 @@ pub fn run(args: PpuDumpArgs) -> Result<()> {
     }
     out.flush()?;
     Ok(())
-}
-
-/// Parse a hex address string (`7E0158`, `0x7E0158`, `$7E0158`).
-fn parse_hex_u32(s: &str) -> Result<u32> {
-    let t = s
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X")
-        .trim_start_matches('$');
-    u32::from_str_radix(t, 16).with_context(|| format!("invalid hex address: {s}"))
 }
 
 /// Print the captured address-watch tail: every read/write to the

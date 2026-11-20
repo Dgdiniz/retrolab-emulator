@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
+use retro_cli::parse::parse_hex_u8;
 use retro_cli::singlestep::{run_suite, Runs, Suite};
 
 /// Default dataset roots, relative to the repository's root (the cargo
@@ -79,12 +80,6 @@ pub struct SinglestepSpc700Args {
     pub diagnose: bool,
 }
 
-/// Parse `a9` / `0xA9` / `$A9` into a byte.
-fn parse_hex_u8(s: &str) -> Result<u8, String> {
-    let cleaned = s.trim().trim_start_matches("0x").trim_start_matches('$');
-    u8::from_str_radix(cleaned, 16).map_err(|e| format!("invalid hex opcode '{s}': {e}"))
-}
-
 const SUITE_65816: Suite = Suite {
     command: "singlestep-65816",
     name: "65816",
@@ -132,30 +127,4 @@ pub fn run_spc700(args: SinglestepSpc700Args) -> Result<()> {
         _ => Runs::Sweep,
     };
     run_suite::<UnderTest>(&SUITE_SPC700, &args.base, runs, args.cases, args.diagnose)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_bare_hex() {
-        assert_eq!(parse_hex_u8("a9").unwrap(), 0xA9);
-        assert_eq!(parse_hex_u8("00").unwrap(), 0x00);
-        assert_eq!(parse_hex_u8("ff").unwrap(), 0xFF);
-    }
-
-    #[test]
-    fn parses_prefixed_hex() {
-        assert_eq!(parse_hex_u8("0xE8").unwrap(), 0xE8);
-        assert_eq!(parse_hex_u8("$1b").unwrap(), 0x1B);
-        assert_eq!(parse_hex_u8("  3C ").unwrap(), 0x3C);
-    }
-
-    #[test]
-    fn rejects_garbage_and_overflow() {
-        assert!(parse_hex_u8("zz").is_err());
-        assert!(parse_hex_u8("100").is_err()); // > u8::MAX
-        assert!(parse_hex_u8("").is_err());
-    }
 }

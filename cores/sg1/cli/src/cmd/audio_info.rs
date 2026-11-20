@@ -2,40 +2,51 @@
 //! after running a ROM. A `--interval`/`--total-frames` monitoring mode
 //! prints the state periodically so you can watch a tune evolve.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::Args;
+use retro_cli::rom::{load, RomArgs};
 use retro_core::frame::run_frame_on;
 use retro_core::{EmulatorCore, ExecutionTier};
 use sg1_core::GenesisEmulator;
 
+use crate::console::{Genesis, GenesisBoot};
+
 #[derive(Args, Debug)]
-pub struct AudioInfoArgs {
-    /// Path to the ROM file (`.bin` / `.md` / `.gen`).
-    pub rom: PathBuf,
-    /// Number of frames to run before reporting (default: 60).
-    #[arg(short, long, default_value_t = 60)]
-    pub frames: u64,
+pub struct AudioInfoArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Number of frames to run before reporting, e.g. `60`; with
+    /// `--interval`, `--total-frames` is the run's length instead.
+    #[arg(short, long)]
+    pub frames: Option<u64>,
     /// Print state every N frames (live monitoring).
     #[arg(long)]
     pub interval: Option<u64>,
-    /// Total frames to run in monitoring mode.
+    /// Total frames to run in monitoring mode, e.g. `600`.
     #[arg(long)]
     pub total_frames: Option<u64>,
 }
 
-pub fn run(args: AudioInfoArgs) -> Result<()> {
-    let (_, mut emu) = super::load_rom(&args.rom)?;
+pub fn run(args: AudioInfoArgs<GenesisBoot>) -> Result<()> {
+    // The run's length is the monitoring mode's total, or the frames.
+    let length = match args.interval {
+        Some(_) => args
+            .total_frames
+            .ok_or_else(|| anyhow::anyhow!("specify --total-frames"))?,
+        None => args
+            .frames
+            .ok_or_else(|| anyhow::anyhow!("specify --frames"))?,
+    };
+    let (_, mut emu) = load::<Genesis>(&args.rom)?;
 
     println!("=== SG1 Audio Info ===");
-    println!("ROM: {}", args.rom.display());
+    println!("ROM: {}", args.rom.path.display());
     super::print_rom_title(&emu);
 
     emu.set_audio_enabled(true);
 
     if let Some(interval_frames) = args.interval {
-        let total = args.total_frames.unwrap_or(600);
+        let total = length;
         println!("Monitoring mode: printing state every {interval_frames} frames (total: {total})");
         println!();
         for frame in 0..total {
@@ -48,8 +59,8 @@ pub fn run(args: AudioInfoArgs) -> Result<()> {
             }
         }
     } else {
-        println!("Running {} frames...", args.frames);
-        for _ in 0..args.frames {
+        println!("Running {length} frames...");
+        for _ in 0..length {
             run_frame_on(&mut emu, ExecutionTier::Play);
             emu.host_audio_mut().clear();
         }

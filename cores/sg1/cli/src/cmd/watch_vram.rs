@@ -6,40 +6,48 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args;
+use retro_cli::parse::parse_hex_range;
+use retro_cli::rom::{load, RomArgs};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
 
+use crate::console::{Genesis, GenesisBoot};
+
 #[derive(Args, Debug)]
-pub struct WatchVramArgs {
-    /// Path to the ROM file (`.bin` / `.md` / `.gen`).
-    pub rom: PathBuf,
-    /// VRAM address range to watch, e.g. `C000-CFFF` (hex).
+pub struct WatchVramArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// VRAM address range to watch, `START-END` inclusive or a single
+    /// address (16-bit hex, e.g. `C000-CFFF`).
     #[arg(short, long)]
     pub range: String,
-    /// Number of frames to run.
-    #[arg(short, long, default_value_t = 60)]
-    pub frames: u64,
+    /// Number of frames to run, e.g. `60`.
+    #[arg(short, long)]
+    pub frames: Option<u64>,
     /// Render a PNG after running.
     #[arg(long)]
     pub screenshot: Option<PathBuf>,
 }
 
-pub fn run(args: WatchVramArgs) -> Result<()> {
+pub fn run(args: WatchVramArgs<GenesisBoot>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
     let (start, end) = parse_range(&args.range)?;
 
-    let (_, mut emu) = super::load_rom(&args.rom)?;
+    let (_, mut emu) = load::<Genesis>(&args.rom)?;
     super::print_rom_title(&emu);
 
     emu.vdp_mut().set_watch_vram(start, end);
     println!("Watching VRAM writes in range 0x{start:04X}-0x{end:04X}");
 
     emu.debugger().set_execution_mode(ExecutionMode::Running);
-    println!("Running {} frames...", args.frames);
-    for _ in 0..args.frames {
+    println!("Running {frames} frames...");
+    for _ in 0..frames {
         emu.run_frame();
     }
-    println!("Done! Executed {} frames", args.frames);
+    println!("Done! Executed {frames} frames");
 
     if let Some(ref path) = args.screenshot {
         super::save_screenshot(&emu, path)?;
@@ -47,16 +55,10 @@ pub fn run(args: WatchVramArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `START-END` hex range (each side may carry a `0x`/`0X` prefix).
+/// The `--range` of VRAM addresses ([`parse_hex_range`], 16 bits wide).
 fn parse_range(range: &str) -> Result<(u16, u16)> {
-    let (start_s, end_s) = range
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("range must be START-END, e.g. C000-CFFF"))?;
-    let parse = |s: &str| -> Result<u16> {
-        let cleaned = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-        u16::from_str_radix(cleaned, 16).with_context(|| format!("invalid address: {s}"))
-    };
-    Ok((parse(start_s)?, parse(end_s)?))
+    let (start, end) = parse_hex_range(range, 16).map_err(|e| anyhow::anyhow!("--range: {e}"))?;
+    Ok((start as u16, end as u16))
 }
 
 #[cfg(test)]
@@ -71,7 +73,8 @@ mod tests {
 
     #[test]
     fn rejects_malformed_ranges() {
-        assert!(parse_range("C000").is_err());
+        assert_eq!(parse_range("C000").unwrap(), (0xC000, 0xC000));
         assert!(parse_range("ZZZZ-0000").is_err());
+        assert!(parse_range("0000-10000").is_err());
     }
 }

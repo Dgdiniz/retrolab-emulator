@@ -804,6 +804,7 @@ dependencies = [
  "image",
  "indicatif",
  "retro-core",
+ "serde_json",
 ]
 
 [[package]]

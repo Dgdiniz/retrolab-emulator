@@ -24,6 +24,11 @@ pub struct TraceToTextArgs {
     /// The ROM the trace was made from, for lines that disassemble its memory.
     #[arg(short, long)]
     pub rom: Option<PathBuf>,
+    /// Load the ROM with this cartridge manifest (`cartridge-manifest-v1`
+    /// JSON, such as `manifest detect` writes) in place of the core's
+    /// detection of its mapping and chips.
+    #[arg(long, value_name = "FILE", requires = "rom")]
+    pub manifest: Option<PathBuf>,
 }
 
 pub fn run<C: Console>(args: TraceToTextArgs) -> Result<()> {
@@ -34,7 +39,9 @@ pub fn run<C: Console>(args: TraceToTextArgs) -> Result<()> {
 
     let text = match &args.rom {
         Some(rom) => {
-            let (_, mut emu) = load::<C>(&RomArgs::new(rom))?;
+            let mut rom_args = RomArgs::new(rom);
+            rom_args.manifest = args.manifest.clone();
+            let (_, mut emu) = load::<C>(&rom_args)?;
             cpu.check_slot::<C>(&emu)?;
             C::trace_text(&mut emu, cpu, &data, false)?
         }

@@ -14,6 +14,7 @@ use retro_core::debug::{ByteOrder, TraceEntry, TraceText};
 use retro_core::video::PixelImage;
 use retro_core::{CpuArchitecture, EmulatorCore};
 use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE};
+use sg1_core::golden::SIX_BUTTON;
 use sg1_core::vdp::RenderLayerMode;
 use sg1_core::GenesisEmulator;
 
@@ -151,6 +152,10 @@ impl Console for Genesis {
         "sound-trace",
         "savestate",
         "sram",
+        "golden",
+        "golden-set",
+        "golden-compare",
+        "manifest",
     ];
     const WORK_RAM: (u32, u32) = (0xFF_0000, 0x1_0000);
     const CHIP_ACTIVITY: &'static str = "the SVP's cycle count climbing on Virtua Racing";
@@ -206,7 +211,7 @@ impl Console for Genesis {
     const PRESS_EXAMPLE: &'static str = "";
     const RESET_EXAMPLE: &'static str = "";
 
-    fn stage(_: &mut GenesisEmulator, _: &[u8], _: &GenesisBoot) -> Result<()> {
+    fn stage(_: &mut GenesisEmulator, _: &[u8], _: &GenesisBoot, _: bool) -> Result<()> {
         Ok(())
     }
 
@@ -217,6 +222,14 @@ impl Console for Genesis {
             emu.connect_controllers(true);
         }
         Ok(())
+    }
+
+    /// `--six-button` is the golden manifests' `six-button`.
+    fn golden_flags(boot: &GenesisBoot) -> Vec<&'static str> {
+        match boot.six_button {
+            true => vec![SIX_BUTTON],
+            false => Vec::new(),
+        }
     }
 
     /// The file's path and size, then the header's title, region, checksum
@@ -357,6 +370,25 @@ mod tests {
             FieldValue::Number(n) => Some(n),
             _ => None,
         }
+    }
+
+    #[test]
+    fn a_manifest_the_core_refuses_names_its_file() {
+        let path =
+            std::env::temp_dir().join(format!("sg1-cli-manifest-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{ "core": "sg1", "version": "2.0" "#).unwrap();
+        let file = retro_cli::rom::ManifestFile::read(&path).unwrap();
+        let err = file.parse::<GenesisEmulator>().unwrap_err().to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            err.starts_with(&format!("{}: invalid JSON", path.display())),
+            "{err}"
+        );
+        assert_eq!(
+            Genesis::golden_flags(&GenesisBoot { six_button: true }),
+            vec![SIX_BUTTON]
+        );
+        assert!(Genesis::golden_flags(&GenesisBoot::default()).is_empty());
     }
 
     #[test]

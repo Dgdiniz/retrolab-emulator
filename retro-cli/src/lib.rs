@@ -12,9 +12,9 @@
 //! - [`cli`]: the command line every tool parses ([`Cli`]), its shared
 //!   commands, [`command`] (the clap command with the tool's own texts) and
 //!   [`run`].
-//! - [`rom`]: [`RomArgs`], the ROM a command loads and the tool's start-up
-//!   flags, [`rom::load`] and the line a command prints about what it
-//!   loaded.
+//! - [`rom`]: [`RomArgs`], the ROM a command loads, the cartridge manifest
+//!   `--manifest` loads it with and the tool's start-up flags,
+//!   [`rom::load`] and the line a command prints about what it loaded.
 //! - [`input`]: [`InputArgs`], the scripted player-1 input of a command
 //!   that runs frames, and the plan made of it.
 //! - [`output`]: the report or trace a command writes, to a file or to

@@ -1,8 +1,9 @@
-//! `profile`: where a frame's time goes. Warms up 60 frames, then averages
-//! the frame driver's profiles (`retro_core::frame::run_frame_profiled`:
-//! the play tier with each part of the machine the core names timed apart)
-//! over the frames asked for, by the console's report lines, and ranks the
-//! top bottlenecks against the 16.67 ms (60 FPS) budget.
+//! `profile`: where a frame's time goes. Runs the `--warmup-frames` asked
+//! for, unprofiled, then averages the frame driver's profiles
+//! (`retro_core::frame::run_frame_profiled`: the play tier with each part
+//! of the machine the core names timed apart) over the frames asked for,
+//! by the console's report lines, and ranks the top bottlenecks against
+//! the 16.67 ms (60 FPS) budget.
 
 use anyhow::Result;
 use retro_core::frame::{run_frame_on, run_frame_profiled, FrameProfile};
@@ -12,16 +13,18 @@ use crate::console::{Console, ProfileLine};
 use crate::input::InputArgs;
 use crate::rom::{load, write_banner, RomArgs};
 
-/// The frames run before the profiled ones, so the game is past its boot.
-pub const WARMUP_FRAMES: u64 = 60;
-
 #[derive(clap::Args, Debug)]
 pub struct ProfileArgs<B: clap::Args> {
     #[command(flatten)]
     pub rom: RomArgs<B>,
-    /// Number of frames to profile.
+    /// Number of frames to profile, after the `--warmup-frames`, e.g.
+    /// `300` (5 s at 60 fps).
     #[arg(long, short)]
     pub frames: Option<u64>,
+    /// Frames to run before the profiled ones, not profiled, so the game is
+    /// past its boot, e.g. `60`.
+    #[arg(long, default_value_t = 0)]
+    pub warmup_frames: u64,
     #[command(flatten)]
     pub input: InputArgs,
 }
@@ -223,8 +226,11 @@ pub fn run<C: Console>(args: ProfileArgs<C::BootArgs>) -> Result<()> {
     write_banner(&mut emu, &mut std::io::stdout())?;
     println!();
 
-    println!("Warming up ({WARMUP_FRAMES} frames)...");
-    for frame in 0..WARMUP_FRAMES {
+    let warmup = args.warmup_frames;
+    if warmup > 0 {
+        println!("Warming up ({warmup} frames)...");
+    }
+    for frame in 0..warmup {
         input.before_frame(&mut emu, frame);
         run_frame_on(&mut emu, ExecutionTier::Play);
     }
@@ -232,7 +238,7 @@ pub fn run<C: Console>(args: ProfileArgs<C::BootArgs>) -> Result<()> {
     println!("Profiling {frames} frames...");
     let profiles: Vec<FrameProfile> = (0..frames)
         .map(|frame| {
-            input.before_frame(&mut emu, WARMUP_FRAMES + frame);
+            input.before_frame(&mut emu, warmup + frame);
             run_frame_profiled(&mut emu)
         })
         .collect();

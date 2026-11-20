@@ -27,19 +27,23 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use retro_cli::parse::parse_hex_range;
+use retro_cli::rom::{load, RomArgs};
+use retro_cli::InputArgs;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
 use sg1_core::debugger::MAIN_CPU;
 use sg1_core::system::InstructionAccessLog;
 use sg1_core::vdp::dma::{DmaTarget, MemoryDma};
 use sg1_core::GenesisEmulator;
 
-use super::{apply_press, connect_controllers, open_output, parse_press_schedule};
+use super::open_output;
+use crate::console::{Genesis, GenesisBoot};
 
 #[derive(clap::Args, Debug)]
-pub struct WatchReadArgs {
-    /// Path to the ROM file (`.bin` / `.md` / `.gen`).
-    pub rom: PathBuf,
+pub struct WatchReadArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
     /// Address range to watch, `START-END` inclusive or a single address
     /// (24-bit hex, e.g. `D6EBA-DC0BF`). Repeat the flag to watch several
     /// ranges at once.
@@ -49,7 +53,7 @@ pub struct WatchReadArgs {
     #[arg(long, default_value_t = 0)]
     pub warmup_frames: u64,
     /// Instructions to single-step while watching (a Genesis frame is
-    /// roughly 60k-130k 68000 instructions).
+    /// roughly 9k-14k 68000 instructions).
     #[arg(long, default_value_t = 2_000_000)]
     pub max_steps: u64,
     /// Stop after this many matching reads and DMA transfers (0 = no limit).
@@ -62,13 +66,8 @@ pub struct WatchReadArgs {
     /// words, which are fetches rather than data reads.
     #[arg(long)]
     pub include_fetch: bool,
-    /// Connect 6-button pads so `x`/`y`/`z`/`mode` reach the game.
-    #[arg(long)]
-    pub six_button: bool,
-    /// Frame-scheduled player-1 input during the warmup, same format as
-    /// `screenshot`: `"F:buttons;F:buttons"` (e.g. `"180:start;186:"`).
-    #[arg(long)]
-    pub press_at: Option<String>,
+    #[command(flatten)]
+    pub input: InputArgs,
     /// Write the report to a file instead of stdout.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -157,25 +156,22 @@ impl Findings {
     }
 }
 
-pub fn run(args: WatchReadArgs) -> Result<()> {
+pub fn run(args: WatchReadArgs<GenesisBoot>) -> Result<()> {
     let ranges = args
         .ranges
         .iter()
         .map(|s| parse_range(s))
         .collect::<Result<Vec<_>>>()?;
-    let schedule = parse_press_schedule(args.press_at.as_deref())?;
+    let input = args.input.plan::<GenesisEmulator>()?;
     let mut out = open_output(args.output.as_ref())?;
 
-    let (_, mut emu) = super::load_rom(&args.rom)?;
+    let (_, mut emu) = load::<Genesis>(&args.rom)?;
     super::print_rom_title(&emu);
-    if args.six_button {
-        connect_controllers(&mut emu, true);
-    }
 
     // Boot/attract prologue at full frame speed.
     emu.debugger().set_execution_mode(ExecutionMode::Running);
     for frame in 0..args.warmup_frames {
-        apply_press(&mut emu, schedule.as_ref(), frame);
+        input.before_frame(&mut emu, frame);
         emu.run_frame();
     }
     writeln!(
@@ -302,32 +298,10 @@ pub fn run(args: WatchReadArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `START-END` (inclusive) or single-address watch range. Each side
-/// is 24-bit hex and may carry a `0x`, `0X` or `$` prefix.
+/// Parse a `START-END` (inclusive) or single-address watch range
+/// ([`parse_hex_range`], 24 bits wide).
 fn parse_range(spec: &str) -> Result<WatchRange> {
-    let parse = |s: &str| -> Result<u32> {
-        let cleaned = s
-            .trim()
-            .trim_start_matches("0x")
-            .trim_start_matches("0X")
-            .trim_start_matches('$');
-        let v = u32::from_str_radix(cleaned, 16)
-            .with_context(|| format!("invalid address '{}' in --range", s.trim()))?;
-        if v > 0x00FF_FFFF {
-            anyhow::bail!("address '{}' in --range is wider than 24 bits", s.trim());
-        }
-        Ok(v)
-    };
-    let (start, end) = match spec.split_once('-') {
-        Some((a, b)) => (parse(a)?, parse(b)?),
-        None => {
-            let a = parse(spec)?;
-            (a, a)
-        }
-    };
-    if start > end {
-        anyhow::bail!("--range '{spec}' ends before it starts");
-    }
+    let (start, end) = parse_hex_range(spec, 24).map_err(|e| anyhow::anyhow!("--range: {e}"))?;
     Ok(WatchRange { start, end })
 }
 

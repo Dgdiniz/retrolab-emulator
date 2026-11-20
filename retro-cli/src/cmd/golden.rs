@@ -5,37 +5,36 @@
 //! writes a folder: `hashes.txt` (one line per frame: the state, picture
 //! and audio hashes), `frame-NNNNN.png` at the listed shots, optionally
 //! `audio.wav`, and `summary.txt`. `golden-set` does that for every entry
-//! of a manifest into `<out>/<name>/`, skipping
-//! the ROMs that are not on disk. `golden-compare` reads two such folders
-//! (or two set folders) and reports where each run first parts from the
-//! other and how many pixels differ on each shot. It is the gate every
-//! rewrite of a module passes: the same output, frame for frame.
+//! of a manifest into `<out>/<name>/`, skipping the ROMs that are not on
+//! disk, each entry loaded as the golden tests load it
+//! ([`GoldenConsole::load_for_golden`]), so a record it writes is the one
+//! a test holds. `golden-compare` reads two such folders (or two set
+//! folders) and reports where each run first parts from the other and how
+//! many pixels differ on each shot. It is the gate every rewrite of a
+//! module passes: the same output, frame for frame.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Args;
 use retro_core::golden::{
     entry_spec_of, first_divergence, format_records_of, parse_manifest_of, parse_records_of,
-    run_golden, FrameRecord, GoldenSpec,
+    run_golden, FrameRecord, GoldenConsole, GoldenSpec,
 };
 use retro_core::{fnv1a64, EmulatorCore};
-use snes1_core::golden::FORCE_DETECT;
-use snes1_core::SnesEmulator;
 
-use super::{
-    apply_force_detect, parse_press_schedule, parse_reset_frames, read_rom, CoprocessorArgs,
-};
+use crate::console::Console;
+use crate::input::{parse_press_schedule, parse_reset_frames};
+use crate::parse::parse_frame_list;
+use crate::rom::{load, read_rom, RomArgs};
 
-#[derive(Args, Debug)]
-pub struct GoldenArgs {
-    /// Path to the ROM file (`.sfc` / `.smc`).
-    pub rom: PathBuf,
-    /// Frames to run.
-    #[arg(long, default_value_t = 600)]
-    pub frames: u64,
+#[derive(clap::Args, Debug)]
+pub struct GoldenArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Frames to run, e.g. `600`.
+    #[arg(long)]
+    pub frames: Option<u64>,
     /// Frame counts at which to write a PNG (comma-separated, e.g.
     /// `60,300,600`); default: the last frame.
     #[arg(long)]
@@ -46,26 +45,20 @@ pub struct GoldenArgs {
     /// Inject a console `reset()` before these frames (comma-separated).
     #[arg(long)]
     pub reset_at: Option<String>,
-    /// Load a low-confidence ROM by forcing its vector-implied mapping.
-    #[arg(long)]
-    pub force_detect: bool,
     /// Also write the captured audio as `audio.wav`.
     #[arg(long)]
     pub wav: bool,
     /// Output folder (created if missing).
-    #[arg(long, short)]
+    #[arg(long, short, visible_alias = "output")]
     pub out: PathBuf,
-    /// DSP-1 firmware + coprocessor-mode flags.
-    #[command(flatten)]
-    pub coprocessor: CoprocessorArgs,
 }
 
-#[derive(Args, Debug)]
+#[derive(clap::Args, Debug)]
 pub struct GoldenSetArgs {
     /// The manifest: one ROM per line, as `name=... rom=... frames=...`.
     pub manifest: PathBuf,
     /// Output folder; each entry writes into `<out>/<name>/`.
-    #[arg(long, short)]
+    #[arg(long, short, visible_alias = "output")]
     pub out: PathBuf,
     /// Root the manifest's ROM paths are relative to (default: the
     /// current directory, i.e. run from the repository's root).
@@ -79,7 +72,7 @@ pub struct GoldenSetArgs {
     pub wav: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(clap::Args, Debug)]
 pub struct GoldenCompareArgs {
     /// A run folder (holding `hashes.txt`) or a set folder of them.
     pub a: PathBuf,
@@ -87,48 +80,51 @@ pub struct GoldenCompareArgs {
     pub b: PathBuf,
 }
 
-/// Parse `--shots 60,300` into a set; `None` -> empty (the run uses its
-/// last frame).
-fn parse_shots(spec: Option<&str>) -> Result<BTreeSet<u64>> {
-    let mut shots = BTreeSet::new();
-    for s in spec
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        shots.insert(
-            s.parse::<u64>()
-                .with_context(|| format!("invalid --shots frame {s:?} (want an integer)"))?,
-        );
-    }
-    Ok(shots)
+/// How a run was asked for, as its record's header names it.
+struct RunHeader<'a> {
+    press_at: Option<&'a str>,
+    reset_at: Option<&'a str>,
+    /// The console's golden flags that were set.
+    flags: Vec<&'a str>,
+    /// The cartridge manifest the ROM was loaded with.
+    manifest: Option<&'a Path>,
 }
 
-pub fn run(args: GoldenArgs) -> Result<()> {
-    let mut shots = parse_shots(args.shots.as_deref())?;
+pub fn run<C: Console>(args: GoldenArgs<C::BootArgs>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    let mut shots = parse_frame_list(args.shots.as_deref().unwrap_or(""))
+        .map_err(|e| anyhow::anyhow!("--shots: {e}"))?;
     if shots.is_empty() {
-        shots.insert(args.frames);
+        shots.insert(frames);
     }
     let spec = GoldenSpec {
-        frames: args.frames,
+        frames,
         shots,
-        presses: parse_press_schedule(args.press_at.as_deref())?,
+        presses: parse_press_schedule::<C::Emulator>(args.press_at.as_deref())?,
         resets: parse_reset_frames(args.reset_at.as_deref())?,
     };
     let name = args
         .rom
+        .path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "rom".to_string());
-    let outcome = run_one(
+    let (rom, emu) = load::<C>(&args.rom)?;
+    let header = RunHeader {
+        press_at: args.press_at.as_deref(),
+        reset_at: args.reset_at.as_deref(),
+        flags: C::golden_flags(&args.rom.boot),
+        manifest: args.rom.manifest.as_deref(),
+    };
+    let outcome = record::<C>(
+        emu,
         &name,
-        &args.rom,
+        &args.rom.path,
+        &rom,
         &spec,
-        args.press_at.as_deref(),
-        args.reset_at.as_deref(),
-        args.force_detect,
-        &args.coprocessor,
+        &header,
         args.wav,
         &args.out,
     )?;
@@ -136,12 +132,11 @@ pub fn run(args: GoldenArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run_set(args: GoldenSetArgs) -> Result<()> {
+pub fn run_set<C: Console>(args: GoldenSetArgs) -> Result<()> {
     let text = fs::read_to_string(&args.manifest)
         .with_context(|| format!("failed to read manifest: {}", args.manifest.display()))?;
-    let entries = parse_manifest_of::<SnesEmulator>(&text).map_err(anyhow::Error::msg)?;
+    let entries = parse_manifest_of::<C::Emulator>(&text).map_err(anyhow::Error::msg)?;
     let root = args.root.clone().unwrap_or_else(|| PathBuf::from("."));
-    let coprocessor = CoprocessorArgs::default();
     let (mut ran, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for entry in &entries {
         if let Some(only) = &args.only {
@@ -149,28 +144,43 @@ pub fn run_set(args: GoldenSetArgs) -> Result<()> {
                 continue;
             }
         }
-        let rom = root.join(&entry.rom);
-        if !rom.is_file() {
+        let rom_path = root.join(&entry.rom);
+        if !rom_path.is_file() {
             println!(
                 "{:<28} skipped - ROM not on disk ({})",
                 entry.name,
-                rom.display()
+                rom_path.display()
             );
             skipped += 1;
             continue;
         }
-        let spec = entry_spec_of::<SnesEmulator>(entry).map_err(anyhow::Error::msg)?;
-        match run_one(
-            &entry.name,
-            &rom,
-            &spec,
-            entry.press_at.as_deref(),
-            entry.reset_at.as_deref(),
-            entry.has_flag(FORCE_DETECT),
-            &coprocessor,
-            args.wav,
-            &args.out.join(&entry.name),
-        ) {
+        let spec = entry_spec_of::<C::Emulator>(entry).map_err(anyhow::Error::msg)?;
+        let header = RunHeader {
+            press_at: entry.press_at.as_deref(),
+            reset_at: entry.reset_at.as_deref(),
+            flags: <C::Emulator as GoldenConsole>::FLAGS
+                .iter()
+                .copied()
+                .filter(|flag| entry.has_flag(flag))
+                .collect(),
+            manifest: None,
+        };
+        let outcome = read_rom(&rom_path).and_then(|rom| {
+            let mut emu = C::Emulator::new_for_golden();
+            emu.load_for_golden(entry, &rom)
+                .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
+            record::<C>(
+                emu,
+                &entry.name,
+                &rom_path,
+                &rom,
+                &spec,
+                &header,
+                args.wav,
+                &args.out.join(&entry.name),
+            )
+        });
+        match outcome {
             Ok(outcome) => {
                 println!("{outcome}");
                 ran += 1;
@@ -194,25 +204,19 @@ pub fn run_set(args: GoldenSetArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run one ROM and write its folder. Returns the one-line summary.
+/// Run a loaded ROM through `spec` and write its folder. Returns the
+/// one-line summary.
 #[allow(clippy::too_many_arguments)]
-fn run_one(
+fn record<C: Console>(
+    mut emu: C::Emulator,
     name: &str,
     rom_path: &Path,
+    rom: &[u8],
     spec: &GoldenSpec,
-    press_at: Option<&str>,
-    reset_at: Option<&str>,
-    force_detect: bool,
-    coprocessor: &CoprocessorArgs,
+    asked: &RunHeader<'_>,
     wav: bool,
     out: &Path,
 ) -> Result<String> {
-    let rom = read_rom(rom_path)?;
-    let mut emu = SnesEmulator::new();
-    coprocessor.apply(&mut emu)?;
-    apply_force_detect(&mut emu, &rom, force_detect);
-    emu.load_rom(&rom)
-        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
     let title = emu
         .get_rom_info()
         .map(|i| i.title.trim().to_string())
@@ -246,38 +250,22 @@ fn run_one(
     }
     if wav {
         let rate = emu.get_audio_info().sample_rate;
-        let bytes = retro_cli::audio::encode_wav(&samples, rate, 2);
+        let bytes = crate::audio::encode_wav(&samples, rate, 2);
         fs::write(out.join("audio.wav"), bytes)
             .with_context(|| format!("failed to write {}", out.join("audio.wav").display()))?;
     }
 
-    let header = vec![
-        format!(
-            "rom={} size={} fnv={:016x} title={:?}",
-            rom_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            rom.len(),
-            fnv1a64(&rom),
-            title
-        ),
-        format!(
-            "frames={} shots={} press-at={} reset-at={} force-detect={}",
-            spec.frames,
-            spec.shots
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-            press_at.unwrap_or("-"),
-            reset_at.unwrap_or("-"),
-            force_detect
-        ),
-    ];
+    let header = header_lines(
+        rom_path,
+        rom,
+        &title,
+        spec,
+        asked,
+        <C::Emulator as GoldenConsole>::FLAGS,
+    );
     fs::write(
         out.join("hashes.txt"),
-        format_records_of::<SnesEmulator>(&header, &records),
+        format_records_of::<C::Emulator>(&header, &records),
     )
     .with_context(|| format!("failed to write {}", out.join("hashes.txt").display()))?;
 
@@ -298,7 +286,48 @@ fn run_one(
     Ok(summary)
 }
 
-pub fn run_compare(args: GoldenCompareArgs) -> Result<()> {
+/// The record's header: the ROM file (its name, size, FNV-1a and title,
+/// and the manifest it was loaded with), then how the run was asked for,
+/// each of the console's golden flags (`all_flags`) with whether it was
+/// set.
+fn header_lines(
+    rom_path: &Path,
+    rom: &[u8],
+    title: &str,
+    spec: &GoldenSpec,
+    asked: &RunHeader<'_>,
+    all_flags: &[&str],
+) -> Vec<String> {
+    let mut file = format!(
+        "rom={} size={} fnv={:016x} title={title:?}",
+        rom_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        rom.len(),
+        fnv1a64(rom),
+    );
+    if let Some(manifest) = asked.manifest {
+        file.push_str(&format!(" manifest={:?}", manifest.display().to_string()));
+    }
+    let mut run = format!(
+        "frames={} shots={} press-at={} reset-at={}",
+        spec.frames,
+        spec.shots
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        asked.press_at.unwrap_or("-"),
+        asked.reset_at.unwrap_or("-"),
+    );
+    for flag in all_flags {
+        run.push_str(&format!(" {flag}={}", asked.flags.contains(flag)));
+    }
+    vec![file, run]
+}
+
+pub fn run_compare<C: Console>(args: GoldenCompareArgs) -> Result<()> {
     let pairs = if args.a.join("hashes.txt").is_file() {
         vec![(
             args.a
@@ -331,7 +360,7 @@ pub fn run_compare(args: GoldenCompareArgs) -> Result<()> {
 
     let mut differing = 0usize;
     for (name, a, b) in pairs {
-        match compare_runs(&a, &b) {
+        match compare_runs::<C::Emulator>(&a, &b) {
             Ok(report) => {
                 if !report.same {
                     differing += 1;
@@ -358,12 +387,12 @@ struct CompareReport {
 
 /// Compare one run folder with another: the hash records, then every
 /// shot present on both sides.
-fn compare_runs(a: &Path, b: &Path) -> Result<CompareReport> {
+fn compare_runs<E: GoldenConsole>(a: &Path, b: &Path) -> Result<CompareReport> {
     let read = |dir: &Path| -> Result<Vec<FrameRecord>> {
         let path = dir.join("hashes.txt");
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (_, records) = parse_records_of::<SnesEmulator>(&text).map_err(anyhow::Error::msg)?;
+        let (_, records) = parse_records_of::<E>(&text).map_err(anyhow::Error::msg)?;
         Ok(records)
     };
     let ra = read(a)?;
@@ -434,7 +463,7 @@ fn shots_in(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
 }
 
 /// Count the pixels whose RGB bytes differ between two same-sized buffers.
-pub(crate) fn differing_pixels(a: &[u8], b: &[u8]) -> usize {
+fn differing_pixels(a: &[u8], b: &[u8]) -> usize {
     a.as_chunks::<3>()
         .0
         .iter()
@@ -448,13 +477,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shots_parse_and_default_to_empty() {
-        assert_eq!(parse_shots(None).unwrap(), BTreeSet::new());
+    fn the_header_names_the_rom_the_run_and_every_flag() {
+        let spec = GoldenSpec {
+            frames: 600,
+            shots: [300, 600].into(),
+            presses: None,
+            resets: Default::default(),
+        };
+        let mut asked = RunHeader {
+            press_at: None,
+            reset_at: Some("360"),
+            flags: Vec::new(),
+            manifest: None,
+        };
+        let lines = |asked: &RunHeader<'_>| {
+            header_lines(
+                Path::new("roms/smw.sfc"),
+                b"abc",
+                "SUPER MARIOWORLD",
+                &spec,
+                asked,
+                &["force-detect"],
+            )
+        };
         assert_eq!(
-            parse_shots(Some(" 60, 300 ,60")).unwrap(),
-            BTreeSet::from([60, 300])
+            lines(&asked),
+            vec![
+                format!(
+                    "rom=smw.sfc size=3 fnv={:016x} title=\"SUPER MARIOWORLD\"",
+                    fnv1a64(b"abc")
+                ),
+                "frames=600 shots=300,600 press-at=- reset-at=360 force-detect=false".to_string(),
+            ]
         );
-        assert!(parse_shots(Some("60,x")).is_err());
+        asked.flags = vec!["force-detect"];
+        asked.manifest = Some(Path::new("smw.json"));
+        let with = lines(&asked);
+        assert!(with[0].ends_with(" manifest=\"smw.json\""), "{}", with[0]);
+        assert!(with[1].ends_with(" force-detect=true"), "{}", with[1]);
     }
 
     #[test]
@@ -469,7 +529,8 @@ mod tests {
 
     #[test]
     fn shots_in_reads_only_frame_pngs_in_order() {
-        let dir = std::env::temp_dir().join(format!("snes1-golden-shots-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("retro-cli-golden-shots-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         for n in [
             "frame-00300.png",

@@ -17,29 +17,28 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
+use retro_cli::rom::{load, RomArgs};
+use retro_cli::InputArgs;
 use retro_core::frame::run_frame_on;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::psg::PsgWrite;
 use sg1_core::ym2612::FmWrite;
+use sg1_core::GenesisEmulator;
 
-use super::{apply_press, connect_controllers, parse_press_schedule};
+use crate::console::{Genesis, GenesisBoot};
 
 #[derive(Args, Debug)]
-pub struct SoundTraceArgs {
-    /// Path to the ROM file (`.bin` / `.md` / `.gen`).
-    pub rom: PathBuf,
-    /// Number of frames to run and trace.
-    #[arg(long, short, default_value_t = 1)]
-    pub frames: u64,
+pub struct SoundTraceArgs<B: clap::Args> {
+    #[command(flatten)]
+    pub rom: RomArgs<B>,
+    /// Number of frames to run and trace, e.g. `1`.
+    #[arg(long, short)]
+    pub frames: Option<u64>,
     /// Write the trace here instead of stdout.
     #[arg(long, short)]
     pub output: Option<PathBuf>,
-    /// Frame-scheduled player-1 input `"F:buttons;F:buttons"`.
-    #[arg(long)]
-    pub press_at: Option<String>,
-    /// Connect 6-button pads so `x`/`y`/`z`/`mode` reach the game.
-    #[arg(long)]
-    pub six_button: bool,
+    #[command(flatten)]
+    pub input: InputArgs,
     /// Only trace YM2612 (FM) writes.
     #[arg(long, conflicts_with = "psg_only")]
     pub fm_only: bool,
@@ -48,13 +47,13 @@ pub struct SoundTraceArgs {
     pub psg_only: bool,
 }
 
-pub fn run(args: SoundTraceArgs) -> Result<()> {
-    let schedule = parse_press_schedule(args.press_at.as_deref())?;
+pub fn run(args: SoundTraceArgs<GenesisBoot>) -> Result<()> {
+    let Some(frames) = args.frames else {
+        anyhow::bail!("specify --frames");
+    };
+    let input = args.input.plan::<GenesisEmulator>()?;
 
-    let (_, mut emu) = super::load_rom(&args.rom)?;
-    if args.six_button {
-        connect_controllers(&mut emu, true);
-    }
+    let (_, mut emu) = load::<Genesis>(&args.rom)?;
     // Make the CPU actually run (the default mode does not advance under
     // `run_frame`), so the game executes its sound driver, same reason
     // `screenshot`/`fingerprint` set this.
@@ -79,8 +78,8 @@ pub fn run(args: SoundTraceArgs) -> Result<()> {
     )?;
 
     let mut total: u64 = 0;
-    for frame in 0..args.frames {
-        apply_press(&mut emu, schedule.as_ref(), frame);
+    for frame in 0..frames {
+        input.before_frame(&mut emu, frame);
         run_frame_on(&mut emu, ExecutionTier::Play);
         // Drain the rendered audio so the chips' ring buffers don't back up;
         // each write was already timestamped at render time, so this does not
@@ -104,10 +103,7 @@ pub fn run(args: SoundTraceArgs) -> Result<()> {
         }
     }
     out.flush()?;
-    eprintln!(
-        "Traced {total} sound write(s) over {} frame(s).",
-        args.frames
-    );
+    eprintln!("Traced {total} sound write(s) over {frames} frame(s).");
     Ok(())
 }
 
