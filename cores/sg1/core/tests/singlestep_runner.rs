@@ -1,6 +1,8 @@
 //! SingleStepTests Z80 Test Suite Runner
 //!
 //! Runs the comprehensive SingleStepTests test suite to validate Z80 CPU implementation.
+//! The Z80's side of the cases is `singlestep::UnderTest` (`tests/singlestep/mod.rs`);
+//! retro-core's runner (`retro_core::testing::singlestep`) runs them.
 //!
 //! ## Usage
 //!
@@ -18,744 +20,78 @@
 //! ```bash
 //! SINGLESTEP_INDEX=42 cargo test --package sg1-core --test singlestep_runner test_opcode_00 -- --ignored --nocapture
 //! ```
+//!
+//! `SINGLESTEP_FULL_DIAG=1` diagnoses the first 20 failures, and
+//! `SINGLESTEP_CHECK_CYCLES=1` compares each case's cycle count with the
+//! length of its cycle list.
 
 mod singlestep;
 
-use retro_core::cpu::Addressable;
-use sg1_core::z80::Z80;
-use singlestep::{find_test_files, load_test_file, opcode_from_filename, Z80Test};
-use std::collections::HashMap;
-use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
+use retro_core::testing::singlestep::{
+    load_cases, print_file_result, run_file, run_sweep, vector_files, RunOptions,
+};
+use singlestep::{group_of_label, opcode_from_filename, UnderTest, Z80Test};
+use std::path::{Path, PathBuf};
 
-// ============================================================================
-// Test Bus with I/O Port Support
-// ============================================================================
-
-/// Test bus providing 64KB RAM and I/O port read/write support.
-/// Port reads return values from `port_reads` map; port writes are captured.
-struct TestBus {
-    memory: Vec<u8>,
-    /// Expected port read values: port_address -> value
-    port_reads: Vec<(u16, u8)>,
-    port_read_index: usize,
-    /// Captured port writes: (port_address, value)
-    port_writes: Vec<(u16, u8)>,
+fn base_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/singlesteptests/z80")
 }
 
-impl TestBus {
-    fn new() -> Self {
-        Self {
-            memory: vec![0; 0x10000],
-            port_reads: Vec::new(),
-            port_read_index: 0,
-            port_writes: Vec::new(),
-        }
-    }
-
-    fn read_byte(&self, addr: u16) -> u8 {
-        self.memory[addr as usize]
-    }
-
-    fn write_byte(&mut self, addr: u16, value: u8) {
-        self.memory[addr as usize] = value;
-    }
+/// Every vector file, each with the label of its opcode (`DD CB __ 04`).
+fn labelled_files() -> Vec<(String, PathBuf)> {
+    vector_files(&base_path().join("v1"))
+        .into_iter()
+        .map(|(name, path)| {
+            let label = opcode_from_filename(&path).map_or(name, |group| group.label());
+            (label, path)
+        })
+        .collect()
 }
 
-impl Addressable for TestBus {
-    fn read(&mut self, addr: u32) -> u8 {
-        self.read_byte((addr & 0xFFFF) as u16)
-    }
-
-    fn write(&mut self, addr: u32, value: u8) {
-        self.write_byte((addr & 0xFFFF) as u16, value);
-    }
-
-    fn io_read(&mut self, _port: u16) -> u8 {
-        // Return next expected port read value in order
-        if self.port_read_index < self.port_reads.len() {
-            let (_, value) = self.port_reads[self.port_read_index];
-            self.port_read_index += 1;
-            value
-        } else {
-            0xFF // Floating bus default
-        }
-    }
-
-    fn io_write(&mut self, port: u16, value: u8) {
-        self.port_writes.push((port, value));
-    }
-}
-
-// ============================================================================
-// State Management
-// ============================================================================
-
-/// Apply initial state to Z80 CPU and TestBus
-fn apply_initial_state(cpu: &mut Z80, bus: &mut TestBus, test: &Z80Test) {
-    let state = &test.initial;
-
-    // Set 8-bit registers
-    cpu.a = state.a;
-    cpu.b = state.b;
-    cpu.c = state.c;
-    cpu.d = state.d;
-    cpu.e = state.e;
-    cpu.f = state.f;
-    cpu.h = state.h;
-    cpu.l = state.l;
-    cpu.i = state.i;
-    cpu.r = state.r;
-
-    // Set 16-bit registers
-    cpu.pc = state.pc;
-    cpu.sp = state.sp;
-    cpu.ix = state.ix;
-    cpu.iy = state.iy;
-
-    // Set internal registers
-    cpu.wz = state.wz;
-    cpu.ei = state.ei;
-    cpu.p = state.p;
-    cpu.q = state.q;
-
-    // Set shadow registers (stored as 16-bit in test format)
-    cpu.a_ = (state.af_ >> 8) as u8;
-    cpu.f_ = (state.af_ & 0xFF) as u8;
-    cpu.b_ = (state.bc_ >> 8) as u8;
-    cpu.c_ = (state.bc_ & 0xFF) as u8;
-    cpu.d_ = (state.de_ >> 8) as u8;
-    cpu.e_ = (state.de_ & 0xFF) as u8;
-    cpu.h_ = (state.hl_ >> 8) as u8;
-    cpu.l_ = (state.hl_ & 0xFF) as u8;
-
-    // Set interrupt state
-    cpu.im = state.im;
-    cpu.iff1 = state.iff1 != 0;
-    cpu.iff2 = state.iff2 != 0;
-
-    // Ensure CPU is not halted
-    cpu.halted = false;
-
-    // Clear and write RAM
-    for byte in bus.memory.iter_mut() {
-        *byte = 0;
-    }
-    for entry in &state.ram {
-        let addr = entry[0];
-        let value = entry[1] as u8;
-        bus.write_byte(addr, value);
-    }
-
-    // Setup I/O port expectations from test's ports field
-    bus.port_reads.clear();
-    bus.port_read_index = 0;
-    bus.port_writes.clear();
-
-    for port_access in &test.ports {
-        if port_access.2 == "r" {
-            bus.port_reads.push((port_access.0, port_access.1));
-        }
-    }
-}
-
-/// Check if final state matches expected. Returns Ok(()) or Err with list of mismatches.
-fn check_final_state(cpu: &Z80, bus: &TestBus, test: &Z80Test) -> Result<(), Vec<String>> {
-    let expected = &test.final_state;
-    let mut errors = Vec::new();
-
-    // Check 8-bit registers
-    macro_rules! check_reg8 {
-        ($name:expr, $actual:expr, $expected:expr) => {
-            if $actual != $expected {
-                errors.push(format!(
-                    "{}: expected {:02X}, got {:02X}",
-                    $name, $expected, $actual
-                ));
-            }
-        };
-    }
-    check_reg8!("A", cpu.a, expected.a);
-    check_reg8!("B", cpu.b, expected.b);
-    check_reg8!("C", cpu.c, expected.c);
-    check_reg8!("D", cpu.d, expected.d);
-    check_reg8!("E", cpu.e, expected.e);
-    check_reg8!("F", cpu.f, expected.f);
-    check_reg8!("H", cpu.h, expected.h);
-    check_reg8!("L", cpu.l, expected.l);
-    check_reg8!("I", cpu.i, expected.i);
-    check_reg8!("R", cpu.r, expected.r);
-
-    // Check 16-bit registers
-    macro_rules! check_reg16 {
-        ($name:expr, $actual:expr, $expected:expr) => {
-            if $actual != $expected {
-                errors.push(format!(
-                    "{}: expected {:04X}, got {:04X}",
-                    $name, $expected, $actual
-                ));
-            }
-        };
-    }
-    check_reg16!("PC", cpu.pc, expected.pc);
-    check_reg16!("SP", cpu.sp, expected.sp);
-    check_reg16!("IX", cpu.ix, expected.ix);
-    check_reg16!("IY", cpu.iy, expected.iy);
-    check_reg16!("WZ", cpu.wz, expected.wz);
-
-    // Check shadow registers
-    let actual_af_ = ((cpu.a_ as u16) << 8) | (cpu.f_ as u16);
-    check_reg16!("AF'", actual_af_, expected.af_);
-
-    let actual_bc_ = ((cpu.b_ as u16) << 8) | (cpu.c_ as u16);
-    check_reg16!("BC'", actual_bc_, expected.bc_);
-
-    let actual_de_ = ((cpu.d_ as u16) << 8) | (cpu.e_ as u16);
-    check_reg16!("DE'", actual_de_, expected.de_);
-
-    let actual_hl_ = ((cpu.h_ as u16) << 8) | (cpu.l_ as u16);
-    check_reg16!("HL'", actual_hl_, expected.hl_);
-
-    // Check interrupt state
-    check_reg8!("IM", cpu.im, expected.im);
-
-    let actual_iff1: u8 = if cpu.iff1 { 1 } else { 0 };
-    if actual_iff1 != expected.iff1 {
-        errors.push(format!(
-            "IFF1: expected {}, got {}",
-            expected.iff1, actual_iff1
-        ));
-    }
-
-    let actual_iff2: u8 = if cpu.iff2 { 1 } else { 0 };
-    if actual_iff2 != expected.iff2 {
-        errors.push(format!(
-            "IFF2: expected {}, got {}",
-            expected.iff2, actual_iff2
-        ));
-    }
-
-    // Check internal state
-    check_reg8!("EI", cpu.ei, expected.ei);
-    check_reg8!("P", cpu.p, expected.p);
-    check_reg8!("Q", cpu.q, expected.q);
-
-    // Check RAM
-    for entry in &expected.ram {
-        let addr = entry[0];
-        let expected_val = entry[1] as u8;
-        let actual_val = bus.read_byte(addr);
-        if actual_val != expected_val {
-            errors.push(format!(
-                "RAM[{:04X}]: expected {:02X}, got {:02X}",
-                addr, expected_val, actual_val
-            ));
-        }
-    }
-
-    // Check I/O port writes
-    let expected_writes: Vec<(u16, u8)> = test
-        .ports
-        .iter()
-        .filter(|p| p.2 == "w")
-        .map(|p| (p.0, p.1))
-        .collect();
-
-    if expected_writes.len() != bus.port_writes.len() {
-        errors.push(format!(
-            "Port writes count: expected {}, got {}",
-            expected_writes.len(),
-            bus.port_writes.len()
-        ));
-    } else {
-        for (i, (exp, act)) in expected_writes
-            .iter()
-            .zip(bus.port_writes.iter())
-            .enumerate()
-        {
-            if exp.1 != act.1 {
-                errors.push(format!(
-                    "Port write[{}] value: expected {:02X} (port {:04X}), got {:02X} (port {:04X})",
-                    i, exp.1, exp.0, act.1, act.0
-                ));
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-// ============================================================================
-// Test Execution
-// ============================================================================
-
-enum TestResult {
-    Pass,
-    Fail(Vec<String>),
-    Panic(String),
-}
-
-/// Run a single test with panic catching
-fn run_test(test: &Z80Test) -> TestResult {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut cpu = Z80::new();
-        let mut bus = TestBus::new();
-
-        apply_initial_state(&mut cpu, &mut bus, test);
-
-        // Execute one instruction
-        let _cycles = cpu.step(&mut bus);
-
-        check_final_state(&cpu, &bus, test)
-    }));
-
-    match result {
-        Ok(Ok(())) => TestResult::Pass,
-        Ok(Err(errors)) => TestResult::Fail(errors),
-        Err(panic_info) => {
-            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "Unknown panic".to_string()
-            };
-            TestResult::Panic(msg)
-        }
-    }
-}
-
-/// Run a test with detailed diagnostics output
-fn run_test_with_diagnostics(test: &Z80Test) {
-    println!("\n{}", "=".repeat(70));
-    println!("TEST: {}", test.name);
-    println!("{}", "=".repeat(70));
-
-    // Print initial state
-    println!("\n--- INITIAL STATE ---");
-    print_z80_state("Initial", &test.initial);
-
-    if !test.initial.ram.is_empty() {
-        println!("\nInitial RAM:");
-        for entry in &test.initial.ram {
-            println!("  [{:04X}] = {:02X}", entry[0], entry[1]);
-        }
-    }
-
-    if !test.ports.is_empty() {
-        println!("\nPorts:");
-        for p in &test.ports {
-            println!("  port {:04X} = {:02X} ({})", p.0, p.1, p.2);
-        }
-    }
-
-    // Execute
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut cpu = Z80::new();
-        let mut bus = TestBus::new();
-        apply_initial_state(&mut cpu, &mut bus, test);
-
-        let cycles = cpu.step(&mut bus);
-        (cpu, bus, cycles)
-    }));
-
-    match result {
-        Ok((cpu, bus, cycles)) => {
-            // Print actual state
-            println!("\n--- ACTUAL STATE (after execution) ---");
-            print_cpu_state_from_z80("Actual", &cpu);
-            println!("Cycles: {}", cycles);
-
-            // Print expected state
-            println!("\n--- EXPECTED STATE ---");
-            print_z80_state("Expected", &test.final_state);
-            println!("Expected cycles: {}", test.cycles.len());
-
-            // Print differences
-            println!("\n--- DIFFERENCES ---");
-            match check_final_state(&cpu, &bus, test) {
-                Ok(()) => println!("(no differences - test PASSED)"),
-                Err(errors) => {
-                    for e in &errors {
-                        println!("  {}", e);
-                    }
-                }
-            }
-
-            // Print flag differences in detail
-            if cpu.f != test.final_state.f {
-                print_flag_diff(test.final_state.f, cpu.f);
-            }
-        }
-        Err(panic_info) => {
-            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "Unknown panic".to_string()
-            };
-            println!("\n--- PANIC ---");
-            println!("  {}", msg);
-        }
-    }
-
-    println!();
-}
-
-// ============================================================================
-// Display Helpers
-// ============================================================================
-
-fn print_z80_state(label: &str, state: &singlestep::Z80State) {
-    println!("{}:", label);
-    println!(
-        "  A={:02X} F={:02X} B={:02X} C={:02X} D={:02X} E={:02X} H={:02X} L={:02X}",
-        state.a, state.f, state.b, state.c, state.d, state.e, state.h, state.l
-    );
-    println!(
-        "  I={:02X} R={:02X} IX={:04X} IY={:04X} SP={:04X} PC={:04X} WZ={:04X}",
-        state.i, state.r, state.ix, state.iy, state.sp, state.pc, state.wz
-    );
-    println!(
-        "  AF'={:04X} BC'={:04X} DE'={:04X} HL'={:04X}",
-        state.af_, state.bc_, state.de_, state.hl_
-    );
-    println!(
-        "  IM={} IFF1={} IFF2={} EI={} P={} Q={}",
-        state.im, state.iff1, state.iff2, state.ei, state.p, state.q
-    );
-    print_flags(state.f);
-}
-
-fn print_cpu_state_from_z80(label: &str, cpu: &Z80) {
-    println!("{}:", label);
-    println!(
-        "  A={:02X} F={:02X} B={:02X} C={:02X} D={:02X} E={:02X} H={:02X} L={:02X}",
-        cpu.a, cpu.f, cpu.b, cpu.c, cpu.d, cpu.e, cpu.h, cpu.l
-    );
-    println!(
-        "  I={:02X} R={:02X} IX={:04X} IY={:04X} SP={:04X} PC={:04X} WZ={:04X}",
-        cpu.i, cpu.r, cpu.ix, cpu.iy, cpu.sp, cpu.pc, cpu.wz
-    );
-    let af_ = ((cpu.a_ as u16) << 8) | (cpu.f_ as u16);
-    let bc_ = ((cpu.b_ as u16) << 8) | (cpu.c_ as u16);
-    let de_ = ((cpu.d_ as u16) << 8) | (cpu.e_ as u16);
-    let hl_ = ((cpu.h_ as u16) << 8) | (cpu.l_ as u16);
-    println!(
-        "  AF'={:04X} BC'={:04X} DE'={:04X} HL'={:04X}",
-        af_, bc_, de_, hl_
-    );
-    println!(
-        "  IM={} IFF1={} IFF2={} EI={} P={} Q={}",
-        cpu.im,
-        if cpu.iff1 { 1 } else { 0 },
-        if cpu.iff2 { 1 } else { 0 },
-        cpu.ei,
-        cpu.p,
-        cpu.q
-    );
-    print_flags(cpu.f);
-}
-
-fn print_flags(f: u8) {
-    println!(
-        "  Flags: S={} Z={} Y={} H={} X={} P/V={} N={} C={}",
-        (f >> 7) & 1,
-        (f >> 6) & 1,
-        (f >> 5) & 1,
-        (f >> 4) & 1,
-        (f >> 3) & 1,
-        (f >> 2) & 1,
-        (f >> 1) & 1,
-        f & 1,
-    );
-}
-
-fn print_flag_diff(expected: u8, actual: u8) {
-    let flag_names = ["C", "N", "P/V", "X", "H", "Y", "Z", "S"];
-    let mut diffs = Vec::new();
-    for (bit, name) in flag_names.iter().enumerate() {
-        let exp = (expected >> bit) & 1;
-        let act = (actual >> bit) & 1;
-        if exp != act {
-            diffs.push(format!("{}:{}->{}", name, exp, act));
-        }
-    }
-    if !diffs.is_empty() {
-        println!("  Flag diffs: {}", diffs.join(", "));
-    }
-}
-
-// ============================================================================
-// Generic Test Runner
-// ============================================================================
-
-/// Run all tests from a single file. Returns (passed, failed, panicked, first_errors).
-fn run_test_file(path: &Path) -> (usize, usize, usize, Vec<String>) {
-    let tests = match load_test_file(path) {
-        Ok(tests) => tests,
-        Err(e) => {
-            eprintln!("Failed to load test file {:?}: {}", path, e);
-            return (0, 0, 0, vec![format!("Failed to load file: {}", e)]);
-        }
-    };
-
-    let diagnose_mode = std::env::var("SINGLESTEP_DIAGNOSE").is_ok();
-    let full_diag_mode = std::env::var("SINGLESTEP_FULL_DIAG").is_ok();
-    let specific_index: Option<usize> = std::env::var("SINGLESTEP_INDEX")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    // If specific index requested, run only that test
-    if let Some(idx) = specific_index {
-        if idx >= tests.len() {
-            eprintln!("Index {} out of range (max: {})", idx, tests.len() - 1);
-            return (0, 1, 0, vec!["Index out of range".to_string()]);
-        }
-        println!("\n>>> Running single test at index {} <<<", idx);
-        run_test_with_diagnostics(&tests[idx]);
-        match run_test(&tests[idx]) {
-            TestResult::Pass => return (1, 0, 0, vec![]),
-            TestResult::Fail(e) => return (0, 1, 0, e),
-            TestResult::Panic(e) => return (0, 0, 1, vec![e]),
-        }
-    }
-
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut panicked = 0;
-    let mut first_errors = Vec::new();
-    let mut first_failure_idx: Option<usize> = None;
-    let mut failure_indices: Vec<usize> = Vec::new();
-
-    for (i, test) in tests.iter().enumerate() {
-        match run_test(test) {
-            TestResult::Pass => {
-                passed += 1;
-            }
-            TestResult::Fail(errors) => {
-                failed += 1;
-                if first_failure_idx.is_none() {
-                    first_failure_idx = Some(i);
-                }
-                failure_indices.push(i);
-                if first_errors.len() < 3 {
-                    first_errors.push(format!(
-                        "Test {} ({}): \n  {}",
-                        i,
-                        test.name,
-                        errors.join("\n  ")
-                    ));
-                }
-            }
-            TestResult::Panic(msg) => {
-                panicked += 1;
-                if first_failure_idx.is_none() {
-                    first_failure_idx = Some(i);
-                }
-                failure_indices.push(i);
-                if first_errors.len() < 3 {
-                    first_errors.push(format!("Test {} ({}): PANIC: {}", i, test.name, msg));
-                }
-            }
-        }
-    }
-
-    // Diagnostic modes
-    if (failed > 0 || panicked > 0) && full_diag_mode {
-        let limit = failure_indices.len().min(20);
-        println!(
-            "\n>>> FULL DIAGNOSTICS MODE - Showing {} of {} failures <<<",
-            limit,
-            failure_indices.len()
-        );
-        for &idx in failure_indices.iter().take(limit) {
-            run_test_with_diagnostics(&tests[idx]);
-        }
-    } else if (failed > 0 || panicked > 0) && diagnose_mode {
-        if let Some(idx) = first_failure_idx {
-            println!(
-                "\n>>> DETAILED DIAGNOSTICS FOR FIRST FAILURE (index {}) <<<",
-                idx
-            );
-            run_test_with_diagnostics(&tests[idx]);
-        }
-    }
-
-    (passed, failed, panicked, first_errors)
-}
-
-/// Run tests for a specific file by name pattern. This is the main entry point
+/// Run the tests of one file by its name. This is the main entry point
 /// modeled after the Tom Harte runner.
-fn run_file_tests(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let base_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/singlesteptests/z80");
+fn run_file_tests(filename: &str) {
+    let base_path = base_path();
 
     if !base_path.exists() {
         eprintln!("Warning: SingleStepTests not found at {:?}", base_path);
         eprintln!("Skipping test. Download the vectors (the README says how) to run it.");
-        return Ok(());
+        return;
     }
 
     let test_file = base_path.join(format!("v1/{}", filename));
     if !test_file.exists() {
         eprintln!("Warning: Test file not found: {:?}", test_file);
-        return Ok(());
+        return;
     }
 
-    let group = opcode_from_filename(&test_file);
-    let label = group
+    let label = opcode_from_filename(&test_file)
         .map(|g| g.label())
         .unwrap_or_else(|| filename.to_string());
-
-    println!("Loading tests from: {}", test_file.display());
-
-    let (passed, failed, panicked, errors) = run_test_file(&test_file);
-    let total = passed + failed + panicked;
-
-    println!("\n{}", "=".repeat(60));
-    if panicked > 0 {
-        println!(
-            "{}: {} passed, {} failed, {} panicked out of {} ({}%)",
-            label,
-            passed,
-            failed,
-            panicked,
-            total,
-            (passed * 100).checked_div(total).unwrap_or(0)
+    let result = run_file::<UnderTest>(&test_file, &label, &RunOptions::from_env(0));
+    print_file_result(&result);
+    if result.counts.failures() > 0 {
+        // Don't panic - just print. Some opcodes may have expected failures.
+        eprintln!(
+            "Test had failures: {} tests failed, {} panicked",
+            result.counts.failed, result.counts.panicked
         );
-    } else {
-        println!(
-            "{}: {} passed, {} failed out of {} ({}%)",
-            label,
-            passed,
-            failed,
-            total,
-            (passed * 100).checked_div(total).unwrap_or(0)
-        );
-    }
-
-    if !errors.is_empty() && std::env::var("SINGLESTEP_INDEX").is_err() {
-        println!("\nFirst errors:");
-        for error in &errors {
-            println!("{}", error);
-        }
-
-        println!("\nTIP: Run with SINGLESTEP_DIAGNOSE=1 for detailed first failure analysis");
-        println!("TIP: Run with SINGLESTEP_FULL_DIAG=1 to see all failures (limited to 20)");
-        println!("TIP: Run with SINGLESTEP_INDEX=N to test only that case");
-    }
-
-    if failed > 0 || panicked > 0 {
-        Err(format!("{} tests failed, {} panicked", failed, panicked).into())
-    } else {
-        Ok(())
     }
 }
 
-/// Run all test files and produce aggregate summary
+/// Run all test files as one sweep, with its lines per prefix group.
 fn run_all_tests_summary() {
-    let base_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/singlesteptests/z80");
-
-    if !base_path.exists() {
-        eprintln!("Warning: SingleStepTests not found at {:?}", base_path);
-        return;
-    }
-
-    let files = find_test_files(&base_path);
+    let files = labelled_files();
     if files.is_empty() {
-        eprintln!("No test files found");
+        eprintln!("Warning: SingleStepTests not found at {:?}", base_path());
         return;
     }
-
-    println!("Found {} test files", files.len());
-    println!("{}", "=".repeat(70));
-
-    let mut total_passed = 0usize;
-    let mut total_failed = 0usize;
-    let mut total_panicked = 0usize;
-    let mut group_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
-    let mut failed_files: Vec<(String, usize, usize, usize)> = Vec::new();
-
-    for file in &files {
-        let group = opcode_from_filename(file);
-        let label = group
-            .as_ref()
-            .map(|g| g.label())
-            .unwrap_or_else(|| file.file_stem().unwrap().to_str().unwrap().to_string());
-        let prefix = group
-            .as_ref()
-            .map(|g| g.prefix_name().to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        let (passed, failed, panicked, _) = run_test_file(file);
-        total_passed += passed;
-        total_failed += failed;
-        total_panicked += panicked;
-
-        let entry = group_stats.entry(prefix).or_insert((0, 0, 0));
-        entry.0 += passed;
-        entry.1 += failed;
-        entry.2 += panicked;
-
-        if failed > 0 || panicked > 0 {
-            failed_files.push((label, passed, failed, panicked));
-        }
-    }
-
-    // Summary
-    let total = total_passed + total_failed + total_panicked;
-    println!("\n{}", "=".repeat(70));
-    println!("OVERALL SUMMARY");
-    println!("{}", "=".repeat(70));
-    println!(
-        "Total: {} passed, {} failed, {} panicked out of {} ({}%)",
-        total_passed,
-        total_failed,
-        total_panicked,
-        total,
-        (total_passed * 100).checked_div(total).unwrap_or(0)
+    run_sweep::<UnderTest>(
+        "all",
+        &files,
+        &RunOptions::from_env(0),
+        Some(group_of_label),
     );
-
-    // Per-group summary
-    println!("\n--- Per Group ---");
-    let mut groups: Vec<_> = group_stats.into_iter().collect();
-    groups.sort_by_key(|(name, _)| name.clone());
-    for (name, (passed, failed, panicked)) in &groups {
-        let grp_total = passed + failed + panicked;
-        let pct = (passed * 100).checked_div(grp_total).unwrap_or(0);
-        println!(
-            "  {:12}: {} passed, {} failed, {} panicked ({}%)",
-            name, passed, failed, panicked, pct
-        );
-    }
-
-    // Failed files summary (limited)
-    if !failed_files.is_empty() {
-        println!(
-            "\n--- Failed Opcodes ({} files with failures) ---",
-            failed_files.len()
-        );
-        for (label, passed, failed, panicked) in failed_files.iter().take(50) {
-            let total = passed + failed + panicked;
-            println!(
-                "  {}: {} passed, {} failed, {} panicked (of {})",
-                label, passed, failed, panicked, total
-            );
-        }
-        if failed_files.len() > 50 {
-            println!(
-                "  ... and {} more files with failures",
-                failed_files.len() - 50
-            );
-        }
-    }
 }
 
 // ============================================================================
@@ -772,9 +108,7 @@ mod tests {
 
     #[test]
     fn test_singlestep_infrastructure() {
-        let base_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/singlesteptests/z80");
-        let test_files = find_test_files(&base_path);
+        let test_files = vector_files(&base_path().join("v1"));
 
         // The Z80 SingleStepTests vectors are downloaded into
         // `tests/singlesteptests/z80` (the README says how), like the Tom
@@ -792,8 +126,8 @@ mod tests {
 
         // The vectors are present: verify the loader actually parses the
         // first file so infra breakage is caught.
-        let first_file = &test_files[0];
-        let tests = load_test_file(first_file).expect("Failed to load test file");
+        let first_file = &test_files[0].1;
+        let tests = load_cases::<Z80Test>(first_file).expect("Failed to load test file");
         assert!(!tests.is_empty(), "Test file was empty");
 
         println!("SingleStepTests infrastructure working!");
@@ -820,10 +154,7 @@ mod tests {
             #[test]
             #[ignore = "SingleStep test - run manually with --ignored"]
             fn $name() {
-                run_file_tests($file).unwrap_or_else(|e| {
-                    // Don't panic - just print. Some opcodes may have expected failures.
-                    eprintln!("Test had failures: {}", e);
-                });
+                run_file_tests($file);
             }
         };
     }
@@ -1182,66 +513,29 @@ mod tests {
         run_prefix_group_tests("ed");
     }
 
-    /// Helper: run all test files matching a prefix group
+    /// Helper: run all test files matching a prefix group, as one sweep
     fn run_prefix_group_tests(prefix: &str) {
-        let base_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/singlesteptests/z80");
-        if !base_path.exists() {
+        if !base_path().exists() {
             eprintln!("Warning: SingleStepTests not found");
             return;
         }
 
-        let files = find_test_files(&base_path);
-        let matching: Vec<_> = files
-            .iter()
-            .filter(|f| {
-                let stem = f.file_stem().unwrap().to_str().unwrap();
-                match prefix {
-                    "dd" => stem.starts_with("dd ") && !stem.starts_with("dd cb"),
-                    "fd" => stem.starts_with("fd ") && !stem.starts_with("fd cb"),
-                    "dd cb" => stem.starts_with("dd cb"),
-                    "fd cb" => stem.starts_with("fd cb"),
-                    other => stem.starts_with(other),
-                }
+        let matching: Vec<_> = vector_files(&base_path().join("v1"))
+            .into_iter()
+            .filter(|(stem, _)| match prefix {
+                "dd" => stem.starts_with("dd ") && !stem.starts_with("dd cb"),
+                "fd" => stem.starts_with("fd ") && !stem.starts_with("fd cb"),
+                "dd cb" => stem.starts_with("dd cb"),
+                "fd cb" => stem.starts_with("fd cb"),
+                other => stem.starts_with(other),
             })
             .collect();
 
-        println!("Found {} {} test files", matching.len(), prefix);
-
-        let mut total_passed = 0usize;
-        let mut total_failed = 0usize;
-        let mut total_panicked = 0usize;
-
-        for file in &matching {
-            let label = file.file_stem().unwrap().to_str().unwrap();
-            let (passed, failed, panicked, _) = run_test_file(file);
-            let total = passed + failed + panicked;
-            total_passed += passed;
-            total_failed += failed;
-            total_panicked += panicked;
-
-            if failed > 0 || panicked > 0 {
-                println!(
-                    "  {} {}: {} passed, {} failed, {} panicked (of {})",
-                    if panicked > 0 { "PANIC" } else { "FAIL" },
-                    label,
-                    passed,
-                    failed,
-                    panicked,
-                    total
-                );
-            }
-        }
-
-        let total = total_passed + total_failed + total_panicked;
-        println!(
-            "\n{} prefix summary: {} passed, {} failed, {} panicked out of {} ({}%)",
-            prefix.to_uppercase(),
-            total_passed,
-            total_failed,
-            total_panicked,
-            total,
-            (total_passed * 100).checked_div(total).unwrap_or(0)
+        run_sweep::<UnderTest>(
+            &format!("{} prefix", prefix.to_uppercase()),
+            &matching,
+            &RunOptions::from_env(0),
+            None,
         );
     }
 }

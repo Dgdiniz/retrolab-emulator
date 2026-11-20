@@ -1,9 +1,11 @@
 //! SingleStepTests runner for the WDC 65C816.
 //!
-//! The per-case harness + dataset loaders live in `wdc65816::singlestep`
-//! (compiled via the crate's `singlestep` feature, which the self
-//! dev-dependency in `Cargo.toml` turns on for tests). This file only wires
-//! the dataset location + the `#[test]` entry points.
+//! The 65C816's side of the cases (their shape, the state a case sets, the
+//! comparison) is `wdc65816::singlestep::UnderTest`, compiled via the crate's
+//! `singlestep` feature (which the self dev-dependency in `Cargo.toml` turns
+//! on for tests); retro-core's runner (`retro_core::testing::singlestep`)
+//! runs it. This file only wires the dataset location + the `#[test]` entry
+//! points.
 //!
 //! ## Usage
 //!
@@ -22,17 +24,19 @@
 //! cargo test --release -p wdc65816 --test singlestep_runner singlestep_sweep_sample -- --ignored --nocapture
 //! ```
 //!
-//! Full sweep (10 000 cases x 512 opcode-modes, ~60-90 min release):
+//! Full sweep (10 000 cases x 512 opcode-modes, ~20 min release):
 //! ```bash
 //! cargo test --release -p wdc65816 --test singlestep_runner singlestep_sweep_summary -- --ignored --nocapture
 //! ```
 //!
-//! Env vars (honoured by the shared runner):
+//! Env vars (honoured by the runner):
 //! - `SINGLESTEP_INDEX=N`: diagnose a single case by index (skips the rest).
 //! - `SINGLESTEP_DIAGNOSE=1`: print initial/final/diff for the first failure.
+//! - `SINGLESTEP_FULL_DIAG=1`: the same for the first 20 failures.
 
+use retro_core::testing::singlestep::{self as runner, RunOptions};
 use std::path::{Path, PathBuf};
-use wdc65816::singlestep::{self, TestMode};
+use wdc65816::singlestep::{self, TestMode, UnderTest};
 
 fn base_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/singlesteptests/65816")
@@ -42,23 +46,44 @@ fn base_path() -> PathBuf {
 /// the dataset is not present so CI without the fixture stays green.
 fn run_opcode(opcode: u8, mode: TestMode) {
     let base = base_path();
-    match singlestep::run_opcode(&base, opcode, mode, 0) {
-        Some(res) => {
-            singlestep::print_file_result(&res);
-            if res.failed > 0 || res.panicked > 0 {
-                eprintln!(
-                    "{}: {} failed, {} panicked (of {})",
-                    res.label, res.failed, res.panicked, res.total
-                );
-            }
-        }
-        None => eprintln!(
+    let path = base.join("v1").join(singlestep::file_name(opcode, mode));
+    if !path.is_file() {
+        eprintln!(
             "SingleStepTests 65816 fixture/file missing under {} for {:02X}.{} - skipping.",
             base.display(),
             opcode,
             mode.suffix()
-        ),
+        );
+        return;
     }
+    let res = runner::run_file::<UnderTest>(
+        &path,
+        &singlestep::label(opcode, mode),
+        &RunOptions::from_env(0),
+    );
+    runner::print_file_result(&res);
+    if res.counts.failures() > 0 {
+        eprintln!(
+            "{}: {} failed, {} panicked (of {})",
+            res.label,
+            res.counts.failed,
+            res.counts.panicked,
+            res.counts.total()
+        );
+    }
+}
+
+/// Run `max_cases` of every opcode-mode file as one sweep.
+fn sweep(title: &str, max_cases: usize) {
+    let files = runner::vector_files(&base_path().join("v1"));
+    if files.is_empty() {
+        eprintln!(
+            "SingleStepTests 65816 fixture not found at {} - skipping sweep.",
+            base_path().display()
+        );
+        return;
+    }
+    runner::run_sweep::<UnderTest>(title, &files, &RunOptions::from_env(max_cases), None);
 }
 
 // ============================================================================
@@ -75,10 +100,11 @@ fn test_singlestep_infrastructure() {
         );
         return;
     }
-    let Some(path) = singlestep::find_test_file(&base, 0xA9, TestMode::Emulation) else {
-        panic!("a9.e.json missing under {}", base.display());
-    };
-    let tests = singlestep::load_test_file(&path).expect("parse a9.e.json");
+    let path = base
+        .join("v1")
+        .join(singlestep::file_name(0xA9, TestMode::Emulation));
+    assert!(path.is_file(), "a9.e.json missing under {}", base.display());
+    let tests = runner::load_cases::<singlestep::Test65816>(&path).expect("parse a9.e.json");
     assert!(
         !tests.is_empty(),
         "a9.e.json contains no cases under {}",
@@ -87,7 +113,7 @@ fn test_singlestep_infrastructure() {
 
     let limit = tests.len().min(10);
     for test in tests.iter().take(limit) {
-        let _ = singlestep::run_test(test);
+        let _ = runner::run_case::<UnderTest>(test, &RunOptions::default());
     }
     println!(
         "infrastructure ok: parsed {} cases, ran {} without unrecoverable panic",
@@ -99,23 +125,13 @@ fn test_singlestep_infrastructure() {
 #[test]
 #[ignore = "SingleStep sweep - run manually with --ignored --nocapture"]
 fn singlestep_sweep_sample() {
-    if singlestep::run_sweep(&base_path(), 1_000, "sample").is_none() {
-        eprintln!(
-            "SingleStepTests 65816 fixture not found at {} - skipping sweep.",
-            base_path().display()
-        );
-    }
+    sweep("sample", 1_000);
 }
 
 #[test]
-#[ignore = "SingleStep sweep - full pass (60-90 min release)"]
+#[ignore = "SingleStep sweep - full pass (about 20 min release)"]
 fn singlestep_sweep_summary() {
-    if singlestep::run_sweep(&base_path(), 10_000, "full").is_none() {
-        eprintln!(
-            "SingleStepTests 65816 fixture not found at {} - skipping sweep.",
-            base_path().display()
-        );
-    }
+    sweep("full", 10_000);
 }
 
 // ============================================================================

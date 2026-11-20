@@ -20,6 +20,7 @@ pub mod input;
 pub mod input_schedule;
 pub mod memory;
 pub mod savestate;
+pub mod testing;
 pub mod types;
 pub mod video;
 

@@ -10,12 +10,13 @@ description = "Sony SPC700 CPU emulation (SNES audio CPU)"
 [dependencies]
 retro-core = { path = "../../retro-core" }
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 
 [features]
-# Compiles the `singlestep` module (SingleStepTests runner) and pulls in
-# serde/serde_json. Off by default so the core/WASM builds stay lean.
-singlestep = ["dep:serde", "dep:serde_json"]
+# Compiles the `singlestep` module: the CPU under the SingleStepTests (the
+# cases' shape and the comparison), which retro-core's runner runs, and
+# pulls in serde and the runner. Off by default so the core/WASM builds stay
+# lean.
+singlestep = ["dep:serde", "retro-core/singlestep"]
 
 [dev-dependencies]
 # Self dev-dependency that turns on `singlestep` whenever the crate's own

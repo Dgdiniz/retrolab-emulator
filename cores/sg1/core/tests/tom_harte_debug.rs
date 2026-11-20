@@ -3,26 +3,18 @@
 mod tom_harte;
 
 use retro_core::cpu::Addressable;
+use retro_core::testing::singlestep::load_cases;
 use sg1_core::bus::AddressBus;
 use sg1_core::cpu68k::M68k;
-use std::path::PathBuf;
-use tom_harte::{find_test_files, load_test_file};
+use tom_harte::{vector_file, HarteTest};
 
 #[test]
 fn debug_first_moveq_test() {
-    let repo_path = PathBuf::from("../../../tests/tom_harte_repo");
-    let test_files = find_test_files(&repo_path);
-
     // Developer debug helper over Tom Harte's 68000 test vectors, which the
     // README says how to download into `tests/tom_harte_repo`. Skip (rather
     // than panic) when they are absent so a plain `cargo test --workspace`
     // stays green.
-    let Some(test_file) = test_files.iter().find(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.starts_with("MOVE.q"))
-            .unwrap_or(false)
-    }) else {
+    let Some(test_file) = vector_file("MOVE.q") else {
         eprintln!(
             "skipping debug_first_moveq_test: Tom Harte vectors not downloaded \
              (tests/tom_harte_repo is empty)"
@@ -30,7 +22,7 @@ fn debug_first_moveq_test() {
         return;
     };
 
-    let tests = load_test_file(test_file).expect("Failed to load tests");
+    let tests = load_cases::<HarteTest>(&test_file).expect("Failed to load tests");
     let test = &tests[0]; // First test
 
     println!("\n=== TEST: {} ===", test.name);

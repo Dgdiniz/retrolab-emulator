@@ -810,6 +810,7 @@ name = "retro-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "flate2",
  "js-sys",
  "serde",
  "serde_json",
@@ -927,7 +928,6 @@ dependencies = [
  "bincode",
  "chrono",
  "criterion",
- "flate2",
  "image",
  "js-sys",
  "paste",
@@ -1032,7 +1032,6 @@ version = "0.1.0"
 dependencies = [
  "retro-core",
  "serde",
- "serde_json",
  "spc700",
 ]
 
@@ -1252,7 +1251,6 @@ version = "0.1.0"
 dependencies = [
  "retro-core",
  "serde",
- "serde_json",
  "wdc65816",
 ]
 

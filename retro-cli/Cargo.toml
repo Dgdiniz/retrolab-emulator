@@ -8,7 +8,8 @@ repository.workspace = true
 description = "The commands the console cores' command-line tools share"
 
 [dependencies]
-retro-core = { path = "../retro-core" }
+# The test-vector runner, which the `singlestep` front-end runs.
+retro-core = { path = "../retro-core", features = ["singlestep"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"

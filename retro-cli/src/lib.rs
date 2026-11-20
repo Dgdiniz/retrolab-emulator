@@ -20,6 +20,8 @@
 //! - [`output`]: the report or trace a command writes, to a file or to
 //!   standard output.
 //! - [`progress`]: the progress bars, on standard error.
+//! - [`singlestep`]: the front-end of a command that runs a CPU's test
+//!   vectors over retro-core's runner.
 //! - [`trace`]: the trace driver, the parsed trace line and its differ,
 //!   and the comparison of a trace with a reference.
 //! - [`cmd`]: one module per shared command.
@@ -31,6 +33,7 @@ pub mod input;
 pub mod output;
 pub mod progress;
 pub mod rom;
+pub mod singlestep;
 pub mod trace;
 
 pub use cli::{command, run, Cli};

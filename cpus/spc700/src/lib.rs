@@ -17,9 +17,10 @@ pub mod disasm;
 pub mod instructions;
 pub mod interrupts;
 
-/// SingleStepTests runner, shared by the crate's integration tests and
-/// `snes1-cli singlestep-spc700`. Gated behind the `singlestep` feature so the
-/// default and WASM builds never compile in `serde`/`serde_json`.
+/// The CPU under the SingleStepTests, which retro-core's runner runs for the
+/// crate's integration tests and `snes1-cli singlestep-spc700`. Gated behind the
+/// `singlestep` feature so the default and WASM builds never compile in
+/// `serde` or the runner.
 #[cfg(feature = "singlestep")]
 pub mod singlestep;
 
