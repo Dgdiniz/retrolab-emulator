@@ -10,6 +10,7 @@ description = "The commands the console cores' command-line tools share"
 [dependencies]
 # The test-vector runner, which the `singlestep` front-end runs.
 retro-core = { path = "../retro-core", features = ["singlestep"] }
-clap = { version = "4", features = ["derive"] }
+# `string`: the help texts and defaults a console's facts make at run time.
+clap = { version = "4", features = ["derive", "string"] }
 anyhow = "1.0"
 indicatif = "0.17"

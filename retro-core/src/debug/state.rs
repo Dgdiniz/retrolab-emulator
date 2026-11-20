@@ -619,6 +619,10 @@ impl<const N: usize, C: ConsoleDebug> DebuggerCore for DebuggerState<N, C> {
         self.cpu_states.clone()
     }
 
+    fn get_cpu_state(&self, cpu_id: usize) -> Option<&CpuState> {
+        self.cpu_states.iter().find(|state| state.cpu_id == cpu_id)
+    }
+
     fn get_cpu_info(&self, cpu_id: usize) -> Option<&CpuInfo> {
         self.system_info.cpus.get(cpu_id)
     }
@@ -970,6 +974,8 @@ mod tests {
             flags: 0,
         }]);
         assert_eq!(state.get_cpu_states()[0].pc, 0x400);
+        assert_eq!(state.get_cpu_state(0).map(|cpu| cpu.pc), Some(0x400));
+        assert!(state.get_cpu_state(1).is_none(), "no state was set for it");
         assert_eq!(state.get_cpu_info(1).map(|info| info.id), Some(1));
         assert!(state.get_cpu_info(2).is_none());
     }

@@ -6,8 +6,15 @@ use clap::{CommandFactory, FromArgMatches};
 
 use crate::cmd::compare::CompareArgs;
 use crate::cmd::compare_trace::CompareTraceArgs;
+use crate::cmd::determinism_check::DeterminismCheckArgs;
+use crate::cmd::disasm::DisasmArgs;
+use crate::cmd::fingerprint::FingerprintArgs;
+use crate::cmd::info::InfoArgs;
+use crate::cmd::memory::MemoryArgs;
+use crate::cmd::run::RunArgs;
 use crate::cmd::trace::TraceArgs;
 use crate::cmd::trace_to_text::TraceToTextArgs;
+use crate::cmd::watch_ram::WatchRamArgs;
 use crate::console::{cpu_help_list, join_words, CliCpu, Console};
 use crate::input::button_names;
 
@@ -33,6 +40,22 @@ pub enum AllCommands<C: Console> {
 pub enum SharedCommand<B: clap::Args> {
     /// Print the CLI version.
     Version,
+    /// Inspect a ROM's header (title, region, checksum, mapper), its
+    /// coprocessors and its CPU memory map.
+    Info(InfoArgs<B>),
+    /// Boot a ROM and run it for a bounded window.
+    Run(RunArgs<B>),
+    /// Forward-disassemble a CPU's instruction stream.
+    Disasm(DisasmArgs<B>),
+    /// Run a ROM and dump a region of CPU-visible memory (hex + ASCII).
+    Memory(MemoryArgs<B>),
+    /// Single-step a window and name the instruction that writes a RAM cell.
+    WatchRam(WatchRamArgs<B>),
+    /// Emit a per-frame CRC32 of a work-RAM region for divergence bisection.
+    Fingerprint(FingerprintArgs<B>),
+    /// Verify netplay determinism and savestate completeness over a long
+    /// replay (lockstep / rollback).
+    DeterminismCheck(DeterminismCheckArgs<B>),
     /// Dump an execution trace.
     Trace(TraceArgs<B>),
     /// Diff the core's live trace against a reference log.
@@ -44,12 +67,14 @@ pub enum SharedCommand<B: clap::Args> {
 }
 
 /// The tool's clap command: the tool's name, about line and version, the
-/// help texts that name its ROM files, its CPUs, its trace format and its
-/// buttons, its start-up flags listed after each command's own, and its
-/// commands in its order.
+/// help texts that name its ROM files, its CPUs, its trace format, its
+/// buttons, its work RAM and its examples, its start-up flags listed after
+/// each command's own, and its commands in its order.
 pub fn command<C: Console>() -> clap::Command {
     let cpus = cpu_help_list(C::CPUS);
     let main = &C::CPUS[0];
+    let bits = main.address_bits;
+    let digits = usize::from(bits).div_ceil(4);
     let rom_help = format!("Path to the ROM file ({})", C::ROM_FILES);
     let format = C::TRACE_FORMAT;
     let ignore_help = format!(
@@ -61,14 +86,107 @@ pub fn command<C: Console>() -> clap::Command {
     if let Some(note) = own_trace_note(C::CPUS, format) {
         compare_cpu_help = format!("{compare_cpu_help}. {note}");
     }
+    let (work_ram, work_ram_size) = C::WORK_RAM;
+    let settles = match C::DECODED_WITH {
+        "" => "PC settles".to_string(),
+        with => format!("PC + {with} settle"),
+    };
 
     let mut cmd = Cli::<C>::command()
         .name(C::TOOL)
         .about(C::ABOUT)
         .version(C::VERSION)
+        .mut_subcommand("info", |s| {
+            s.mut_arg("frames", |a| {
+                a.help(format!(
+                    "Run this many frames after loading before dumping coprocessor + memory \
+                     state (0 = static snapshot at reset). Use to confirm a coprocessor actually \
+                     fired, e.g. {}",
+                    C::CHIP_ACTIVITY
+                ))
+            })
+        })
+        .mut_subcommand("run", |s| {
+            s.mut_arg("instructions", |a| {
+                a.help(format!(
+                    "Run exactly N {} instructions; a step that only waits or only takes an \
+                     interrupt is not one",
+                    main.label
+                ))
+            })
+            .mut_arg("until_vblank", |a| {
+                a.help(format!(
+                    "Run the first frame to the start of its vertical blanking and stop there, \
+                     the picture drawn and the {} not yet raised",
+                    C::VBLANK_INTERRUPT
+                ))
+            })
+            .mut_arg("until_pc", |a| {
+                a.help(format!(
+                    "Step until the {} reaches this {bits}-bit PC (hex, e.g. `{}`)",
+                    main.label,
+                    C::PC_EXAMPLE
+                ))
+            })
+        })
+        .mut_subcommand("disasm", |s| {
+            s.mut_arg("cpu", |a| {
+                a.default_value(main.name())
+                    .help(format!("Which CPU to disassemble: {cpus}"))
+            })
+            .mut_arg("frames", |a| {
+                a.help(format!(
+                    "Run this many frames before decoding (so {settles})"
+                ))
+            })
+        })
+        .mut_subcommand("memory", |s| {
+            s.mut_arg("addr", |a| {
+                a.help(format!(
+                    "Start address ({bits}-bit hex, e.g. `{work_ram:0digits$x}`, \
+                     `0x{work_ram:0digits$X}`, `${work_ram:0digits$X}`)"
+                ))
+            })
+        })
+        .mut_subcommand("watch-ram", |s| {
+            let example = C::WATCH_EXAMPLE;
+            s.mut_arg("addr", |a| {
+                a.help(format!(
+                    "Work-RAM address to watch ({bits}-bit hex, e.g. `{example:0digits$X}`, \
+                     `0x{example:0digits$X}`)"
+                ))
+            })
+            .mut_arg("max_steps", |a| {
+                a.help(format!(
+                    "Instructions to single-step while watching the cell ({})",
+                    C::FRAME_INSTRUCTIONS
+                ))
+            })
+            .mut_arg("report_pc", |a| {
+                a.help(format!(
+                    "Also print the watched value every time this PC is about to execute \
+                     ({bits}-bit hex). Use to reproduce a known read/dispatch site"
+                ))
+            })
+        })
+        .mut_subcommand("fingerprint", |s| {
+            s.mut_arg("addr", |a| {
+                a.default_value(format!("{work_ram:0digits$X}"))
+                    .help(format!(
+                    "Region start address ({bits}-bit hex, default `{work_ram:0digits$X}` = Work \
+                     RAM)"
+                ))
+            })
+            .mut_arg("len", |a| {
+                a.default_value(format!("{work_ram_size:X}")).help(format!(
+                    "Region length in bytes (default `{work_ram_size:X}` = the whole {} KB Work \
+                     RAM)",
+                    work_ram_size / 1024
+                ))
+            })
+        })
         .mut_subcommand("trace", |s| {
             s.about(format!("Dump an execution trace in {format} text format"))
-                .mut_arg("rom", |a| a.help(rom_help.clone()))
                 .mut_arg("cpu", |a| {
                     a.default_value(main.name())
                         .help(format!("Which CPU to trace: {cpus}"))
@@ -85,7 +203,6 @@ pub fn command<C: Console>() -> clap::Command {
             s.about(format!(
                 "Diff the core's live trace against a {format} reference log"
             ))
-            .mut_arg("rom", |a| a.help(rom_help.clone()))
             .mut_arg("reference", |a| {
                 a.help(format!("Path to the {format} reference trace log"))
             })
@@ -126,9 +243,9 @@ pub fn command<C: Console>() -> clap::Command {
             .mut_arg("rom", |a| a.help(trace_rom_help::<C>()))
         });
 
-    // The shared commands' input flags name the console's buttons, and their
-    // start-up flags come after their own options; the tool's own commands
-    // keep their texts and their order.
+    // The shared commands' ROM names the console's files, their input flags
+    // name its buttons, and their start-up flags come after their own
+    // options; the tool's own commands keep their texts and their order.
     let buttons = button_names(<C::Emulator as retro_core::golden::GoldenConsole>::BUTTONS);
     let boot: Vec<String> = <C::BootArgs as clap::Args>::augment_args(clap::Command::new("boot"))
         .get_arguments()
@@ -139,9 +256,14 @@ pub fn command<C: Console>() -> clap::Command {
     );
     for name in shared.get_subcommands().map(|s| s.get_name().to_string()) {
         cmd = cmd.mut_subcommand(&name, |mut s| {
+            if s.get_arguments()
+                .any(|arg| arg.get_id() == "rom" && arg.is_positional())
+            {
+                s = s.mut_arg("rom", |a| a.help(rom_help.clone()));
+            }
             if INPUT_FLAGS.iter().all(|id| has_arg(&s, id)) {
-                let frames_only = has_arg(&s, "instructions");
-                s = with_input_help(s, &buttons, frames_only);
+                let note = input_note(&s);
+                s = with_input_help(s, &buttons, &note);
             }
             for (i, id) in boot.iter().enumerate() {
                 if has_arg(&s, id) {
@@ -168,41 +290,59 @@ fn has_arg(cmd: &clap::Command, id: &str) -> bool {
     cmd.get_arguments().any(|arg| arg.get_id() == id)
 }
 
-/// The input flags' help, naming the console's buttons. `frames_only`: the
-/// command also runs a number of instructions, which have no frame
-/// boundary to apply the input at.
-fn with_input_help(cmd: clap::Command, buttons: &str, frames_only: bool) -> clap::Command {
-    let frames = if frames_only {
-        ". Frame-bounded runs only: a run of `--instructions` has no frame boundary to apply it at"
-    } else {
-        ""
-    };
+/// What the input flags' help of `cmd` says, after each flag's own text,
+/// about the runs it makes a step at a time: they have no frame boundary
+/// to apply the input at. Empty for a command that only runs frames.
+fn input_note(cmd: &clap::Command) -> String {
+    if has_arg(cmd, "warmup_frames") {
+        return ". Applied to the `--warmup-frames` only: the single-stepped window has no frame \
+                boundary to apply it at"
+            .to_string();
+    }
+    let stepped: Vec<String> = ["instructions", "until_pc"]
+        .iter()
+        .filter(|id| has_arg(cmd, id))
+        .map(|id| format!("`--{}`", id.replace('_', "-")))
+        .collect();
+    match stepped.is_empty() {
+        true => String::new(),
+        false => format!(
+            ". Frame-bounded runs only: a run of {} has no frame boundary to apply it at",
+            join_words(stepped, "or")
+        ),
+    }
+}
+
+/// The input flags' help, naming the console's buttons, each followed by
+/// `note` ([`input_note`]).
+fn with_input_help(cmd: clap::Command, buttons: &str, note: &str) -> clap::Command {
     cmd.mut_arg("press_at", |a| {
         a.help(format!(
             "Frame-scheduled player-1 input: `\"F:buttons;F:buttons\"` (e.g. \
-             `\"180:start;186:\"`). Each set-point holds its buttons from frame `F` until the \
-             next; an empty list releases. It reproduces presses timed by hand, such as those a \
-             reference log was captured with. Takes precedence over `--press-hold` and \
-             `--press`. Without it, `--press-hold` or `--press`, the run gets no input{frames}"
+             `\"180:start;186:;240:a,b\"`, the buttons of a set-point separated by `,` or `+`). \
+             Each set-point holds its buttons from frame `F` until the next; an empty list \
+             releases. It reproduces presses timed by hand, such as those a reference log was \
+             captured with. Takes precedence over `--press-hold` and `--press`. Without it, \
+             `--press-hold` or `--press`, the run gets no input{note}"
         ))
     })
     .mut_arg("press_hold", |a| {
         a.help(format!(
             "Hold these player-1 buttons every frame (comma-separated: `{buttons}`), to run a \
              routine while a button (a direction, say) is held. Takes precedence over \
-             `--press`{frames}"
+             `--press`{note}"
         ))
     })
     .mut_arg("press", |a| {
         a.help(format!(
             "Pulse these player-1 buttons (comma-separated: `{buttons}`) on and off every 6 \
              frames, so that a screen waiting for a new press (a title, a menu) moves on and \
-             the run reaches screens a run with no input cannot{frames}"
+             the run reaches screens a run with no input cannot{note}"
         ))
     })
     .mut_arg("reset_at", |a| {
         a.help(format!(
-            "Reset the console before these frames (comma-separated, e.g. `\"360,720\"`){frames}"
+            "Reset the console before these frames (comma-separated, e.g. `\"360,720\"`){note}"
         ))
     })
 }
@@ -305,6 +445,13 @@ fn run_shared<C: Console>(command: SharedCommand<C::BootArgs>) -> Result<()> {
             println!("{} {}", C::TOOL, C::VERSION);
             Ok(())
         }
+        SharedCommand::Info(args) => crate::cmd::info::run::<C>(args),
+        SharedCommand::Run(args) => crate::cmd::run::run::<C>(args),
+        SharedCommand::Disasm(args) => crate::cmd::disasm::run::<C>(args),
+        SharedCommand::Memory(args) => crate::cmd::memory::run::<C>(args),
+        SharedCommand::WatchRam(args) => crate::cmd::watch_ram::run::<C>(args),
+        SharedCommand::Fingerprint(args) => crate::cmd::fingerprint::run::<C>(args),
+        SharedCommand::DeterminismCheck(args) => crate::cmd::determinism_check::run::<C>(args),
         SharedCommand::Trace(args) => crate::cmd::trace::run::<C>(args),
         SharedCommand::CompareTrace(args) => crate::cmd::compare_trace::run::<C>(args),
         SharedCommand::Compare(args) => crate::cmd::compare::run::<C>(args),

@@ -13,8 +13,9 @@ use crate::console::Console;
 /// console's [`Console::BootArgs`]).
 #[derive(clap::Args, Clone, Debug)]
 pub struct RomArgs<B: clap::Args> {
-    /// Path to the ROM file.
-    #[arg(id = "rom", value_name = "ROM")]
+    /// Path to the ROM file; the first argument of every command that
+    /// takes one.
+    #[arg(id = "rom", value_name = "ROM", index = 1)]
     pub path: PathBuf,
     #[command(flatten)]
     pub boot: B,
@@ -40,12 +41,19 @@ pub fn read_rom(path: &Path) -> Result<Vec<u8>> {
 /// machine.
 pub fn load<C: Console>(args: &RomArgs<C::BootArgs>) -> Result<(Vec<u8>, C::Emulator)> {
     let rom = read_rom(&args.path)?;
-    let mut emu = C::Emulator::new_for_golden();
-    C::stage(&mut emu, &rom, &args.boot)?;
-    emu.load_rom(&rom)
-        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
-    C::after_load(&mut emu, &args.boot)?;
+    let emu = load_image::<C>(&rom, &args.boot)?;
     Ok((rom, emu))
+}
+
+/// A new machine with the ROM image `rom` loaded, the start-up flags set
+/// around the load as the console sets them.
+pub fn load_image<C: Console>(rom: &[u8], boot: &C::BootArgs) -> Result<C::Emulator> {
+    let mut emu = C::Emulator::new_for_golden();
+    C::stage(&mut emu, rom, boot)?;
+    emu.load_rom(rom)
+        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
+    C::after_load(&mut emu, boot)?;
+    Ok(emu)
 }
 
 /// Write what was loaded: `Loaded "TITLE" [REGION]`, then the cartridge's

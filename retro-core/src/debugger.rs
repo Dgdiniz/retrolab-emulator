@@ -11,6 +11,10 @@ pub trait DebuggerCore {
     /// Get current CPU states for all CPUs in the system.
     fn get_cpu_states(&self) -> Vec<CpuState>;
 
+    /// The state of CPU `cpu_id` as the core last refreshed it, borrowed
+    /// rather than copied; `None` for a CPU the system lacks.
+    fn get_cpu_state(&self, cpu_id: usize) -> Option<&CpuState>;
+
     /// Get CPU info for a specific CPU.
     fn get_cpu_info(&self, cpu_id: usize) -> Option<&CpuInfo>;
 

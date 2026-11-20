@@ -186,7 +186,7 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
     }
 
     if args.coprocessor_state {
-        super::print_coprocessors(&emu);
+        super::print_coprocessors(&mut emu)?;
     }
 
     // A forced-blank or zero-brightness frame is legal but renders all

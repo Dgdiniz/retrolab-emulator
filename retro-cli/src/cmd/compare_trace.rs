@@ -26,6 +26,7 @@ pub struct CompareTraceArgs<B: clap::Args> {
     #[command(flatten)]
     pub rom: RomArgs<B>,
     /// Path to the reference trace log.
+    #[arg(index = 2)]
     pub reference: PathBuf,
     /// Which CPU to compare.
     #[arg(long, default_value = "")]

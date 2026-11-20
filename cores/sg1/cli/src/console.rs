@@ -3,11 +3,13 @@
 //! 68000's optional timing columns.
 
 use std::fmt::Write as _;
+use std::io;
+use std::path::Path;
 
 use anyhow::Result;
 use retro_cli::{CliCpu, Console};
-use retro_core::debug::{TraceEntry, TraceText};
-use retro_core::CpuArchitecture;
+use retro_core::debug::{ByteOrder, TraceEntry, TraceText};
+use retro_core::{CpuArchitecture, EmulatorCore};
 use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE};
 use sg1_core::GenesisEmulator;
 
@@ -46,6 +48,9 @@ impl Console for Genesis {
             label: "68000",
             description: "68000",
             architecture: CpuArchitecture::M68000,
+            address_bits: 24,
+            disassembly_bytes: 5,
+            byte_order: ByteOrder::BigEndian,
             timing_columns: "TC/FR/BX/BY",
             parse_line: trace_ref::parse_m68k,
             compared_with_own_trace: false,
@@ -57,6 +62,9 @@ impl Console for Genesis {
             label: "Z80",
             description: "",
             architecture: CpuArchitecture::Z80,
+            address_bits: 16,
+            disassembly_bytes: 5,
+            byte_order: ByteOrder::LittleEndian,
             timing_columns: "TC/FR/BX/BY",
             parse_line: trace_ref::parse_z80,
             compared_with_own_trace: false,
@@ -88,6 +96,13 @@ impl Console for Genesis {
         "savestate",
         "sram",
     ];
+    const WORK_RAM: (u32, u32) = (0xFF_0000, 0x1_0000);
+    const CHIP_ACTIVITY: &'static str = "the SVP's cycle count climbing on Virtua Racing";
+    const VBLANK_INTERRUPT: &'static str = "VBlank interrupt";
+    const PC_EXAMPLE: &'static str = "000400";
+    const DECODED_WITH: &'static str = "";
+    const WATCH_EXAMPLE: u32 = 0xFF_A190;
+    const FRAME_INSTRUCTIONS: &'static str = "a Genesis frame is roughly 9k-14k 68000 instructions";
 
     fn stage(_: &mut GenesisEmulator, _: &[u8], _: &GenesisBoot) -> Result<()> {
         Ok(())
@@ -98,6 +113,29 @@ impl Console for Genesis {
     fn after_load(emu: &mut GenesisEmulator, boot: &GenesisBoot) -> Result<()> {
         if boot.six_button {
             emu.connect_controllers(true);
+        }
+        Ok(())
+    }
+
+    /// The file's path and size, then the header's title, region, checksum
+    /// and mapper.
+    fn write_rom_header(
+        emu: &GenesisEmulator,
+        rom: &[u8],
+        path: &Path,
+        out: &mut dyn io::Write,
+    ) -> io::Result<()> {
+        writeln!(out, "ROM: {}", path.display())?;
+        writeln!(out, "Size: {} bytes ({} KB)", rom.len(), rom.len() / 1024)?;
+        if let Some(info) = emu.get_rom_info() {
+            writeln!(out)?;
+            writeln!(out, "ROM Information:")?;
+            writeln!(out, "  Title: {}", info.title.trim())?;
+            writeln!(out, "  Region: {}", info.region)?;
+            writeln!(out, "  Checksum: 0x{:04X}", info.checksum)?;
+            if let Some(mapper) = &info.mapper {
+                writeln!(out, "  Mapper: {mapper}")?;
+            }
         }
         Ok(())
     }
@@ -203,6 +241,24 @@ mod tests {
         assert_eq!(listed, ordered);
     }
 
+    #[test]
+    fn the_rom_comes_first_where_a_command_takes_two_arguments() {
+        let usage = |name: &str| {
+            retro_cli::command::<Genesis>()
+                .find_subcommand_mut(name)
+                .expect(name)
+                .render_usage()
+                .to_string()
+        };
+        assert!(
+            usage("memory").ends_with("<ROM> <ADDR>"),
+            "{}",
+            usage("memory")
+        );
+        assert!(usage("compare-trace").ends_with("<ROM> <REFERENCE>"));
+        assert!(usage("compare").ends_with("<TRACE1> <TRACE2>"));
+    }
+
     /// The help text of `command`'s `--id`.
     fn help_of(command: &str, id: &str) -> String {
         let cmd = retro_cli::command::<Genesis>();
@@ -231,6 +287,37 @@ mod tests {
              (without it, their instruction column is omitted); the Z80's need none"
         );
         assert!(!help_of("compare-trace", "cpu").contains("own trace"));
+        assert!(help_of("info", "frames")
+            .ends_with("e.g. the SVP's cycle count climbing on Virtua Racing"));
+        assert!(help_of("run", "until_vblank").ends_with("the VBlank interrupt not yet raised"));
+        assert_eq!(
+            help_of("run", "until_pc"),
+            "Step until the 68000 reaches this 24-bit PC (hex, e.g. `000400`)"
+        );
+        assert_eq!(
+            help_of("disasm", "frames"),
+            "Run this many frames before decoding (so PC settles)"
+        );
+        assert_eq!(
+            help_of("memory", "addr"),
+            "Start address (24-bit hex, e.g. `ff0000`, `0xFF0000`, `$FF0000`)"
+        );
+        assert_eq!(
+            help_of("watch-ram", "addr"),
+            "Work-RAM address to watch (24-bit hex, e.g. `FFA190`, `0xFFA190`)"
+        );
+        assert!(help_of("watch-ram", "press_at").ends_with(
+            "`--warmup-frames` only: the \
+            single-stepped window has no frame boundary to apply it at"
+        ));
+        assert!(help_of("run", "press").ends_with(
+            "a run of `--instructions` or `--until-pc` \
+            has no frame boundary to apply it at"
+        ));
+        assert_eq!(
+            help_of("fingerprint", "len"),
+            "Region length in bytes (default `10000` = the whole 64 KB Work RAM)"
+        );
     }
 
     #[test]
@@ -240,6 +327,11 @@ mod tests {
         let mut names: Vec<&str> = Vec::new();
         for cpu in Genesis::CPUS {
             assert_eq!(cpus[cpu.id].architecture, cpu.architecture, "{}", cpu.label);
+            assert_eq!(
+                cpus[cpu.id].address_width, cpu.address_bits,
+                "{}",
+                cpu.label
+            );
             names.extend(cpu.names.iter().copied());
         }
         let count = names.len();

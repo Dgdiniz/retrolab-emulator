@@ -19,7 +19,10 @@
 //!   that runs frames, and the plan made of it.
 //! - [`output`]: the report or trace a command writes, to a file or to
 //!   standard output.
+//! - [`parse`]: the parsers of the values the command lines take.
 //! - [`progress`]: the progress bars, on standard error.
+//! - [`report`]: the reports the inspection commands print (a hex dump, a
+//!   disassembly row, the cartridge's memory map and chips, a CRC-32).
 //! - [`singlestep`]: the front-end of a command that runs a CPU's test
 //!   vectors over retro-core's runner.
 //! - [`trace`]: the trace driver, the parsed trace line and its differ,
@@ -31,7 +34,9 @@ pub mod cmd;
 pub mod console;
 pub mod input;
 pub mod output;
+pub mod parse;
 pub mod progress;
+pub mod report;
 pub mod rom;
 pub mod singlestep;
 pub mod trace;

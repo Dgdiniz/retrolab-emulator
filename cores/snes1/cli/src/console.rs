@@ -3,13 +3,16 @@
 //! lines, and its start-up flags (the DSP-1's emulation and the forced
 //! mapping of a ROM the detector doubts).
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use retro_cli::report::human_bytes;
 use retro_cli::{CliCpu, Console};
+use retro_core::debug::ByteOrder;
 use retro_core::{CpuArchitecture, EmulatorCore};
-use snes1_core::{CoprocessorMode, SnesEmulator, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU};
+use snes1_core::{CoprocessorMode, PresetKind, SnesEmulator, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU};
 
 use crate::trace_ref;
 
@@ -49,6 +52,9 @@ impl Console for Snes {
             label: "65C816",
             description: "65C816",
             architecture: CpuArchitecture::Mos65816,
+            address_bits: 24,
+            disassembly_bytes: 4,
+            byte_order: ByteOrder::LittleEndian,
             timing_columns: "V/H/F",
             parse_line: trace_ref::parse_65816,
             compared_with_own_trace: false,
@@ -60,6 +66,9 @@ impl Console for Snes {
             label: "SPC700",
             description: "",
             architecture: CpuArchitecture::Spc700,
+            address_bits: 16,
+            disassembly_bytes: 4,
+            byte_order: ByteOrder::LittleEndian,
             timing_columns: "",
             parse_line: trace_ref::parse_spc700,
             compared_with_own_trace: false,
@@ -71,6 +80,9 @@ impl Console for Snes {
             label: "GSU",
             description: "Super FX",
             architecture: CpuArchitecture::SuperFx,
+            address_bits: 24,
+            disassembly_bytes: 4,
+            byte_order: ByteOrder::LittleEndian,
             timing_columns: "",
             parse_line: trace_ref::parse_gsu,
             compared_with_own_trace: true,
@@ -86,6 +98,9 @@ impl Console for Snes {
             label: "Cx4",
             description: "Cx4 HG51B169",
             architecture: CpuArchitecture::Hg51b,
+            address_bits: 24,
+            disassembly_bytes: 4,
+            byte_order: ByteOrder::LittleEndian,
             timing_columns: "",
             parse_line: trace_ref::parse_cx4,
             compared_with_own_trace: true,
@@ -114,11 +129,20 @@ impl Console for Snes {
         "singlestep-spc700",
         "benchmark",
         "memory",
+        "watch-ram",
+        "fingerprint",
         "savestate",
         "golden",
         "golden-set",
         "golden-compare",
     ];
+    const WORK_RAM: (u32, u32) = (0x7E_0000, 0x2_0000);
+    const CHIP_ACTIVITY: &'static str = "S-DD1 `DECOMPS > 0`";
+    const VBLANK_INTERRUPT: &'static str = "NMI";
+    const PC_EXAMPLE: &'static str = "00ff03";
+    const DECODED_WITH: &'static str = "flags";
+    const WATCH_EXAMPLE: u32 = 0x7E_0019;
+    const FRAME_INSTRUCTIONS: &'static str = "a SNES frame is roughly 11k-14k 65C816 instructions";
 
     /// The DSP-1's emulation and firmware, then the forced mapping.
     fn stage(emu: &mut SnesEmulator, rom: &[u8], boot: &SnesBoot) -> Result<()> {
@@ -127,8 +151,99 @@ impl Console for Snes {
         Ok(())
     }
 
+    /// The file and its size, then the header: its title and how sure the
+    /// detector is of it, the region, the mapping, the sizes, the vectors
+    /// and the checksum.
+    fn write_rom_header(
+        emu: &SnesEmulator,
+        rom: &[u8],
+        path: &Path,
+        out: &mut dyn io::Write,
+    ) -> io::Result<()> {
+        writeln!(out, "File:        {}", path.display())?;
+        writeln!(
+            out,
+            "File size:   {} bytes ({})",
+            rom.len(),
+            human_bytes(rom.len())
+        )?;
+        if let Some(info) = emu.get_rom_info() {
+            writeln!(
+                out,
+                "Title:       {:?} (confidence: {})",
+                info.title.trim(),
+                info.title_confidence
+            )?;
+            writeln!(out, "Region:      {}", info.region)?;
+        }
+        let mapper = emu.preset_kind().map_or("unknown", preset_name);
+        let Some(h) = emu.header() else {
+            return writeln!(out, "Mapper:      {mapper} (no parsed header)");
+        };
+        writeln!(
+            out,
+            "Mapper:      {mapper} (map_mode ${:02x}, low ${:x}){}",
+            h.map_mode,
+            h.map_mode_low(),
+            if h.is_fastrom() {
+                ", FastROM"
+            } else {
+                ", SlowROM"
+            }
+        )?;
+        writeln!(
+            out,
+            "ROM size:    header {} ({}), file {}",
+            h.rom_size_bytes(),
+            human_bytes(h.rom_size_bytes() as usize),
+            human_bytes(rom.len())
+        )?;
+        writeln!(
+            out,
+            "SRAM size:   {} ({})",
+            h.sram_size_bytes(),
+            human_bytes(h.sram_size_bytes() as usize)
+        )?;
+        writeln!(
+            out,
+            "Reset vec:   ${:04x}   NMI: native ${:04x} / emu ${:04x}",
+            h.vectors.emu_reset, h.vectors.native_nmi, h.vectors.emu_nmi
+        )?;
+        writeln!(
+            out,
+            "IRQ vec:     native ${:04x} / emu ${:04x}",
+            h.vectors.native_irq, h.vectors.emu_irq
+        )?;
+        writeln!(
+            out,
+            "Checksum:    ${:04x}  complement ${:04x}  [{}]",
+            h.checksum,
+            h.checksum_complement,
+            if h.checksum_is_consistent() {
+                "consistent"
+            } else {
+                "INCONSISTENT"
+            }
+        )
+    }
+
     fn run_command(command: crate::cmd::Command) -> Result<()> {
         crate::cmd::run(command)
+    }
+}
+
+/// The name `info` gives a cartridge's mapping.
+fn preset_name(kind: PresetKind) -> &'static str {
+    match kind {
+        PresetKind::LoRom => "LoROM",
+        PresetKind::HiRom => "HiROM",
+        PresetKind::ExHiRom => "ExHiROM",
+        PresetKind::Sdd1 => "S-DD1",
+        PresetKind::Spc7110 => "SPC7110",
+        PresetKind::Sa1 => "SA-1",
+        PresetKind::SuperFx => "Super FX",
+        PresetKind::Cx4 => "Cx4",
+        PresetKind::Custom => "Custom",
     }
 }
 
@@ -242,6 +357,24 @@ mod tests {
         assert_eq!(listed, ordered);
     }
 
+    #[test]
+    fn the_rom_comes_first_where_a_command_takes_two_arguments() {
+        let usage = |name: &str| {
+            retro_cli::command::<Snes>()
+                .find_subcommand_mut(name)
+                .expect(name)
+                .render_usage()
+                .to_string()
+        };
+        assert!(
+            usage("memory").ends_with("<ROM> <ADDR>"),
+            "{}",
+            usage("memory")
+        );
+        assert!(usage("compare-trace").ends_with("<ROM> <REFERENCE>"));
+        assert!(usage("compare").ends_with("<TRACE1> <TRACE2>"));
+    }
+
     /// The help text of `command`'s `--id`.
     fn help_of(command: &str, id: &str) -> String {
         let cmd = retro_cli::command::<Snes>();
@@ -269,6 +402,24 @@ mod tests {
             "The ROM the trace was made from: the GSU's and the Cx4's lines need it, to know \
              which CPU the cartridge put in their slot; the 65C816's and the SPC700's need none"
         );
+        assert!(help_of("info", "frames").ends_with("e.g. S-DD1 `DECOMPS > 0`"));
+        assert!(help_of("run", "until_vblank").ends_with("the NMI not yet raised"));
+        assert_eq!(
+            help_of("run", "until_pc"),
+            "Step until the 65C816 reaches this 24-bit PC (hex, e.g. `00ff03`)"
+        );
+        assert_eq!(
+            help_of("disasm", "frames"),
+            "Run this many frames before decoding (so PC + flags settle)"
+        );
+        assert_eq!(
+            help_of("memory", "addr"),
+            "Start address (24-bit hex, e.g. `7e0000`, `0x7E0000`, `$7E0000`)"
+        );
+        assert_eq!(
+            help_of("fingerprint", "addr"),
+            "Region start address (24-bit hex, default `7E0000` = Work RAM)"
+        );
     }
 
     #[test]
@@ -280,6 +431,7 @@ mod tests {
             // The cartridge's slot exists only once a cartridge brings a CPU.
             if let Some(info) = cpus.get(cpu.id) {
                 assert_eq!(info.architecture, cpu.architecture, "{}", cpu.label);
+                assert_eq!(info.address_width, cpu.address_bits, "{}", cpu.label);
             } else {
                 assert_eq!(cpu.id, CARTRIDGE_CPU, "{}", cpu.label);
             }

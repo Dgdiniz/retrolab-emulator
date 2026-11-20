@@ -1,8 +1,11 @@
 //! What a console's command-line tool gives the shared commands.
 
 use std::fmt::Debug;
+use std::io::{self, Write};
+use std::path::Path;
 
 use anyhow::Result;
+use retro_core::debug::ByteOrder;
 use retro_core::golden::GoldenConsole;
 use retro_core::{CpuArchitecture, EmulatorCore};
 
@@ -38,6 +41,30 @@ pub trait Console: Sized + 'static {
     /// The tool's commands, shared and its own, in the order its help
     /// lists them.
     const COMMAND_ORDER: &'static [&'static str];
+    /// The main CPU's work RAM on its bus: its first address and its size
+    /// in bytes. `fingerprint` hashes it unless told otherwise,
+    /// `determinism-check` says whether it differs where two machines part,
+    /// and the help of `memory` gives its first address as an example.
+    const WORK_RAM: (u32, u32);
+    /// A coprocessor at work, as `info --frames` shows it: the example its
+    /// help gives.
+    const CHIP_ACTIVITY: &'static str;
+    /// The interrupt the start of vertical blanking raises, as the help of
+    /// `run --until-vblank` names it.
+    const VBLANK_INTERRUPT: &'static str;
+    /// An address of the main CPU's program, in hex, as wide as its
+    /// addresses: the example the help of `run --until-pc` gives.
+    const PC_EXAMPLE: &'static str;
+    /// What the disassembly of the console's CPUs reads besides the
+    /// program counter (`"flags"`), which `disasm --frames` lets settle;
+    /// empty for nothing.
+    const DECODED_WITH: &'static str;
+    /// An address in work RAM: the example the help of `watch-ram --addr`
+    /// gives.
+    const WATCH_EXAMPLE: u32;
+    /// How many instructions of the main CPU a frame runs, as the help of
+    /// `watch-ram --max-steps` says it.
+    const FRAME_INSTRUCTIONS: &'static str;
 
     /// Set the boot flags on a new machine, before its ROM loads.
     fn stage(emu: &mut Self::Emulator, rom: &[u8], boot: &Self::BootArgs) -> Result<()>;
@@ -47,6 +74,15 @@ pub trait Console: Sized + 'static {
         let _ = (emu, boot);
         Ok(())
     }
+
+    /// What `info` prints about the ROM file at `path` and its header,
+    /// before the chips and the memory map.
+    fn write_rom_header(
+        emu: &Self::Emulator,
+        rom: &[u8],
+        path: &Path,
+        out: &mut dyn Write,
+    ) -> io::Result<()>;
 
     /// The text of trace entries of `cpu` the debugger handed out, one line
     /// per entry, each followed by `"\n"`. `timing` asks for the timing
@@ -88,6 +124,13 @@ pub struct CliCpu {
     /// The CPU its slot must hold: a cartridge's slot holds the CPU the
     /// cartridge brought, which may be another one.
     pub architecture: CpuArchitecture,
+    /// How many bits its addresses have, as the help names them: the
+    /// core's `CpuInfo::address_width` for the CPU.
+    pub address_bits: u8,
+    /// How many bytes the bytes column of its disassembly is as wide as.
+    pub disassembly_bytes: usize,
+    /// The order of the bytes of a wider value in its memory.
+    pub byte_order: ByteOrder,
     /// The timing columns its lines and its reference's carry, as the
     /// comparison's header names them; empty for none.
     pub timing_columns: &'static str,
@@ -186,6 +229,39 @@ pub fn join_words(mut items: Vec<String>, word: &str) -> String {
     }
 }
 
+/// The program counter of CPU `cpu`, the debugger's states refreshed
+/// first: a CPU that runs in banks has its bank in it, and the value is
+/// cut to the CPU's address width. 0 for a CPU the machine lacks.
+pub fn program_counter<E: EmulatorCore>(emu: &mut E, cpu: usize) -> u32 {
+    emu.refresh_debugger_state();
+    held_program_counter(emu, cpu)
+}
+
+/// The program counter of CPU `cpu` from the debugger's states as they
+/// were last refreshed, which a host step does after every step; read as
+/// [`program_counter`] reads it, borrowing the state rather than copying
+/// it, so a loop can read it after every step.
+pub fn held_program_counter<E: EmulatorCore>(emu: &E, cpu: usize) -> u32 {
+    let pc = emu
+        .debugger_ref()
+        .get_cpu_state(cpu)
+        .map_or(0, |state| state.pc);
+    let bits = emu
+        .system_info()
+        .cpus
+        .get(cpu)
+        .map_or(32, |info| info.address_width);
+    pc & address_mask(bits)
+}
+
+/// The mask of an address `bits` wide.
+pub fn address_mask(bits: u8) -> u32 {
+    match bits {
+        32.. => u32::MAX,
+        bits => (1u32 << bits) - 1,
+    }
+}
+
 /// The core's text of trace entries of `cpu` the debugger handed out.
 pub fn core_trace_text<E: EmulatorCore>(emu: &mut E, cpu: &CliCpu, data: &[u8]) -> Result<String> {
     emu.trace_to_text(cpu.id, data).ok_or_else(|| {
@@ -209,6 +285,9 @@ mod tests {
             label,
             description: label,
             architecture: CpuArchitecture::M68000,
+            address_bits: 24,
+            disassembly_bytes: 4,
+            byte_order: ByteOrder::BigEndian,
             timing_columns: "",
             parse_line: |_| None,
             compared_with_own_trace: false,
@@ -236,6 +315,14 @@ mod tests {
         let words = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
         assert_eq!(join_words(words(3), "and"), "0, 1 and 2");
         assert_eq!(join_words(words(1), "and"), "0");
+    }
+
+    #[test]
+    fn an_address_mask_is_as_wide_as_its_bits() {
+        assert_eq!(address_mask(16), 0xFFFF);
+        assert_eq!(address_mask(24), 0x00FF_FFFF);
+        assert_eq!(address_mask(32), u32::MAX);
+        assert_eq!(address_mask(40), u32::MAX);
     }
 
     #[test]

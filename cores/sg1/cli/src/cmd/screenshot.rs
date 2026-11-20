@@ -131,7 +131,7 @@ pub fn run(args: ScreenshotArgs) -> Result<()> {
 
     if args.coprocessor_state {
         println!();
-        super::print_coprocessors(&emu);
+        super::print_coprocessors(&mut emu)?;
     }
 
     Ok(())

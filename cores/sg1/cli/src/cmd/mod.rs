@@ -6,19 +6,12 @@
 pub mod audio_dump;
 pub mod audio_info;
 pub mod benchmark;
-pub mod determinism_check;
-pub mod disasm;
 pub mod dump_vdp;
-pub mod fingerprint;
-pub mod info;
-pub mod memory;
 pub mod profile;
-pub mod run;
 pub mod savestate;
 pub mod screenshot;
 pub mod sound_trace;
 pub mod sram;
-pub mod watch_ram;
 pub mod watch_read;
 pub mod watch_vram;
 
@@ -27,7 +20,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use retro_cli::RomArgs;
-use retro_core::cartridge::ExpansionChipState;
 use retro_core::input_schedule::PressSchedule;
 use retro_core::EmulatorCore;
 use sg1_core::GenesisEmulator;
@@ -39,28 +31,14 @@ use crate::console::Genesis;
 /// The Mega Drive's own commands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Inspect a ROM's header (title, region, checksum, mapper).
-    Info(info::InfoArgs),
-    /// Boot a ROM and run it for a bounded window.
-    Run(run::RunArgs),
     /// Run a ROM and save the framebuffer as a PNG (+ layer dumps).
     Screenshot(screenshot::ScreenshotArgs),
-    /// Forward-disassemble a CPU's instruction stream.
-    Disasm(disasm::DisasmArgs),
-    /// Run a ROM and dump a region of CPU-visible memory (hex + ASCII).
-    Memory(memory::MemoryArgs),
     /// Run a ROM and dump a full VDP state report.
     DumpVdp(dump_vdp::DumpVdpArgs),
     /// Log VDP writes that land in a VRAM address window while running.
     WatchVram(watch_vram::WatchVramArgs),
-    /// Single-step a window and name the instruction that writes a RAM cell.
-    WatchRam(watch_ram::WatchRamArgs),
     /// Single-step a window and name the instructions that read an address range.
     WatchRead(watch_read::WatchReadArgs),
-    /// Emit a per-frame CRC32 of a work-RAM region for divergence bisection.
-    Fingerprint(fingerprint::FingerprintArgs),
-    /// Verify deterministic replay + savestate completeness for netplay.
-    DeterminismCheck(determinism_check::DeterminismCheckArgs),
     /// Benchmark the execution tiers (fast / light-debug / +trace / full).
     Benchmark(benchmark::BenchmarkArgs),
     /// Profile per-subsystem frame timing and rank bottlenecks.
@@ -80,17 +58,10 @@ pub enum Command {
 /// Run one of the Mega Drive's own commands.
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Info(args) => info::run(args),
-        Command::Run(args) => run::run(args),
         Command::Screenshot(args) => screenshot::run(args),
-        Command::Disasm(args) => disasm::run(args),
-        Command::Memory(args) => memory::run(args),
         Command::DumpVdp(args) => dump_vdp::run(args),
         Command::WatchVram(args) => watch_vram::run(args),
-        Command::WatchRam(args) => watch_ram::run(args),
         Command::WatchRead(args) => watch_read::run(args),
-        Command::Fingerprint(args) => fingerprint::run(args),
-        Command::DeterminismCheck(args) => determinism_check::run(args),
         Command::Benchmark(args) => benchmark::run(args),
         Command::Profile(args) => profile::run(args),
         Command::AudioDump(args) => audio_dump::run(args),
@@ -115,62 +86,11 @@ pub(crate) fn print_rom_title(emu: &GenesisEmulator) {
     }
 }
 
-/// Print the installed coprocessor(s): a label summary followed by each
-/// chip's live state. A plain cartridge prints `Coprocessor: none`; a
-/// multi-chip cartridge enumerates every chip by `chip_id`. Shared by
-/// `info` and `screenshot --coprocessor-state`, mirroring the snes1-cli
-/// helper of the same name.
-pub(crate) fn print_coprocessors(emu: &GenesisEmulator) {
-    let labels = emu.coprocessor_labels();
-    match labels.as_slice() {
-        [] => {
-            println!("Coprocessor: none");
-            return;
-        }
-        [(_, label)] => println!("Coprocessor: {label}"),
-        many => {
-            println!("Coprocessors: {}", many.len());
-            for (id, label) in many {
-                println!("  [{id}] {label}");
-            }
-        }
-    }
-    for (id, state) in emu.coprocessors_debug_state() {
-        print_coprocessor_state(id, &state);
-    }
-}
-
-/// Print one coprocessor chip's live state (for the SVP: the SSP1601
-/// program counter, cycle count, and IRAM size). Values reflect however
-/// many frames the caller ran before dumping, `info` defaults to a reset
-/// snapshot (`--frames 0`), while `info --frames N` and
-/// `screenshot --coprocessor-state` show live state after N frames (e.g.
-/// the SVP's `Cycle count` climbing once Virtua Racing has driven it).
-pub(crate) fn print_coprocessor_state(chip_id: u8, state: &ExpansionChipState) {
-    println!();
-    println!("Coprocessor chip state [{chip_id}]:");
-    println!("  Type:           {:?}", state.chip_type);
-    match state.program_counter {
-        Some(pc) => println!("  PC:             ${pc:04x}"),
-        None => println!("  PC:             (idle - no program loaded)"),
-    }
-    println!("  Cycle count:    {}", state.cycle_count);
-    match &state.internal_ram {
-        Some(ram) => println!(
-            "  Internal RAM:   {} bytes ({} x 16-bit words)",
-            ram.len(),
-            ram.len() / 2
-        ),
-        None => println!("  Internal RAM:   (none)"),
-    }
-    if state.registers.is_empty() {
-        println!("  Registers:      (none - chip present but not driven)");
-    } else {
-        println!("  Registers:");
-        for r in &state.registers {
-            println!("    {:<8} ${:04x}  {}", r.name, r.value, r.description);
-        }
-    }
+/// Print the cartridge's chips and their state, as `info` prints them
+/// (`screenshot --coprocessor-state`).
+pub(crate) fn print_coprocessors(emu: &mut GenesisEmulator) -> Result<()> {
+    retro_cli::report::write_chips(emu, &mut std::io::stdout())?;
+    Ok(())
 }
 
 /// Force 6-button pads on both DE-9 ports.
