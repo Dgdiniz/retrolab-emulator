@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 snes1-core = { path = "../core", default-features = false }
 retro-core = { path = "../../../retro-core" }
+retro-cli = { path = "../../../retro-cli" }
 # CPU crates with the SingleStepTests runner enabled, so `singlestep-65816`
 # / `singlestep-spc700` share one harness with `cargo test -p {wdc65816,spc700}`.
 wdc65816 = { path = "../../../cpus/wdc65816", features = ["singlestep"] }

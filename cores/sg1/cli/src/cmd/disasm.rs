@@ -10,10 +10,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
+use retro_cli::console::find_cpu;
+use retro_cli::CliCpu;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, Instruction};
+use sg1_core::debugger::MAIN_CPU;
 use sg1_core::GenesisEmulator;
 
-use crate::trace_ref::TraceCpu;
+use crate::console::Genesis;
 
 #[derive(Args, Debug)]
 pub struct DisasmArgs {
@@ -42,7 +45,7 @@ fn parse_hex_u32(s: &str) -> Result<u32, String> {
 }
 
 pub fn run(args: DisasmArgs) -> Result<()> {
-    let cpu = TraceCpu::parse(&args.cpu)?;
+    let cpu = find_cpu::<Genesis>(&args.cpu)?;
 
     let (_, mut emu) = super::load_rom(&args.rom)?;
     // `run_frame` only advances the CPU in `Running` mode; otherwise the PC
@@ -55,13 +58,13 @@ pub fn run(args: DisasmArgs) -> Result<()> {
     }
 
     let addr = args.addr.unwrap_or_else(|| current_pc(&emu, cpu));
-    let rows = emu.disassemble_cpu(cpu.cpu_id(), addr, args.count);
+    let rows = emu.disassemble_cpu(cpu.id, addr, args.count);
 
     let mut out = super::open_output(args.output.as_ref())?;
     writeln!(
         out,
         "Disassembly of {} at ${:06X} ({} instruction(s)):",
-        cpu.label(),
+        cpu.label,
         addr,
         rows.len()
     )?;
@@ -73,10 +76,11 @@ pub fn run(args: DisasmArgs) -> Result<()> {
 }
 
 /// Live PC of the selected CPU (68000: the 24-bit PC; Z80: the 16-bit PC).
-fn current_pc(emu: &GenesisEmulator, cpu: TraceCpu) -> u32 {
-    match cpu {
-        TraceCpu::M68k => emu.cpu().pc & 0x00FF_FFFF,
-        TraceCpu::Z80 => emu.z80().pc as u32,
+fn current_pc(emu: &GenesisEmulator, cpu: &CliCpu) -> u32 {
+    if cpu.id == MAIN_CPU {
+        emu.cpu().pc & 0x00FF_FFFF
+    } else {
+        emu.z80().pc as u32
     }
 }
 

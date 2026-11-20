@@ -19,8 +19,9 @@ and video views. It compiles to WebAssembly, and it is the emulator the
 - `retro-core/`: what every core shares (the traits a core implements, the
   types it hands a host, the frame loop and its debugger tiers, the
   debugger's, audio's and capture's shared logic); `retro-wasm/`: what the
-  cores' WebAssembly bindings share. A core holds only what its console's
-  hardware makes different.
+  cores' WebAssembly bindings share; `retro-cli/`: the commands the cores'
+  command-line tools share. A core holds only what its console's hardware
+  makes different.
 - `web/`: a debugger that runs in the browser; `debugger-core/` holds the
   TypeScript it shares with RetroLab's.
 

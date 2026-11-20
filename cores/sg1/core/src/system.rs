@@ -906,7 +906,6 @@ impl EmulatorCore for GenesisEmulator {
         // live game's mapping for the editor.
         self.last_rom = data.to_vec();
 
-        // Print ROM info (debug)
         let info = cartridge.info();
         // A cartridge sold only in PAL markets ran on a 50 Hz console and
         // its game logic (music tempo, timers, physics) assumes it; running
@@ -925,18 +924,6 @@ impl EmulatorCore for GenesisEmulator {
         } else {
             VideoRegion::Ntsc
         };
-        eprintln!("Loaded ROM: {}", info.title);
-        eprintln!("  System: {:?}", info.system);
-        eprintln!("  ROM Size: {} bytes", info.rom_size);
-        if info.sram_size > 0 {
-            eprintln!("  SRAM: {} bytes ({:?})", info.sram_size, info.sram_type);
-        }
-        if let Some(ref mapper_info) = info.mapper_info {
-            eprintln!("  Mapper: {:?}", mapper_info.mapper_id);
-        }
-        if let Some(ref chip_info) = info.expansion_chip_info {
-            eprintln!("  Expansion Chip: {:?}", chip_info.chip_type);
-        }
 
         // Verify checksum (warn if mismatch)
         if let (Some(header_ck), Some(calc_ck)) = (info.header_checksum, info.calculated_checksum) {

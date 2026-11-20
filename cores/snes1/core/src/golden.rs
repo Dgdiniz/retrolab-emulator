@@ -11,12 +11,29 @@ use retro_core::golden::{GoldenConsole, GoldenEntry};
 use retro_core::EmulatorCore;
 
 use crate::cartridge::{fixed_unix_time, set_fixed_unix_time};
-use crate::input_schedule::BUTTONS;
 use crate::SnesEmulator;
 
 /// The manifest flag that loads a low-confidence ROM by forcing its
 /// vector-implied mapping.
 pub const FORCE_DETECT: &str = "force-detect";
+
+/// The pad's button names in the order of the generic input bits
+/// (`InputState::buttons`), matching the `BTN_*` constants of
+/// [`crate::controller`].
+const BUTTON_NAMES: [&str; 12] = [
+    "up", "down", "left", "right", "a", "b", "x", "y", "l", "r", "start", "select",
+];
+
+/// The same names with their bit, as the shared input grammar takes them.
+const BUTTONS: [(&str, u32); 12] = {
+    let mut table = [("", 0u32); 12];
+    let mut i = 0;
+    while i < 12 {
+        table[i] = (BUTTON_NAMES[i], i as u32);
+        i += 1;
+    }
+    table
+};
 
 impl GoldenConsole for SnesEmulator {
     const RECORD_FORMAT: &'static str = "snes1-golden 1";
@@ -52,6 +69,24 @@ mod tests {
     use retro_core::golden::{
         entry_spec_of, format_records_of, parse_manifest_of, parse_records_of, FrameRecord,
     };
+
+    #[test]
+    fn button_names_follow_the_controller_constants() {
+        use crate::controller::*;
+        use retro_core::input_schedule::parse_button_mask;
+        let expected = [
+            BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_A, BTN_B, BTN_X, BTN_Y, BTN_L, BTN_R,
+            BTN_START, BTN_SELECT,
+        ];
+        for (i, bit) in expected.iter().enumerate() {
+            assert_eq!(
+                parse_button_mask(Some(BUTTON_NAMES[i]), &BUTTONS).unwrap(),
+                Some(1 << bit),
+                "{}",
+                BUTTON_NAMES[i]
+            );
+        }
+    }
 
     #[test]
     fn the_snes_layer_reads_its_own_format_buttons_and_flag() {

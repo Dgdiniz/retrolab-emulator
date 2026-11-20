@@ -1,13 +1,11 @@
-//! Subcommand handlers for `sg1-cli`. Each module owns its clap argument
-//! struct and a `run` entry point; `main.rs` only wires the `Commands`
-//! enum to these. Shared helpers (ROM loading, output sinks, screenshot
-//! encoding, controller-input scheduling) live here.
+//! The Mega Drive's own commands: each module owns its clap arguments and
+//! a `run` entry point, and [`Command`] lists them for `retro-cli`, which
+//! runs the commands both tools share. The helpers the commands share live
+//! here.
 
 pub mod audio_dump;
 pub mod audio_info;
 pub mod benchmark;
-pub mod compare;
-pub mod compare_trace;
 pub mod determinism_check;
 pub mod disasm;
 pub mod dump_vdp;
@@ -20,53 +18,94 @@ pub mod savestate;
 pub mod screenshot;
 pub mod sound_trace;
 pub mod sram;
-pub mod trace;
-pub mod trace_to_text;
 pub mod watch_ram;
 pub mod watch_read;
 pub mod watch_vram;
 
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
+use clap::Subcommand;
+use retro_cli::RomArgs;
 use retro_core::cartridge::ExpansionChipState;
-use retro_core::{EmulatorCore, InputState};
+use retro_core::input_schedule::PressSchedule;
+use retro_core::EmulatorCore;
 use sg1_core::GenesisEmulator;
 
-/// Open a buffered writer for an optional output path, falling back to
-/// stdout when `path` is `None`.
-pub(crate) fn open_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
-    match path {
-        Some(p) => {
-            let f = File::create(p)
-                .with_context(|| format!("failed to create output file: {}", p.display()))?;
-            Ok(Box::new(BufWriter::new(f)))
-        }
-        None => Ok(Box::new(BufWriter::new(std::io::stdout()))),
+pub(crate) use retro_cli::output::open_output;
+
+use crate::console::Genesis;
+
+/// The Mega Drive's own commands.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Inspect a ROM's header (title, region, checksum, mapper).
+    Info(info::InfoArgs),
+    /// Boot a ROM and run it for a bounded window.
+    Run(run::RunArgs),
+    /// Run a ROM and save the framebuffer as a PNG (+ layer dumps).
+    Screenshot(screenshot::ScreenshotArgs),
+    /// Forward-disassemble a CPU's instruction stream.
+    Disasm(disasm::DisasmArgs),
+    /// Run a ROM and dump a region of CPU-visible memory (hex + ASCII).
+    Memory(memory::MemoryArgs),
+    /// Run a ROM and dump a full VDP state report.
+    DumpVdp(dump_vdp::DumpVdpArgs),
+    /// Log VDP writes that land in a VRAM address window while running.
+    WatchVram(watch_vram::WatchVramArgs),
+    /// Single-step a window and name the instruction that writes a RAM cell.
+    WatchRam(watch_ram::WatchRamArgs),
+    /// Single-step a window and name the instructions that read an address range.
+    WatchRead(watch_read::WatchReadArgs),
+    /// Emit a per-frame CRC32 of a work-RAM region for divergence bisection.
+    Fingerprint(fingerprint::FingerprintArgs),
+    /// Verify deterministic replay + savestate completeness for netplay.
+    DeterminismCheck(determinism_check::DeterminismCheckArgs),
+    /// Benchmark the execution tiers (fast / light-debug / +trace / full).
+    Benchmark(benchmark::BenchmarkArgs),
+    /// Profile per-subsystem frame timing and rank bottlenecks.
+    Profile(profile::ProfileArgs),
+    /// Run a ROM with audio capture and save the output as a WAV.
+    AudioDump(audio_dump::AudioDumpArgs),
+    /// Print a PSG + YM2612 channel-state summary.
+    AudioInfo(audio_info::AudioInfoArgs),
+    /// Dump YM2612 + PSG register writes with their in-frame sample offset.
+    SoundTrace(sound_trace::SoundTraceArgs),
+    /// Save or load an emulator savestate.
+    Savestate(savestate::SavestateArgs),
+    /// Dump or seed a game's battery-backed SRAM.
+    Sram(sram::SramArgs),
+}
+
+/// Run one of the Mega Drive's own commands.
+pub fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Info(args) => info::run(args),
+        Command::Run(args) => run::run(args),
+        Command::Screenshot(args) => screenshot::run(args),
+        Command::Disasm(args) => disasm::run(args),
+        Command::Memory(args) => memory::run(args),
+        Command::DumpVdp(args) => dump_vdp::run(args),
+        Command::WatchVram(args) => watch_vram::run(args),
+        Command::WatchRam(args) => watch_ram::run(args),
+        Command::WatchRead(args) => watch_read::run(args),
+        Command::Fingerprint(args) => fingerprint::run(args),
+        Command::DeterminismCheck(args) => determinism_check::run(args),
+        Command::Benchmark(args) => benchmark::run(args),
+        Command::Profile(args) => profile::run(args),
+        Command::AudioDump(args) => audio_dump::run(args),
+        Command::AudioInfo(args) => audio_info::run(args),
+        Command::SoundTrace(args) => sound_trace::run(args),
+        Command::Savestate(args) => savestate::run(args),
+        Command::Sram(args) => sram::run(args),
     }
 }
 
-/// Parse a comma-separated `--ignore PC,SR,A7` list into an upper-cased set.
-pub(crate) fn parse_ignore(spec: Option<&str>) -> HashSet<String> {
-    crate::trace_ref::parse_ignore(spec)
-}
-
-/// Read a ROM file into memory with a contextual error.
-pub(crate) fn read_rom(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("failed to read ROM: {}", path.display()))
-}
-
-/// Read a ROM and boot a fresh emulator with it, returning both the raw
-/// bytes (some callers report the size) and the loaded emulator.
+/// Read a ROM and boot a new emulator with it, the start-up flags at
+/// their defaults: the ROM's bytes (some callers report the size) and the
+/// loaded emulator.
 pub(crate) fn load_rom(path: &Path) -> Result<(Vec<u8>, GenesisEmulator)> {
-    let rom = read_rom(path)?;
-    let mut emu = GenesisEmulator::new();
-    emu.load_rom(&rom)
-        .map_err(|e| anyhow::anyhow!("failed to load ROM: {e}"))?;
-    Ok((rom, emu))
+    retro_cli::rom::load::<Genesis>(&RomArgs::new(path))
 }
 
 /// Print the parsed ROM title (best-effort) to stdout.
@@ -178,211 +217,19 @@ pub(crate) fn save_screenshot(emu: &GenesisEmulator, output_path: &Path) -> Resu
     Ok(())
 }
 
-/// Genesis controller button bit positions, matching the
-/// `Genesis{3,6}ButtonDevice` layout (`set_port_button_state` /
-/// `InputState::buttons`). The 6-button extras (`X`/`Y`/`Z`/`MODE`) only
-/// reach a game when 6-button pads are connected (`--six-button`).
-const BUTTON_BITS: &[(&str, u32)] = &[
-    ("up", 0),
-    ("down", 1),
-    ("left", 2),
-    ("right", 3),
-    ("b", 4),
-    ("c", 5),
-    ("a", 6),
-    ("start", 7),
-    ("z", 8),
-    ("y", 9),
-    ("x", 10),
-    ("mode", 11),
-];
-
-/// Parse a comma- or `+`-separated button list into the controller
-/// bitmask the core expects. Returns `None` when no spec was given;
-/// errors on an unknown name so a typo fails loudly instead of silently
-/// pressing nothing. Shared by the `screenshot`/`trace`/`compare-trace`
-/// input-injection paths.
-pub(crate) fn parse_button_mask(spec: Option<&str>) -> Result<Option<u32>> {
-    let Some(spec) = spec else {
-        return Ok(None);
-    };
-    let mut mask = 0u32;
-    for name in spec
-        .split(['+', ','])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let lower = name.to_ascii_lowercase();
-        let bit = BUTTON_BITS
-            .iter()
-            .find(|(n, _)| *n == lower)
-            .map(|(_, b)| *b)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown button '{name}' (expected up,down,left,right,a,b,c,start,x,y,z,mode)"
-                )
-            })?;
-        mask |= 1 << bit;
-    }
-    Ok(Some(mask))
-}
-
-/// A frame-scheduled controller-input program for the `screenshot`,
-/// `trace`, and `compare-trace` drivers. Parsed from
-/// `--press-at "F:btns;F:btns"` (e.g. `"180:start;186:;240:a+c"`). Each
-/// `F:buttons` set-point installs that player-1 mask starting on frame
-/// `F` and holds it until the next set-point; an empty button list
-/// (`F:`) releases all buttons. This reproduces timed human presses so a
-/// game can be driven to a specific screen for a screenshot or trace.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PressSchedule {
-    /// Sorted `(frame, mask)` set-points.
-    points: Vec<(u64, u32)>,
-}
-
-impl PressSchedule {
-    /// The mask in effect on `frame` (the latest set-point with
-    /// `set_frame <= frame`), or `None` before the first set-point, so
-    /// the caller leaves input untouched until the schedule begins.
-    pub(crate) fn mask_at(&self, frame: u64) -> Option<u32> {
-        let mut current = None;
-        for &(f, m) in &self.points {
-            if f <= frame {
-                current = Some(m);
-            } else {
-                break;
-            }
-        }
-        current
-    }
-}
-
-/// Parse a `--press-at "F:buttons;F:buttons"` spec into a
-/// [`PressSchedule`]. Returns `None` when no spec was given. Errors on a
-/// malformed segment, a non-numeric frame, or an unknown button name.
+/// Parse a `--press-at "F:buttons;F:buttons"` schedule (e.g.
+/// `"180:start;186:;240:a+c"`) in the pad's button names; `None` when none
+/// was given. Each set-point holds its buttons from frame `F` until the
+/// next; an empty list releases.
 pub(crate) fn parse_press_schedule(spec: Option<&str>) -> Result<Option<PressSchedule>> {
-    let Some(spec) = spec else {
-        return Ok(None);
-    };
-    let mut points: Vec<(u64, u32)> = Vec::new();
-    for seg in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        let (frame_s, buttons_s) = seg.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("invalid --press-at segment '{seg}' (expected 'frame:buttons')")
-        })?;
-        let frame: u64 = frame_s
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid frame number '{}' in --press-at", frame_s.trim()))?;
-        // An empty button list releases all buttons on that frame.
-        let mask = parse_button_mask(Some(buttons_s))?.unwrap_or(0);
-        points.push((frame, mask));
-    }
-    if points.is_empty() {
-        return Ok(None);
-    }
-    points.sort_by_key(|&(f, _)| f);
-    Ok(Some(PressSchedule { points }))
+    retro_cli::input::parse_press_schedule::<GenesisEmulator>(spec)
 }
 
-/// Apply the player-1 input for `frame` from `schedule` (if any) as a
-/// sticky direct override. Routed through `set_input` (not
-/// `set_port_button_state`) so it survives `run_frame`'s per-frame input
-/// resync. A `None` mask (before the first set-point) leaves input
-/// untouched.
+/// Install player 1's buttons for `frame` from `schedule` (if any), from
+/// its first set-point on, through `set_input`, which a frame's input
+/// resync keeps.
 pub(crate) fn apply_press(emu: &mut GenesisEmulator, schedule: Option<&PressSchedule>, frame: u64) {
-    if let Some(sched) = schedule {
-        if let Some(buttons) = sched.mask_at(frame) {
-            emu.set_input(0, InputState { buttons });
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_button_mask_none_for_missing_spec() {
-        assert_eq!(parse_button_mask(None).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_button_mask_maps_each_name_to_its_bit() {
-        let cases = [
-            ("up", 0),
-            ("down", 1),
-            ("left", 2),
-            ("right", 3),
-            ("b", 4),
-            ("c", 5),
-            ("a", 6),
-            ("start", 7),
-            ("z", 8),
-            ("y", 9),
-            ("x", 10),
-            ("mode", 11),
-        ];
-        for (name, bit) in cases {
-            assert_eq!(
-                parse_button_mask(Some(name)).unwrap(),
-                Some(1 << bit),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_button_mask_accepts_plus_and_comma_and_is_case_insensitive() {
-        let mask = parse_button_mask(Some("A+UP")).unwrap().unwrap();
-        assert_eq!(mask, (1 << 6) | (1 << 0));
-        let mask = parse_button_mask(Some(" Start , C ")).unwrap().unwrap();
-        assert_eq!(mask, (1 << 7) | (1 << 5));
-    }
-
-    #[test]
-    fn parse_button_mask_rejects_unknown_name() {
-        assert!(parse_button_mask(Some("turbo")).is_err());
-    }
-
-    #[test]
-    fn parse_button_mask_empty_string_is_zero() {
-        assert_eq!(parse_button_mask(Some(" , ")).unwrap(), Some(0));
-    }
-
-    #[test]
-    fn parse_press_schedule_none_for_missing_spec() {
-        assert_eq!(parse_press_schedule(None).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_press_schedule_builds_sorted_setpoints() {
-        let sched = parse_press_schedule(Some("186:;180:start"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(sched.points, vec![(180, 1 << 7), (186, 0)]);
-    }
-
-    #[test]
-    fn press_schedule_mask_at_holds_until_next_setpoint() {
-        let sched = parse_press_schedule(Some("180:start;186:"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(sched.mask_at(179), None);
-        assert_eq!(sched.mask_at(180), Some(1 << 7));
-        assert_eq!(sched.mask_at(185), Some(1 << 7));
-        assert_eq!(sched.mask_at(186), Some(0));
-        assert_eq!(sched.mask_at(10_000), Some(0));
-    }
-
-    #[test]
-    fn parse_press_schedule_rejects_bad_frame_and_button() {
-        assert!(parse_press_schedule(Some("notaframe:start")).is_err());
-        assert!(parse_press_schedule(Some("12:bogus")).is_err());
-        assert!(parse_press_schedule(Some("12start")).is_err());
-    }
-
-    #[test]
-    fn parse_press_schedule_empty_spec_is_none() {
-        assert_eq!(parse_press_schedule(Some(" ; ")).unwrap(), None);
+    if let Some(schedule) = schedule {
+        retro_cli::input::apply_schedule(emu, schedule, frame);
     }
 }

@@ -1,0 +1,14 @@
+[package]
+name = "retro-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The commands the console cores' command-line tools share"
+
+[dependencies]
+retro-core = { path = "../retro-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+indicatif = "0.17"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "retro-core",
     "retro-wasm",
+    "retro-cli",
     "cores/sg1/core",
     "cores/sg1/wasm",
     "cores/sg1/cli",

@@ -10,10 +10,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
+use retro_cli::console::find_cpu;
+use retro_cli::CliCpu;
 use retro_core::{EmulatorCore, Instruction};
-use snes1_core::SnesEmulator;
+use snes1_core::{SnesEmulator, MAIN_CPU, SOUND_CPU};
 
-use crate::trace_ref::TraceCpu;
+use crate::console::Snes;
 
 #[derive(Args, Debug)]
 pub struct DisasmArgs {
@@ -43,7 +45,7 @@ fn parse_hex_u32(s: &str) -> Result<u32, String> {
 }
 
 pub fn run(args: DisasmArgs) -> Result<()> {
-    let cpu = TraceCpu::parse(&args.cpu)?;
+    let cpu = find_cpu::<Snes>(&args.cpu)?;
 
     let rom = super::read_rom(&args.rom)?;
     let mut emu = SnesEmulator::new();
@@ -55,13 +57,13 @@ pub fn run(args: DisasmArgs) -> Result<()> {
     }
 
     let addr = args.addr.unwrap_or_else(|| current_pc(&emu, cpu));
-    let rows = emu.disassemble_cpu(cpu.cpu_id(), addr, args.count);
+    let rows = emu.disassemble_cpu(cpu.id, addr, args.count);
 
     let mut out = super::open_output(args.output.as_ref())?;
     writeln!(
         out,
         "Disassembly of {} at ${:06X} ({} instruction(s)):",
-        cpu.label(),
+        cpu.label,
         addr,
         rows.len()
     )?;
@@ -76,14 +78,14 @@ pub fn run(args: DisasmArgs) -> Result<()> {
 /// SPC700: the 16-bit `PC`; Super FX GSU: `R15` / Cx4 HG51B169: the 23-bit
 /// program counter, both from the side-effect-free coprocessor debug
 /// state's `program_counter`; `0` when no chip is installed).
-fn current_pc(emu: &SnesEmulator, cpu: TraceCpu) -> u32 {
-    match cpu {
-        TraceCpu::Snes => {
+fn current_pc(emu: &SnesEmulator, cpu: &CliCpu) -> u32 {
+    match cpu.id {
+        MAIN_CPU => {
             let c = emu.cpu();
             ((c.pbr as u32) << 16) | c.pc as u32
         }
-        TraceCpu::Spc700 => emu.bus().apu().spc700().pc as u32,
-        TraceCpu::Gsu | TraceCpu::Hg51b => emu
+        SOUND_CPU => emu.bus().apu().spc700().pc as u32,
+        _ => emu
             .coprocessor_debug_state()
             .and_then(|s| s.program_counter)
             .unwrap_or(0),

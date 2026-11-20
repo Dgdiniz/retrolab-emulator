@@ -1,407 +1,149 @@
-//! Pure parser + field-level differ for MAME-format Genesis trace lines.
+//! The parsers of MAME-format Mega Drive trace lines, ours and MAME's, into
+//! the [`TraceLine`] the shared comparison reads.
 //!
-//! This module has no dependency on the emulator core: it parses a text
-//! trace line (either our own dump or a MAME reference log) into a typed
-//! [`TraceLine`] and diffs two of them field by field. The live capture,
-//! binary->text formatting, and run loops live in `trace_driver.rs`; the
-//! command handlers live under `cmd/`. Keeping the parse/diff logic here
-//! makes it unit-testable without a ROM.
-//!
-//! Two CPUs are supported. The 68000 line carries the optional MAME
-//! timing prefix (`TC`/`FR`/`BX`/`BY`); divergence is decided purely on
-//! the architectural registers (PC, SR, D0-D7, A0-A7), with the timing
-//! columns surfaced only as a "timing-only" classification so a run that
-//! matches every register but drifts on cycle count is reported as a
-//! match. The Z80 line carries PC + the register pairs + interrupt state.
+//! A 68000 line is `PC:.. SR:.. D0:.. .. A7:.. | disassembly`, with MAME's
+//! timing columns (`TC`/`FR`/`BX`/`BY`) in front of it when it carries them
+//! (our trace writes `TC` and `BY` with `--timing`, and in `compare-trace`).
+//! The disassembly takes no part: MAME's and ours spell instructions
+//! differently. A Z80 line is `PC:.. AF:.. .. HALT:.. | disassembly`, with
+//! the same timing columns in MAME's.
 
-use std::collections::HashSet;
+use retro_cli::trace::line::{
+    shown_decimal, shown_hex_upper, FieldValue, Show, TraceField, TraceLine,
+};
 
-/// Which CPU a trace line describes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceCpu {
-    M68k,
-    Z80,
-}
+const DATA_REGISTERS: [&str; 8] = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7"];
+const ADDRESS_REGISTERS: [&str; 8] = ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7"];
 
-impl TraceCpu {
-    /// Parse a `--cpu` argument. Accepts `m68k`/`68k`/`68000` and `z80`.
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "m68k" | "68k" | "68000" => Ok(TraceCpu::M68k),
-            "z80" => Ok(TraceCpu::Z80),
-            other => anyhow::bail!("unknown CPU '{other}' (expected m68k or z80)"),
+/// The timing columns, as MAME writes them and in its order.
+const TIMING: [(&str, Show); 4] = [
+    ("TC", shown_hex_upper::<16>),
+    ("FR", shown_hex_upper::<6>),
+    ("BX", shown_hex_upper::<4>),
+    ("BY", shown_hex_upper::<4>),
+];
+
+/// Parse a 68000 line, or `None` for a line with no `PC` (a blank line, an
+/// interrupt note). A register the line lacks reads 0; a timing column it
+/// lacks takes no part. The program counter is the 68000's 24 bits.
+pub fn parse_m68k(line: &str) -> Option<TraceLine> {
+    let registers = line.split('|').next()?;
+    let mut pc = None;
+    let mut sr = 0u16;
+    let mut d = [0u32; 8];
+    let mut a = [0u32; 8];
+    let mut timing = [None; 4];
+
+    for part in registers.split_whitespace() {
+        let Some((name, value)) = part.split_once(':') else {
+            continue;
+        };
+        if let Some(column) = TIMING.iter().position(|(column, _)| *column == name) {
+            timing[column] = u64::from_str_radix(value, 16).ok();
+            continue;
         }
-    }
-
-    /// Human-readable label for report headers.
-    pub fn label(self) -> &'static str {
-        match self {
-            TraceCpu::M68k => "68000",
-            TraceCpu::Z80 => "Z80",
-        }
-    }
-
-    /// The `DebuggerCore` CPU id (68000 = 0, Z80 = 1).
-    pub fn cpu_id(self) -> usize {
-        match self {
-            TraceCpu::M68k => 0,
-            TraceCpu::Z80 => 1,
-        }
-    }
-}
-
-/// One differing field between two trace lines, for the divergence report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FieldDiff {
-    pub field: String,
-    pub ours: String,
-    pub theirs: String,
-}
-
-/// A parsed 68000 trace entry.
-///
-/// Works for both our dump and the MAME reference: the optional MAME
-/// timing fields (`TC`/`FR`/`BX`/`BY`) are parsed when present and left
-/// `None` otherwise. PC is stored full-width but compared masked to 24
-/// bits (the 68000 address bus width).
-#[derive(Default, Clone)]
-pub struct TraceEntry {
-    pub pc: u32,
-    pub sr: u16,
-    pub d: [u32; 8],
-    pub a: [u32; 8],
-    pub total_cycles: Option<u64>,
-    pub beam_y: Option<u32>,
-    pub beam_x: Option<u32>,
-    pub frame: Option<u32>,
-}
-
-impl TraceEntry {
-    /// Parse a 68000 trace line. Supports the bare register format
-    /// (`PC:XXXXXX SR:XXXX D0:... | disasm`) and the MAME extended format
-    /// (`TC:... FR:... BX:... BY:... PC:... | disasm`). Returns `None`
-    /// for any line without a `PC` field (blank lines, interrupt
-    /// notifications, etc.).
-    pub fn parse(line: &str) -> Option<Self> {
-        let regs_part = line.split('|').next()?;
-        let mut entry = TraceEntry::default();
-        let mut found_pc = false;
-
-        for part in regs_part.split_whitespace() {
-            if let Some((name, value)) = part.split_once(':') {
-                match name {
-                    "TC" => entry.total_cycles = u64::from_str_radix(value, 16).ok(),
-                    "FR" => entry.frame = u32::from_str_radix(value, 16).ok(),
-                    "BX" => entry.beam_x = u32::from_str_radix(value, 16).ok(),
-                    "BY" => entry.beam_y = u32::from_str_radix(value, 16).ok(),
-                    _ => {
-                        if let Ok(val) = u32::from_str_radix(value, 16) {
-                            match name {
-                                "PC" => {
-                                    entry.pc = val;
-                                    found_pc = true;
-                                }
-                                "SR" => entry.sr = val as u16,
-                                "D0" => entry.d[0] = val,
-                                "D1" => entry.d[1] = val,
-                                "D2" => entry.d[2] = val,
-                                "D3" => entry.d[3] = val,
-                                "D4" => entry.d[4] = val,
-                                "D5" => entry.d[5] = val,
-                                "D6" => entry.d[6] = val,
-                                "D7" => entry.d[7] = val,
-                                "A0" => entry.a[0] = val,
-                                "A1" => entry.a[1] = val,
-                                "A2" => entry.a[2] = val,
-                                "A3" => entry.a[3] = val,
-                                "A4" => entry.a[4] = val,
-                                "A5" => entry.a[5] = val,
-                                "A6" => entry.a[6] = val,
-                                "A7" => entry.a[7] = val,
-                                _ => {}
-                            }
-                        }
-                    }
+        let Ok(value) = u32::from_str_radix(value, 16) else {
+            continue;
+        };
+        match name {
+            "PC" => pc = Some(value),
+            "SR" => sr = value as u16,
+            _ => {
+                if let Some(i) = DATA_REGISTERS.iter().position(|r| *r == name) {
+                    d[i] = value;
+                } else if let Some(i) = ADDRESS_REGISTERS.iter().position(|r| *r == name) {
+                    a[i] = value;
                 }
             }
         }
-
-        if found_pc {
-            Some(entry)
-        } else {
-            None
-        }
     }
 
-    /// Whether the architectural registers (PC, SR, D, A) differ, honoring
-    /// the ignore set. PC is masked to 24 bits.
-    pub fn regs_differ(&self, other: &Self, ignore: &HashSet<String>) -> bool {
-        if !ignore.contains("PC") && (self.pc & 0x00FF_FFFF) != (other.pc & 0x00FF_FFFF) {
-            return true;
-        }
-        if !ignore.contains("SR") && self.sr != other.sr {
-            return true;
-        }
-        for i in 0..8 {
-            if !ignore.contains(&format!("D{i}")) && self.d[i] != other.d[i] {
-                return true;
-            }
-        }
-        for i in 0..8 {
-            if !ignore.contains(&format!("A{i}")) && self.a[i] != other.a[i] {
-                return true;
-            }
-        }
-        false
+    let pc = pc? & 0x00FF_FFFF;
+    let mut fields = Vec::with_capacity(22);
+    fields.push(TraceField::number("PC", pc as u64, shown_hex_upper::<6>));
+    fields.push(TraceField::number("SR", sr as u64, shown_sr));
+    for (&name, value) in DATA_REGISTERS.iter().zip(d) {
+        fields.push(TraceField::number(name, value as u64, shown_hex_upper::<8>));
     }
-
-    /// Whether only the timing columns differ (every register matches but a
-    /// present `TC`/`BX`/`BY`/`FR` value differs). Used to classify a
-    /// register-clean line for the `--skip-timing` statistic.
-    pub fn only_timing_differs(&self, other: &Self, ignore: &HashSet<String>) -> bool {
-        if self.regs_differ(other, ignore) {
-            return false;
-        }
-        let pairs = [
-            (self.total_cycles, other.total_cycles),
-            (
-                self.beam_y.map(|v| v as u64),
-                other.beam_y.map(|v| v as u64),
-            ),
-            (
-                self.beam_x.map(|v| v as u64),
-                other.beam_x.map(|v| v as u64),
-            ),
-            (self.frame.map(|v| v as u64), other.frame.map(|v| v as u64)),
-        ];
-        pairs
-            .iter()
-            .any(|(a, b)| matches!((a, b), (Some(x), Some(y)) if x != y))
+    for (&name, value) in ADDRESS_REGISTERS.iter().zip(a) {
+        fields.push(TraceField::number(name, value as u64, shown_hex_upper::<8>));
     }
-
-    /// Per-field register differences for the divergence report.
-    pub fn register_diffs(&self, other: &Self, ignore: &HashSet<String>) -> Vec<FieldDiff> {
-        let mut diffs = Vec::new();
-        if !ignore.contains("PC") && (self.pc & 0x00FF_FFFF) != (other.pc & 0x00FF_FFFF) {
-            diffs.push(FieldDiff {
-                field: "PC".to_string(),
-                ours: format!("{:06X}", self.pc & 0x00FF_FFFF),
-                theirs: format!("{:06X}", other.pc & 0x00FF_FFFF),
-            });
-        }
-        if !ignore.contains("SR") && self.sr != other.sr {
-            diffs.push(FieldDiff {
-                field: "SR".to_string(),
-                ours: format!("{:04X} ({})", self.sr, format_sr_flags(self.sr)),
-                theirs: format!("{:04X} ({})", other.sr, format_sr_flags(other.sr)),
-            });
-        }
-        for i in 0..8 {
-            let name = format!("D{i}");
-            if !ignore.contains(&name) && self.d[i] != other.d[i] {
-                diffs.push(FieldDiff {
-                    field: name,
-                    ours: format!("{:08X}", self.d[i]),
-                    theirs: format!("{:08X}", other.d[i]),
-                });
-            }
-        }
-        for i in 0..8 {
-            let name = format!("A{i}");
-            if !ignore.contains(&name) && self.a[i] != other.a[i] {
-                diffs.push(FieldDiff {
-                    field: name,
-                    ours: format!("{:08X}", self.a[i]),
-                    theirs: format!("{:08X}", other.a[i]),
-                });
-            }
-        }
-        diffs
-    }
+    push_timing(&mut fields, timing);
+    Some(TraceLine { pc, fields })
 }
 
-/// A parsed Z80 trace entry (PC + register pairs + interrupt state).
-#[derive(Default, Clone)]
-pub struct Z80TraceEntry {
-    pub pc: u16,
-    pub af: u16,
-    pub bc: u16,
-    pub de: u16,
-    pub hl: u16,
-    pub ix: u16,
-    pub iy: u16,
-    pub sp: u16,
-    pub i_reg: u8,
-    pub r_reg: u8,
-    pub im: u8,
-    pub iff1: bool,
-    pub iff2: bool,
-    pub halt: bool,
-}
+/// Parse a Z80 line, or `None` for a line with no `PC` or with a register
+/// that does not read.
+pub fn parse_z80(line: &str) -> Option<TraceLine> {
+    const PAIRS: [&str; 8] = ["PC", "AF", "BC", "DE", "HL", "IX", "IY", "SP"];
+    const BYTES: [&str; 2] = ["I", "R"];
+    const BITS: [&str; 3] = ["IFF1", "IFF2", "HALT"];
 
-impl Z80TraceEntry {
-    /// Parse a Z80 MAME trace line:
-    /// `TC:.. FR:.. BX:.. BY:.. PC:XXXX AF:XXXX .. HALT:X | disasm`.
-    /// The timing columns are skipped. Returns `None` without a `PC`.
-    pub fn parse(line: &str) -> Option<Self> {
-        let regs_part = line.split('|').next()?;
-        let mut entry = Z80TraceEntry::default();
-        let mut found_pc = false;
+    let registers = line.split('|').next()?;
+    let mut pairs = [0u64; 8];
+    let mut bytes = [0u64; 2];
+    let mut im = 0u64;
+    let mut bits = [0u64; 3];
+    let mut timing = [None; 4];
+    let mut found_pc = false;
 
-        for part in regs_part.split_whitespace() {
-            if let Some((name, value)) = part.split_once(':') {
-                match name {
-                    "TC" | "FR" | "BX" | "BY" => { /* timing columns: ignored */ }
-                    "PC" => {
-                        entry.pc = u16::from_str_radix(value, 16).ok()?;
-                        found_pc = true;
-                    }
-                    "AF" => entry.af = u16::from_str_radix(value, 16).ok()?,
-                    "BC" => entry.bc = u16::from_str_radix(value, 16).ok()?,
-                    "DE" => entry.de = u16::from_str_radix(value, 16).ok()?,
-                    "HL" => entry.hl = u16::from_str_radix(value, 16).ok()?,
-                    "IX" => entry.ix = u16::from_str_radix(value, 16).ok()?,
-                    "IY" => entry.iy = u16::from_str_radix(value, 16).ok()?,
-                    "SP" => entry.sp = u16::from_str_radix(value, 16).ok()?,
-                    "I" => entry.i_reg = u8::from_str_radix(value, 16).ok()?,
-                    "R" => entry.r_reg = u8::from_str_radix(value, 16).ok()?,
-                    "IM" => entry.im = value.parse().ok()?,
-                    "IFF1" => entry.iff1 = value == "1",
-                    "IFF2" => entry.iff2 = value == "1",
-                    "HALT" => entry.halt = value == "1",
-                    _ => {}
-                }
-            }
-        }
-
-        if found_pc {
-            Some(entry)
-        } else {
-            None
-        }
-    }
-
-    /// Whether any non-ignored register/flag differs.
-    pub fn regs_differ(&self, other: &Self, ignore: &HashSet<String>) -> bool {
-        !self.register_diffs(other, ignore).is_empty()
-    }
-
-    /// Per-field differences for the divergence report.
-    pub fn register_diffs(&self, other: &Self, ignore: &HashSet<String>) -> Vec<FieldDiff> {
-        let mut diffs = Vec::new();
-
-        let mut push16 = |name: &str, a: u16, b: u16| {
-            if !ignore.contains(name) && a != b {
-                diffs.push(FieldDiff {
-                    field: name.to_string(),
-                    ours: format!("{a:04X}"),
-                    theirs: format!("{b:04X}"),
-                });
-            }
+    for part in registers.split_whitespace() {
+        let Some((name, value)) = part.split_once(':') else {
+            continue;
         };
-        push16("PC", self.pc, other.pc);
-        push16("AF", self.af, other.af);
-        push16("BC", self.bc, other.bc);
-        push16("DE", self.de, other.de);
-        push16("HL", self.hl, other.hl);
-        push16("IX", self.ix, other.ix);
-        push16("IY", self.iy, other.iy);
-        push16("SP", self.sp, other.sp);
-
-        let mut push8 = |name: &str, a: u8, b: u8| {
-            if !ignore.contains(name) && a != b {
-                diffs.push(FieldDiff {
-                    field: name.to_string(),
-                    ours: format!("{a:02X}"),
-                    theirs: format!("{b:02X}"),
-                });
-            }
-        };
-        push8("I", self.i_reg, other.i_reg);
-        push8("R", self.r_reg, other.r_reg);
-
-        if !ignore.contains("IM") && self.im != other.im {
-            diffs.push(FieldDiff {
-                field: "IM".to_string(),
-                ours: self.im.to_string(),
-                theirs: other.im.to_string(),
-            });
+        if let Some(column) = TIMING.iter().position(|(column, _)| *column == name) {
+            timing[column] = u64::from_str_radix(value, 16).ok();
+        } else if let Some(i) = PAIRS.iter().position(|r| *r == name) {
+            pairs[i] = u16::from_str_radix(value, 16).ok()? as u64;
+            found_pc |= i == 0;
+        } else if let Some(i) = BYTES.iter().position(|r| *r == name) {
+            bytes[i] = u8::from_str_radix(value, 16).ok()? as u64;
+        } else if name == "IM" {
+            im = value.parse::<u8>().ok()? as u64;
+        } else if let Some(i) = BITS.iter().position(|r| *r == name) {
+            bits[i] = u64::from(value == "1");
         }
+    }
+    if !found_pc {
+        return None;
+    }
 
-        let mut push_bool = |name: &str, a: bool, b: bool| {
-            if !ignore.contains(name) && a != b {
-                diffs.push(FieldDiff {
-                    field: name.to_string(),
-                    ours: (a as u8).to_string(),
-                    theirs: (b as u8).to_string(),
-                });
-            }
-        };
-        push_bool("IFF1", self.iff1, other.iff1);
-        push_bool("IFF2", self.iff2, other.iff2);
-        push_bool("HALT", self.halt, other.halt);
+    let mut fields = Vec::with_capacity(18);
+    for (&name, value) in PAIRS.iter().zip(pairs) {
+        fields.push(TraceField::number(name, value, shown_hex_upper::<4>));
+    }
+    for (&name, value) in BYTES.iter().zip(bytes) {
+        fields.push(TraceField::number(name, value, shown_hex_upper::<2>));
+    }
+    fields.push(TraceField::number("IM", im, shown_decimal));
+    for (&name, value) in BITS.iter().zip(bits) {
+        fields.push(TraceField::number(name, value, shown_decimal));
+    }
+    push_timing(&mut fields, timing);
+    Some(TraceLine {
+        pc: pairs[0] as u32,
+        fields,
+    })
+}
 
-        diffs
+/// The timing columns, after the registers: a column the line lacks takes
+/// no part.
+fn push_timing(fields: &mut Vec<TraceField>, timing: [Option<u64>; 4]) {
+    for (&(name, show), value) in TIMING.iter().zip(timing) {
+        let value = value.map_or(FieldValue::Missing, FieldValue::Number);
+        fields.push(TraceField::of(name, value, show).as_timing());
     }
 }
 
-/// A parsed trace line for one of the two CPUs. The comparator keys on
-/// this so the same diff logic serves both the live `compare-trace` and
-/// the offline `compare`.
-#[derive(Clone)]
-pub enum TraceLine {
-    M68k(TraceEntry),
-    Z80(Z80TraceEntry),
-}
-
-impl TraceLine {
-    /// Parse `line` as a trace entry for `cpu`, or `None` if it has no PC.
-    pub fn parse(cpu: TraceCpu, line: &str) -> Option<Self> {
-        match cpu {
-            TraceCpu::M68k => TraceEntry::parse(line).map(TraceLine::M68k),
-            TraceCpu::Z80 => Z80TraceEntry::parse(line).map(TraceLine::Z80),
-        }
-    }
-
-    /// The program counter, for resync notes.
-    pub fn pc(&self) -> u32 {
-        match self {
-            TraceLine::M68k(e) => e.pc & 0x00FF_FFFF,
-            TraceLine::Z80(e) => e.pc as u32,
-        }
-    }
-
-    /// Whether the architectural registers differ (the divergence test).
-    /// Two lines for different CPUs are always considered to differ.
-    pub fn regs_differ(&self, other: &Self, ignore: &HashSet<String>) -> bool {
-        match (self, other) {
-            (TraceLine::M68k(a), TraceLine::M68k(b)) => a.regs_differ(b, ignore),
-            (TraceLine::Z80(a), TraceLine::Z80(b)) => a.regs_differ(b, ignore),
-            _ => true,
-        }
-    }
-
-    /// Per-field register differences for the divergence report.
-    pub fn register_diffs(&self, other: &Self, ignore: &HashSet<String>) -> Vec<FieldDiff> {
-        match (self, other) {
-            (TraceLine::M68k(a), TraceLine::M68k(b)) => a.register_diffs(b, ignore),
-            (TraceLine::Z80(a), TraceLine::Z80(b)) => a.register_diffs(b, ignore),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Whether the registers match but a timing column differs (68000
-    /// only; always false for the Z80, which has no timing columns here).
-    pub fn only_timing_differs(&self, other: &Self, ignore: &HashSet<String>) -> bool {
-        match (self, other) {
-            (TraceLine::M68k(a), TraceLine::M68k(b)) => a.only_timing_differs(b, ignore),
-            _ => false,
-        }
+/// The status register with its condition codes: `2704 (..Z..)`.
+fn shown_sr(value: &FieldValue) -> String {
+    match value {
+        FieldValue::Number(sr) => format!("{sr:04X} ({})", format_sr_flags(*sr as u16)),
+        other => shown_hex_upper::<4>(other),
     }
 }
 
-/// Format the 68000 status-register CCR bits as `XNZVC` (a set bit shows
-/// its letter, a clear bit shows `.`).
+/// The 68000's condition codes as `XNZVC`, a clear bit shown as `.`.
 pub fn format_sr_flags(sr: u16) -> String {
     let bit = |mask: u16, ch: char| if sr & mask != 0 { ch } else { '.' };
     format!(
@@ -414,190 +156,262 @@ pub fn format_sr_flags(sr: u16) -> String {
     )
 }
 
-/// Parse a comma-separated `--ignore` list into an upper-cased set.
-pub fn parse_ignore(spec: Option<&str>) -> HashSet<String> {
-    spec.map(|s| {
-        s.split(',')
-            .map(|r| r.trim().to_ascii_uppercase())
-            .filter(|r| !r.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retro_cli::trace::compare::{Comparator, CompareRules};
+    use std::collections::HashSet;
+    use std::io::Cursor;
+    use std::ops::ControlFlow;
 
-    fn no_ignore() -> HashSet<String> {
-        HashSet::new()
+    fn number(line: &TraceLine, name: &str) -> FieldValue {
+        line.field(name).expect("field").value.clone()
     }
 
+    const MAME_LINE: &str = "TC:0000000000000022 FR:000000 BX:0054 BY:00E0 PC:000200 SR:2700 \
+        D0:00000001 D1:00000000 D2:00000000 D3:00000000 D4:00000000 D5:00000000 D6:00000000 \
+        D7:00000000 A0:00000000 A1:00000000 A2:00000000 A3:00000000 A4:00000000 A5:00000000 \
+        A6:00000000 A7:FFFFFF00 | 000200: tst.l $a10008.l";
+
     #[test]
-    fn parse_mame_m68k_line_with_timing() {
-        let line = "TC:0000000000000022 FR:000000 BX:0054 BY:00E0 PC:000200 SR:2700 D0:00000001 D1:00000000 D2:00000000 D3:00000000 D4:00000000 D5:00000000 D6:00000000 D7:00000000 A0:00000000 A1:00000000 A2:00000000 A3:00000000 A4:00000000 A5:00000000 A6:00000000 A7:FFFFFF00 | 000200: tst.l $a10008.l";
-        let e = TraceEntry::parse(line).expect("parses");
+    fn a_mame_68000_line_reads_with_its_timing() {
+        let e = parse_m68k(MAME_LINE).expect("parses");
         assert_eq!(e.pc, 0x000200);
-        assert_eq!(e.sr, 0x2700);
-        assert_eq!(e.d[0], 1);
-        assert_eq!(e.a[7], 0xFFFF_FF00);
-        assert_eq!(e.total_cycles, Some(0x22));
-        assert_eq!(e.beam_y, Some(0xE0));
+        assert_eq!(number(&e, "SR"), FieldValue::Number(0x2700));
+        assert_eq!(number(&e, "D0"), FieldValue::Number(1));
+        assert_eq!(number(&e, "A7"), FieldValue::Number(0xFFFF_FF00));
+        assert_eq!(number(&e, "TC"), FieldValue::Number(0x22));
+        assert_eq!(number(&e, "BY"), FieldValue::Number(0xE0));
+        assert!(e.field("TC").unwrap().timing);
     }
 
     #[test]
-    fn parse_bare_m68k_line_without_timing() {
-        let line = "PC:000206 SR:2708 D0:00000000 D1:00000000 D2:00000000 D3:00000000 D4:00000000 D5:00000000 D6:00000000 D7:00000000 A0:00000000 A1:00000000 A2:00000000 A3:00000000 A4:00000000 A5:00000000 A6:00000000 A7:00FFFE00 | TST.L $00A10008";
-        let e = TraceEntry::parse(line).expect("parses");
+    fn a_bare_68000_line_reads_without_timing() {
+        let line = "PC:000206 SR:2708 D0:00000000 D1:00000000 D2:00000000 D3:00000000 \
+            D4:00000000 D5:00000000 D6:00000000 D7:00000000 A0:00000000 A1:00000000 \
+            A2:00000000 A3:00000000 A4:00000000 A5:00000000 A6:00000000 A7:00FFFE00 | TST.L $00A10008";
+        let e = parse_m68k(line).expect("parses");
         assert_eq!(e.pc, 0x000206);
-        assert_eq!(e.total_cycles, None);
+        assert_eq!(number(&e, "TC"), FieldValue::Missing);
     }
 
     #[test]
-    fn non_pc_lines_are_skipped() {
-        assert!(TraceEntry::parse("").is_none());
-        assert!(TraceEntry::parse("(interrupted at 000932, IRQ 6)").is_none());
-        assert!(Z80TraceEntry::parse("").is_none());
+    fn a_line_with_no_pc_does_not_parse() {
+        assert!(parse_m68k("").is_none());
+        assert!(parse_m68k("(interrupted at 000932, IRQ 6)").is_none());
+        assert!(parse_z80("").is_none());
     }
 
     #[test]
-    fn pc_compared_masked_to_24_bits() {
-        let a = TraceEntry {
-            pc: 0xFF00_0200,
-            ..Default::default()
-        };
-        let b = TraceEntry {
-            pc: 0x0000_0200,
-            ..Default::default()
-        };
-        assert!(!a.regs_differ(&b, &no_ignore()));
+    fn the_68000_pc_is_compared_on_24_bits() {
+        let a = parse_m68k("PC:FF000200 SR:0000").unwrap();
+        let b = parse_m68k("PC:00000200 SR:0000").unwrap();
+        assert!(!a.differs_from(&b, false, &HashSet::new()));
+        assert_eq!(a.pc_text(), "000200");
     }
 
     #[test]
-    fn register_diff_lists_changed_fields() {
-        let a = TraceEntry {
-            pc: 0x200,
-            d: [1, 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
-        let b = TraceEntry {
-            pc: 0x200,
-            d: [2, 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
-        let diffs = a.register_diffs(&b, &no_ignore());
+    fn a_differing_register_is_reported_as_the_report_always_showed_it() {
+        let a = parse_m68k("PC:000200 SR:2704 D0:00000001").unwrap();
+        let b = parse_m68k("PC:000200 SR:2700 D0:00000002").unwrap();
+        let diffs = a.differences(&b, false, &HashSet::new());
+        let shown: Vec<(&str, &str, &str)> = diffs
+            .iter()
+            .map(|d| (d.field, d.ours.as_str(), d.theirs.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("SR", "2704 (..Z..)", "2700 (.....)"),
+                ("D0", "00000001", "00000002")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ignored_register_takes_no_part() {
+        let a = parse_m68k("PC:000200 A7:00000100").unwrap();
+        let b = parse_m68k("PC:000200 A7:00000200").unwrap();
+        let ignore: HashSet<String> = ["A7".to_string()].into();
+        assert!(!a.differs_from(&b, false, &ignore));
+    }
+
+    #[test]
+    fn the_timing_columns_both_lines_carry_take_part_unless_skipped() {
+        let ours = parse_m68k("TC:0000000000000010 BY:0000 PC:000400 SR:0000").unwrap();
+        let theirs =
+            parse_m68k("TC:0000000000000010 FR:000000 BX:0004 BY:00E0 PC:000400 SR:0000").unwrap();
+        let diffs = ours.differences(&theirs, false, &HashSet::new());
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].field, "D0");
-        assert_eq!(diffs[0].ours, "00000001");
-        assert_eq!(diffs[0].theirs, "00000002");
+        assert_eq!(
+            (
+                diffs[0].field,
+                diffs[0].ours.as_str(),
+                diffs[0].theirs.as_str()
+            ),
+            ("BY", "0000", "00E0")
+        );
+        assert!(!ours.differs_from(&theirs, true, &HashSet::new()));
     }
 
     #[test]
-    fn ignore_set_suppresses_named_fields() {
-        let a = TraceEntry {
-            a: [0, 0, 0, 0, 0, 0, 0, 0x100],
-            ..Default::default()
-        };
-        let b = TraceEntry {
-            a: [0, 0, 0, 0, 0, 0, 0, 0x200],
-            ..Default::default()
-        };
-        let mut ignore = HashSet::new();
-        ignore.insert("A7".to_string());
-        assert!(!a.regs_differ(&b, &ignore));
-    }
-
-    #[test]
-    fn only_timing_differs_when_regs_match_but_cycles_drift() {
-        let a = TraceEntry {
-            pc: 0x200,
-            total_cycles: Some(100),
-            ..Default::default()
-        };
-        let b = TraceEntry {
-            pc: 0x200,
-            total_cycles: Some(110),
-            ..Default::default()
-        };
-        assert!(a.only_timing_differs(&b, &no_ignore()));
-        assert!(!a.regs_differ(&b, &no_ignore()));
-    }
-
-    #[test]
-    fn timing_only_false_when_a_register_also_differs() {
-        let a = TraceEntry {
-            pc: 0x200,
-            total_cycles: Some(100),
-            ..Default::default()
-        };
-        let b = TraceEntry {
-            pc: 0x204,
-            total_cycles: Some(110),
-            ..Default::default()
-        };
-        assert!(!a.only_timing_differs(&b, &no_ignore()));
-    }
-
-    #[test]
-    fn parse_z80_line_skips_timing_columns() {
-        let line = "TC:0000000000001000 FR:000001 BX:0000 BY:0000 PC:0008 AF:0040 BC:0000 DE:0000 HL:0000 IX:0000 IY:0000 SP:FFFE I:00 R:02 IM:1 IFF1:1 IFF2:1 HALT:0 | ei";
-        let e = Z80TraceEntry::parse(line).expect("parses");
+    fn a_mame_z80_line_reads_with_its_timing() {
+        let line = "TC:0000000000001000 FR:000001 BX:0000 BY:0000 PC:0008 AF:0040 BC:0000 \
+            DE:0000 HL:0000 IX:0000 IY:0000 SP:FFFE I:00 R:02 IM:1 IFF1:1 IFF2:1 HALT:0 | ei";
+        let e = parse_z80(line).expect("parses");
         assert_eq!(e.pc, 0x0008);
-        assert_eq!(e.af, 0x0040);
-        assert_eq!(e.r_reg, 0x02);
-        assert_eq!(e.im, 1);
-        assert!(e.iff1);
-        assert!(!e.halt);
+        assert_eq!(number(&e, "AF"), FieldValue::Number(0x0040));
+        assert_eq!(number(&e, "R"), FieldValue::Number(0x02));
+        assert_eq!(number(&e, "IM"), FieldValue::Number(1));
+        assert_eq!(number(&e, "IFF1"), FieldValue::Number(1));
+        assert_eq!(number(&e, "HALT"), FieldValue::Number(0));
+        assert_eq!(number(&e, "TC"), FieldValue::Number(0x1000));
     }
 
     #[test]
-    fn z80_register_diff_reports_flags() {
-        let a = Z80TraceEntry {
-            pc: 0x10,
-            iff1: true,
-            ..Default::default()
-        };
-        let b = Z80TraceEntry {
-            pc: 0x10,
-            iff1: false,
-            ..Default::default()
-        };
-        let diffs = a.register_diffs(&b, &no_ignore());
+    fn a_z80_flag_difference_is_one_field() {
+        let a = parse_z80("PC:0010 IFF1:1").unwrap();
+        let b = parse_z80("PC:0010 IFF1:0").unwrap();
+        let diffs = a.differences(&b, false, &HashSet::new());
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].field, "IFF1");
+        assert_eq!((diffs[0].field, diffs[0].ours.as_str()), ("IFF1", "1"));
     }
 
     #[test]
-    fn trace_cpu_parse_accepts_aliases() {
-        assert_eq!(TraceCpu::parse("m68k").unwrap(), TraceCpu::M68k);
-        assert_eq!(TraceCpu::parse("68000").unwrap(), TraceCpu::M68k);
-        assert_eq!(TraceCpu::parse("Z80").unwrap(), TraceCpu::Z80);
-        assert!(TraceCpu::parse("spc700").is_err());
-    }
-
-    #[test]
-    fn trace_line_pc_masks_m68k() {
-        let line = TraceLine::M68k(TraceEntry {
-            pc: 0xAB00_0200,
-            ..Default::default()
-        });
-        assert_eq!(line.pc(), 0x0000_0200);
-    }
-
-    #[test]
-    fn sr_flags_render() {
+    fn the_condition_codes_read_as_letters() {
         assert_eq!(format_sr_flags(0x0000), ".....");
         assert_eq!(format_sr_flags(0x001F), "XNZVC");
         assert_eq!(format_sr_flags(0x0008), ".N...");
     }
 
+    // The shared comparator on MAME's lines.
+
+    /// A 68000 line; `d0` differs per loop iteration so that two iterations
+    /// never match during a resync.
+    fn tl(pc: u32, disasm: &str, d0: u32) -> String {
+        format!(
+            "PC:{pc:06X} SR:0000 D0:{d0:08X} D1:00000000 D2:00000000 D3:00000000 D4:00000000 \
+             D5:00000000 D6:00000000 D7:00000000 A0:00000000 A1:00000000 A2:00000000 A3:00000000 \
+             A4:00000000 A5:00000000 A6:00000000 A7:00000000 | {disasm}"
+        )
+    }
+
+    fn make_cmp(
+        reference: &str,
+        budget: usize,
+        skip_timing: bool,
+    ) -> Comparator<Cursor<Vec<u8>>, Vec<u8>> {
+        let rules = CompareRules {
+            parse: parse_m68k,
+            skip_timing,
+            ignore: HashSet::new(),
+            max_errors: 1,
+        };
+        Comparator::new(
+            rules,
+            Cursor::new(reference.as_bytes().to_vec()),
+            Vec::new(),
+            budget,
+        )
+    }
+
     #[test]
-    fn parse_ignore_uppercases_and_trims() {
-        let set = parse_ignore(Some(" sr , a7 ,, d0 "));
-        assert!(set.contains("SR"));
-        assert!(set.contains("A7"));
-        assert!(set.contains("D0"));
-        assert_eq!(set.len(), 3);
-        assert!(parse_ignore(None).is_empty());
+    fn an_exact_match_takes_each_line_without_divergence() {
+        let reference = format!("{}\n{}\n", tl(0x400, "NOP", 0), tl(0x402, "NOP", 0));
+        let mut c = make_cmp(&reference, 0, false);
+        assert!(c.feed(&tl(0x400, "NOP", 0)).unwrap().is_continue());
+        assert!(c.feed(&tl(0x402, "NOP", 0)).unwrap().is_continue());
+        let stats = c.stats();
+        assert_eq!(
+            (stats.divergences, stats.compared, stats.resync_events),
+            (0, 2, 0)
+        );
+    }
+
+    #[test]
+    fn our_side_looping_more_resyncs_by_skipping_our_lines() {
+        // The reference has left the loop; ours spins two more iterations.
+        let reference = format!("{}\n", tl(0x408, "ADDQ", 0x0080));
+        let mut c = make_cmp(&reference, 8, false);
+        assert!(c.feed(&tl(0x400, "BTST", 0x0042)).unwrap().is_continue());
+        assert!(c.feed(&tl(0x404, "BEQ", 0x0042)).unwrap().is_continue());
+        assert!(c.feed(&tl(0x408, "ADDQ", 0x0080)).unwrap().is_continue());
+        let stats = c.stats();
+        assert_eq!((stats.divergences, stats.resync_events), (0, 1));
+        assert_eq!((stats.ours_skipped, stats.ref_skipped), (2, 0));
+    }
+
+    #[test]
+    fn the_reference_looping_more_resyncs_by_skipping_its_lines() {
+        let reference = format!(
+            "{}\n{}\n{}\n",
+            tl(0x400, "BTST", 0x0042),
+            tl(0x404, "BEQ", 0x0042),
+            tl(0x408, "ADDQ", 0x0080)
+        );
+        let mut c = make_cmp(&reference, 8, false);
+        assert!(c.feed(&tl(0x408, "ADDQ", 0x0080)).unwrap().is_continue());
+        let stats = c.stats();
+        assert_eq!((stats.divergences, stats.resync_events), (0, 1));
+        assert_eq!((stats.ref_skipped, stats.ours_skipped), (2, 0));
+        let report = String::from_utf8(c.output().clone()).unwrap();
+        assert_eq!(
+            report,
+            "  [resync] @ instr 0 pc 000408: skipped 0 ours / 2 ref line(s)\n"
+        );
+    }
+
+    #[test]
+    fn a_real_divergence_is_reported_once_the_window_is_spent() {
+        let reference = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            tl(0x408, "ADDQ", 0x0080),
+            tl(0x40A, "NOP", 0),
+            tl(0x40C, "NOP", 0),
+            tl(0x40E, "NOP", 0),
+            tl(0x410, "NOP", 0)
+        );
+        let mut c = make_cmp(&reference, 3, false);
+        for line in [
+            tl(0x9000, "JMP", 0x00FF),
+            tl(0x9006, "NOP", 0),
+            tl(0x900C, "NOP", 0),
+        ] {
+            assert!(c.feed(&line).unwrap().is_continue());
+        }
+        assert!(c.feed(&tl(0x9012, "NOP", 0)).unwrap().is_break());
+        let stats = c.stats();
+        assert_eq!(stats.divergences, 1);
+        // The held divergence is the first mismatch, where the paths split.
+        assert_eq!(stats.first_divergence, Some(1));
+    }
+
+    #[test]
+    fn with_no_window_the_first_mismatch_is_reported_at_once() {
+        let reference = format!("{}\n", tl(0x408, "ADDQ", 0x0080));
+        let mut c = make_cmp(&reference, 0, false);
+        assert!(matches!(
+            c.feed(&tl(0x9000, "JMP", 0x00FF)).unwrap(),
+            ControlFlow::Break(())
+        ));
+        let stats = c.stats();
+        assert_eq!((stats.divergences, stats.resync_events), (1, 0));
+    }
+
+    #[test]
+    fn under_skip_timing_a_timing_difference_is_counted_not_reported() {
+        let ours = format!("TC:0000000000000010 BY:0000 {}", tl(0x400, "NOP", 0));
+        let reference = format!("TC:0000000000000099 BY:00E0 {}\n", tl(0x400, "NOP", 0));
+        let mut c = make_cmp(&reference, 0, true);
+        assert!(c.feed(&ours).unwrap().is_continue());
+        let stats = c.stats();
+        assert_eq!(
+            (stats.divergences, stats.compared, stats.timing_skipped),
+            (0, 1, 1)
+        );
+
+        let mut c = make_cmp(&reference, 0, false);
+        assert!(c.feed(&ours).unwrap().is_break());
+        assert_eq!(c.stats().divergences, 1);
     }
 }

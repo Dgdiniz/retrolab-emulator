@@ -1,11 +1,10 @@
-//! Subcommand handlers for `snes1-cli`. Each module owns its clap
-//! argument struct and a `run` entry point; `main.rs` only wires the
-//! `Commands` enum to these.
+//! The SNES's own commands: each module owns its clap arguments and a
+//! `run` entry point, and [`Command`] lists them for `retro-cli`, which runs
+//! the commands both tools share. The helpers the commands share live here.
 
 pub mod apu_dump;
 pub mod audio_dump;
 pub mod benchmark;
-pub mod compare;
 pub mod determinism_check;
 pub mod disasm;
 pub mod golden;
@@ -16,57 +15,78 @@ pub mod run;
 pub mod savestate;
 pub mod screenshot;
 pub mod singlestep;
-pub mod trace;
 
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 
-use anyhow::{Context, Result};
-use clap::Args;
+use anyhow::Result;
+use clap::Subcommand;
 use retro_core::cartridge::ExpansionChipState;
-use retro_core::EmulatorCore;
-use snes1_core::{CoprocessorMode, SnesEmulator};
+use snes1_core::SnesEmulator;
 
-/// Open a buffered writer for an optional output path, falling back to
-/// stdout when `path` is `None`.
-pub(crate) fn open_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
-    match path {
-        Some(p) => {
-            let f = File::create(p)
-                .with_context(|| format!("failed to create output file: {}", p.display()))?;
-            Ok(Box::new(BufWriter::new(f)))
-        }
-        None => Ok(Box::new(BufWriter::new(std::io::stdout()))),
-    }
+pub(crate) use crate::console::{apply_force_detect, CoprocessorArgs};
+pub(crate) use retro_cli::output::open_output;
+pub(crate) use retro_cli::rom::read_rom;
+pub(crate) use retro_core::input_schedule::PressSchedule;
+
+/// The SNES's own commands.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Inspect a ROM's header, mapper, and CPU memory map.
+    Info(info::InfoArgs),
+    /// Boot a ROM and run it for a bounded window.
+    Run(run::RunArgs),
+    /// Verify netplay determinism over a long replay (lockstep / rollback).
+    DeterminismCheck(determinism_check::DeterminismCheckArgs),
+    /// Run a ROM and save the visible PPU output as a PNG.
+    Screenshot(screenshot::ScreenshotArgs),
+    /// Forward-disassemble a CPU's instruction stream.
+    Disasm(disasm::DisasmArgs),
+    /// Run a ROM and summarise PPU state (+ optional dumps / PNGs).
+    PpuDump(ppu_dump::PpuDumpArgs),
+    /// Run a ROM and summarise APU (S-DSP) state (+ optional dumps).
+    ApuDump(apu_dump::ApuDumpArgs),
+    /// Run a ROM with audio capture and save the S-DSP output as a WAV.
+    AudioDump(audio_dump::AudioDumpArgs),
+    /// Run the 65C816 SingleStepTests (Tom Harte) against the core.
+    #[command(name = "singlestep-65816")]
+    Singlestep65816(singlestep::Singlestep65816Args),
+    /// Run the SPC700 SingleStepTests against the core.
+    #[command(name = "singlestep-spc700")]
+    SinglestepSpc700(singlestep::SinglestepSpc700Args),
+    /// Benchmark the three execution tiers (Fast / LightDebug / +trace).
+    Benchmark(benchmark::BenchmarkArgs),
+    /// Run a ROM and dump a region of CPU-visible memory (hex + ASCII).
+    Memory(memory::MemoryArgs),
+    /// Save or load an emulator savestate.
+    Savestate(savestate::SavestateArgs),
+    /// Record a ROM's output frame by frame (state, picture and audio
+    /// hashes, PNGs at chosen frames) into a folder.
+    Golden(golden::GoldenArgs),
+    /// Record every ROM of a manifest into a folder.
+    GoldenSet(golden::GoldenSetArgs),
+    /// Compare two golden folders: first differing frame and pixel diffs.
+    GoldenCompare(golden::GoldenCompareArgs),
 }
 
-/// Parse a `--ignore A,X,DB` list into an upper-cased set.
-pub(crate) fn parse_ignore(spec: Option<&str>) -> HashSet<String> {
-    spec.map(|s| {
-        s.split(',')
-            .map(|r| r.trim().to_ascii_uppercase())
-            .filter(|r| !r.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Read a ROM file into memory with a contextual error.
-pub(crate) fn read_rom(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("failed to read ROM: {}", path.display()))
-}
-
-/// When `force` is set, stage the threshold-free best-guess mapping as a
-/// manifest override so a low-confidence ROM (blank title / bad checksum,
-/// like Nintendo's SNES Test Program cartridge) loads with its vector-implied
-/// preset instead of being rejected by the detector's confidence gate.
-/// A no-op otherwise. Call before `load_rom`.
-pub(crate) fn apply_force_detect(emu: &mut SnesEmulator, rom: &[u8], force: bool) {
-    if force {
-        let manifest = emu.detected_manifest(rom);
-        emu.set_cartridge_manifest_override(Some(manifest));
+/// Run one of the SNES's own commands.
+pub fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Info(args) => info::run(args),
+        Command::Run(args) => run::run(args),
+        Command::DeterminismCheck(args) => determinism_check::run(args),
+        Command::Screenshot(args) => screenshot::run(args),
+        Command::Disasm(args) => disasm::run(args),
+        Command::PpuDump(args) => ppu_dump::run(args),
+        Command::ApuDump(args) => apu_dump::run(args),
+        Command::AudioDump(args) => audio_dump::run(args),
+        Command::Singlestep65816(args) => singlestep::run_65816(args),
+        Command::SinglestepSpc700(args) => singlestep::run_spc700(args),
+        Command::Benchmark(args) => benchmark::run(args),
+        Command::Memory(args) => memory::run(args),
+        Command::Savestate(args) => savestate::run(args),
+        Command::Golden(args) => golden::run(args),
+        Command::GoldenSet(args) => golden::run_set(args),
+        Command::GoldenCompare(args) => golden::run_compare(args),
     }
 }
 
@@ -131,111 +151,21 @@ pub(crate) fn print_coprocessor_state(chip_id: u8, state: &ExpansionChipState) {
 }
 
 /// Parse a comma-separated button list into the generic input bitmask
-/// (`InputState::buttons`). The grammar and the button names live in
-/// [`snes1_core::input_schedule`]; this wrapper only turns its error
-/// into an `anyhow` one. Shared by the input-injection paths.
+/// (`InputState::buttons`), in the pad's names; `None` when no spec was
+/// given.
 pub(crate) fn parse_button_mask(spec: Option<&str>) -> Result<Option<u32>> {
-    snes1_core::input_schedule::parse_button_mask(spec).map_err(anyhow::Error::msg)
+    retro_cli::input::parse_buttons::<SnesEmulator>(spec)
 }
 
-/// A frame-scheduled controller-input program, parsed from
-/// `--press-at "F:buttons;F:buttons"` (e.g. `"180:start;186:;240:select"`).
-pub(crate) use snes1_core::input_schedule::PressSchedule;
-
-/// Parse a `--press-at` spec into a [`PressSchedule`]; `None` when no spec
-/// was given.
+/// Parse a `--press-at "F:buttons;F:buttons"` spec (e.g.
+/// `"180:start;186:;240:select"`) into a [`PressSchedule`]; `None` when no
+/// spec was given.
 pub(crate) fn parse_press_schedule(spec: Option<&str>) -> Result<Option<PressSchedule>> {
-    snes1_core::input_schedule::parse_press_schedule(spec).map_err(anyhow::Error::msg)
+    retro_cli::input::parse_press_schedule::<SnesEmulator>(spec)
 }
 
 /// Parse the `--reset-at` frame list (`"360,720"`) into a sorted set of
 /// frame indices before which the console is reset.
-pub(crate) fn parse_reset_frames(spec: Option<&str>) -> Result<std::collections::BTreeSet<u64>> {
-    snes1_core::input_schedule::parse_reset_frames(spec).map_err(anyhow::Error::msg)
-}
-
-/// Shared coprocessor flags for the commands that boot a ROM (`run`,
-/// `trace`, `compare-trace`, `screenshot`, `info`). Flattened into each
-/// command's args via `#[command(flatten)]`.
-#[derive(Args, Debug, Clone, Default)]
-pub(crate) struct CoprocessorArgs {
-    /// Path to a DSP-1 firmware dump (`dsp1b.rom` / `dsp1b.bin`, 8192
-    /// bytes) enabling cycle-accurate low-level emulation of DSP-1 games
-    /// such as Super Mario Kart (the `nec-lle` feature, on by default; a
-    /// snes1-cli built without it ignores the dump, with a warning).
-    /// Optional: without it those carts run the firmware-free
-    /// high-level emulation (HLE), which renders the Mode-7 track
-    /// correctly. Byte order (`.bin` BE / `.rom` LE) and revision are
-    /// auto-detected by SHA-256.
-    #[arg(long, value_name = "PATH")]
-    pub dsp1_firmware: Option<PathBuf>,
-    /// How a detected coprocessor is emulated: `auto` (LLE when firmware
-    /// is present and built in, otherwise the firmware-free HLE), `lle`
-    /// (force low-level, falls back to a non-hanging idle stub if
-    /// firmware is missing/invalid; refused by a build without the
-    /// `nec-lle` feature), or `hle` (force the firmware-free HLE).
-    #[arg(
-        long,
-        value_name = "MODE",
-        default_value = "auto",
-        value_parser = parse_coprocessor_mode
-    )]
-    pub coprocessor_mode: CoprocessorMode,
-}
-
-fn parse_coprocessor_mode(s: &str) -> std::result::Result<CoprocessorMode, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "auto" => Ok(CoprocessorMode::Auto),
-        "lle" => Ok(CoprocessorMode::Lle),
-        "hle" => Ok(CoprocessorMode::Hle),
-        other => Err(format!(
-            "unknown coprocessor mode '{other}' (expected auto|lle|hle)"
-        )),
-    }
-}
-
-impl CoprocessorArgs {
-    /// Stage these flags on `emu` before `load_rom`: read the firmware
-    /// file (if any) and set the emulation mode.
-    pub(crate) fn apply(&self, emu: &mut SnesEmulator) -> Result<()> {
-        if !snes1_core::NEC_LLE_BUILT {
-            if self.coprocessor_mode == CoprocessorMode::Lle {
-                anyhow::bail!(
-                    "--coprocessor-mode lle: low-level emulation is not built into this \
-                     snes1-cli (build it with `--features nec-lle`); DSP-1 games run on the HLE"
-                );
-            }
-            if self.dsp1_firmware.is_some() {
-                eprintln!(
-                    "warning: --dsp1-firmware ignored: low-level emulation is not built into \
-                     this snes1-cli (build it with `--features nec-lle`); the DSP-1 runs on the HLE"
-                );
-            }
-        }
-        emu.set_coprocessor_mode(self.coprocessor_mode);
-        if let Some(path) = &self.dsp1_firmware {
-            let fw = std::fs::read(path)
-                .with_context(|| format!("failed to read DSP-1 firmware: {}", path.display()))?;
-            emu.set_coprocessor_firmware(Some(fw));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn forced_lle_is_refused_by_a_build_without_it() {
-        let args = CoprocessorArgs {
-            dsp1_firmware: None,
-            coprocessor_mode: CoprocessorMode::Lle,
-        };
-        let result = args.apply(&mut SnesEmulator::new());
-        assert_eq!(result.is_err(), !snes1_core::NEC_LLE_BUILT);
-        if let Err(err) = result {
-            assert!(err.to_string().contains("not built"), "{err}");
-        }
-    }
+pub(crate) fn parse_reset_frames(spec: Option<&str>) -> Result<BTreeSet<u64>> {
+    retro_cli::input::parse_reset_frames(spec)
 }

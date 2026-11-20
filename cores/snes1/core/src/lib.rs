@@ -16,7 +16,6 @@ pub mod debugger;
 pub mod dma;
 pub mod expr_ctx;
 pub mod golden;
-pub mod input_schedule;
 pub mod irq;
 pub mod ppu;
 pub mod savestate;

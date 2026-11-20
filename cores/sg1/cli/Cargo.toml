@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 sg1-core = { path = "../core" }
 retro-core = { path = "../../../retro-core" }
+retro-cli = { path = "../../../retro-cli" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"
