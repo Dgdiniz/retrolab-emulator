@@ -100,6 +100,7 @@ macro_rules! frame_conformance_tests {
             an_interrupt_pushes_a_frame_its_return_pops_on_every_debug_loop,
             a_step_of_the_focused_cpu_is_the_step_the_trait_makes,
             a_host_step_records_each_instruction,
+            history_off_changes_only_the_history,
             host_steps_keep_the_timeline,
             a_step_from_the_capture_boundary_is_the_loops_next_step,
             finishing_a_held_frame_stops_nowhere_and_counts_nothing,
@@ -575,6 +576,66 @@ pub fn a_host_step_records_each_instruction<E: DebugMachine>(core: &FrameCoreUnd
         assert!(steps < PATIENCE, "the call never returns");
     }
     assert_eq!(call_stack(&e).len(), depth, "the return pops it");
+}
+
+/// Host steps of a main CPU whose history is off make the machine, the
+/// steps' results, every CPU's trace and coverage and the call stack that
+/// host steps with it on make, through a call, its return, the wait for
+/// the interrupt and the handler, and record no history; turned on again,
+/// the history records the next instruction.
+pub fn history_off_changes_only_the_history<E: DebugMachine>(core: &FrameCoreUnderTest<E>) {
+    let mut on = (core.build)();
+    let mut off = (core.build)();
+    assert!(
+        on.debugger_ref().is_history_enabled(MAIN_CPU),
+        "a new machine records its main CPU's history"
+    );
+    off.debugger().set_history_enabled(MAIN_CPU, false);
+    assert!(!off.debugger_ref().is_history_enabled(MAIN_CPU));
+    trace_every_cpu(&mut on);
+    trace_every_cpu(&mut off);
+    let mut steps = 0;
+    while (core.frame_count)(&on) < 2 {
+        let kept = on.step_cpu(MAIN_CPU);
+        let none = off.step_cpu(MAIN_CPU);
+        assert_eq!(
+            (kept.cycles, kept.breakpoint_hit, kept.instruction_executed),
+            (none.cycles, none.breakpoint_hit, none.instruction_executed),
+            "step {steps}: the same result"
+        );
+        steps += 1;
+        assert!(steps < PATIENCE * 2, "two frames never end");
+    }
+    assert!(
+        parted(core, &on, &off).is_empty(),
+        "the machines part in {:?}",
+        parted(core, &on, &off)
+    );
+    assert_eq!((core.state_hash)(&on), (core.state_hash)(&off));
+    for cpu in 0..on.system_info().cpus.len() {
+        assert!(
+            on.debugger_ref().get_trace_flush_data(cpu)
+                == off.debugger_ref().get_trace_flush_data(cpu),
+            "CPU {cpu}'s trace"
+        );
+        assert_eq!(
+            on.debugger_ref().coverage_stats(cpu),
+            off.debugger_ref().coverage_stats(cpu),
+            "CPU {cpu}'s coverage"
+        );
+    }
+    assert!(traced(&on)[MAIN_CPU] > 0, "the main CPU was traced");
+    assert_eq!(call_stack(&on), call_stack(&off));
+    assert!(!history(&on).is_empty(), "with it on, the history records");
+    assert!(history(&off).is_empty(), "with it off, it records nothing");
+
+    off.debugger().set_history_enabled(MAIN_CPU, true);
+    let mut steps = 0;
+    while !off.step_cpu(MAIN_CPU).instruction_executed {
+        steps += 1;
+        assert!(steps < PATIENCE, "the main CPU never runs an instruction");
+    }
+    assert_eq!(history(&off).len(), 1, "on again, it records the next one");
 }
 
 /// Host steps keep the frames' timeline: stepped to the end of each frame,

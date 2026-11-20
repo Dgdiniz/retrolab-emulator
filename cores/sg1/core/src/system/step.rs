@@ -32,6 +32,7 @@ impl GenesisEmulator {
         // Capture pre-execution state for trace and history
         let pre_pc = self.z80.pc;
         let z80_tracing = self.debugger.tracing(SOUND_CPU);
+        let z80_history = self.debugger.is_history_enabled(SOUND_CPU);
         let scanline = self.bus.vdp().timing().scanline;
 
         // Check for interrupts before stepping
@@ -45,9 +46,10 @@ impl GenesisEmulator {
         }
 
         // The instruction's bytes at PC (up to 4), read without side effects
-        // and disassembled before the step.
+        // before the step, and disassembled for the history while it is on.
         let raw_bytes = z80_bus.instruction_bytes(pre_pc);
-        let (disasm_text, _) = crate::z80::disasm::disassemble_from_bytes(pre_pc, &raw_bytes);
+        let disasm_text =
+            z80_history.then(|| crate::z80::disasm::disassemble_from_bytes(pre_pc, &raw_bytes).0);
 
         // Record Z80 trace BEFORE step (captures pre-execution state, as a
         // frame's Z80 runs record it)
@@ -68,15 +70,17 @@ impl GenesisEmulator {
         z80_bus.clock_psg(total_cycles);
 
         // Record Z80 instruction history using pre-execution PC and disassembly
-        self.debugger.record_history(
-            SOUND_CPU,
-            InstructionTrace {
-                address: u32::from(pre_pc),
-                instruction: disasm_text,
-                registers_before: Vec::new(),
-                cycle_count: total_cycles,
-            },
-        );
+        if let Some(instruction) = disasm_text {
+            self.debugger.record_history(
+                SOUND_CPU,
+                InstructionTrace {
+                    address: u32::from(pre_pc),
+                    instruction,
+                    registers_before: Vec::new(),
+                    cycle_count: total_cycles,
+                },
+            );
+        }
 
         // A breakpoint where the Z80 goes next stops this step: the check its
         // own step makes, the only one any Z80 breakpoint gets.

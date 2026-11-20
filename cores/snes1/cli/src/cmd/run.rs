@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use retro_core::EmulatorCore;
-use snes1_core::SnesEmulator;
+use snes1_core::{SnesEmulator, MAIN_CPU};
 
 /// Safety bound for `--instructions` / `--until-pc` so a stuck core
 /// cannot spin forever.
@@ -77,6 +77,9 @@ pub fn run(args: RunArgs) -> Result<()> {
     if let Some(chip) = emu.coprocessor_label() {
         println!("Coprocessor: {chip}");
     }
+    // A host step records its instruction in the history, which nothing
+    // here reads: the steps below keep none.
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
 
     let start = Instant::now();
     let mut instructions_executed = 0u64;

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::debugger::MAIN_CPU;
 use sg1_core::GenesisEmulator;
 
 use super::{apply_press, connect_controllers, parse_press_schedule};
@@ -90,8 +91,11 @@ pub fn run(args: WatchRamArgs) -> Result<()> {
     println!("  initial ${:06X} = {prev:0hex_w$X}", args.addr);
 
     // StepInto does not tick the frame counter, so the window is bounded by
-    // stepped instructions; the warmup already positioned the run.
+    // stepped instructions; the warmup already positioned the run. A host
+    // step records its instruction in the history, which nothing here
+    // reads: the steps keep none.
     emu.debugger().set_execution_mode(ExecutionMode::StepInto);
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
     let mut steps = 0u64;
     let mut changes = 0u64;
     let mut report_hits = 0u64;

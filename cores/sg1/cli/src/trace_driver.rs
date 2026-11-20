@@ -102,6 +102,10 @@ where
         );
     }
 
+    // A host step records its instruction in the history, which nothing
+    // here reads: the steps below keep none.
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
+
     // Warmup runs untraced so the trace starts at the comparison window.
     if warmup > 0 {
         emu.debugger().set_execution_mode(ExecutionMode::StepInto);

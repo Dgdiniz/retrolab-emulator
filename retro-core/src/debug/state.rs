@@ -208,12 +208,16 @@ pub struct CpuDebug {
     coverage: CoverageBitmap,
     trace: Option<TracingState>,
     history: HistoryRing<InstructionTrace>,
+    /// Whether the CPU's steps record their instructions in the history:
+    /// on for a CPU whose spec keeps a history, until a host turns it off.
+    history_enabled: bool,
     call_stack: CallStack,
 }
 
 impl CpuDebug {
     /// A CPU's slot, empty: no coverage recorded, no trace ring yet (one is
-    /// made when its tracing is first enabled), no history, no calls.
+    /// made when its tracing is first enabled), no history, no calls; its
+    /// history recorded when its spec keeps one.
     pub fn new(spec: CpuDebugSpec) -> Self {
         let (history, depth) = if spec.history {
             (HISTORY_CAPACITY, CALL_STACK_DEPTH)
@@ -225,6 +229,7 @@ impl CpuDebug {
             coverage: CoverageBitmap::new(spec.coverage_size),
             trace: None,
             history: HistoryRing::new(history),
+            history_enabled: spec.history,
             call_stack: CallStack::new(depth),
         }
     }
@@ -481,10 +486,13 @@ impl<const N: usize, C: ConsoleDebug> DebuggerState<N, C> {
         }
     }
 
-    /// Keep `entry` as the newest instruction of CPU `cpu`'s history.
+    /// Keep `entry` as the newest instruction of CPU `cpu`'s history, while
+    /// its history is on ([`DebuggerCore::set_history_enabled`]).
     pub fn record_history(&mut self, cpu: usize, entry: InstructionTrace) {
         if let Some(slot) = self.cpus.get_mut(cpu) {
-            slot.history.push(entry);
+            if slot.history_enabled {
+                slot.history.push(entry);
+            }
         }
     }
 
@@ -671,6 +679,19 @@ impl<const N: usize, C: ConsoleDebug> DebuggerCore for DebuggerState<N, C> {
             .get(cpu_id)
             .map(|slot| slot.history.newest_first(count as usize))
             .unwrap_or_default()
+    }
+
+    #[inline]
+    fn is_history_enabled(&self, cpu_id: usize) -> bool {
+        self.cpus
+            .get(cpu_id)
+            .is_some_and(|slot| slot.history_enabled)
+    }
+
+    fn set_history_enabled(&mut self, cpu_id: usize, enabled: bool) {
+        if let Some(slot) = self.cpus.get_mut(cpu_id) {
+            slot.history_enabled = enabled && slot.spec.history;
+        }
     }
 
     fn set_tracing_enabled(&mut self, cpu_id: usize, enabled: bool) {
@@ -1226,6 +1247,62 @@ mod tests {
         assert!(state.get_call_stack(9).is_empty());
     }
 
+    #[test]
+    fn the_history_starts_as_the_spec_says_and_off_records_nothing() {
+        let mut state = state();
+        assert!(state.is_history_enabled(0), "a CPU that keeps a history");
+        assert!(!state.is_history_enabled(1), "a CPU that keeps none");
+        assert!(!state.is_history_enabled(9), "past the CPUs");
+
+        state.record_history(0, instruction(0x10));
+        state.push_call(0, frame(0x10));
+        state.set_history_enabled(0, false);
+        assert!(!state.is_history_enabled(0));
+        state.record_history(0, instruction(0x20));
+        state.push_call(0, frame(0x20));
+        let kept: Vec<u32> = state
+            .get_instruction_history(0, 8)
+            .iter()
+            .map(|entry| entry.address)
+            .collect();
+        assert_eq!(kept, [0x10], "the entries kept stay, and none is added");
+        assert_eq!(state.get_call_stack(0).len(), 2, "the calls go on");
+
+        state.set_history_enabled(0, true);
+        state.record_history(0, instruction(0x30));
+        assert_eq!(state.get_instruction_history(0, 8).len(), 2, "on again");
+    }
+
+    #[test]
+    fn a_cpu_with_no_history_cannot_have_it_turned_on() {
+        let mut state = state();
+        state.set_history_enabled(1, true);
+        state.set_history_enabled(9, true);
+        assert!(!state.is_history_enabled(1));
+        assert!(!state.is_history_enabled(9));
+        state.record_history(1, instruction(1));
+        assert!(state.get_instruction_history(1, 8).is_empty());
+    }
+
+    #[test]
+    fn a_slot_made_anew_records_its_history() {
+        let mut state = state();
+        state.set_history_enabled(0, false);
+        state.configure_cpu(0, MAIN);
+        assert!(
+            !state.is_history_enabled(0),
+            "the same spec keeps the slot and its switch"
+        );
+        state.configure_cpu(
+            0,
+            CpuDebugSpec {
+                trace_entry_size: 8,
+                ..MAIN
+            },
+        );
+        assert!(state.is_history_enabled(0), "a slot made anew");
+    }
+
     // -- Running on from a stop ----------------------------------------
 
     #[test]
@@ -1500,6 +1577,8 @@ mod tests {
         debugger.set_tracing_enabled(0, true);
         assert!(debugger.is_tracing_enabled(0));
         assert_eq!(debugger.traceable_cpu_count(), 2);
+        debugger.set_history_enabled(0, false);
+        assert!(!debugger.is_history_enabled(0));
         let id = debugger.add_breakpoint(execute_at(0x10, 0));
         debugger.enable_breakpoint(id, false);
         debugger.set_breakpoint_access(id, AccessFlags::WRITE);

@@ -70,6 +70,15 @@ pub trait DebuggerCore {
     /// first; empty for a CPU that keeps none.
     fn get_instruction_history(&self, cpu_id: usize, count: u32) -> Vec<InstructionTrace>;
 
+    /// Whether a host step of CPU `cpu_id` records its instruction in the
+    /// history; `false` for a CPU that keeps none, or past the CPUs.
+    fn is_history_enabled(&self, cpu_id: usize) -> bool;
+
+    /// Make a host step of CPU `cpu_id` record its instruction in the
+    /// history, or not. A CPU that keeps no history ignores it; the history
+    /// kept so far and the call stack are left as they are.
+    fn set_history_enabled(&mut self, cpu_id: usize, enabled: bool);
+
     // ===== Per-CPU coverage =====
 
     /// Whether the CPU has run an instruction from `address` (masked to its

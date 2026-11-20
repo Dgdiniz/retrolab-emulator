@@ -16,7 +16,7 @@ use retro_core::debug::TraceEntry;
 use retro_core::EmulatorCore;
 use snes1_core::{
     format_trace_line_65816, format_trace_line_spc700, SnesEmulator, TraceEntryBinary65816,
-    TraceEntryBinarySpc700,
+    TraceEntryBinarySpc700, MAIN_CPU,
 };
 #[cfg(feature = "chip-cx4")]
 use snes1_core::{format_trace_line_cx4, TraceEntryBinaryCx4};
@@ -101,6 +101,9 @@ where
         );
     }
 
+    // A host step records its instruction in the history, which nothing
+    // here reads: the steps below keep none.
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
     emu.debugger().set_tracing_enabled(cpu_id, true);
 
     let start_frames = emu.frame_count();

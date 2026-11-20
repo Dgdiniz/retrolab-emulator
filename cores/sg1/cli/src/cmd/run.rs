@@ -9,6 +9,7 @@ use anyhow::Result;
 use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::debugger::MAIN_CPU;
 
 /// Safety bound for `--instructions` / `--until-pc` so a stuck core
 /// cannot spin forever.
@@ -62,6 +63,9 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     let (_, mut emu) = super::load_rom(&args.rom)?;
     super::print_rom_title(&emu);
+    // A host step records its instruction in the history, which nothing
+    // here reads: the steps below keep none.
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
 
     let start = Instant::now();
     let mut instructions_executed = 0u64;

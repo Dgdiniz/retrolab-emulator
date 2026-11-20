@@ -21,8 +21,8 @@ use helpers::M68kProgram;
 use retro_core::debug::DebugEvent;
 use retro_core::frame::conformance::FrameCoreUnderTest;
 use retro_core::types::{Breakpoint, BreakpointType};
-use retro_core::{EmulatorCore, ExecutionMode};
-use sg1_core::debugger::GenesisEvent;
+use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::debugger::{GenesisEvent, SOUND_CPU};
 use sg1_core::GenesisEmulator;
 
 /// Where the horizontal interrupt's handler starts.
@@ -157,4 +157,50 @@ fn the_transfer_s_stall_uses_up_a_frame_s_last_line_as_it_starts() {
         met > 0,
         "a frame's last line was used up by the stall as it started"
     );
+}
+
+/// The Z80's host step records no history while the Z80's history is off,
+/// and makes the machine, the steps' results and the Z80's trace and
+/// coverage that its host steps with the history on make.
+#[test]
+fn the_z80_s_step_records_no_history_while_its_history_is_off() {
+    let mut on = build();
+    let mut off = build();
+    for emu in [&mut on, &mut off] {
+        // The program lets the Z80 out of reset in its first frame.
+        emu.run_frame();
+        emu.debugger().set_tracing_enabled(SOUND_CPU, true);
+    }
+    off.debugger().set_history_enabled(SOUND_CPU, false);
+    assert!(on.debugger_ref().is_history_enabled(SOUND_CPU));
+    assert!(!off.debugger_ref().is_history_enabled(SOUND_CPU));
+    let mut ran = 0;
+    for step in 0..400 {
+        let kept = on.step_cpu(SOUND_CPU);
+        let none = off.step_cpu(SOUND_CPU);
+        assert_eq!(
+            (kept.cycles, kept.breakpoint_hit, kept.instruction_executed),
+            (none.cycles, none.breakpoint_hit, none.instruction_executed),
+            "step {step}: the same result"
+        );
+        ran += usize::from(kept.instruction_executed);
+    }
+    assert!(ran > 0, "the Z80 ran");
+    assert_eq!(on.state_hash(), off.state_hash());
+    assert!(
+        on.debugger_ref().get_trace_flush_data(SOUND_CPU)
+            == off.debugger_ref().get_trace_flush_data(SOUND_CPU),
+        "the Z80's trace"
+    );
+    assert_eq!(
+        on.debugger_ref().coverage_stats(SOUND_CPU),
+        off.debugger_ref().coverage_stats(SOUND_CPU)
+    );
+    let history = |emu: &GenesisEmulator| {
+        emu.debugger_ref()
+            .get_instruction_history(SOUND_CPU, u32::MAX)
+            .len()
+    };
+    assert_eq!(history(&on), ran, "one record for each instruction");
+    assert_eq!(history(&off), 0);
 }

@@ -2,6 +2,7 @@
 //! written once over a core's [`DebugMachine`].
 
 use crate::debug::MAIN_CPU;
+use crate::debugger::DebuggerCore;
 use crate::types::StackFrame;
 
 use super::adapter::{DebugMachine, FrameDebugger, InstructionStart};
@@ -85,22 +86,30 @@ impl<M: DebugMachine> Tier<M> for LightDebug {
 
 /// The step a host asks for: no execute check (the step runs whatever
 /// breakpoint sits at its instruction), and the history entry besides the
-/// light tier's work. What its checks ask for is counted, and the host
-/// step drops the request to stop: a host step always pauses.
+/// light tier's work, while the main CPU's history is on. What its checks
+/// ask for is counted, and the host step drops the request to stop: a
+/// host step always pauses.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FullDebug;
 
 impl<M: DebugMachine> StepHooks<M> for FullDebug {
-    type Start = (InstructionStart<M>, M::HistoryStart);
+    type Start = (InstructionStart<M>, Option<M::HistoryStart>);
 
     fn before_instruction(&mut self, m: &mut M, pc: u32) -> Flow<Self::Start> {
         let start = start_instruction(m, pc);
-        Flow::Run((start, m.history_start(pc)))
+        let history = if m.debug_state().is_history_enabled(MAIN_CPU) {
+            Some(m.history_start(pc))
+        } else {
+            None
+        };
+        Flow::Run((start, history))
     }
 
     fn after_instruction(&mut self, m: &mut M, (start, history): Self::Start, cycles: u32) {
         finish_instruction(m, start, cycles);
-        m.history_finish(history, cycles);
+        if let Some(history) = history {
+            m.history_finish(history, cycles);
+        }
     }
 
     fn interrupt_taken(&mut self, m: &mut M, interrupted_pc: u32) {

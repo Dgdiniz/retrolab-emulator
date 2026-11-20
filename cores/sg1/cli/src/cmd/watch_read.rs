@@ -29,6 +29,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use sg1_core::debugger::MAIN_CPU;
 use sg1_core::system::InstructionAccessLog;
 use sg1_core::vdp::dma::{DmaTarget, MemoryDma};
 use sg1_core::GenesisEmulator;
@@ -188,8 +189,11 @@ pub fn run(args: WatchReadArgs) -> Result<()> {
     // StepInto does not tick the frame counter, so the window is bounded by
     // stepped instructions; the warmup already positioned the run. A step
     // that executes nothing (a stopped CPU waiting for an interrupt) still
-    // advances time, so the loop is also capped on raw iterations.
+    // advances time, so the loop is also capped on raw iterations. A host
+    // step records its instruction in the history, which nothing here
+    // reads: the steps keep none.
     emu.debugger().set_execution_mode(ExecutionMode::StepInto);
+    emu.debugger().set_history_enabled(MAIN_CPU, false);
     emu.set_instruction_access_logging(true);
 
     let max_iterations = args.max_steps.saturating_mul(64).max(1_000_000);
