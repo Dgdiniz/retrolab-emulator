@@ -14,3 +14,5 @@ retro-core = { path = "../retro-core", features = ["singlestep"] }
 clap = { version = "4", features = ["derive", "string"] }
 anyhow = "1.0"
 indicatif = "0.17"
+# PNG only: the screenshots and the layers a command writes.
+image = { version = "0.25", default-features = false, features = ["png"] }

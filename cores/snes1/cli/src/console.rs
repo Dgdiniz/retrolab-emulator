@@ -1,7 +1,8 @@
 //! What the SNES gives the shared commands of `retro-cli`: its CPUs (a
 //! cartridge's own among them) and the parsers of their bsnes-plus-format
-//! lines, and its start-up flags (the DSP-1's emulation and the forced
-//! mapping of a ROM the detector doubts).
+//! lines, its start-up flags (the DSP-1's emulation and the forced mapping
+//! of a ROM the detector doubts), the warnings about a blanked picture, and
+//! the lines of its profile.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Args;
 use retro_cli::report::human_bytes;
-use retro_cli::{CliCpu, Console};
+use retro_cli::{CliCpu, Console, ProfileLine};
 use retro_core::debug::ByteOrder;
 use retro_core::{CpuArchitecture, EmulatorCore};
 use snes1_core::{CoprocessorMode, PresetKind, SnesEmulator, CARTRIDGE_CPU, MAIN_CPU, SOUND_CPU};
@@ -32,9 +33,14 @@ pub struct SnesBoot {
     pub coprocessor: CoprocessorArgs,
 }
 
+/// The SNES's `screenshot` takes no flags of its own.
+#[derive(Args, Clone, Debug, Default)]
+pub struct SnesScreenshot {}
+
 impl Console for Snes {
     type Emulator = SnesEmulator;
     type BootArgs = SnesBoot;
+    type ScreenshotArgs = SnesScreenshot;
     type Command = crate::cmd::Command;
 
     const TOOL: &'static str = "snes1-cli";
@@ -128,10 +134,12 @@ impl Console for Snes {
         "singlestep-65816",
         "singlestep-spc700",
         "benchmark",
+        "profile",
         "memory",
         "watch-ram",
         "fingerprint",
         "savestate",
+        "sram",
         "golden",
         "golden-set",
         "golden-compare",
@@ -143,6 +151,54 @@ impl Console for Snes {
     const DECODED_WITH: &'static str = "flags";
     const WATCH_EXAMPLE: u32 = 0x7E_0019;
     const FRAME_INSTRUCTIONS: &'static str = "a SNES frame is roughly 11k-14k 65C816 instructions";
+    const VIDEO_CHIP: &'static str = "PPU";
+    const SOUND_CHIPS: &'static str = "S-DSP";
+    const LAYER_NOTES: &'static str = "";
+    const OVERSCAN_HELP: &'static str = "Show the full overscan frame (240/480 tall) instead of \
+        cropping to the 224-line NTSC TV window. Off by default, matching bsnes-plus / snes9x \
+        output";
+    const CHIP_STATE_EXAMPLE: &'static str = "S-DD1 `DECOMPS > 0` + DMA shadow";
+    /// A cartridge's chips (the Super FX, the SA-1, the DSP-1) count in
+    /// "Cartridge".
+    const PROFILE: &'static [ProfileLine] = &[
+        ProfileLine {
+            label: "65C816 CPU",
+            chip: "65C816",
+        },
+        ProfileLine {
+            label: "DMA",
+            chip: "DMA",
+        },
+        ProfileLine {
+            label: "PPU render",
+            chip: "PPU",
+        },
+        ProfileLine {
+            label: "HDMA",
+            chip: "HDMA",
+        },
+        ProfileLine {
+            label: "APU",
+            chip: "APU",
+        },
+        ProfileLine {
+            label: "Audio mix",
+            chip: "audio mix",
+        },
+        ProfileLine {
+            label: "Framebuffer",
+            chip: "framebuffer",
+        },
+        ProfileLine {
+            label: "Cartridge",
+            chip: "cartridge",
+        },
+    ];
+    const PROFILE_CLOCK: &'static str = "master cycles";
+    const BUTTONS_NOTE: &'static str = "";
+    const PRESS_EXAMPLE: &'static str = "a Mode 5 menu";
+    const RESET_EXAMPLE: &'static str = "the SPC7110 A/B self-test (press A -> reset -> press B \
+        -> reset -> the game boots)";
 
     /// The DSP-1's emulation and firmware, then the forced mapping.
     fn stage(emu: &mut SnesEmulator, rom: &[u8], boot: &SnesBoot) -> Result<()> {
@@ -225,6 +281,23 @@ impl Console for Snes {
                 "INCONSISTENT"
             }
         )
+    }
+
+    /// A frame in forced blank, or at zero brightness, is black: say so,
+    /// so a black PNG is not taken for a capture that went wrong.
+    fn picture_notes(emu: &SnesEmulator, frames: u64) -> Vec<String> {
+        if emu.ppu().display_disable() {
+            vec![format!(
+                "PPU is in forced blank (display_disable set) after {frames} frames - the image \
+                 will be black"
+            )]
+        } else if emu.ppu().display_brightness() == 0 {
+            vec![format!(
+                "PPU master brightness is 0 after {frames} frames - the image will be black"
+            )]
+        } else {
+            Vec::new()
+        }
     }
 
     fn run_command(command: crate::cmd::Command) -> Result<()> {
@@ -395,7 +468,19 @@ mod tests {
         assert!(help_of("compare-trace", "ignore").ends_with("(e.g. `A,X,DB,P,eff`)"));
         assert!(help_of("compare-trace", "press_at").contains("the run gets no input"));
         assert!(help_of("trace", "press")
-            .contains("a screen waiting for a new press (a title, a menu)"));
+            .contains("a screen waiting for a new press (a title, a menu, such as a Mode 5 menu)"));
+        assert!(help_of("screenshot", "reset_at").contains(
+            "a plain run cannot, most notably the SPC7110 A/B self-test (press A -> reset -> \
+             press B -> reset -> the game boots), letting a single run reach real gameplay"
+        ));
+        assert!(help_of("screenshot", "show_only")
+            .contains("(`0`=BG1, `1`=BG2, `2`=BG3, `3`=BG4 and `4`=OBJ)"));
+        assert!(help_of("screenshot", "hide").contains("E.g. `--hide 0` drops BG1"));
+        assert!(help_of("screenshot", "render_layers")
+            .contains("(`<stem>_bg1`, `<stem>_bg2`, `<stem>_bg3`, `<stem>_bg4` and `<stem>_obj`)"));
+        assert!(help_of("screenshot", "overscan").starts_with("Show the full overscan frame"));
+        assert!(help_of("screenshot", "coprocessor_state")
+            .contains("(e.g. S-DD1 `DECOMPS > 0` + DMA shadow)"));
         assert!(help_of("trace", "press_hold").contains("to run a routine while a button"));
         assert_eq!(
             help_of("trace-to-text", "rom"),

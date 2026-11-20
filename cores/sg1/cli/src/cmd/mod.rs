@@ -3,21 +3,15 @@
 //! runs the commands both tools share. The helpers the commands share live
 //! here.
 
-pub mod audio_dump;
 pub mod audio_info;
-pub mod benchmark;
 pub mod dump_vdp;
-pub mod profile;
-pub mod savestate;
-pub mod screenshot;
 pub mod sound_trace;
-pub mod sram;
 pub mod watch_read;
 pub mod watch_vram;
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use retro_cli::RomArgs;
 use retro_core::input_schedule::PressSchedule;
@@ -31,44 +25,26 @@ use crate::console::Genesis;
 /// The Mega Drive's own commands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a ROM and save the framebuffer as a PNG (+ layer dumps).
-    Screenshot(screenshot::ScreenshotArgs),
     /// Run a ROM and dump a full VDP state report.
     DumpVdp(dump_vdp::DumpVdpArgs),
     /// Log VDP writes that land in a VRAM address window while running.
     WatchVram(watch_vram::WatchVramArgs),
     /// Single-step a window and name the instructions that read an address range.
     WatchRead(watch_read::WatchReadArgs),
-    /// Benchmark the execution tiers (fast / light-debug / +trace / full).
-    Benchmark(benchmark::BenchmarkArgs),
-    /// Profile per-subsystem frame timing and rank bottlenecks.
-    Profile(profile::ProfileArgs),
-    /// Run a ROM with audio capture and save the output as a WAV.
-    AudioDump(audio_dump::AudioDumpArgs),
     /// Print a PSG + YM2612 channel-state summary.
     AudioInfo(audio_info::AudioInfoArgs),
     /// Dump YM2612 + PSG register writes with their in-frame sample offset.
     SoundTrace(sound_trace::SoundTraceArgs),
-    /// Save or load an emulator savestate.
-    Savestate(savestate::SavestateArgs),
-    /// Dump or seed a game's battery-backed SRAM.
-    Sram(sram::SramArgs),
 }
 
 /// Run one of the Mega Drive's own commands.
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Screenshot(args) => screenshot::run(args),
         Command::DumpVdp(args) => dump_vdp::run(args),
         Command::WatchVram(args) => watch_vram::run(args),
         Command::WatchRead(args) => watch_read::run(args),
-        Command::Benchmark(args) => benchmark::run(args),
-        Command::Profile(args) => profile::run(args),
-        Command::AudioDump(args) => audio_dump::run(args),
         Command::AudioInfo(args) => audio_info::run(args),
         Command::SoundTrace(args) => sound_trace::run(args),
-        Command::Savestate(args) => savestate::run(args),
-        Command::Sram(args) => sram::run(args),
     }
 }
 
@@ -86,13 +62,6 @@ pub(crate) fn print_rom_title(emu: &GenesisEmulator) {
     }
 }
 
-/// Print the cartridge's chips and their state, as `info` prints them
-/// (`screenshot --coprocessor-state`).
-pub(crate) fn print_coprocessors(emu: &mut GenesisEmulator) -> Result<()> {
-    retro_cli::report::write_chips(emu, &mut std::io::stdout())?;
-    Ok(())
-}
-
 /// Force 6-button pads on both DE-9 ports.
 ///
 /// `load_rom` already auto-selects 6-button when the cartridge header
@@ -103,36 +72,13 @@ pub(crate) fn connect_controllers(emu: &mut GenesisEmulator, six_button: bool) {
     emu.connect_controllers(six_button);
 }
 
-/// Save the emulator's framebuffer as a PNG. The Genesis framebuffer is
-/// already display-sized (no overscan crop needed), so the whole RGBA
-/// buffer is converted to RGB and encoded as-is.
+/// Save the picture the emulator shows as a PNG
+/// ([`retro_cli::image::write_frame_png`]), and say so.
 pub(crate) fn save_screenshot(emu: &GenesisEmulator, output_path: &Path) -> Result<()> {
-    let fb = emu.get_framebuffer();
-    let width = fb.width;
-    let height = fb.height;
-
-    if fb.data.is_empty() || width == 0 || height == 0 {
-        anyhow::bail!("framebuffer is empty ({width}x{height})");
-    }
-
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for px in fb.data.as_chunks::<4>().0 {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-    }
-
-    let img = image::RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
-        anyhow::anyhow!("failed to build {width}x{height} image from framebuffer")
-    })?;
-    img.save(output_path)
-        .with_context(|| format!("failed to save screenshot: {}", output_path.display()))?;
-
+    let (width, height) = retro_cli::image::write_frame_png(emu, output_path)?;
     println!(
-        "Screenshot saved: {} ({}x{})",
-        output_path.display(),
-        width,
-        height
+        "Screenshot saved: {} ({width}x{height})",
+        output_path.display()
     );
     Ok(())
 }

@@ -2,8 +2,13 @@
 //! own, and the texts of the help that name the console's facts.
 
 use anyhow::Result;
-use clap::{CommandFactory, FromArgMatches};
+use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+use clap::{CommandFactory, FromArgMatches, ValueEnum};
+use retro_core::golden::GoldenConsole;
+use retro_core::EmulatorCore;
 
+use crate::cmd::audio_dump::AudioDumpArgs;
+use crate::cmd::benchmark::{BenchmarkArgs, Mode, HOST_STEPS_TIME_LIMIT};
 use crate::cmd::compare::CompareArgs;
 use crate::cmd::compare_trace::CompareTraceArgs;
 use crate::cmd::determinism_check::DeterminismCheckArgs;
@@ -11,7 +16,11 @@ use crate::cmd::disasm::DisasmArgs;
 use crate::cmd::fingerprint::FingerprintArgs;
 use crate::cmd::info::InfoArgs;
 use crate::cmd::memory::MemoryArgs;
+use crate::cmd::profile::{ProfileArgs, WARMUP_FRAMES};
 use crate::cmd::run::RunArgs;
+use crate::cmd::savestate::SavestateArgs;
+use crate::cmd::screenshot::ScreenshotArgs;
+use crate::cmd::sram::SramArgs;
 use crate::cmd::trace::TraceArgs;
 use crate::cmd::trace_to_text::TraceToTextArgs;
 use crate::cmd::watch_ram::WatchRamArgs;
@@ -30,14 +39,15 @@ pub struct Cli<C: Console> {
 #[derive(clap::Subcommand, Debug)]
 pub enum AllCommands<C: Console> {
     #[command(flatten)]
-    Shared(Box<SharedCommand<C::BootArgs>>),
+    Shared(Box<SharedCommand<C::BootArgs, C::ScreenshotArgs>>),
     #[command(flatten)]
     Own(C::Command),
 }
 
-/// The commands both tools run, `B` the tool's start-up flags.
+/// The commands both tools run, `B` the tool's start-up flags and `S` its
+/// own `screenshot` flags.
 #[derive(clap::Subcommand, Debug)]
-pub enum SharedCommand<B: clap::Args> {
+pub enum SharedCommand<B: clap::Args, S: clap::Args> {
     /// Print the CLI version.
     Version,
     /// Inspect a ROM's header (title, region, checksum, mapper), its
@@ -64,6 +74,19 @@ pub enum SharedCommand<B: clap::Args> {
     Compare(CompareArgs),
     /// Convert a binary trace blob to text.
     TraceToText(TraceToTextArgs),
+    /// Run a ROM and save the visible picture as a PNG (+ layer dumps).
+    Screenshot(ScreenshotArgs<B, S>),
+    /// Benchmark the execution tiers (fast / light-debug / +trace /
+    /// fast+recording / full, in host steps).
+    Benchmark(BenchmarkArgs<B>),
+    /// Profile per-subsystem frame timing and rank bottlenecks.
+    Profile(ProfileArgs<B>),
+    /// Run a ROM with audio capture and save the output as a WAV.
+    AudioDump(AudioDumpArgs<B>),
+    /// Save or load an emulator savestate.
+    Savestate(SavestateArgs<B>),
+    /// Dump or seed a game's battery-backed SRAM.
+    Sram(SramArgs<B>),
 }
 
 /// The tool's clap command: the tool's name, about line and version, the
@@ -243,40 +266,227 @@ pub fn command<C: Console>() -> clap::Command {
             .mut_arg("rom", |a| a.help(trace_rom_help::<C>()))
         });
 
+    // The commands of pictures, sound, states and timing: the help names
+    // the console's chips, its layers (read from a machine of the console),
+    // its sample rate and its main CPU.
+    let facts = MachineFacts::of::<C>();
+    let layer_ids = join_words(
+        facts
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(id, name)| format!("`{id}`={name}"))
+            .collect(),
+        "and",
+    );
+    let layer_files = join_words(
+        facts
+            .layers
+            .iter()
+            .map(|name| format!("`<stem>_{}`", crate::cmd::screenshot::layer_suffix(name)))
+            .collect(),
+        "and",
+    );
+    let first_layer = facts.layers.first().cloned().unwrap_or_default();
+    let mut render_layers_help = format!(
+        "Also write each layer alone beside the screenshot ({layer_files}), RGBA PNGs in which \
+         every pixel the layer does not cover is transparent (alpha 0). All of them come from \
+         the screenshot's own frame: the run records the settings each line is drawn with (its \
+         scroll, palette, registers and the video memory it read) from the first frame on, the \
+         last frame stops at its capture boundary, where its picture is drawn and vertical \
+         blanking has not begun, and each layer is drawn again from that frame's lines, so a \
+         raster effect (a scroll, a palette or a mode changed part of the way down the screen) \
+         comes out in the layers as it does in the picture"
+    );
+    if !C::LAYER_NOTES.is_empty() {
+        render_layers_help = format!("{render_layers_help}. {}", C::LAYER_NOTES);
+    }
+    cmd = cmd
+        .mut_subcommand("screenshot", |s| {
+            s.about(format!(
+                "Run a ROM and save the visible {} output as a PNG (+ layer dumps)",
+                C::VIDEO_CHIP
+            ))
+            .mut_arg("show_only", |a| {
+                a.help(format!(
+                    "Isolate a single layer: render only this one ({layer_ids}). Applies the \
+                     debugger layer-disable mask to every other layer, then renders one more \
+                     frame so the capture reflects the mask. Diagnoses which layer owns which \
+                     pixels; a value that is not a layer is refused"
+                ))
+            })
+            .mut_arg("hide", |a| {
+                a.help(format!(
+                    "Hide these layers (comma-separated ids, same numbering as `--show-only`), \
+                     keeping the rest. E.g. `--hide 0` drops {first_layer}; a value that is not a \
+                     layer is refused"
+                ))
+            })
+            .mut_arg("render_layers", |a| a.help(render_layers_help))
+            .mut_arg("overscan", |a| a.help(C::OVERSCAN_HELP))
+            .mut_arg("coprocessor_state", |a| {
+                a.help(format!(
+                    "After capturing, print the installed coprocessor(s) and their live state, \
+                     the same dump as `info` (e.g. {}). Ties \"take a screenshot\" and \"confirm \
+                     the coprocessor did its job\" into one command",
+                    C::CHIP_STATE_EXAMPLE
+                ))
+            })
+        })
+        .mut_subcommand("audio-dump", |s| {
+            s.about(format!(
+                "Run a ROM with audio capture and save the {} output as a WAV",
+                C::SOUND_CHIPS
+            ))
+            .mut_arg("sample_rate", |a| {
+                a.default_value(facts.sample_rate.to_string())
+            })
+        })
+        .mut_subcommand("benchmark", |s| {
+            s.mut_arg("mode", |a| a.value_parser(benchmark_modes(main.label)))
+        })
+        .mut_subcommand("profile", |s| {
+            s.mut_arg("frames", |a| {
+                a.help(format!(
+                    "Number of frames to profile, after {WARMUP_FRAMES} frames of warm-up, e.g. \
+                     `300` (5 s at 60 fps)"
+                ))
+            })
+        });
+
     // The shared commands' ROM names the console's files, their input flags
     // name its buttons, and their start-up flags come after their own
-    // options; the tool's own commands keep their texts and their order.
-    let buttons = button_names(<C::Emulator as retro_core::golden::GoldenConsole>::BUTTONS);
+    // options, in their own subcommands too; the tool's own commands keep
+    // their texts and their order.
+    let input_help = InputHelp {
+        buttons: button_names(<C::Emulator as GoldenConsole>::BUTTONS),
+        buttons_note: C::BUTTONS_NOTE,
+        press_example: C::PRESS_EXAMPLE,
+        reset_example: C::RESET_EXAMPLE,
+    };
     let boot: Vec<String> = <C::BootArgs as clap::Args>::augment_args(clap::Command::new("boot"))
         .get_arguments()
         .map(|arg| arg.get_id().to_string())
         .collect();
-    let shared = <SharedCommand<C::BootArgs> as clap::Subcommand>::augment_subcommands(
-        clap::Command::new("shared"),
-    );
+    let shared =
+        <SharedCommand<C::BootArgs, C::ScreenshotArgs> as clap::Subcommand>::augment_subcommands(
+            clap::Command::new("shared"),
+        );
     for name in shared.get_subcommands().map(|s| s.get_name().to_string()) {
-        cmd = cmd.mut_subcommand(&name, |mut s| {
-            if s.get_arguments()
-                .any(|arg| arg.get_id() == "rom" && arg.is_positional())
-            {
-                s = s.mut_arg("rom", |a| a.help(rom_help.clone()));
-            }
-            if INPUT_FLAGS.iter().all(|id| has_arg(&s, id)) {
-                let note = input_note(&s);
-                s = with_input_help(s, &buttons, &note);
-            }
-            for (i, id) in boot.iter().enumerate() {
-                if has_arg(&s, id) {
-                    s = s.mut_arg(id, |a| a.display_order(BOOT_DISPLAY_ORDER + i));
-                }
-            }
-            s
-        });
+        cmd = cmd.mut_subcommand(&name, |s| shared_edits(s, &rom_help, &input_help, &boot));
     }
+    cmd = cmd
+        .mut_subcommand("audio-dump", |s| {
+            s.mut_arg("press_at", |a| {
+                let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+                a.help(format!(
+                    "{help}. Most games sit silent on a title screen until something is \
+                     pressed, so a capture without input records the boot jingle at best"
+                ))
+            })
+        })
+        .mut_subcommand("savestate", |s| {
+            s.mut_subcommand("load", |s| {
+                s.mut_arg("rom", |a| {
+                    a.help(format!("{rom_help} the state was captured against"))
+                })
+            })
+        });
     for (i, name) in C::COMMAND_ORDER.iter().enumerate() {
         cmd = cmd.mut_subcommand(name, |s| s.display_order(i));
     }
     cmd
+}
+
+/// What the help reads from a machine of the console: the rate its sound
+/// is made at, and the names of its picture's layers, by id.
+struct MachineFacts {
+    sample_rate: u32,
+    layers: Vec<String>,
+}
+
+impl MachineFacts {
+    fn of<C: Console>() -> Self {
+        let mut emu = C::Emulator::new_for_golden();
+        let sample_rate = emu.get_audio_info().sample_rate;
+        let debugger = emu.video_debugger();
+        let layers = (0..debugger.get_layer_count())
+            .map(|id| {
+                debugger
+                    .get_layer_data(id)
+                    .map_or_else(|| format!("layer {id}"), |data| data.name)
+            })
+            .collect();
+        Self {
+            sample_rate,
+            layers,
+        }
+    }
+}
+
+/// `benchmark --mode`: its rows, named in the help with the console's main
+/// CPU.
+fn benchmark_modes(main: &str) -> impl TypedValueParser<Value = Mode> {
+    let limit = HOST_STEPS_TIME_LIMIT.as_secs();
+    let help = |mode: Mode| match mode {
+        Mode::LightTrace => format!("LightDebug with {main} tracing active"),
+        Mode::HostSteps => format!(
+            "Host steps of the {main} until the frames are done, as a debugger steps (at most \
+             {limit} seconds of them)"
+        ),
+        other => other
+            .to_possible_value()
+            .and_then(|value| value.get_help().map(|h| h.to_string()))
+            .unwrap_or_default(),
+    };
+    let values: Vec<PossibleValue> = Mode::value_variants()
+        .iter()
+        .filter_map(|&mode| mode.to_possible_value().map(|value| value.help(help(mode))))
+        .collect();
+    PossibleValuesParser::new(values).map(|name| Mode::from_str(&name, false).unwrap_or(Mode::All))
+}
+
+/// The edits every shared command gets, and each of its own subcommands:
+/// the help of its ROM and of its input flags, and its start-up flags after
+/// its own options.
+fn shared_edits(
+    mut s: clap::Command,
+    rom_help: &str,
+    input: &InputHelp,
+    boot: &[String],
+) -> clap::Command {
+    if s.get_arguments()
+        .any(|arg| arg.get_id() == "rom" && arg.is_positional())
+    {
+        s = s.mut_arg("rom", |a| a.help(rom_help.to_string()));
+    }
+    if INPUT_FLAGS.iter().all(|id| has_arg(&s, id)) {
+        let note = input_note(&s);
+        s = with_input_help(s, input, &note);
+    }
+    for (i, id) in boot.iter().enumerate() {
+        if has_arg(&s, id) {
+            s = s.mut_arg(id, |a| a.display_order(BOOT_DISPLAY_ORDER + i));
+        }
+    }
+    let nested: Vec<String> = s
+        .get_subcommands()
+        .map(|n| n.get_name().to_string())
+        .collect();
+    for name in nested {
+        s = s.mut_subcommand(&name, |n| shared_edits(n, rom_help, input, boot));
+    }
+    s
+}
+
+/// What the input flags' help names of the console: its buttons, and its
+/// notes ([`Console::BUTTONS_NOTE`], [`Console::PRESS_EXAMPLE`],
+/// [`Console::RESET_EXAMPLE`]).
+struct InputHelp {
+    buttons: String,
+    buttons_note: &'static str,
+    press_example: &'static str,
+    reset_example: &'static str,
 }
 
 /// The ids of the flags [`crate::InputArgs`] brings.
@@ -313,36 +523,51 @@ fn input_note(cmd: &clap::Command) -> String {
     }
 }
 
-/// The input flags' help, naming the console's buttons, each followed by
-/// `note` ([`input_note`]).
-fn with_input_help(cmd: clap::Command, buttons: &str, note: &str) -> clap::Command {
+/// The input flags' help, naming the console's buttons and its notes, each
+/// followed by `note` ([`input_note`]).
+fn with_input_help(cmd: clap::Command, input: &InputHelp, note: &str) -> clap::Command {
+    let buttons = match input.buttons_note {
+        "" => format!("`{}`", input.buttons),
+        extra => format!("`{}`; {extra}", input.buttons),
+    };
+    let press_example = match input.press_example {
+        "" => String::new(),
+        example => format!(", such as {example}"),
+    };
+    let reset_example = match input.reset_example {
+        "" => String::new(),
+        example => format!(", most notably {example}"),
+    };
     cmd.mut_arg("press_at", |a| {
         a.help(format!(
             "Frame-scheduled player-1 input: `\"F:buttons;F:buttons\"` (e.g. \
-             `\"180:start;186:;240:a,b\"`, the buttons of a set-point separated by `,` or `+`). \
-             Each set-point holds its buttons from frame `F` until the next; an empty list \
-             releases. It reproduces presses timed by hand, such as those a reference log was \
-             captured with. Takes precedence over `--press-hold` and `--press`. Without it, \
-             `--press-hold` or `--press`, the run gets no input{note}"
+             `\"180:start;186:;240:a,b\"`, the buttons of a set-point separated by `,` or `+`, \
+             from {buttons}). Each set-point holds its buttons from frame `F` until the next; an \
+             empty list releases. It reaches a given screen the same way on every run, and \
+             reproduces presses timed by hand, such as those a reference log was captured with. \
+             Takes precedence over `--press-hold` and `--press`. Without it, `--press-hold` or \
+             `--press`, the run gets no input{note}"
         ))
     })
     .mut_arg("press_hold", |a| {
         a.help(format!(
-            "Hold these player-1 buttons every frame (comma-separated: `{buttons}`), to run a \
+            "Hold these player-1 buttons every frame (comma-separated: {buttons}), to run a \
              routine while a button (a direction, say) is held. Takes precedence over \
              `--press`{note}"
         ))
     })
     .mut_arg("press", |a| {
         a.help(format!(
-            "Pulse these player-1 buttons (comma-separated: `{buttons}`) on and off every 6 \
-             frames, so that a screen waiting for a new press (a title, a menu) moves on and \
-             the run reaches screens a run with no input cannot{note}"
+            "Pulse these player-1 buttons (comma-separated: {buttons}) on and off every 6 \
+             frames, so that a screen waiting for a new press (a title, a menu{press_example}) \
+             moves on and the run reaches screens a run with no input cannot{note}"
         ))
     })
     .mut_arg("reset_at", |a| {
         a.help(format!(
-            "Reset the console before these frames (comma-separated, e.g. `\"360,720\"`){note}"
+            "Reset the console before these frames (comma-separated, e.g. `\"360,720\"`). \
+             Battery SRAM survives a reset, so this drives reset-gated first-boot routines a \
+             plain run cannot{reset_example}, letting a single run reach real gameplay{note}"
         ))
     })
 }
@@ -439,7 +664,7 @@ pub fn run<C: Console>() -> Result<()> {
     }
 }
 
-fn run_shared<C: Console>(command: SharedCommand<C::BootArgs>) -> Result<()> {
+fn run_shared<C: Console>(command: SharedCommand<C::BootArgs, C::ScreenshotArgs>) -> Result<()> {
     match command {
         SharedCommand::Version => {
             println!("{} {}", C::TOOL, C::VERSION);
@@ -456,5 +681,11 @@ fn run_shared<C: Console>(command: SharedCommand<C::BootArgs>) -> Result<()> {
         SharedCommand::CompareTrace(args) => crate::cmd::compare_trace::run::<C>(args),
         SharedCommand::Compare(args) => crate::cmd::compare::run::<C>(args),
         SharedCommand::TraceToText(args) => crate::cmd::trace_to_text::run::<C>(args),
+        SharedCommand::Screenshot(args) => crate::cmd::screenshot::run::<C>(args),
+        SharedCommand::Benchmark(args) => crate::cmd::benchmark::run::<C>(args),
+        SharedCommand::Profile(args) => crate::cmd::profile::run::<C>(args),
+        SharedCommand::AudioDump(args) => crate::cmd::audio_dump::run::<C>(args),
+        SharedCommand::Savestate(args) => crate::cmd::savestate::run::<C>(args),
+        SharedCommand::Sram(args) => crate::cmd::sram::run::<C>(args),
     }
 }

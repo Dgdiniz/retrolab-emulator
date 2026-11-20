@@ -5,8 +5,11 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::Result;
+use retro_core::capture::CaptureCore;
 use retro_core::debug::ByteOrder;
+use retro_core::frame::DebugMachine;
 use retro_core::golden::GoldenConsole;
+use retro_core::video::PixelImage;
 use retro_core::{CpuArchitecture, EmulatorCore};
 
 use crate::trace::line::TraceLine;
@@ -16,9 +19,11 @@ use crate::trace::line::TraceLine;
 /// call it where the console does something its own way.
 pub trait Console: Sized + 'static {
     /// The machine the tool drives.
-    type Emulator: GoldenConsole;
+    type Emulator: GoldenConsole + DebugMachine + CaptureCore;
     /// The flags every command of this tool that loads a ROM takes.
     type BootArgs: clap::Args + Clone + Debug + Default;
+    /// The flags only this console's `screenshot` takes.
+    type ScreenshotArgs: clap::Args + Clone + Debug + Default;
     /// The tool's own commands.
     type Command: clap::Subcommand + Debug;
 
@@ -65,6 +70,36 @@ pub trait Console: Sized + 'static {
     /// How many instructions of the main CPU a frame runs, as the help of
     /// `watch-ram --max-steps` says it.
     const FRAME_INSTRUCTIONS: &'static str;
+    /// The chip that draws the picture, as the help of `screenshot` names
+    /// what it saves.
+    const VIDEO_CHIP: &'static str;
+    /// The chips that make the sound, as the help of `audio-dump` names
+    /// what it saves.
+    const SOUND_CHIPS: &'static str;
+    /// What the help of `screenshot --render-layers` says of the files it
+    /// writes besides one per layer (images of the console's own, how a
+    /// layer shares the screen with another); empty for nothing.
+    const LAYER_NOTES: &'static str;
+    /// The help of `screenshot --overscan`.
+    const OVERSCAN_HELP: &'static str;
+    /// A coprocessor's state at work, as the help of `screenshot
+    /// --coprocessor-state` gives its example.
+    const CHIP_STATE_EXAMPLE: &'static str;
+    /// The lines of the `profile` report, each a part of the machine the
+    /// core names in its profiles.
+    const PROFILE: &'static [ProfileLine];
+    /// What the machine's clock counts, as the `profile` report names a
+    /// count of it (`FrameProfile::elapsed`).
+    const PROFILE_CLOCK: &'static str;
+    /// What the help of the input flags adds after the console's buttons
+    /// (buttons that reach a game only on another pad); empty for nothing.
+    const BUTTONS_NOTE: &'static str;
+    /// A screen of the console's games that waits for a new press, as the
+    /// help of `--press` gives its example; empty for none.
+    const PRESS_EXAMPLE: &'static str;
+    /// A first boot of the console's games that only a reset gets past, as
+    /// the help of `--reset-at` gives its example; empty for none.
+    const RESET_EXAMPLE: &'static str;
 
     /// Set the boot flags on a new machine, before its ROM loads.
     fn stage(emu: &mut Self::Emulator, rom: &[u8], boot: &Self::BootArgs) -> Result<()>;
@@ -106,8 +141,50 @@ pub trait Console: Sized + 'static {
         None
     }
 
+    /// `screenshot`: what the console's own flags set before the run's last
+    /// frame.
+    fn before_last_frame(emu: &mut Self::Emulator, args: &Self::ScreenshotArgs) -> Result<()> {
+        let _ = (emu, args);
+        Ok(())
+    }
+
+    /// `screenshot`: what the console's own flags do once the run's frames
+    /// are done, before the picture is saved: a change to the machine that
+    /// one more frame shows ([`crate::cmd::screenshot::draw_again`]), and
+    /// undoing what [`Console::before_last_frame`] set.
+    fn after_frames(emu: &mut Self::Emulator, args: &Self::ScreenshotArgs) -> Result<()> {
+        let _ = (emu, args);
+        Ok(())
+    }
+
+    /// `screenshot`: warnings about the picture the machine shows after
+    /// `frames` frames, such as a screen the console has blanked, each
+    /// printed as `warning: ...` before the picture is saved.
+    fn picture_notes(emu: &Self::Emulator, frames: u64) -> Vec<String> {
+        let _ = (emu, frames);
+        Vec::new()
+    }
+
+    /// `screenshot --render-layers`: the images of the held frame it writes
+    /// after the layers, each with the suffix of its file.
+    fn extra_layer_images(emu: &mut Self::Emulator) -> Vec<(&'static str, PixelImage)> {
+        let _ = emu;
+        Vec::new()
+    }
+
     /// Run one of the tool's own commands.
     fn run_command(command: Self::Command) -> Result<()>;
+}
+
+/// A line of the `profile` report: the part of the machine whose time it
+/// shows.
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileLine {
+    /// What the report calls it.
+    pub label: &'static str,
+    /// The name the core gives it in its profiles (`ChipTime::chip`); a
+    /// CPU's is the label of the CPU in [`Console::CPUS`].
+    pub chip: &'static str,
 }
 
 /// A CPU the trace commands can name with `--cpu`.

@@ -3,12 +3,8 @@
 //! the commands both tools share. The helpers the commands share live here.
 
 pub mod apu_dump;
-pub mod audio_dump;
-pub mod benchmark;
 pub mod golden;
 pub mod ppu_dump;
-pub mod savestate;
-pub mod screenshot;
 pub mod singlestep;
 
 use std::collections::BTreeSet;
@@ -25,24 +21,16 @@ pub(crate) use retro_cli::rom::read_rom;
 /// The SNES's own commands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a ROM and save the visible PPU output as a PNG.
-    Screenshot(screenshot::ScreenshotArgs),
     /// Run a ROM and summarise PPU state (+ optional dumps / PNGs).
     PpuDump(ppu_dump::PpuDumpArgs),
     /// Run a ROM and summarise APU (S-DSP) state (+ optional dumps).
     ApuDump(apu_dump::ApuDumpArgs),
-    /// Run a ROM with audio capture and save the S-DSP output as a WAV.
-    AudioDump(audio_dump::AudioDumpArgs),
     /// Run the 65C816 SingleStepTests (Tom Harte) against the core.
     #[command(name = "singlestep-65816")]
     Singlestep65816(singlestep::Singlestep65816Args),
     /// Run the SPC700 SingleStepTests against the core.
     #[command(name = "singlestep-spc700")]
     SinglestepSpc700(singlestep::SinglestepSpc700Args),
-    /// Benchmark the three execution tiers (Fast / LightDebug / +trace).
-    Benchmark(benchmark::BenchmarkArgs),
-    /// Save or load an emulator savestate.
-    Savestate(savestate::SavestateArgs),
     /// Record a ROM's output frame by frame (state, picture and audio
     /// hashes, PNGs at chosen frames) into a folder.
     Golden(golden::GoldenArgs),
@@ -55,32 +43,14 @@ pub enum Command {
 /// Run one of the SNES's own commands.
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Screenshot(args) => screenshot::run(args),
         Command::PpuDump(args) => ppu_dump::run(args),
         Command::ApuDump(args) => apu_dump::run(args),
-        Command::AudioDump(args) => audio_dump::run(args),
         Command::Singlestep65816(args) => singlestep::run_65816(args),
         Command::SinglestepSpc700(args) => singlestep::run_spc700(args),
-        Command::Benchmark(args) => benchmark::run(args),
-        Command::Savestate(args) => savestate::run(args),
         Command::Golden(args) => golden::run(args),
         Command::GoldenSet(args) => golden::run_set(args),
         Command::GoldenCompare(args) => golden::run_compare(args),
     }
-}
-
-/// Print the cartridge's chips and their state, as `info` prints them
-/// (`screenshot --coprocessor-state`).
-pub(crate) fn print_coprocessors(emu: &mut SnesEmulator) -> Result<()> {
-    retro_cli::report::write_chips(emu, &mut std::io::stdout())?;
-    Ok(())
-}
-
-/// Parse a comma-separated button list into the generic input bitmask
-/// (`InputState::buttons`), in the pad's names; `None` when no spec was
-/// given.
-pub(crate) fn parse_button_mask(spec: Option<&str>) -> Result<Option<u32>> {
-    retro_cli::input::parse_buttons::<SnesEmulator>(spec)
 }
 
 /// Parse a `--press-at "F:buttons;F:buttons"` spec (e.g.

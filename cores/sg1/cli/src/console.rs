@@ -1,16 +1,20 @@
 //! What the Mega Drive gives the shared commands of `retro-cli`: its CPUs
-//! and the parsers of their MAME-format lines, its start-up flag, and the
-//! 68000's optional timing columns.
+//! and the parsers of their MAME-format lines, its start-up flag, the
+//! 68000's optional timing columns, its `screenshot` flags (a pixel's
+//! composition logged, VRAM patched) and its priority views, and the lines
+//! of its profile.
 
 use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
 use anyhow::Result;
-use retro_cli::{CliCpu, Console};
+use retro_cli::{CliCpu, Console, ProfileLine};
 use retro_core::debug::{ByteOrder, TraceEntry, TraceText};
+use retro_core::video::PixelImage;
 use retro_core::{CpuArchitecture, EmulatorCore};
 use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE};
+use sg1_core::vdp::RenderLayerMode;
 use sg1_core::GenesisEmulator;
 
 use crate::trace_ref;
@@ -28,9 +32,61 @@ pub struct GenesisBoot {
     pub six_button: bool,
 }
 
+/// The flags only the Mega Drive's `screenshot` takes.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct GenesisScreenshot {
+    /// Log per-pixel composition data for a screen coordinate `X,Y`
+    /// (e.g. `160,120`). Output goes to stderr.
+    #[arg(long, value_parser = parse_debug_pixel)]
+    pub debug_pixel: Option<(u16, u16)>,
+    /// Patch VRAM word(s) before the last frame render (for debugging):
+    /// after the frames run, the words are written and one more frame is
+    /// drawn for the screenshot. Format: `ADDR=VALUE` (hex, e.g.
+    /// `C6A6=825C`). Repeatable.
+    #[arg(long, value_parser = parse_vram_patch)]
+    pub patch_vram: Vec<(u16, u16)>,
+}
+
+/// A `--debug-pixel` coordinate, `X,Y`.
+fn parse_debug_pixel(spec: &str) -> std::result::Result<(u16, u16), String> {
+    let Some((x, y)) = spec.split_once(',') else {
+        return Err("expected X,Y, e.g. 160,120".to_string());
+    };
+    let x = x.trim().parse().map_err(|_| format!("invalid X: {x}"))?;
+    let y = y.trim().parse().map_err(|_| format!("invalid Y: {y}"))?;
+    Ok((x, y))
+}
+
+/// A `--patch-vram` word, `ADDR=VALUE` in hex.
+fn parse_vram_patch(spec: &str) -> std::result::Result<(u16, u16), String> {
+    let Some((addr, value)) = spec.split_once('=') else {
+        return Err("expected ADDR=VALUE".to_string());
+    };
+    let addr = u16::from_str_radix(addr.trim(), 16)
+        .map_err(|_| format!("invalid hex address '{addr}'"))?;
+    let value = u16::from_str_radix(value.trim(), 16)
+        .map_err(|_| format!("invalid hex value '{value}'"))?;
+    Ok((addr, value))
+}
+
+/// Write each patch's word into VRAM, big-endian at its byte address, and
+/// say so on stderr; a patch past the end of VRAM is left out.
+fn patch_vram(emu: &mut GenesisEmulator, patches: &[(u16, u16)]) {
+    for &(addr, value) in patches {
+        let vram = emu.vdp_mut().get_vram_mut();
+        let at = usize::from(addr);
+        if at + 1 < vram.len() {
+            vram[at] = (value >> 8) as u8;
+            vram[at + 1] = (value & 0xFF) as u8;
+            eprintln!("[patch-vram] addr=0x{addr:04X} = 0x{value:04X}");
+        }
+    }
+}
+
 impl Console for Genesis {
     type Emulator = GenesisEmulator;
     type BootArgs = GenesisBoot;
+    type ScreenshotArgs = GenesisScreenshot;
     type Command = crate::cmd::Command;
 
     const TOOL: &'static str = "sg1-cli";
@@ -103,6 +159,52 @@ impl Console for Genesis {
     const DECODED_WITH: &'static str = "";
     const WATCH_EXAMPLE: u32 = 0xFF_A190;
     const FRAME_INSTRUCTIONS: &'static str = "a Genesis frame is roughly 9k-14k 68000 instructions";
+    const VIDEO_CHIP: &'static str = "VDP";
+    const SOUND_CHIPS: &'static str = "YM2612 + PSG";
+    const LAYER_NOTES: &'static str = "Besides the layers, the two priority views \
+        `<stem>_priority` and `<stem>_sprite_priority`, which are opaque. `_plane_a` and \
+        `_window` each show only their own part of the screen: the window replaces plane A where \
+        it covers";
+    const OVERSCAN_HELP: &'static str = "Changes nothing on the Mega Drive: its core shows no \
+        overscan, the picture being the lines the VDP draws";
+    const CHIP_STATE_EXAMPLE: &'static str = "the SVP's SSP1601 PC + cycle count on Virtua Racing";
+    /// Work the core names otherwise (its cartridge's chips) counts in
+    /// "Other/overhead", with the driver's own.
+    const PROFILE: &'static [ProfileLine] = &[
+        ProfileLine {
+            label: "68K CPU",
+            chip: "68000",
+        },
+        ProfileLine {
+            label: "Z80 CPU",
+            chip: "Z80",
+        },
+        ProfileLine {
+            label: "VDP render",
+            chip: "VDP",
+        },
+        ProfileLine {
+            label: "YM2612",
+            chip: "YM2612",
+        },
+        ProfileLine {
+            label: "PSG",
+            chip: "PSG",
+        },
+        ProfileLine {
+            label: "Audio mix",
+            chip: "audio mix",
+        },
+        ProfileLine {
+            label: "Framebuffer",
+            chip: "framebuffer",
+        },
+    ];
+    const PROFILE_CLOCK: &'static str = "68K cycles";
+    const BUTTONS_NOTE: &'static str = "`x`, `y`, `z` and `mode` reach the game only on 6-button \
+        pads: `--six-button`, or a ROM whose header asks for them";
+    const PRESS_EXAMPLE: &'static str = "";
+    const RESET_EXAMPLE: &'static str = "";
 
     fn stage(_: &mut GenesisEmulator, _: &[u8], _: &GenesisBoot) -> Result<()> {
         Ok(())
@@ -203,6 +305,37 @@ impl Console for Genesis {
             }
         }
         Some(text)
+    }
+
+    /// The pixel `--debug-pixel` names logs its composition from the
+    /// run's last frame on.
+    fn before_last_frame(emu: &mut GenesisEmulator, args: &GenesisScreenshot) -> Result<()> {
+        if let Some((x, y)) = args.debug_pixel {
+            emu.vdp_mut().set_debug_pixel(x, y);
+        }
+        Ok(())
+    }
+
+    /// The VRAM patches, drawn by one more frame; then the pixel's log
+    /// stops, before the layers and the priority views are drawn again.
+    fn after_frames(emu: &mut GenesisEmulator, args: &GenesisScreenshot) -> Result<()> {
+        if !args.patch_vram.is_empty() {
+            retro_cli::cmd::screenshot::draw_again(emu, |emu| patch_vram(emu, &args.patch_vram));
+        }
+        emu.vdp_mut().clear_debug_pixel();
+        Ok(())
+    }
+
+    /// The two priority views of the held frame: the layers by priority,
+    /// and the sprites' priority.
+    fn extra_layer_images(emu: &mut GenesisEmulator) -> Vec<(&'static str, PixelImage)> {
+        [
+            (RenderLayerMode::PriorityOverlay, "priority"),
+            (RenderLayerMode::SpritePriority, "sprite_priority"),
+        ]
+        .into_iter()
+        .map(|(mode, suffix)| (suffix, emu.vdp_mut().render_mode_image(mode)))
+        .collect()
     }
 
     fn run_command(command: crate::cmd::Command) -> Result<()> {
@@ -318,6 +451,20 @@ mod tests {
             help_of("fingerprint", "len"),
             "Region length in bytes (default `10000` = the whole 64 KB Work RAM)"
         );
+        assert!(help_of("screenshot", "press_at").contains(
+            "from `up,down,left,right,a,b,c,start,x,y,z,mode`; `x`, `y`, `z` and `mode` reach the \
+             game only on 6-button pads: `--six-button`, or a ROM whose header asks for them)"
+        ));
+        assert!(help_of("screenshot", "show_only")
+            .contains("(`0`=Plane A, `1`=Plane B, `2`=Window and `3`=Sprites)"));
+        assert!(help_of("screenshot", "render_layers").ends_with(
+            "the two priority views `<stem>_priority` and `<stem>_sprite_priority`, which are \
+             opaque. `_plane_a` and `_window` each show only their own part of the screen: the \
+             window replaces plane A where it covers"
+        ));
+        assert!(help_of("screenshot", "overscan").starts_with("Changes nothing on the Mega Drive"));
+        assert!(help_of("audio-dump", "press_at")
+            .ends_with("so a capture without input records the boot jingle at best"));
     }
 
     #[test]
@@ -418,6 +565,45 @@ mod tests {
         assert_eq!(number(&line, "IM"), Some(1));
         assert_eq!(number(&line, "IFF1"), Some(1));
         assert_eq!(number(&line, "HALT"), Some(0));
+    }
+
+    /// A profile of `spans`, made the way the profiler makes one: through
+    /// the hooks a core calls around its parts' work.
+    fn profile_of(spans: &[(&'static str, u32)]) -> retro_core::frame::FrameProfile {
+        use retro_core::frame::{Profiled, StepHooks};
+        let mut profiler = Profiled::with_sample_period(1);
+        for (chip, units) in spans {
+            <Profiled as StepHooks<GenesisEmulator>>::chip_start(&mut profiler, chip);
+            <Profiled as StepHooks<GenesisEmulator>>::chip_finish(&mut profiler, *units);
+        }
+        profiler.into_profile()
+    }
+
+    #[test]
+    fn each_profile_line_is_found_by_the_name_the_core_gives_it() {
+        use retro_cli::cmd::profile::ProfileSums;
+        let a = profile_of(&[("68000", 3), ("Z80", 2), ("PSG", 0), ("68000", 1)]);
+        let b = profile_of(&[("Z80", 4), ("68000", 2), ("cartridge", 0)]);
+        let avg = ProfileSums::of(&[a, b], Genesis::PROFILE).average(2);
+        assert_eq!(avg.units[0], 3, "68000: (3 + 1 + 2) / 2");
+        assert_eq!(avg.units[1], 3, "Z80: (2 + 4) / 2");
+        // Every line's part of the machine is one the core names.
+        for line in Genesis::PROFILE {
+            assert!(
+                [
+                    "68000",
+                    "Z80",
+                    "VDP",
+                    "YM2612",
+                    "PSG",
+                    "audio mix",
+                    "framebuffer"
+                ]
+                .contains(&line.chip),
+                "{}",
+                line.chip
+            );
+        }
     }
 
     #[test]
