@@ -380,7 +380,8 @@ pub struct SystemTimingState {
 /// that table so a restore rebinds the right one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BankMapperKind {
-    /// SEGA mapper (`0xA130F0..0xA130F7` bank registers, 8 x 512 KiB slots).
+    /// SEGA mapper (8 x 512 KiB slots; the bank registers are the odd
+    /// addresses `0xA130F3..0xA130FF`, for slots 1-7; slot 0 holds bank 0).
     Sega,
     /// Super Street Fighter II (`0xA130F1` toggles bank 7/8 into slot 7).
     Ssf2,

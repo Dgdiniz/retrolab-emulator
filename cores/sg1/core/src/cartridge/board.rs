@@ -307,7 +307,7 @@ mod tests {
         );
         assert_eq!(banked.source_place(0x300010), SourcePlace::Rom(0x300010));
         assert_eq!(banked.source_place(0x000020), SourcePlace::Rom(0x20));
-        banked.observe_bus_write(0xA130F6, 9);
+        banked.observe_bus_write(0xA130FD, 9);
         assert_eq!(banked.source_place(0x300010), SourcePlace::Rom(0x480010));
         assert_eq!(banked.source_place(0x37FFFF), SourcePlace::Rom(0x4FFFFF));
         assert_eq!(banked.coprocessor_accesses(), 0, "nothing was read");
@@ -329,7 +329,7 @@ mod tests {
             )
         };
         let mut saved_from = banked(&rom);
-        saved_from.observe_bus_write(0xA130F6, 9);
+        saved_from.observe_bus_write(0xA130FD, 9);
         let saved = saved_from.coprocessors_savestate();
         assert!(matches!(
             saved.as_slice(),

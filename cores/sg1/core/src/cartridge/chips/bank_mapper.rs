@@ -10,10 +10,14 @@
 //! `Rom` target.
 //!
 //! The bank table is programmed differently per scheme:
-//! - **SEGA**: writes to `0xA130F0..0xA130F7` set the bank for slot
-//!   `addr & 0x0F` (8 x 512 KiB slots; the mapper ignores `0xA130F8..0xA130FF`).
-//!   Delivered via `observe_write` because `0xA130Fx` is outside the ROM
-//!   window.
+//! - **SEGA**: 8 x 512 KiB slots. The bank registers are the odd
+//!   addresses `0xA130F3` to `0xA130FF`, one for each of slots 1-7
+//!   (`slot = (addr & 0x0F) >> 1`). Slot 0 has no register and always
+//!   holds bank 0; `0xA130F1` is the board's SRAM switch and sets no bank,
+//!   and the even addresses set none either. A 68000 word write reaches a
+//!   register as its low byte: the bus sends the word's high byte to the
+//!   even address and its low byte to the odd one. Delivered via
+//!   `observe_write` because `0xA130Fx` is outside the ROM window.
 //! - **SSF2**: a single `0xA130F1` write toggles slot 7 between bank 7
 //!   and bank 8; slots 0-6 stay linear. Also via `observe_write`.
 //! - **Codemasters**: bank selects are *ROM-window* writes to
@@ -147,6 +151,22 @@ fn physical_offset(kind: BankMapperKind, banks: &[u8], addr: u32) -> usize {
     bank * BANK_SIZE + (addr & BANK_OFFSET_MASK) as usize
 }
 
+/// The SEGA scheme's bank registers: the odd addresses from slot 1's to
+/// slot 7's.
+const SEGA_BANK_REGISTERS: std::ops::RangeInclusive<u32> = 0xA130F3..=0xA130FF;
+
+/// The slot whose bank a write to `addr` sets under the SEGA scheme: 1-7
+/// for the odd addresses `0xA130F3`-`0xA130FF`, `None` for any other
+/// address (slot 0 has no register).
+fn sega_bank_slot(addr: u32) -> Option<usize> {
+    (SEGA_BANK_REGISTERS.contains(&addr) && addr & 1 == 1).then_some(((addr & 0x0F) >> 1) as usize)
+}
+
+/// The SEGA scheme's bank register of `slot` (1-7).
+fn sega_bank_register(slot: usize) -> u32 {
+    0xA130F1 + 2 * slot as u32
+}
+
 impl Coprocessor for BankMapperChip {
     fn info(&self) -> &ExpansionChipInfo {
         &self.info
@@ -202,11 +222,8 @@ impl Coprocessor for BankMapperChip {
     fn observe_write(&mut self, addr: u32, value: u8) {
         match self.kind {
             BankMapperKind::Sega => {
-                if (0xA130F0..=0xA130FF).contains(&addr) {
-                    let slot = (addr & 0x0F) as usize;
-                    if slot < 8 {
-                        self.banks[slot] = self.clamp_bank(value);
-                    }
+                if let Some(slot) = sega_bank_slot(addr) {
+                    self.banks[slot] = self.clamp_bank(value);
                 }
             }
             BankMapperKind::Ssf2 => {
@@ -251,17 +268,29 @@ impl Coprocessor for BankMapperChip {
     }
 
     fn debug_state(&self) -> ExpansionChipState {
-        let registers = self
-            .banks
-            .iter()
-            .enumerate()
-            .map(|(i, &bank)| ChipRegister {
-                address: 0xA130F0 + i as u32,
-                name: format!("BANK{i}"),
-                value: u32::from(bank),
-                description: "ROM bank selection".to_string(),
-            })
-            .collect();
+        let register = |address: u32, slot: usize, bank: u8| ChipRegister {
+            address,
+            name: format!("BANK{slot}"),
+            value: u32::from(bank),
+            description: "ROM bank selection".to_string(),
+        };
+        let registers = match self.kind {
+            // Slot 0 has no register (it always holds bank 0): the list is
+            // the seven registers, each at its address.
+            BankMapperKind::Sega => self
+                .banks
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(slot, &bank)| register(sega_bank_register(slot), slot, bank))
+                .collect(),
+            BankMapperKind::Ssf2 | BankMapperKind::Codemasters => self
+                .banks
+                .iter()
+                .enumerate()
+                .map(|(i, &bank)| register(0xA130F0 + i as u32, i, bank))
+                .collect(),
+        };
         ExpansionChipState {
             chip_type: self.info.chip_type,
             registers,
@@ -302,38 +331,97 @@ mod tests {
         }
     }
 
+    /// The table a SEGA mapper starts with: slot `i` holds bank `i`.
+    const LINEAR: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
     #[test]
-    fn sega_bank_switch_via_observe() {
+    fn each_sega_bank_register_sets_its_slot() {
+        for (register, slot) in [
+            (0xA130F3, 1),
+            (0xA130F5, 2),
+            (0xA130F7, 3),
+            (0xA130F9, 4),
+            (0xA130FB, 5),
+            (0xA130FD, 6),
+            (0xA130FF, 7),
+        ] {
+            let mut m = BankMapperChip::sega(rom(16));
+            let bank = 8 + slot as u8;
+            m.observe_write(register, bank);
+            let mut expected = LINEAR;
+            expected[slot] = bank;
+            assert_eq!(m.banks(), expected, "{register:#08X}");
+            assert_eq!(m.read(slot as u32 * 0x80000, 0), bank, "{register:#08X}");
+        }
+    }
+
+    #[test]
+    fn the_even_addresses_and_a130f1_set_no_bank() {
         let mut m = BankMapperChip::sega(rom(16));
-        // Switch slot 0 to bank 15 through 0xA130F0.
-        m.observe_write(0xA130F0, 15);
-        assert_eq!(m.read(0x000000, 0), 15);
-        // Slot 1 unchanged.
-        assert_eq!(m.read(0x080000, 0), 1);
-        // Clamp beyond bank_count.
-        m.observe_write(0xA130F0, 200);
-        assert_eq!(m.read(0x000000, 0), 15, "clamped to last bank");
+        for register in (0xA130F0..=0xA130FE).step_by(2).chain([0xA130F1]) {
+            m.observe_write(register, 12);
+        }
+        assert_eq!(m.banks(), LINEAR);
+
+        // A word write as the bus delivers it: the high byte at the even
+        // address, then the low byte at the odd one, which sets the bank.
+        m.observe_write(0xA130F4, 0x0B);
+        assert_eq!(m.banks(), LINEAR, "the high byte sets nothing");
+        m.observe_write(0xA130F5, 0x0A);
+        assert_eq!(m.read(0x100000, 0), 10, "the low byte sets slot 2");
+    }
+
+    #[test]
+    fn slot_0_stays_bank_0() {
+        let mut m = BankMapperChip::sega(rom(16));
+        for register in 0xA130F0..=0xA130FF {
+            m.observe_write(register, 15);
+        }
+        assert_eq!(m.banks(), [0, 15, 15, 15, 15, 15, 15, 15]);
+        assert_eq!(m.read(0x000000, 0), 0);
+        assert_eq!(m.source_place(0x01_2345), SourcePlace::Rom(0x01_2345));
+        assert_eq!(m.source_place(0x07_FFFF), SourcePlace::Rom(0x07_FFFF));
+    }
+
+    #[test]
+    fn a_bank_past_the_rom_is_clamped_to_its_last() {
+        // 5 MiB, as Super Street Fighter II: banks 0-9.
+        let mut m = BankMapperChip::sega(rom(10));
+        m.observe_write(0xA130FD, 9);
+        assert_eq!(m.read(0x300000, 0), 9, "the last bank, as written");
+        m.observe_write(0xA130FD, 10);
+        assert_eq!(m.read(0x300000, 0), 9, "one past it is the last bank");
+        m.observe_write(0xA130FF, 200);
+        assert_eq!(m.read(0x380000, 0), 9, "far past it too");
+        assert_eq!(m.banks(), [0, 1, 2, 3, 4, 5, 9, 9]);
     }
 
     #[test]
     fn sega_savestate_round_trips() {
         let mut m = BankMapperChip::sega(rom(16));
-        m.observe_write(0xA130F0, 9);
-        m.observe_write(0xA130F7, 5);
+        m.observe_write(0xA130F3, 9);
+        m.observe_write(0xA130FF, 5);
         let bytes = m.serialize();
 
         let mut n = BankMapperChip::sega(rom(16));
         n.restore(&bytes, 0);
-        assert_eq!(n.read(0x000000, 0), 9);
+        assert_eq!(n.banks(), [0, 9, 2, 3, 4, 5, 6, 5]);
+        assert_eq!(n.read(0x080000, 0), 9);
         assert_eq!(n.read(0x380000, 0), 5);
+        assert_eq!(
+            n.serialize(),
+            bytes,
+            "the restored table saves the same bytes"
+        );
     }
 
     #[test]
     fn sega_reset_restores_linear() {
         let mut m = BankMapperChip::sega(rom(16));
-        m.observe_write(0xA130F0, 9);
+        m.observe_write(0xA130F3, 9);
         m.reset(0);
-        assert_eq!(m.read(0x000000, 0), 0);
+        assert_eq!(m.banks(), LINEAR);
+        assert_eq!(m.read(0x080000, 0), 1);
         assert_eq!(m.accesses(), 1, "reset zeroes the counter, then one read");
     }
 
@@ -372,18 +460,35 @@ mod tests {
 
     #[test]
     fn debug_state_lists_banks_and_type() {
-        let m = BankMapperChip::sega(rom(8));
+        let mut m = BankMapperChip::sega(rom(16));
+        m.observe_write(0xA130FD, 11);
         let st = m.debug_state();
         assert_eq!(st.chip_type, ExpansionChipType::Custom(CUSTOM_SEGA));
-        assert_eq!(st.registers.len(), 8);
-        assert_eq!(st.registers[0].name, "BANK0");
+        // Slot 0 has no register: the seven registers, at their addresses.
+        let listed: Vec<(u32, &str, u32)> = st
+            .registers
+            .iter()
+            .map(|r| (r.address, r.name.as_str(), r.value))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (0xA130F3, "BANK1", 1),
+                (0xA130F5, "BANK2", 2),
+                (0xA130F7, "BANK3", 3),
+                (0xA130F9, "BANK4", 4),
+                (0xA130FB, "BANK5", 5),
+                (0xA130FD, "BANK6", 11),
+                (0xA130FF, "BANK7", 7),
+            ]
+        );
         assert_eq!(m.label(), "SEGA mapper");
     }
 
     #[test]
     fn a_byte_s_source_is_the_rom_offset_the_chip_reads() {
         let mut sega = BankMapperChip::sega(rom(16));
-        sega.observe_write(0xA130F6, 11);
+        sega.observe_write(0xA130FD, 11);
         let mut ssf2 = BankMapperChip::ssf2(rom(9));
         ssf2.observe_write(0xA130F1, 0x01);
         let mut codemasters = BankMapperChip::codemasters(rom(8));
@@ -428,11 +533,11 @@ mod tests {
     #[test]
     fn restore_rejects_mismatched_scheme() {
         let mut sega = BankMapperChip::sega(rom(8));
-        sega.observe_write(0xA130F0, 3);
+        sega.observe_write(0xA130F3, 3);
         let sega_bytes = sega.serialize();
         // A Codemasters chip must not accept a SEGA table.
         let mut cm = BankMapperChip::codemasters(rom(8));
         cm.restore(&sega_bytes, 0);
-        assert_eq!(cm.read(0x000000, 0), 0, "unchanged by mismatched restore");
+        assert_eq!(cm.read(0x080000, 0), 1, "unchanged by mismatched restore");
     }
 }

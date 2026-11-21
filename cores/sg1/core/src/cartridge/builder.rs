@@ -653,10 +653,10 @@ mod tests {
         let mut cart = build_genesis_cartridge(rom).unwrap();
         assert_eq!(cart.map_plan().name, "sega");
         assert_eq!(cart.coprocessor_label(), Some("SEGA mapper"));
-        // Bank-switch slot 0 to bank 9 via 0xA130F0 (through the observer),
-        // then a ROM-window read at 0x000000 comes from physical bank 9.
-        cart.write_bus(0xA130F0, 9, 0);
-        assert_eq!(cart.read_bus(0x000000, 0, 0xFF), 0x9B);
+        // Bank-switch slot 1 to bank 9 via 0xA130F3 (through the observer),
+        // then a ROM-window read at 0x080000 comes from physical bank 9.
+        cart.write_bus(0xA130F3, 9, 0);
+        assert_eq!(cart.read_bus(0x080000, 0, 0xFF), 0x9B);
         assert!(cart.coprocessor_accesses() > 0);
     }
 
@@ -825,8 +825,8 @@ mod tests {
         let mut cart = build_with_manifest(rom, &manifest).unwrap();
         assert_eq!(cart.map_plan().name, "sega");
         assert_eq!(cart.coprocessor_label(), Some("SEGA mapper"));
-        cart.write_bus(0xA130F0, 9, 0);
-        assert_eq!(cart.read_bus(0x000000, 0, 0xFF), 0x9B);
+        cart.write_bus(0xA130F3, 9, 0);
+        assert_eq!(cart.read_bus(0x080000, 0, 0xFF), 0x9B);
     }
 
     #[test]

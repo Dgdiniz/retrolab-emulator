@@ -610,7 +610,7 @@ fn banked_program() -> Vec<u8> {
         0x46FC, 0x2700,
         0x41F9, 0x00C0, 0x0004,
         0x30BC, 0x8114, 0x30BC, 0x8C81, 0x30BC, 0x8F02,
-        0x13FC, 0x0009, 0x00A1, 0x30F6, // MOVE.B #9,($A130F6).L: slot 6 is bank 9
+        0x13FC, 0x0009, 0x00A1, 0x30FD, // MOVE.B #9,($A130FD).L: slot 6 is bank 9
         0x30BC, 0x9308, 0x30BC, 0x9400,
         0x30BC, 0x9500, 0x30BC, 0x9600, 0x30BC, 0x9718, // source $300000
         0x20BC, 0x4000, 0x0080,         // VRAM $0000 by DMA
@@ -642,7 +642,7 @@ fn a_banked_source_resolves_through_the_banks_as_they_stand() {
     assert_eq!(emu.resolve_sources(&[0x00_0100]), [0x100]);
 
     // The banks as they stand: slot 6 back to bank 6.
-    emu.bus_mut().write(0xA1_30F6, 6);
+    emu.bus_mut().write(0xA1_30FD, 6);
     assert_eq!(emu.resolve_sources(&[0x30_0004]), [0x30_0004]);
 }
 
