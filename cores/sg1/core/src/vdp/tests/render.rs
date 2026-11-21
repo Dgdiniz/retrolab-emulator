@@ -486,29 +486,6 @@ fn test_debug_layer_disable_suppresses_sprites() {
     );
 }
 
-#[test]
-fn test_shadow_color() {
-    let color = (200, 100, 50);
-    let shadowed = Vdp::shadow_color(color);
-    assert_eq!(shadowed, (100, 50, 25));
-}
-
-#[test]
-fn test_highlight_color() {
-    let color = (100, 100, 100);
-    let highlighted = Vdp::highlight_color(color);
-    // 100 * 3 / 2 = 150
-    assert_eq!(highlighted, (150, 150, 150));
-}
-
-#[test]
-fn test_highlight_color_clamped() {
-    let color = (200, 200, 200);
-    let highlighted = Vdp::highlight_color(color);
-    // 200 * 3 / 2 = 300, clamped to 255
-    assert_eq!(highlighted, (255, 255, 255));
-}
-
 // ===== DMA Integration Tests =====
 
 /// Verify that the renderer correctly decodes all tile attribute bits
@@ -581,7 +558,10 @@ fn test_nametable_word_decode_in_render_path() {
 /// Render-path shadow/highlight test. With S/H enabled a low-priority
 /// plane-A pixel must be shadowed and a high-priority one must stay normal.
 /// Drives the full composite->index-buffer then remap->RGB pipeline (the
-/// remap pass owns S/H), so S/H is checked without a game that uses it.
+/// composite resolves each pixel's shade, the remap colours by it), so S/H
+/// is checked without a game that uses it. Colour `0x008E` is red 7, green
+/// 4, blue 0: levels 14, 8 and 0 of the fifteen as it is, 7, 4 and 0
+/// shadowed.
 #[test]
 fn test_shadow_highlight_render_path() {
     for (priority_word, high_pri) in [(0x0000u16, false), (0x8000u16, true)] {
@@ -605,11 +585,8 @@ fn test_shadow_highlight_render_path() {
         vdp.render_scanline(0);
 
         let got = (vdp.framebuffer[0], vdp.framebuffer[1], vdp.framebuffer[2]);
-        let expected = if high_pri {
-            base
-        } else {
-            Vdp::shadow_color(base)
-        };
+        assert_eq!(base, (255, 146, 0));
+        let expected = if high_pri { base } else { (128, 73, 0) };
         assert_eq!(
             got, expected,
             "S/H render mismatch (high_pri={high_pri}): got {got:?} expected {expected:?} base {base:?}"
@@ -618,6 +595,46 @@ fn test_shadow_highlight_render_path() {
             assert_ne!(got, base, "shadow must darken the low-priority pixel");
         }
     }
+}
+
+/// A line composited with shadow and highlight off resolves no shade, so
+/// colouring it again with them on (a palette write made after register 12
+/// was written part of the way along the line) shows it as it is, not with
+/// the shades the line before left in the buffer.
+#[test]
+fn a_line_composited_without_shadow_and_highlight_is_coloured_as_it_is() {
+    let mut vdp = Vdp::new();
+    vdp.set_test_register(1, 0x44); // the display on
+    vdp.set_test_register(2, 0x30); // plane A at 0xC000
+                                    // Tile 1, every pixel colour 1; plane A's cell (0, 0) is tile 1, palette
+                                    // 0, of low priority.
+    for i in 0..32 {
+        vdp.vram[0x20 + i] = 0x11;
+    }
+    vdp.vram[0xC000] = 0x00;
+    vdp.vram[0xC001] = 0x01;
+    vdp.cram[1] = 0x008E;
+    vdp.rebuild_cram_rgb();
+    let pixel = |vdp: &Vdp, y: usize| {
+        let at = y * 320 * 4;
+        (
+            vdp.framebuffer[at],
+            vdp.framebuffer[at + 1],
+            vdp.framebuffer[at + 2],
+        )
+    };
+
+    // Line 0 with shadow and highlight on: the low-priority pixel is shadowed.
+    vdp.set_test_register(12, 0x89);
+    vdp.render_scanline(0);
+    assert_eq!(pixel(&vdp, 0), (128, 73, 0));
+
+    // Line 1 with them off, then coloured again with them on.
+    vdp.set_test_register(12, 0x81);
+    vdp.render_scanline(1);
+    assert_eq!(pixel(&vdp, 1), (255, 146, 0));
+    vdp.remap_columns(1, 0, 320, true);
+    assert_eq!(pixel(&vdp, 1), (255, 146, 0), "as it is, not shadowed");
 }
 
 /// Mid-line CRAM beam-X segment re-tint: an

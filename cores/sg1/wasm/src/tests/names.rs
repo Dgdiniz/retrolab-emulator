@@ -70,7 +70,7 @@ fn the_video_registers_are_the_vdp_s() {
 fn the_colour_levels_are_the_vdp_s() {
     let mut emu = running();
     let levels = emu.genesis.video_debugger().colour_levels();
-    assert_eq!((levels.name, levels.levels.len()), ("mega-drive-8", 8));
+    assert_eq!((levels.name, levels.levels.len()), ("mega-drive-15", 15));
     assert_eq!(shape(&emu.get_colour_levels()), shape(&to_js(&levels)));
 }
 

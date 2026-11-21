@@ -34,12 +34,14 @@ impl Vdp {
         }
     }
 
-    /// Rebuild the CRAM RGB lookup table from current CRAM contents.
-    /// Called whenever CRAM is written.
+    /// Rebuild the renderer's tables of the palette (`cram_rgb` and its
+    /// shadowed and highlighted twins) from CRAM as it is: a savestate's
+    /// load calls it, a CRAM write sets its one entry.
     pub(super) fn rebuild_cram_rgb(&mut self) {
         for i in 0..64 {
             if i < self.cram.len() {
-                self.cram_rgb[i] = Self::convert_genesis_color(self.cram[i]);
+                let word = self.cram[i];
+                self.set_palette_colour(i, word);
             }
         }
     }
@@ -171,6 +173,7 @@ impl Vdp {
             let shadow_highlight = (self.registers[12] & 0x08) != 0;
             trace.notes().remapped(
                 (&self.line_index, &self.line_sh_op, &self.line_high_pri),
+                (self.line_shaded, &self.line_shade),
                 0,
                 width,
                 shadow_highlight,
@@ -250,6 +253,8 @@ impl Vdp {
             (0, 0, 0)
         };
         let bd_idx = backdrop.min(63) as u8;
+        // The backdrop is as it is: the line resolves no shade.
+        self.line_shaded = false;
         for x in 0..width {
             // Keep the index buffers consistent with the backdrop fill: a
             // disabled line holds the backdrop pen, so a later mid-line CRAM
@@ -284,13 +289,36 @@ impl Vdp {
     /// pixel each column resolves to came from (`T::ON`): its layer, the
     /// character and the map entry or sprite it was read from. The frame
     /// loops pass [`NoTrace`].
+    ///
+    /// Shadow and highlight (register 12 bit 3) are on or off for the
+    /// whole line, and the line is composited by a body built for each:
+    /// with them on, each pixel's shade is resolved into `line_shade`;
+    /// with them off, none is, and `line_shaded` says every pixel of the
+    /// line is as it is.
     pub(super) fn composite_scanline_with<T: PixelTrace<Notes = LineTrace>>(
         &mut self,
         line: u16,
         trace: &mut T,
     ) {
+        let shaded = (self.registers[12] & 0x08) != 0;
+        if shaded {
+            self.composite_line::<T, true>(line, trace);
+        } else {
+            self.composite_line::<T, false>(line, trace);
+        }
+        self.line_shaded = shaded;
+    }
+
+    /// The body of [`Self::composite_scanline_with`], with shadow and
+    /// highlight on (`SHADED`) or off: built twice, so a line with them off
+    /// does no work for them at all.
+    fn composite_line<T: PixelTrace<Notes = LineTrace>, const SHADED: bool>(
+        &mut self,
+        line: u16,
+        trace: &mut T,
+    ) {
         let width = self.display_width() as usize;
-        let shadow_highlight = (self.registers[12] & 0x08) != 0;
+        let shadow_highlight = SHADED;
         let bd_idx = self.backdrop_index().min(63) as u8;
 
         // Debugger per-layer force-disable mask (read once per line).
@@ -402,39 +430,45 @@ impl Vdp {
             let nt_off_b = row_off_b + tile_col_b * 2;
             let addr_b = (plane_b_nametable + nt_off_b) as usize;
 
-            let (plane_b_idx, plane_b_pri) = if !dis_plane_b && addr_b + 1 < self.vram.len() {
-                let word_b = ((self.vram[addr_b] as u16) << 8) | (self.vram[addr_b + 1] as u16);
-                let pattern_b = word_b & 0x07FF;
-                let flip_h_b = (word_b & 0x0800) != 0;
-                let flip_v_b = (word_b & 0x1000) != 0;
-                let palette_b = ((word_b >> 13) & 0x03) as usize;
-                let priority_b = (word_b & 0x8000) != 0;
+            // `plane_b_bit`: the map entry's priority bit, which shadow and
+            // highlight read where the pixel is transparent too;
+            // `plane_b_pri` is the bit of an opaque pixel only.
+            let (plane_b_idx, plane_b_pri, plane_b_bit) =
+                if !dis_plane_b && addr_b + 1 < self.vram.len() {
+                    let word_b = ((self.vram[addr_b] as u16) << 8) | (self.vram[addr_b + 1] as u16);
+                    let pattern_b = word_b & 0x07FF;
+                    let flip_h_b = (word_b & 0x0800) != 0;
+                    let flip_v_b = (word_b & 0x1000) != 0;
+                    let palette_b = ((word_b >> 13) & 0x03) as usize;
+                    let priority_b = (word_b & 0x8000) != 0;
 
-                let ci_b = Self::read_tile_pixel_flipped(
-                    &self.vram, pattern_b, px_b, py_b, flip_h_b, flip_v_b,
-                );
-                if ci_b != 0 {
-                    if T::ON {
-                        origin_b = sources::PenOrigin::character(
-                            sources::DRAWN_BY_PLANE_B,
-                            word_b,
-                            addr_b,
-                            px_b,
-                            py_b,
-                        );
+                    let ci_b = Self::read_tile_pixel_flipped(
+                        &self.vram, pattern_b, px_b, py_b, flip_h_b, flip_v_b,
+                    );
+                    if ci_b != 0 {
+                        if T::ON {
+                            origin_b = sources::PenOrigin::character(
+                                sources::DRAWN_BY_PLANE_B,
+                                word_b,
+                                addr_b,
+                                px_b,
+                                py_b,
+                            );
+                        }
+                        let cram_i = palette_b * 16 + ci_b as usize;
+                        (Some(cram_i.min(63) as u8), priority_b, priority_b)
+                    } else {
+                        (None, false, priority_b)
                     }
-                    let cram_i = palette_b * 16 + ci_b as usize;
-                    (Some(cram_i.min(63) as u8), priority_b)
                 } else {
-                    (None, false)
-                }
-            } else {
-                (None, false)
-            };
+                    (None, false, false)
+                };
 
             // ---- Plane A or Window ----
+            // `plane_a_bit`: as `plane_b_bit`, the window's bit where the
+            // window covers.
             let in_window = line_is_window || window_area.takes_column(xu16);
-            let (plane_a_idx, plane_a_pri) = if in_window {
+            let (plane_a_idx, plane_a_pri, plane_a_bit) = if in_window {
                 // Window plane (no scrolling)
                 let wtx = xu16 / 8;
                 let wty = line / 8;
@@ -463,12 +497,12 @@ impl Vdp {
                             );
                         }
                         let cram_i = wpal * 16 + wci as usize;
-                        (Some(cram_i.min(63) as u8), wpri)
+                        (Some(cram_i.min(63) as u8), wpri, wpri)
                     } else {
-                        (None, false)
+                        (None, false, wpri)
                     }
                 } else {
-                    (None, false)
+                    (None, false, false)
                 }
             } else {
                 // Plane A (with scrolling)
@@ -520,12 +554,12 @@ impl Vdp {
                             );
                         }
                         let cram_i = palette_a * 16 + ci_a as usize;
-                        (Some(cram_i.min(63) as u8), priority_a)
+                        (Some(cram_i.min(63) as u8), priority_a, priority_a)
                     } else {
-                        (None, false)
+                        (None, false, priority_a)
                     }
                 } else {
-                    (None, false)
+                    (None, false, false)
                 }
             };
 
@@ -553,44 +587,50 @@ impl Vdp {
 
             // ---- Composite to a final palette index ----
             // `sprite_shown`: the final pixel is the sprite's; read by a
-            // trace alone.
-            let (final_index, is_high_priority, sh_operator, sprite_shown) = if has_sprite {
-                let s_pal = self.sprite_line_palette[x] as usize;
-                let s_pri = self.sprite_line_priority[x];
-                let s_idx = (s_pal * 16 + s_ci as usize).min(63) as u8;
+            // trace alone. `sprite_pen`: the sprite pixel in front, its
+            // palette line, colour (0 for none) and priority bit, which
+            // shadow and highlight read.
+            let (final_index, is_high_priority, sh_operator, sprite_shown, sprite_pen) =
+                if has_sprite {
+                    let s_pal = self.sprite_line_palette[x] as usize;
+                    let s_pri = self.sprite_line_priority[x];
+                    let s_idx = (s_pal * 16 + s_ci as usize).min(63) as u8;
+                    let pen = (s_pal as u8, s_ci, s_pri);
 
-                // Shadow/Highlight operator sprites (palette 3, colour 14/15) are
-                // transparent brightness operators, not drawn pixels.
-                let is_sh_operator = shadow_highlight && s_pal == 3 && (s_ci == 14 || s_ci == 15);
-                let sh_op = if is_sh_operator { s_ci } else { 0 };
+                    // Shadow/Highlight operator sprites (palette 3, colour 14/15) are
+                    // transparent brightness operators, not drawn pixels.
+                    let is_sh_operator =
+                        shadow_highlight && s_pal == 3 && (s_ci == 14 || s_ci == 15);
+                    let sh_op = if is_sh_operator { s_ci } else { 0 };
 
-                if is_sh_operator {
-                    // Operator sprite: transparent, keep the underlying pixel index.
-                    match merged_idx {
-                        None => (bd_idx, false, sh_op, false),
-                        Some(bi) => (bi, merged_pri, sh_op, false),
+                    if is_sh_operator {
+                        // Operator sprite: transparent, keep the underlying pixel index.
+                        match merged_idx {
+                            None => (bd_idx, false, sh_op, false, pen),
+                            Some(bi) => (bi, merged_pri, sh_op, false, pen),
+                        }
+                    } else {
+                        let (idx, pri, shown) = match merged_idx {
+                            None => (s_idx, false, true),
+                            Some(bi) => {
+                                if s_pri {
+                                    (s_idx, true, true)
+                                } else if merged_pri {
+                                    (bi, true, false)
+                                } else {
+                                    (s_idx, false, true)
+                                }
+                            }
+                        };
+                        (idx, pri, 0, shown, pen)
                     }
                 } else {
-                    let (idx, pri, shown) = match merged_idx {
-                        None => (s_idx, false, true),
-                        Some(bi) => {
-                            if s_pri {
-                                (s_idx, true, true)
-                            } else if merged_pri {
-                                (bi, true, false)
-                            } else {
-                                (s_idx, false, true)
-                            }
-                        }
-                    };
-                    (idx, pri, 0, shown)
-                }
-            } else {
-                match merged_idx {
-                    None => (bd_idx, false, 0u8, false),
-                    Some(bi) => (bi, merged_pri, 0u8, false),
-                }
-            };
+                    let none = (0, 0, false);
+                    match merged_idx {
+                        None => (bd_idx, false, 0u8, false, none),
+                        Some(bi) => (bi, merged_pri, 0u8, false, none),
+                    }
+                };
 
             if T::ON {
                 let origin = if sprite_shown {
@@ -651,6 +691,15 @@ impl Vdp {
             self.line_index[x] = final_index;
             self.line_sh_op[x] = sh_operator;
             self.line_high_pri[x] = is_high_priority;
+            // ---- What shadow and highlight do to the pixel ----
+            if SHADED {
+                self.line_shade[x] = sources::shade(
+                    shadow_highlight,
+                    sprite_pen,
+                    (plane_a_idx.is_some(), plane_a_bit),
+                    (plane_b_idx.is_some(), plane_b_bit),
+                );
+            }
             // `plane_a_idx` holds the window's pixel where the window covers.
             let plane_a_or_window = plane_a_idx.map_or(-1, |i| i as i16);
             if in_window {
@@ -685,7 +734,10 @@ impl Vdp {
 
     /// The body of [`Self::remap_scanline_segment`], with shadow and
     /// highlight given, as a palette write recorded on a line gives it when
-    /// the line is drawn again.
+    /// the line is drawn again: with them on, each pixel takes the shade the
+    /// composite resolved for it (`line_shade`, none for a line composited
+    /// with them off), with them off its colour as it is
+    /// ([`sources::coloured_shade`]).
     #[inline]
     pub(super) fn remap_columns(
         &mut self,
@@ -701,15 +753,11 @@ impl Vdp {
             let final_index = self.line_index[x];
             let sh_operator = self.line_sh_op[x];
             let is_high_priority = self.line_high_pri[x];
-            let base_color = self.cram_rgb[final_index as usize];
 
-            // ---- Shadow/Highlight final color adjustment ----
-            let final_color = match sources::shade(shadow_highlight, sh_operator, is_high_priority)
-            {
-                sources::Shade::AsIs => base_color,
-                sources::Shade::Shadowed => Self::shadow_color(base_color),
-                sources::Shade::Highlighted => Self::highlight_color(base_color),
-            };
+            // ---- Shadow/Highlight: the shade the composite resolved ----
+            let shade =
+                sources::coloured_shade(shadow_highlight, (self.line_shaded, &self.line_shade), x);
+            let final_color = self.palette_colour(final_index as usize, shade);
 
             // ---- Layer-mode rendering (debug visualization) ----
             let output_color = match self.render_layer_mode {
@@ -778,20 +826,6 @@ impl Vdp {
                 self.framebuffer[idx + 3] = 255;
             }
         }
-    }
-
-    /// Apply shadow effect (half brightness).
-    pub(super) fn shadow_color(color: (u8, u8, u8)) -> (u8, u8, u8) {
-        (color.0 / 2, color.1 / 2, color.2 / 2)
-    }
-
-    /// Apply highlight effect (increased brightness).
-    pub(super) fn highlight_color(color: (u8, u8, u8)) -> (u8, u8, u8) {
-        // Increase brightness by 50% (capped at 255)
-        let r = ((color.0 as u16 * 3) / 2).min(255) as u8;
-        let g = ((color.1 as u16 * 3) / 2).min(255) as u8;
-        let b = ((color.2 as u16 * 3) / 2).min(255) as u8;
-        (r, g, b)
     }
 
     /// Get scroll plane size from register 16.

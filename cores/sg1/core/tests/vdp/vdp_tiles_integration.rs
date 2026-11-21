@@ -166,8 +166,10 @@ fn colour_0_of_a_tile_lets_the_backdrop_through() {
 fn test_color_conversion_all_values() {
     // Every colour a CRAM word holds, three bits each of red, green and
     // blue, goes into the exports' palette on the levels the debugger
-    // names, as the screen shows it.
+    // names, as the screen shows it: a channel of value c as it is is
+    // level 2c of the fifteen.
     let levels = Vdp::new().colour_levels().levels;
+    assert_eq!(levels.len(), 15);
     let mut cram = [0u16; 64];
     for r in 0u16..8 {
         for g in 0u16..8 {
@@ -176,7 +178,8 @@ fn test_color_conversion_all_values() {
                 cram[0] = genesis_color;
                 let (r_out, g_out, b_out, alpha) = build_rgba_palette(&cram, 0)[0];
 
-                let expected = (levels[r as usize], levels[g as usize], levels[b as usize]);
+                let level = |value: u16| levels[usize::from(value) * 2];
+                let expected = (level(r), level(g), level(b));
                 assert_eq!((r_out, g_out, b_out), expected, "{genesis_color:#06X}");
                 assert_eq!(Vdp::convert_genesis_color(genesis_color), expected);
                 assert_eq!(alpha, 255);

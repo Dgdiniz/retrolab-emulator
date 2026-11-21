@@ -392,7 +392,7 @@ impl Vdp {
                         if index < 64 {
                             let masked = word & 0x0EEE;
                             self.cram[index] = masked;
-                            self.cram_rgb[index] = Self::convert_genesis_color(masked);
+                            self.set_palette_colour(index, masked);
                             self.note_palette_change(
                                 index,
                                 masked,
@@ -499,7 +499,7 @@ impl Vdp {
             if index < 64 {
                 // Only re-tint the render table; `cram` (read-back state) was
                 // already committed to its final value when the DMA executed.
-                self.cram_rgb[index] = Self::convert_genesis_color(word & 0x0EEE);
+                self.set_palette_colour(index, word & 0x0EEE);
             }
             prog.cursor += 1;
         }
@@ -592,7 +592,7 @@ impl Vdp {
             if index < 64 {
                 // Render table only; `cram` read-back state stays at its
                 // DMA-final value (committed in `execute_pending_dma`).
-                self.cram_rgb[index] = Self::convert_genesis_color(word & 0x0EEE);
+                self.set_palette_colour(index, word & 0x0EEE);
                 self.note_palette_change(
                     index,
                     word & 0x0EEE,
@@ -783,7 +783,7 @@ impl Vdp {
                 let index = ((addr & 0x7E) >> 1) as usize;
                 if index < 64 {
                     self.cram[index] = cram_word;
-                    self.cram_rgb[index] = Self::convert_genesis_color(cram_word);
+                    self.set_palette_colour(index, cram_word);
                     self.note_palette_change(
                         index,
                         cram_word,

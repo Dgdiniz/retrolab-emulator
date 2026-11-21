@@ -22,10 +22,12 @@ use super::{
 
 /// The state a line drawn from its record replaces: kept before, put back
 /// after. Video memory is copied only when the journal will change it.
+/// The palette is the renderer's three tables of it: as it is, shadowed
+/// and highlighted.
 struct LiveInputs {
     registers: [u8; 24],
     vertical_scroll: [u16; 40],
-    palette: [(u8, u8, u8); 64],
+    palette: [[(u8, u8, u8); 64]; 3],
     sprite_mask_overflow: bool,
     video_memory: Option<Vec<u8>>,
 }
@@ -37,7 +39,11 @@ impl LiveInputs {
         Self {
             registers: vdp.registers,
             vertical_scroll,
-            palette: vdp.cram_rgb,
+            palette: [
+                vdp.cram_rgb,
+                vdp.cram_rgb_shadowed,
+                vdp.cram_rgb_highlighted,
+            ],
             sprite_mask_overflow: vdp.sprite_mask_overflow,
             video_memory: with_video_memory.then(|| vdp.vram.clone()),
         }
@@ -46,7 +52,11 @@ impl LiveInputs {
     fn put_back(&self, vdp: &mut Vdp) {
         vdp.registers = self.registers;
         vdp.vsram[..40].copy_from_slice(&self.vertical_scroll);
-        vdp.cram_rgb = self.palette;
+        [
+            vdp.cram_rgb,
+            vdp.cram_rgb_shadowed,
+            vdp.cram_rgb_highlighted,
+        ] = self.palette;
         vdp.sprite_mask_overflow = self.sprite_mask_overflow;
         if let Some(video_memory) = &self.video_memory {
             vdp.vram.copy_from_slice(video_memory);
@@ -309,8 +319,8 @@ impl Vdp {
     ) {
         self.registers = row.registers;
         self.vsram[..40].copy_from_slice(&row.vertical_scroll);
-        for (colour, &word) in self.cram_rgb.iter_mut().zip(row.palette.iter()) {
-            *colour = Self::convert_genesis_color(word);
+        for (index, &word) in row.palette.iter().enumerate() {
+            self.set_palette_colour(index, word);
         }
         self.sprite_mask_overflow = row.sprite_mask_carried_in;
         match table.sprite_list_for(row.frame, line) {
@@ -387,7 +397,7 @@ impl Vdp {
             self.render_scanline_with(line, trace);
         }
         for change in &row.palette_changes {
-            self.cram_rgb[usize::from(change.index)] = Self::convert_genesis_color(change.colour);
+            self.set_palette_colour(usize::from(change.index), change.colour);
             match change.redraw {
                 PaletteRedraw::Nothing => {}
                 PaletteRedraw::Columns {
@@ -400,6 +410,7 @@ impl Vdp {
                     if T::ON {
                         trace.notes().remapped(
                             (&self.line_index, &self.line_sh_op, &self.line_high_pri),
+                            (self.line_shaded, &self.line_shade),
                             from,
                             to,
                             shadow_highlight,
@@ -450,7 +461,7 @@ impl Vdp {
         let columns = (pixels.len() / 4).min(self.display_width() as usize);
         self.colour_columns(pixels, 0, columns, &pixel);
         for change in row.map_or(&[][..], |row| row.palette_changes.as_slice()) {
-            self.cram_rgb[usize::from(change.index)] = Self::convert_genesis_color(change.colour);
+            self.set_palette_colour(usize::from(change.index), change.colour);
             match change.redraw {
                 PaletteRedraw::Nothing => {}
                 PaletteRedraw::Columns { from, to, .. } => {

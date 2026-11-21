@@ -491,7 +491,7 @@ impl Vdp {
                     let index = ((init_addr & 0x7E) >> 1) as usize;
                     if index < 64 {
                         self.cram[index] = value & 0x0EEE;
-                        self.cram_rgb[index] = Self::convert_genesis_color(value & 0x0EEE);
+                        self.set_palette_colour(index, value & 0x0EEE);
                         self.note_palette_change(
                             index,
                             value & 0x0EEE,
@@ -581,7 +581,7 @@ impl Vdp {
                 if index < 64 {
                     let masked = value & 0x0EEE;
                     self.cram[index] = masked;
-                    self.cram_rgb[index] = Self::convert_genesis_color(masked);
+                    self.set_palette_colour(index, masked);
                     // A palette change during active display re-tints the
                     // current line (as in Genesis Plus GX). Display on -> re-tint only from
                     // the beam rightward (beam-X segment: pixels already scanned

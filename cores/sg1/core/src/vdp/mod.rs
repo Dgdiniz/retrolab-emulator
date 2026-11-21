@@ -299,7 +299,9 @@ pub struct Vdp {
     // Transient within-line state, never part of the savestate.
     line_index: Vec<u8>,      // final resolved CRAM index (0..63) per pixel
     line_sh_op: Vec<u8>,      // shadow/highlight operator (0 / 14 / 15)
-    line_high_pri: Vec<bool>, // pixel resolved high-priority (S/H "normal" path)
+    line_high_pri: Vec<bool>, // pixel resolved high-priority
+    line_shade: Vec<Shade>,   // what shadow/highlight do to the pixel (`sources::shade`)
+    line_shaded: bool,        // the line's composite resolved `line_shade` (mode on)
     line_plane_a: Vec<i16>,   // plane A CRAM index, -1 transparent or window (layer modes)
     line_window: Vec<i16>,    // window CRAM index, -1 transparent or plane A (layer modes)
     line_plane_b: Vec<i16>,   // plane B CRAM index, -1 transparent (layer modes)
@@ -307,6 +309,10 @@ pub struct Vdp {
     // CRAM RGB lookup table: precomputed (r,g,b) for all 64 CRAM entries.
     // Updated whenever CRAM is written. Eliminates ~143K convert_genesis_color() calls/frame.
     cram_rgb: [(u8, u8, u8); 64],
+    // The same 64 colours shadowed and highlighted, set with `cram_rgb`
+    // (`set_palette_colour`) so the remap's every shade is a lookup.
+    cram_rgb_shadowed: [(u8, u8, u8); 64],
+    cram_rgb_highlighted: [(u8, u8, u8); 64],
 
     // VDP read buffer (prefetch). On real hardware, when a read command is set up
     // the VDP prefetches the first word into this buffer and auto-increments the
@@ -448,6 +454,8 @@ struct DrawState {
     line_index: Vec<u8>,
     line_sh_op: Vec<u8>,
     line_high_pri: Vec<bool>,
+    line_shade: Vec<Shade>,
+    line_shaded: bool,
     line_plane_a: Vec<i16>,
     line_window: Vec<i16>,
     line_plane_b: Vec<i16>,
@@ -470,6 +478,8 @@ impl DrawState {
             line_index: vdp.line_index.clone(),
             line_sh_op: vdp.line_sh_op.clone(),
             line_high_pri: vdp.line_high_pri.clone(),
+            line_shade: vdp.line_shade.clone(),
+            line_shaded: vdp.line_shaded,
             line_plane_a: vdp.line_plane_a.clone(),
             line_window: vdp.line_window.clone(),
             line_plane_b: vdp.line_plane_b.clone(),
@@ -491,6 +501,8 @@ impl DrawState {
         vdp.line_index = self.line_index;
         vdp.line_sh_op = self.line_sh_op;
         vdp.line_high_pri = self.line_high_pri;
+        vdp.line_shade = self.line_shade;
+        vdp.line_shaded = self.line_shaded;
         vdp.line_plane_a = self.line_plane_a;
         vdp.line_window = self.line_window;
         vdp.line_plane_b = self.line_plane_b;
@@ -602,10 +614,15 @@ impl Vdp {
             line_index: vec![0u8; 320],
             line_sh_op: vec![0u8; 320],
             line_high_pri: vec![false; 320],
+            line_shade: vec![Shade::AsIs; 320],
+            line_shaded: false,
             line_plane_a: vec![-1i16; 320],
             line_window: vec![-1i16; 320],
             line_plane_b: vec![-1i16; 320],
-            cram_rgb: [(0, 0, 0); 64],
+            // CRAM starts all 0, black: every entry its colours.
+            cram_rgb: [Self::shaded_colour(0, Shade::AsIs); 64],
+            cram_rgb_shadowed: [Self::shaded_colour(0, Shade::Shadowed); 64],
+            cram_rgb_highlighted: [Self::shaded_colour(0, Shade::Highlighted); 64],
             read_buffer: 0,
             watch_vram: None,
             debug_pixel: None,

@@ -174,8 +174,8 @@ fn shadow_and_highlight_say_what_they_did_to_each_pixel() {
     put_tile(&mut vdp, 2, &solid_tile(2));
     put_tile(&mut vdp, 6, &solid_tile(14));
     put_tile(&mut vdp, 7, &solid_tile(15));
-    // Plane B, cells 0 to 3 of row 0, low priority: shadowed.
-    for column in 0..4 {
+    // Plane B, cells 0 to 3 and 7 of row 0, low priority: shadowed.
+    for column in [0, 1, 2, 3, 7] {
         put_cell(
             &mut vdp,
             PLANE_B,
@@ -185,38 +185,95 @@ fn shadow_and_highlight_say_what_they_did_to_each_pixel() {
             entry(1, 0, false, false, false),
         );
     }
-    // Plane A, cell 5, high priority: as it is.
-    put_cell(&mut vdp, PLANE_A, 32, 5, 0, entry(2, 0, false, false, true));
-    // Over plane B's cell 0, the highlight operator (palette line 3,
-    // colour 14); over its cell 2, the shadow operator (colour 15).
-    put_sprite(&mut vdp, 0, (0, 0), (1, 1), 1, 6 | (3 << 13));
-    put_sprite(&mut vdp, 1, (16, 0), (1, 1), 0, 7 | (3 << 13));
+    // Plane A, cells 5, 9 and 11, high priority: as they are. Cell 7 is of
+    // high priority and transparent: plane B shows through it as it is.
+    for column in [5, 9, 11] {
+        put_cell(
+            &mut vdp,
+            PLANE_A,
+            32,
+            column,
+            0,
+            entry(2, 0, false, false, true),
+        );
+    }
+    put_cell(&mut vdp, PLANE_A, 32, 7, 0, entry(0, 0, false, false, true));
+    // The sprites, one cell each, linked in slot order: the highlight
+    // operator (palette line 3, colour 14) over plane B's cell 0, the
+    // shadow operator (colour 15) over its cell 2, line 1's colour 14 over
+    // its cell 3, all of low priority; the highlight operator of high
+    // priority over plane A's cell 9 and a low shadow operator behind its
+    // cell 11; a low and a high sprite of colour 1 over the backdrop.
+    let line_3 = 3 << 13;
+    let high = 1 << 15;
+    put_sprite(&mut vdp, 0, (0, 0), (1, 1), 1, 6 | line_3);
+    put_sprite(&mut vdp, 1, (16, 0), (1, 1), 2, 7 | line_3);
+    put_sprite(&mut vdp, 2, (24, 0), (1, 1), 3, 6 | (1 << 13));
+    put_sprite(&mut vdp, 3, (72, 0), (1, 1), 4, 6 | line_3 | high);
+    put_sprite(&mut vdp, 4, (88, 0), (1, 1), 5, 7 | line_3);
+    put_sprite(&mut vdp, 5, (104, 0), (1, 1), 6, 1);
+    put_sprite(&mut vdp, 6, (120, 0), (1, 1), 0, 1 | high);
     set_colour(&mut vdp, 1, RED);
     set_colour(&mut vdp, 2, GREEN);
+    set_colour(&mut vdp, 30, BLUE);
     draw_frame(&mut vdp);
     let sources = vdp.pixel_sources(planes::MAIN);
     assert!(sources.matches_picture);
     let layer = sources.layer.expect("asked for");
     let colour = sources.colour.expect("asked for");
     let cell = sources.cell.expect("asked for");
+    let operator = |code: u16| code << OPERATOR_SHIFT;
 
     // An operator is no pixel: the pixel is plane B's, the operator named.
-    let highlight = (OPERATOR_HIGHLIGHT << OPERATOR_SHIFT) | shaded(Shade::Highlighted);
+    // The highlight operator raises a shadowed pixel to as it is.
+    let highlight = operator(OPERATOR_HIGHLIGHT) | shaded(Shade::AsIs);
     assert_eq!(at(&layer, 1, 1), DRAWN_BY_PLANE_B | highlight);
     assert_eq!(at(&colour, 1, 1), 1);
     assert_eq!(at(&cell, 1, 1), 0xE000 / 2);
-    assert_eq!(pixel(&vdp, 1, 1), highlighted(shown(RED)));
+    assert_eq!(pixel(&vdp, 1, 1), shown(RED));
 
     assert_eq!(at(&layer, 9, 1), DRAWN_BY_PLANE_B | shaded(Shade::Shadowed));
-    assert_eq!(pixel(&vdp, 9, 1), shadowed(shown(RED)));
+    assert_eq!(pixel(&vdp, 9, 1), shadowed(&vdp, RED));
+    assert_eq!(shadowed(&vdp, RED), (128, 0, 0));
 
-    // This core shows the pixel under the shadow operator as it is.
-    let shadow_operator = OPERATOR_SHADOW << OPERATOR_SHIFT;
-    assert_eq!(at(&layer, 17, 1), DRAWN_BY_PLANE_B | shadow_operator);
-    assert_eq!(pixel(&vdp, 17, 1), shown(RED));
+    // The shadow operator shadows the pixel under it.
+    let shadow = operator(OPERATOR_SHADOW) | shaded(Shade::Shadowed);
+    assert_eq!(at(&layer, 17, 1), DRAWN_BY_PLANE_B | shadow);
+    assert_eq!(pixel(&vdp, 17, 1), shadowed(&vdp, RED));
+
+    // Colour 14 of palette line 1 is always as it is.
+    assert_eq!(at(&layer, 25, 1), DRAWN_BY_SPRITE | shaded(Shade::AsIs));
+    assert_eq!(at(&colour, 25, 1), 30);
+    assert_eq!(pixel(&vdp, 25, 1), shown(BLUE));
 
     assert_eq!(at(&layer, 41, 1), DRAWN_BY_PLANE_A | HIGH_PRIORITY);
     assert_eq!(pixel(&vdp, 41, 1), shown(GREEN));
+
+    // A transparent pixel's priority bit counts.
+    assert_eq!(at(&layer, 57, 1), DRAWN_BY_PLANE_B | shaded(Shade::AsIs));
+    assert_eq!(pixel(&vdp, 57, 1), shown(RED));
+
+    // The high highlight operator brightens a pixel as it is; the low
+    // shadow operator behind a high plane changes nothing.
+    let brightened = operator(OPERATOR_HIGHLIGHT) | shaded(Shade::Highlighted);
+    assert_eq!(
+        at(&layer, 73, 1),
+        DRAWN_BY_PLANE_A | HIGH_PRIORITY | brightened
+    );
+    assert_eq!(pixel(&vdp, 73, 1), highlighted(&vdp, GREEN));
+    assert_eq!(highlighted(&vdp, GREEN), (128, 255, 128));
+    let behind = operator(OPERATOR_SHADOW) | shaded(Shade::AsIs);
+    assert_eq!(at(&layer, 89, 1), DRAWN_BY_PLANE_A | HIGH_PRIORITY | behind);
+    assert_eq!(pixel(&vdp, 89, 1), shown(GREEN));
+
+    // A low sprite takes the planes' brightness, a high one is as it is.
+    assert_eq!(
+        at(&layer, 105, 1),
+        DRAWN_BY_SPRITE | shaded(Shade::Shadowed)
+    );
+    assert_eq!(pixel(&vdp, 105, 1), shadowed(&vdp, RED));
+    assert_eq!(at(&layer, 121, 1), DRAWN_BY_SPRITE | shaded(Shade::AsIs));
+    assert_eq!(pixel(&vdp, 121, 1), shown(RED));
 
     // The backdrop is of low priority too.
     assert_eq!(
@@ -225,15 +282,23 @@ fn shadow_and_highlight_say_what_they_did_to_each_pixel() {
     );
 }
 
-/// Half of each level, as the renderer shadows.
-fn shadowed((red, green, blue): (u8, u8, u8)) -> (u8, u8, u8) {
-    (red / 2, green / 2, blue / 2)
+/// The colour CRAM word `word` shows with each channel's value c at level
+/// `step(c)` of the levels the VDP gives.
+fn at_levels(vdp: &Vdp, word: u16, step: impl Fn(usize) -> usize) -> (u8, u8, u8) {
+    let levels = vdp.colour_levels().levels;
+    let channel = |shift: u16| levels[step(usize::from((word >> shift) & 7))];
+    (channel(1), channel(5), channel(9))
 }
 
-/// Half again of each level, at most 255, as the renderer highlights.
-fn highlighted((red, green, blue): (u8, u8, u8)) -> (u8, u8, u8) {
-    let up = |level: u8| (u16::from(level) * 3 / 2).min(255) as u8;
-    (up(red), up(green), up(blue))
+/// The colour `word` shows shadowed: each channel's value c at level c.
+fn shadowed(vdp: &Vdp, word: u16) -> (u8, u8, u8) {
+    at_levels(vdp, word, |value| value)
+}
+
+/// The colour `word` shows highlighted: each channel's value c at level
+/// c + 7.
+fn highlighted(vdp: &Vdp, word: u16) -> (u8, u8, u8) {
+    at_levels(vdp, word, |value| value + 7)
 }
 
 /// One entry of a line of [`retro_core::capture::LineSprites`]: the slot, the

@@ -217,7 +217,7 @@ impl Vdp {
             let index = (start + offset) % CRAM_COLOURS;
             let stored = colour & CRAM_COLOUR_BITS;
             self.cram[index] = stored;
-            self.cram_rgb[index] = Self::convert_genesis_color(stored);
+            self.set_palette_colour(index, stored);
             self.patch_recorded_colour(index, stored);
         }
         if !colours.is_empty() {
@@ -624,7 +624,8 @@ impl VideoDebugger for Vdp {
         })
     }
 
-    /// The eight levels of a CRAM colour's channel ([`COLOUR_LEVELS`]).
+    /// The fifteen levels a channel of a colour the VDP draws takes, shadow
+    /// and highlight included ([`COLOUR_LEVELS`]).
     fn colour_levels(&self) -> ColourLevels {
         COLOUR_LEVELS
     }

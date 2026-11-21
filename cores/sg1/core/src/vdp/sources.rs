@@ -80,7 +80,7 @@ pub const DRAWN_BY_WINDOW: u16 = drawn_by(LAYER_WINDOW as u16);
 /// The `layer` plane's bits 0-2 for a pixel a sprite drew.
 pub const DRAWN_BY_SPRITE: u16 = drawn_by(LAYER_SPRITES as u16);
 /// The `layer` plane's bit 3: the pixel shown is a high-priority one, as
-/// the composite resolved priority (the bit shadow and highlight read).
+/// the composite resolved priority.
 pub const HIGH_PRIORITY: u16 = 1 << 3;
 /// Where the `layer` plane's two bits saying what shadow and highlight did
 /// to the pixel start ([`Shade`]).
@@ -94,9 +94,8 @@ pub const OPERATOR_SHIFT: u32 = 6;
 pub const OPERATOR: u16 = 3 << OPERATOR_SHIFT;
 /// The operator: palette line 3's colour 14, the highlight operator.
 pub const OPERATOR_HIGHLIGHT: u16 = 1;
-/// The operator: palette line 3's colour 15, the shadow operator. This core
-/// shows the pixel under it as it is, neither shadowed nor highlighted, so
-/// its [`Shade`] is `AsIs`.
+/// The operator: palette line 3's colour 15, the shadow operator, which
+/// shadows the pixel under it.
 pub const OPERATOR_SHADOW: u16 = 2;
 /// The `layer` plane's bit 8: the character was read flipped across.
 pub const FLIPPED_ACROSS: u16 = 1 << 8;
@@ -110,34 +109,89 @@ pub const SPRITE_TABLE_SLOTS: usize = 80;
 /// The pixels in a line of the line buffers.
 const LINE_WIDTH: usize = FRAMEBUFFER_WIDTH as usize;
 
-/// What shadow and highlight did to a pixel's colour: the rule the
-/// renderer colours each pixel by (`shade`), in the `layer` plane's bits
-/// 4-5.
+/// What shadow and highlight did to a pixel's colour, as the composite
+/// resolves it for each pixel (`shade`), in the `layer` plane's bits 4-5.
+/// A CRAM colour's channel of value c (0-7) is drawn at level 2c of the
+/// fifteen levels as it is, level c shadowed and level c + 7 highlighted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shade {
     /// Its palette colour as it is.
     AsIs = 0,
-    /// Halved: shadow.
+    /// Shadowed: half its brightness.
     Shadowed = 1,
-    /// Brightened: highlight.
+    /// Highlighted: raised half the way to white.
     Highlighted = 2,
 }
 
-/// What shadow and highlight do to a pixel: with the mode on
-/// (`shadow_highlight`, register 12 bit 3), the highlight operator
-/// (`operator` 14) brightens it, a pixel under the shadow operator (15) or
-/// of high priority keeps its colour, and any other is halved; with the
-/// mode off every pixel keeps its colour.
+/// What shadow and highlight do to a pixel, by the hardware's rules (the
+/// ones Genesis Plus GX and Exodus draw by), from what the VDP reads
+/// there: the mode (`shadow_highlight`, register 12 bit 3); the sprite
+/// pixel in front (`sprite`: its palette line, its colour, 0 where no
+/// sprite drew, and its priority bit); and the planes' pixels (`plane_a`,
+/// the window's where the window covers, and `plane_b`: each whether it
+/// is opaque, and its map entry's priority bit). With the mode off every
+/// pixel is as it is. With it on:
+///
+/// - the planes give a pixel its brightness: as it is where either
+///   plane's priority bit is set, the plane's pixel transparent or not,
+///   shadowed where neither is;
+/// - a low-priority sprite pixel behind an opaque high-priority plane
+///   pixel changes nothing, an operator included: the pixel has the
+///   planes' brightness;
+/// - otherwise the shadow operator (palette line 3's colour 15) shadows
+///   the pixel under it, and the highlight operator (colour 14) raises it
+///   a step, a shadowed one to as it is and any other to highlighted;
+/// - colour 14 of palette lines 0-2 is always as it is;
+/// - any other sprite pixel is as it is when of high priority, and takes
+///   the planes' brightness when of low priority.
 #[inline(always)]
-pub(super) fn shade(shadow_highlight: bool, operator: u8, high_priority: bool) -> Shade {
+pub(super) fn shade(
+    shadow_highlight: bool,
+    (palette, colour, sprite_high): (u8, u8, bool),
+    (a_opaque, a_high): (bool, bool),
+    (b_opaque, b_high): (bool, bool),
+) -> Shade {
     if !shadow_highlight {
-        Shade::AsIs
-    } else if operator == 14 {
-        Shade::Highlighted
-    } else if operator == 15 || high_priority {
+        return Shade::AsIs;
+    }
+    let planes = if a_high || b_high {
         Shade::AsIs
     } else {
         Shade::Shadowed
+    };
+    let plane_in_front = (a_opaque && a_high) || (b_opaque && b_high);
+    if colour == 0 || (!sprite_high && plane_in_front) {
+        return planes;
+    }
+    match (palette, colour) {
+        (3, 15) => Shade::Shadowed,
+        (3, 14) if planes == Shade::Shadowed => Shade::AsIs,
+        (3, 14) => Shade::Highlighted,
+        (_, 14) => Shade::AsIs,
+        _ if sprite_high => Shade::AsIs,
+        _ => planes,
+    }
+}
+
+/// The shade a colouring of a line gives its pixel `x`: the one the line's
+/// composite resolved for it ([`shade`]) while shadow and highlight are on
+/// for the colouring (`shadow_highlight`: the mode as the line is drawn,
+/// or as it was at a palette write that colours part of the line again)
+/// and were on for the composite; the pixel's colour as it is otherwise.
+/// `(shaded, shades)` are the line's: whether its composite resolved
+/// shades (one with shadow and highlight off resolves none, and `shades`
+/// then holds another line's), and the shades. The remap and the trace
+/// both colour through here, so the picture and the trace cannot disagree.
+#[inline(always)]
+pub(super) fn coloured_shade(
+    shadow_highlight: bool,
+    (shaded, shades): (bool, &[Shade]),
+    x: usize,
+) -> Shade {
+    if shadow_highlight && shaded {
+        shades[x]
+    } else {
+        Shade::AsIs
     }
 }
 
@@ -389,12 +443,14 @@ impl LineTrace {
     }
 
     /// The renderer coloured the columns `from..to` from the index buffers
-    /// (`index`, `operator`, `high`: the line's resolved CRAM index,
-    /// shadow and highlight operator and priority), with shadow and
-    /// highlight on or off.
+    /// (`index`, `operator`, `high`: the line's resolved CRAM index, shadow
+    /// and highlight operator and priority) and its shades (`shades`:
+    /// whether its composite resolved them, and the shades,
+    /// [`coloured_shade`]), with shadow and highlight on or off.
     pub(super) fn remapped(
         &mut self,
         (index, operator, high): (&[u8], &[u8], &[bool]),
+        shades: (bool, &[Shade]),
         from: usize,
         to: usize,
         shadow_highlight: bool,
@@ -406,7 +462,7 @@ impl LineTrace {
                 15 => OPERATOR_SHADOW,
                 _ => 0,
             };
-            let shaded = shade(shadow_highlight, operator[x], high[x]) as u16;
+            let shaded = coloured_shade(shadow_highlight, shades, x) as u16;
             self.layer[x] = self.pen_layer[x]
                 | if high[x] { HIGH_PRIORITY } else { 0 }
                 | (shaded << SHADE_SHIFT)
@@ -748,18 +804,90 @@ mod tests {
         assert_eq!(origin.cell, 0x6008);
     }
 
+    /// The rule, case by case, as Genesis Plus GX's sprite-over-planes
+    /// table and Exodus's layer priority both give it: each operator over
+    /// each plane priority, transparent pixels with their priority bit,
+    /// colour 14 of palette lines 0-2, low and high sprites.
     #[test]
-    fn shade_is_the_rule_the_renderer_colours_by() {
-        for operator in [0u8, 14, 15] {
-            for high in [false, true] {
-                assert_eq!(shade(false, operator, high), Shade::AsIs);
-            }
+    fn shade_follows_the_hardware_case_by_case() {
+        use Shade::{AsIs, Highlighted, Shadowed};
+        // A plane's pixel: opaque or not, and its priority bit.
+        let low = (true, false);
+        let high = (true, true);
+        let clear = (false, false);
+        let clear_high = (false, true);
+        // The sprite pixel in front: palette line, colour, priority bit.
+        let none = (0, 0, false);
+        let shadow_op = |high: bool| (3, 15, high);
+        let highlight_op = |high: bool| (3, 14, high);
+        type Case = (
+            &'static str,
+            (u8, u8, bool),
+            (bool, bool),
+            (bool, bool),
+            Shade,
+        );
+        #[rustfmt::skip]
+        let cases: [Case; 38] = [
+            // No sprite: the planes give the brightness.
+            ("none, low planes", none, low, low, Shadowed),
+            ("none, the backdrop", none, clear, clear, Shadowed),
+            ("none, A high", none, high, low, AsIs),
+            ("none, B high", none, low, high, AsIs),
+            ("none, A transparent and high", none, clear_high, low, AsIs),
+            ("none, the backdrop, B's bit", none, clear, clear_high, AsIs),
+            // The shadow operator shadows what is under it.
+            ("high shadow, the backdrop", shadow_op(true), clear, clear, Shadowed),
+            ("high shadow, low planes", shadow_op(true), low, low, Shadowed),
+            ("high shadow, A high", shadow_op(true), high, low, Shadowed),
+            ("low shadow behind A high", shadow_op(false), high, low, AsIs),
+            ("low shadow, low planes", shadow_op(false), low, low, Shadowed),
+            ("low shadow, A transparent, high", shadow_op(false), clear_high, low, Shadowed),
+            ("low shadow, B transparent, high", shadow_op(false), low, clear_high, Shadowed),
+            ("high shadow, the backdrop, A's bit", shadow_op(true), clear_high, clear, Shadowed),
+            // The highlight operator raises what is under it a step.
+            ("high highlight, A high", highlight_op(true), high, low, Highlighted),
+            ("low highlight behind A high", highlight_op(false), high, low, AsIs),
+            ("low highlight behind B high", highlight_op(false), low, high, AsIs),
+            ("high highlight, low planes", highlight_op(true), low, low, AsIs),
+            ("low highlight, low planes", highlight_op(false), low, low, AsIs),
+            ("high highlight, the backdrop", highlight_op(true), clear, clear, AsIs),
+            ("low highlight, A clear, high", highlight_op(false), clear_high, low, Highlighted),
+            ("high highlight, backdrop, B bit", highlight_op(true), clear, clear_high, Highlighted),
+            ("low highlight, B clear, high", highlight_op(false), low, clear_high, Highlighted),
+            // Colour 14 of palette lines 0-2 is always as it is.
+            ("line 0's 14, low, low planes", (0, 14, false), low, low, AsIs),
+            ("line 1's 14, low, the backdrop", (1, 14, false), clear, clear, AsIs),
+            ("line 2's 14, high, low planes", (2, 14, true), low, low, AsIs),
+            ("line 2's 14 behind A high", (2, 14, false), high, low, AsIs),
+            ("line 2's 14, high, high planes", (2, 14, true), high, high, AsIs),
+            // Any other sprite pixel: as it is when high, the planes' when low.
+            ("high sprite, low planes", (0, 1, true), low, low, AsIs),
+            ("low sprite, low planes", (0, 1, false), low, low, Shadowed),
+            ("low sprite, the backdrop", (1, 5, false), clear, clear, Shadowed),
+            ("low sprite, A transparent, high", (1, 5, false), clear_high, low, AsIs),
+            ("low sprite, B transparent, high", (1, 5, false), low, clear_high, AsIs),
+            ("low sprite behind A high", (2, 7, false), high, low, AsIs),
+            ("high sprite, high planes", (2, 7, true), high, high, AsIs),
+            ("line 3's 13, low, low planes", (3, 13, false), low, low, Shadowed),
+            ("line 0's 15, low, low planes", (0, 15, false), low, low, Shadowed),
+            ("line 2's 15, high, low planes", (2, 15, true), low, low, AsIs),
+        ];
+        for (case, sprite, plane_a, plane_b, expected) in cases {
+            assert_eq!(shade(true, sprite, plane_a, plane_b), expected, "{case}");
+            // With the mode off every pixel is as it is, and colours 14
+            // and 15 of line 3 are no operators.
+            assert_eq!(shade(false, sprite, plane_a, plane_b), AsIs, "{case}, off");
         }
-        assert_eq!(shade(true, 14, false), Shade::Highlighted);
-        assert_eq!(shade(true, 14, true), Shade::Highlighted);
-        assert_eq!(shade(true, 15, false), Shade::AsIs);
-        assert_eq!(shade(true, 0, true), Shade::AsIs);
-        assert_eq!(shade(true, 0, false), Shade::Shadowed);
+        // A colouring shows the shade the composite resolved only with the
+        // mode on for both; a line composited with it off resolved none.
+        let shades = [AsIs, Shadowed, Highlighted];
+        for (x, &resolved) in shades.iter().enumerate() {
+            assert_eq!(coloured_shade(true, (true, &shades), x), resolved);
+            assert_eq!(coloured_shade(false, (true, &shades), x), AsIs);
+            assert_eq!(coloured_shade(true, (false, &shades), x), AsIs);
+            assert_eq!(coloured_shade(false, (false, &shades), x), AsIs);
+        }
     }
 
     #[test]
