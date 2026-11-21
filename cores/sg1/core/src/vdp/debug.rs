@@ -18,6 +18,9 @@
 //! `write_cram_debug` and `write_vsram_debug` put new contents straight
 //! into video memory, to edit the graphics of a running or paused game,
 //! and keep the renderer's own copies of that memory in step.
+//!
+//! The per-pixel debug log is here too: `set_debug_pixel` names a pixel,
+//! and the compositor logs every candidate for it to stderr.
 
 use std::ops::Range;
 
@@ -604,6 +607,273 @@ impl VideoDebugger for Vdp {
             scroll_x: 0,
             scroll_y: 0,
         })
+    }
+}
+
+impl Vdp {
+    /// Set a pixel coordinate to debug. During render_scanline, all composition
+    /// candidates for this pixel will be logged to stderr.
+    pub fn set_debug_pixel(&mut self, x: u16, y: u16) {
+        self.debug_pixel = Some((x, y));
+    }
+
+    /// Clear the debug pixel.
+    pub fn clear_debug_pixel(&mut self) {
+        self.debug_pixel = None;
+    }
+
+    /// Detailed per-pixel composition diagnostic (stderr).
+    /// Called from render_scanline only when debug_pixel is set and the
+    /// current pixel matches. Kept separate to avoid bloating the hot loop.
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn log_debug_pixel(
+        &self,
+        x: usize,
+        line: u16,
+        in_window: bool,
+        addr_b: usize,
+        plane_a_nametable: u16,
+        plane_b_nametable: u16,
+        window_nametable: u16,
+        pf_shift: u32,
+        pf_col_mask: u16,
+        pf_row_mask: u16,
+        h_scroll_mode: u8,
+        v_scroll_mode: u8,
+        is_h40: bool,
+        hscroll_base: usize,
+        h_scroll_a: u16,
+        h_scroll_b: u16,
+        v_scroll_a_full: u16,
+        v_scroll_b_full: u16,
+        plane_w_px: i32,
+        plane_b_color: Option<(u8, u8, u8)>,
+        plane_b_pri: bool,
+        plane_a_color: Option<(u8, u8, u8)>,
+        plane_a_pri: bool,
+        merged_color: Option<(u8, u8, u8)>,
+        merged_pri: bool,
+        has_sprite: bool,
+        final_color: (u8, u8, u8),
+        is_high_priority: bool,
+        sh_operator: u8,
+        backdrop_color: (u8, u8, u8),
+    ) {
+        let xu16 = x as u16;
+        let s_ci = self.sprite_line_color[x];
+        let s_pal = self.sprite_line_palette[x];
+        let s_pri = self.sprite_line_priority[x];
+
+        let winner = if !has_sprite {
+            if merged_color.is_some() {
+                "plane"
+            } else {
+                "backdrop"
+            }
+        } else if sh_operator != 0 {
+            "sh_operator"
+        } else if s_pri {
+            "sprite(hi)"
+        } else if merged_pri {
+            "plane(hi)"
+        } else {
+            "sprite(lo)"
+        };
+
+        eprintln!(
+            "=== DEBUG PIXEL ({}, {}) frame={} ===",
+            xu16, line, self.timing.frame_count
+        );
+
+        eprintln!("  --- VDP Registers ---");
+        eprintln!(
+            "  r2(PlaneA)=0x{:02X} -> base=0x{:04X}  r4(PlaneB)=0x{:02X} -> base=0x{:04X}",
+            self.registers[2], plane_a_nametable, self.registers[4], plane_b_nametable
+        );
+        let (scroll_width, scroll_height) = self.get_scroll_size();
+        eprintln!(
+            "  r3(Window)=0x{:02X} -> base=0x{:04X}  r16(scroll_size)=0x{:02X} -> {}x{} tiles (shift={} col_mask=0x{:02X} row_mask=0x{:03X})",
+            self.registers[3], window_nametable, self.registers[16], scroll_width, scroll_height,
+            pf_shift, pf_col_mask, pf_row_mask
+        );
+        eprintln!(
+            "  r11(mode3)=0x{:02X} -> hscroll_mode={} vscroll_mode={}",
+            self.registers[11], h_scroll_mode, v_scroll_mode
+        );
+        eprintln!(
+            "  r12(mode4)=0x{:02X} -> H40={}  r13(hscroll_base)=0x{:02X} -> 0x{:04X}",
+            self.registers[12], is_h40, self.registers[13], hscroll_base
+        );
+        eprintln!(
+            "  r15(auto_inc)=0x{:02X}  r17(WinH)=0x{:02X}  r18(WinV)=0x{:02X}",
+            self.registers[15], self.registers[17], self.registers[18]
+        );
+
+        eprintln!("  --- Window Selection ---");
+        let reg17 = self.registers[17];
+        let reg18 = self.registers[18];
+        let v_pos_w = (reg18 & 0x1F) as u16 * 8;
+        let v_down_w = (reg18 & 0x80) != 0;
+        let h_pos_w = (reg17 & 0x1F) as u16;
+        let h_right_w = (reg17 & 0x80) != 0;
+        eprintln!(
+            "  window: v_pos={} v_down={} h_pos={} h_right={} -> in_window={}",
+            v_pos_w, v_down_w, h_pos_w, h_right_w, in_window
+        );
+
+        // Plane B geometry
+        eprintln!("  --- Plane B Geometry ---");
+        let dbg_vscroll_b = if v_scroll_mode == 0 {
+            v_scroll_b_full
+        } else {
+            let col = (xu16 / 16) as usize;
+            let vi = col * 2 + 1;
+            if vi < self.vsram.len() {
+                self.vsram[vi] & 0x03FF
+            } else {
+                0
+            }
+        };
+        let dbg_sx_b = (xu16 as i32 - h_scroll_b as i32).rem_euclid(plane_w_px) as u16;
+        let dbg_vline_b = (line as u32 + dbg_vscroll_b as u32) & pf_row_mask as u32;
+        let dbg_tr_b = (dbg_vline_b >> 3) as u16;
+        let dbg_tc_b = (dbg_sx_b / 8) & pf_col_mask;
+        eprintln!(
+            "  hscroll_b={} vscroll_b={} scrolled=({},{}) tile=({},{}) px=({},{})",
+            h_scroll_b,
+            dbg_vscroll_b,
+            dbg_sx_b,
+            dbg_vline_b,
+            dbg_tc_b,
+            dbg_tr_b,
+            dbg_sx_b % 8,
+            dbg_vline_b & 7
+        );
+        eprintln!(
+            "  nt_base=0x{:04X} nt_off=0x{:04X} -> addr=0x{:04X}",
+            plane_b_nametable,
+            (((dbg_tr_b as u32) << pf_shift) & 0x1FC0) as u16 + dbg_tc_b * 2,
+            addr_b
+        );
+        let word_b = if addr_b + 1 < self.vram.len() {
+            let w = ((self.vram[addr_b] as u16) << 8) | (self.vram[addr_b + 1] as u16);
+            eprintln!(
+                "  raw_bytes=[0x{:02X}, 0x{:02X}] -> word=0x{:04X}",
+                self.vram[addr_b],
+                self.vram[addr_b + 1],
+                w
+            );
+            w
+        } else {
+            0
+        };
+        let ci_b = Self::read_tile_pixel_flipped(
+            &self.vram,
+            word_b & 0x07FF,
+            (dbg_sx_b % 8) as u8,
+            (dbg_vline_b & 7) as u8,
+            (word_b & 0x0800) != 0,
+            (word_b & 0x1000) != 0,
+        );
+        eprintln!(
+            "  decoded: pat={} pal={} flipH={} flipV={} pri={} ci={} color={:?}",
+            word_b & 0x07FF,
+            (word_b >> 13) & 0x03,
+            (word_b & 0x0800) != 0,
+            (word_b & 0x1000) != 0,
+            plane_b_pri,
+            ci_b,
+            plane_b_color
+        );
+
+        // Plane A / Window geometry
+        eprintln!("  --- Plane A Geometry ---");
+        if in_window {
+            let wtx = xu16 / 8;
+            let wty = line / 8;
+            let win_width_tiles: u16 = if is_h40 { 64 } else { 32 };
+            let wnt_off = (wty * win_width_tiles + wtx) * 2;
+            let waddr = (window_nametable + wnt_off) as usize;
+            eprintln!(
+                "  SOURCE=WINDOW  tile=({},{}) window_base=0x{:04X} addr=0x{:04X}",
+                wtx, wty, window_nametable, waddr
+            );
+            if waddr + 1 < self.vram.len() {
+                let w = ((self.vram[waddr] as u16) << 8) | (self.vram[waddr + 1] as u16);
+                eprintln!(
+                    "  raw_bytes=[0x{:02X}, 0x{:02X}] -> word=0x{:04X}",
+                    self.vram[waddr],
+                    self.vram[waddr + 1],
+                    w
+                );
+                eprintln!(
+                    "  decoded: pat={} pal={} flipH={} flipV={} pri={} color={:?}",
+                    w & 0x07FF,
+                    (w >> 13) & 0x03,
+                    (w & 0x0800) != 0,
+                    (w & 0x1000) != 0,
+                    plane_a_pri,
+                    plane_a_color
+                );
+            }
+        } else {
+            let dbg_vscroll_a = if v_scroll_mode == 0 {
+                v_scroll_a_full
+            } else {
+                let col = (xu16 / 16) as usize;
+                let vi = col * 2;
+                if vi < self.vsram.len() {
+                    self.vsram[vi] & 0x03FF
+                } else {
+                    0
+                }
+            };
+            let dbg_sx_a = (xu16 as i32 - h_scroll_a as i32).rem_euclid(plane_w_px) as u16;
+            let dbg_vline_a = (line as u32 + dbg_vscroll_a as u32) & pf_row_mask as u32;
+            let dbg_tr_a = (dbg_vline_a >> 3) as u16;
+            let dbg_tc_a = (dbg_sx_a / 8) & pf_col_mask;
+            eprintln!("  SOURCE=PLANE_A  hscroll_a={} vscroll_a={} scrolled=({},{}) tile=({},{}) px=({},{})",
+                h_scroll_a, dbg_vscroll_a, dbg_sx_a, dbg_vline_a,
+                dbg_tc_a, dbg_tr_a, dbg_sx_a % 8, dbg_vline_a & 7);
+            let nt_off_a = (((dbg_tr_a as u32) << pf_shift) & 0x1FC0) as u16 + dbg_tc_a * 2;
+            let addr_a = (plane_a_nametable + nt_off_a) as usize;
+            eprintln!(
+                "  nt_base=0x{:04X} nt_off=0x{:04X} -> addr=0x{:04X}",
+                plane_a_nametable, nt_off_a, addr_a
+            );
+            if addr_a + 1 < self.vram.len() {
+                let w = ((self.vram[addr_a] as u16) << 8) | (self.vram[addr_a + 1] as u16);
+                eprintln!(
+                    "  raw_bytes=[0x{:02X}, 0x{:02X}] -> word=0x{:04X}",
+                    self.vram[addr_a],
+                    self.vram[addr_a + 1],
+                    w
+                );
+                eprintln!(
+                    "  decoded: pat={} pal={} flipH={} flipV={} pri={} color={:?}",
+                    w & 0x07FF,
+                    (w >> 13) & 0x03,
+                    (w & 0x0800) != 0,
+                    (w & 0x1000) != 0,
+                    plane_a_pri,
+                    plane_a_color
+                );
+            }
+        }
+
+        eprintln!("  --- Merge & Composite ---");
+        eprintln!("  merged: color={:?} pri={}", merged_color, merged_pri);
+        eprintln!(
+            "  sprite: ci={} pal={} pri={} has_sprite={}",
+            s_ci, s_pal, s_pri, has_sprite
+        );
+        eprintln!(
+            "  winner={} final_color={:?} is_high_pri={} sh_op={}",
+            winner, final_color, is_high_priority, sh_operator
+        );
+        eprintln!("  backdrop: {:?}", backdrop_color);
+        eprintln!("=== END DEBUG PIXEL ===");
     }
 }
 

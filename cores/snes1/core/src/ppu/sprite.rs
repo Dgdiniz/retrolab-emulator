@@ -1,7 +1,7 @@
-//! Pure sprite (OBJ) evaluation helpers for the per-scanline
-//! renderer.
+//! Sprites (OBJ) for the per-scanline renderer: the pure evaluation
+//! helpers, and the sprite row the renderer paints with them.
 //!
-//! Like [`crate::ppu::tile`], every function is `&self`-free, they
+//! Like [`crate::ppu::tile`], every free function is `&self`-free, they
 //! take the raw OAM buffer plus the OBSEL-derived addressing
 //! parameters by value, so the renderer can mix them with mutable PPU
 //! state and the unit tests can drive them with synthetic OAM.
@@ -21,6 +21,26 @@
 //! - Y is the raw OAM byte. The "on this scanline" test wraps at 256
 //!   so a sprite near the bottom of OAM space spills onto the top
 //!   rows of the screen.
+//!
+//! ## The sprite row
+//!
+//! `Ppu::render_obj_row` paints a line's sprites into the 256-wide OBJ
+//! row the compositor reads, keeping what the line's budget keeps
+//! ([`line_budget`]: 32 sprites, 34 tile columns), with the decoded
+//! tiles kept by `Ppu::cached_sprite_tile` until VRAM changes.
+//! `Ppu::eval_obj_overflow` sets the STAT77 range and time flags on
+//! every active line, whether sprites are shown or not.
+
+use retro_core::capture::{tile_value, PixelTrace};
+
+use super::render::{ObjRowBuffer, ObjRowPixel, NORMAL_SCANLINE_WIDTH};
+use super::tile::decode_tile_4bpp_row;
+use super::trace::{colour_value, FrameTrace, ObjOrigin};
+use super::Ppu;
+
+// The sprite row below calls this module's helpers by their path,
+// `sprite::parse_sprite`.
+use super::sprite;
 
 /// One parsed OAM sprite entry.
 ///
@@ -429,9 +449,204 @@ pub fn drawn_pixels(s: &SpriteAttrs, columns_drawn: u8) -> u8 {
     pixels
 }
 
+impl Ppu {
+    /// Evaluate OAM for one visible `scanline` and update the STAT77
+    /// ($213E) sprite range-over (bit 6) / time-over (bit 7) flags
+    /// **without painting**.
+    ///
+    /// On hardware the sprite range/tile evaluation walks OAM on every
+    /// active scanline regardless of whether OBJ is enabled on either
+    /// screen ($212C/$212D bit 4) or whether the screen is in forced
+    /// blank, only the *compositing* is gated (checked against
+    /// snes9x, which evaluates them whatever the display state).
+    /// Keeping this as a flag-only twin
+    /// of [`Self::render_obj_row`]'s two passes lets the painted path
+    /// stay display-gated while STAT77 reads back correctly when OBJ is
+    /// off-screen or the line is blanked.
+    ///
+    /// The evaluation is [`sprite::line_flags`], the rule of
+    /// [`sprite::line_budget`] that the painter's caps and the line's
+    /// sprite list share (33rd sprite -> range-over, 35th tile column ->
+    /// time-over, the same off-screen tile-column skip), so the flags agree
+    /// exactly with what the painted path draws.
+    pub(super) fn eval_obj_overflow(&mut self, scanline: u16) {
+        let (over_range, over_time) = sprite::line_flags(
+            self.oam(),
+            self.oam_first_sprite,
+            self.obj_base_size,
+            self.obj_interlace,
+            scanline.wrapping_sub(1),
+        );
+        self.sprite_range_over |= over_range;
+        self.sprite_time_over |= over_time;
+    }
+
+    /// Evaluate OAM for `scanline` and rasterise the visible sprites
+    /// into `obj_row`.
+    ///
+    /// Two passes, the hardware's evaluation and its painting (checked
+    /// against bsnes-plus):
+    ///
+    /// 1. **Range eval**: walk all 128 sprites starting at
+    ///    [`Ppu::oam_first_sprite`]; gather up to 32 that fall on the
+    ///    line. The 33rd onward are dropped (capped at 32).
+    /// 2. **Tile build + raster**: replay the gathered sprites in
+    ///    reverse so the highest-priority sprite paints last (and thus
+    ///    wins on overlap). Each 8-px tile column consumes one of the
+    ///    34 per-scanline tile slots; the 35th caps the loop and drops
+    ///    the remaining (higher-priority) tiles, exactly the hardware
+    ///    "too many sprites vanish" quirk.
+    ///
+    /// This path only *paints* and so runs solely when OBJ is displayed
+    /// (not forced-blank, OBJ enabled on a screen). The STAT77 ($213E)
+    /// range/time-overflow flags are owned by [`Self::eval_obj_overflow`],
+    /// which runs every active scanline regardless of display state, so
+    /// the caps here intentionally leave the flags alone.
+    ///
+    /// `scanline` is the 1-indexed vcounter; the OBJ Y comparison runs
+    /// against `scanline - 1` so a sprite with OAM Y = N lands with its
+    /// top row at output row N (the one-line OBJ pipeline latency is
+    /// already absorbed by the vcounter being 1-indexed, see the
+    /// Mode 7 note in [`Self::render_mode7_rows`] for the same offset
+    /// reasoning).
+    pub(super) fn render_obj_row<T: PixelTrace<Notes = FrameTrace>>(
+        &mut self,
+        scanline: u16,
+        obj_row: &mut ObjRowBuffer,
+        trace: &mut T,
+    ) {
+        *obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+
+        let line = scanline.wrapping_sub(1);
+        let obj_interlace = self.obj_interlace;
+        let field = self.field;
+        let base_size = self.obj_base_size;
+
+        // Pass 1: range eval.
+        let mut items: [u8; 32] = [0xFF; 32];
+        let mut item_count = 0usize;
+        for i in 0..128usize {
+            let idx = (usize::from(self.oam_first_sprite) + i) & 0x7F;
+            let s = sprite::parse_sprite(self.oam(), idx, base_size, obj_interlace);
+            if !sprite::sprite_on_scanline(&s, line, obj_interlace) {
+                continue;
+            }
+            if item_count >= 32 {
+                // Cap the painted set at 32; the range-over flag is set
+                // by `eval_obj_overflow` (runs even when OBJ is off).
+                break;
+            }
+            items[item_count] = idx as u8;
+            item_count += 1;
+        }
+
+        // The active-scan OAM read pointer tracks the last in-range
+        // sprite's high-table word.
+        if item_count > 0 {
+            self.oam_iaddr = 0x0200 + (u16::from(items[item_count - 1]) >> 2);
+        }
+
+        // Pass 2: reverse tile build + raster.
+        let mut tile_count = 0usize;
+        'items: for i in (0..item_count).rev() {
+            let idx = usize::from(items[i]);
+            let s = sprite::parse_sprite(self.oam(), idx, base_size, obj_interlace);
+            let y_row = sprite::sprite_row_in_sprite(&s, line, field, obj_interlace);
+            let row_in_tile = (y_row & 7) as usize;
+            let tiles_wide = u16::from(s.width >> 3);
+
+            for tx in 0..tiles_wide {
+                let sx0 = (s.x + (tx << 3)) & 0x1FF;
+                // Skip tile columns that sit entirely in the off-screen
+                // 256..512 band (unless x == 256, which loads them all).
+                if s.x != 256 && sx0 >= 256 && (sx0 + 7) < 512 {
+                    continue;
+                }
+                if tile_count >= 34 {
+                    // Cap painting at 34 tile columns (the "too many
+                    // sprites vanish" quirk); the time-over flag is set
+                    // by `eval_obj_overflow`.
+                    break 'items;
+                }
+                tile_count += 1;
+
+                let tile_number = sprite::sprite_tile_number(
+                    self.obj_tiledata_addr,
+                    self.obj_name_select,
+                    s.character,
+                    s.nameselect,
+                    s.hflip,
+                    s.width,
+                    tx as u8,
+                    y_row,
+                );
+                let pixels = self.cached_sprite_tile(tile_number);
+                for px in 0..8u16 {
+                    let sx = (sx0 + px) & 0x1FF;
+                    if sx >= 256 {
+                        continue;
+                    }
+                    let col = if s.hflip {
+                        7 - px as usize
+                    } else {
+                        px as usize
+                    };
+                    let pixel = pixels[row_in_tile * 8 + col];
+                    if pixel != 0 {
+                        let cgram_idx = 128 + usize::from(s.palette) * 16 + usize::from(pixel);
+                        obj_row[sx as usize] = ObjRowPixel {
+                            color: self.cgram()[cgram_idx],
+                            opaque: true,
+                            prio: s.priority,
+                            palette: s.palette,
+                        };
+                        if T::ON {
+                            trace.notes().obj[sx as usize] = ObjOrigin {
+                                tile: tile_value(
+                                    u32::from(tile_number) << 4,
+                                    u32::from(tile_number),
+                                    row_in_tile as u32,
+                                    col as u32,
+                                ),
+                                colour: colour_value(cgram_idx as u8, s.palette, 4),
+                                slot: idx as u8,
+                                priority: s.priority,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up, or decode, a 4bpp sprite tile, returning all eight
+    /// rows (`[u8; 64]`, row-major). The returned array is `Copy`, so
+    /// the `&mut self` borrow ends here and the caller can re-borrow
+    /// `self.cgram()` while reading pixels. Coherence rides
+    /// [`Ppu::vram_generation`], the same contract as
+    /// [`Self::cached_tilemap_row`].
+    fn cached_sprite_tile(&mut self, tile_number: u16) -> [u8; 64] {
+        let generation = self.vram_generation;
+        if !self.sprite_tile_cache.matches(tile_number, generation) {
+            let base_byte = u32::from(tile_number) << 5;
+            let mut pixels = [0u8; 64];
+            for row in 0..8usize {
+                let decoded =
+                    decode_tile_4bpp_row(self.vram(), 0, base_byte, row as u8, false, false);
+                pixels[row * 8..row * 8 + 8].copy_from_slice(&decoded);
+            }
+            self.sprite_tile_cache
+                .store(tile_number, generation, pixels);
+        }
+        *self.sprite_tile_cache.pixels(tile_number)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use retro_core::capture::NoTrace;
+    use retro_core::Framebuffer;
 
     fn empty_oam() -> [u8; 0x220] {
         [0u8; 0x220]
@@ -864,5 +1079,345 @@ mod tests {
         assert_eq!(column_visible_pixels(0), 8);
         assert_eq!(column_visible_pixels(252), 4);
         assert_eq!(column_visible_pixels(256), 0);
+    }
+
+    // -- Sprite (OBJ) rasteriser -------------------------------
+
+    /// Bare 8x8-small sprite PPU with the OBJ tile data at VRAM 0 and
+    /// every sprite parked at OAM Y = 240 (below the visible test
+    /// lines), so individual tests can place exactly the sprites they
+    /// care about.
+    fn obj_test_ppu() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.obj_base_size = 0;
+        ppu.obj_tiledata_addr = 0;
+        ppu.obj_name_select = 0;
+        for i in 0..128 {
+            ppu.oam[i * 4 + 1] = 0xF0;
+        }
+        ppu
+    }
+
+    /// Program sprite `idx`'s four low-table bytes.
+    pub(crate) fn set_sprite(ppu: &mut Ppu, idx: usize, x: u8, y: u8, character: u8, attr: u8) {
+        let base = idx * 4;
+        ppu.oam[base] = x;
+        ppu.oam[base + 1] = y;
+        ppu.oam[base + 2] = character;
+        ppu.oam[base + 3] = attr;
+    }
+
+    #[test]
+    fn the_painter_draws_the_columns_the_line_budget_keeps() {
+        // Over random sprite tables, each column of the sprite row belongs to
+        // the sprite a painter working from `sprite::line_budget` gives it:
+        // the kept sprites back to front, each its first `columns_drawn`
+        // fetched columns. Every character pixel is opaque, so a painted
+        // column is never left to the sprite behind.
+        use crate::ppu::trace::FrameTrace;
+        let mut state = 0x5EED_0B1Eu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..300 {
+            let mut ppu = obj_test_ppu();
+            ppu.vram.fill(0xFFFF);
+            ppu.obj_base_size = (next() % 8) as u8;
+            ppu.oam_first_sprite = (next() % 128) as u8;
+            let scanline = 1 + (next() % 224) as u16;
+            let line = scanline - 1;
+            for slot in 0..128 {
+                // Most sprites near the line, so the limits are reached.
+                let near = next() % 4 != 0;
+                let y = if near {
+                    line.wrapping_sub((next() % 48) as u16) as u8
+                } else {
+                    (next() % 256) as u8
+                };
+                let x = (next() % 512) as u16;
+                set_sprite(
+                    &mut ppu,
+                    slot,
+                    x as u8,
+                    y,
+                    (next() % 256) as u8,
+                    (next() % 256) as u8,
+                );
+                let shift = (slot & 3) * 2;
+                let bits = u8::from(x >= 256) | (((next() % 2) as u8) << 1);
+                let high = &mut ppu.oam[0x200 + (slot >> 2)];
+                *high = (*high & !(3 << shift)) | (bits << shift);
+            }
+
+            let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+            let mut trace = FrameTrace::new(0, None);
+            ppu.render_obj_row(scanline, &mut obj, &mut trace);
+
+            let budget = sprite::line_budget(
+                &ppu.oam,
+                ppu.oam_first_sprite,
+                ppu.obj_base_size,
+                false,
+                line,
+                None,
+            );
+            let mut expected = [None; NORMAL_SCANLINE_WIDTH];
+            for k in (0..usize::from(budget.kept_count)).rev() {
+                let slot = budget.kept[k];
+                let s = sprite::parse_sprite(&ppu.oam, usize::from(slot), ppu.obj_base_size, false);
+                let mut left = budget.columns_drawn[k];
+                for tx in 0..u16::from(s.width >> 3) {
+                    let column_x = (s.x + (tx << 3)) & 0x1FF;
+                    if sprite::column_off_screen(s.x, column_x) {
+                        continue;
+                    }
+                    if left == 0 {
+                        break;
+                    }
+                    left -= 1;
+                    for px in 0..8 {
+                        let sx = usize::from((column_x + px) & 0x1FF);
+                        if sx < NORMAL_SCANLINE_WIDTH {
+                            expected[sx] = Some(slot);
+                        }
+                    }
+                }
+            }
+            let painted: Vec<Option<u8>> = obj
+                .iter()
+                .enumerate()
+                .map(|(x, pixel)| pixel.opaque.then(|| trace.obj[x].slot))
+                .collect();
+            assert_eq!(painted, expected.to_vec(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn render_obj_row_single_8x8_sprite() {
+        let mut ppu = obj_test_ppu();
+        set_sprite(&mut ppu, 0, 0, 0, 0, 0);
+        // Tile 0 row 0: plane0 = 0xFF -> colour index 1 across the row.
+        ppu.vram[0] = 0x00FF;
+        ppu.cgram[129] = 0x1234; // 128 + palette 0 * 16 + index 1
+
+        let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+        // Scanline 1 -> line 0 -> sprite row 0.
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+
+        for (x, px) in obj.iter().enumerate().take(8) {
+            assert!(px.opaque, "col {x} opaque");
+            assert_eq!(px.color, 0x1234, "col {x} colour");
+            assert_eq!(px.prio, 0);
+        }
+        assert!(!obj[8].opaque, "column past the sprite is transparent");
+    }
+
+    #[test]
+    fn render_obj_row_palette_and_priority_from_attr() {
+        let mut ppu = obj_test_ppu();
+        // attr: priority 3 (0x30) | palette 5 (0x0A) = 0x3A.
+        set_sprite(&mut ppu, 0, 0, 0, 0, 0x3A);
+        ppu.vram[0] = 0x00FF; // index 1
+        ppu.cgram[128 + 5 * 16 + 1] = 0x7ABC;
+
+        let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        assert!(obj[0].opaque);
+        assert_eq!(obj[0].color, 0x7ABC);
+        assert_eq!(obj[0].prio, 3);
+    }
+
+    #[test]
+    fn render_obj_row_hflip_reverses_row() {
+        let mut ppu = obj_test_ppu();
+        set_sprite(&mut ppu, 0, 0, 0, 0, 0x40); // hflip
+                                                // plane0 bit 7 set -> only column 0 opaque before flipping.
+        ppu.vram[0] = 0x0080;
+        ppu.cgram[129] = 0x1234;
+
+        let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        assert!(obj[7].opaque, "hflip moves the leftmost pixel to column 7");
+        assert_eq!(obj[7].color, 0x1234);
+        assert!(!obj[0].opaque);
+    }
+
+    #[test]
+    fn resolved_render_order_top_matches_obj_row_winner() {
+        // Parity guard: the sprite the resolved order reports on top
+        // (last) must win the overlap pixel the renderer actually paints.
+        use retro_core::video::VideoDebugger;
+        let mut ppu = obj_test_ppu();
+        // The order lists what a frame showing sprites drew.
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        ppu.obj_main_enable = true;
+        // Two 8x8 sprites stacked at (0,0): slot 0 palette 0, slot 1
+        // palette 1, both lit on row 0 -> they overlap at column 0.
+        set_sprite(&mut ppu, 0, 0, 0, 0, 0x00); // palette 0
+        set_sprite(&mut ppu, 1, 0, 0, 0, 0x02); // palette 1 (attr bit 1)
+        ppu.vram[0] = 0x00FF; // tile 0 row 0 -> index 1 across
+        ppu.cgram[128 + 1] = 0xAAAA; // palette 0 index 1 (slot 0)
+        ppu.cgram[128 + 16 + 1] = 0x5555; // palette 1 index 1 (slot 1)
+
+        let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
+        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+
+        let order = ppu.resolved_sprite_render_order();
+        let top = order.last().expect("non-empty order");
+        assert_eq!(top.index, 0, "OAM slot 0 (no rotation) is highest priority");
+        assert!(obj[0].opaque);
+        assert_eq!(
+            obj[0].color, 0xAAAA,
+            "overlap shows the top sprite's colour"
+        );
+        assert_ne!(obj[0].color, 0x5555, "lower sprite did not win the overlap");
+    }
+
+    #[test]
+    fn eval_obj_overflow_range_over_past_32_on_line() {
+        let mut ppu = obj_test_ppu();
+        // 33 sprites all on line 0 at x = 0 -> range overflow.
+        ppu.vram[0] = 0x00FF;
+        ppu.cgram[129] = 0x1234;
+        for i in 0..33 {
+            set_sprite(&mut ppu, i, 0, 0, 0, 0);
+        }
+        ppu.eval_obj_overflow(1);
+        assert!(
+            ppu.sprite_range_over,
+            "33 sprites on one line sets range-over"
+        );
+        assert!(
+            !ppu.sprite_time_over,
+            "33 single-tile sprites stay under 34 tiles"
+        );
+    }
+
+    #[test]
+    fn eval_obj_overflow_time_over_past_34_tiles() {
+        let mut ppu = obj_test_ppu();
+        ppu.obj_base_size = 2; // small 8x8, large 64x64
+        ppu.vram[0] = 0x00FF;
+        ppu.cgram[129] = 0x1234;
+        // Five 64-wide large sprites = 5 x 8 = 40 tile columns > 34.
+        // Spread their X so the tile columns are on-screen.
+        for i in 0..5 {
+            // high-table large bit for sprite i.
+            ppu.oam[0x200 + (i >> 2)] |= 0x02 << ((i & 3) * 2);
+            set_sprite(&mut ppu, i, 0, 0, 0, 0);
+        }
+        ppu.eval_obj_overflow(1);
+        assert!(ppu.sprite_time_over, ">34 tiles on one line sets time-over");
+    }
+
+    #[test]
+    fn render_scanline_sets_overflow_flags_with_obj_off_and_forced_blank() {
+        // The Electronics Test of Nintendo's SNES Test Program needs this:
+        // STAT77 ($213E) range/time-over must be set by sprite evaluation even
+        // when OBJ is disabled on both screens AND the screen is in
+        // forced blank, only compositing is display-gated on hardware
+        // (checked against snes9x). render_obj_row (the
+        // painted path) would be skipped in both states, so the flags
+        // have to come from the unconditional eval in render_scanline.
+        let mut ppu = obj_test_ppu();
+        ppu.vram[0] = 0x00FF;
+        ppu.cgram[129] = 0x1234;
+        for i in 0..33 {
+            set_sprite(&mut ppu, i, 0, 0, 0, 0);
+        }
+        // OBJ off on both screens + forced blank: the painter never runs.
+        ppu.obj_main_enable = false;
+        ppu.obj_sub_enable = false;
+        ppu.display_disable = true;
+
+        let mut fb = Framebuffer::new(NORMAL_SCANLINE_WIDTH as u32, 224);
+        ppu.render_scanline(1, &mut fb);
+        assert!(
+            ppu.sprite_range_over,
+            "range-over must be set even with OBJ off + forced blank"
+        );
+    }
+
+    #[test]
+    fn cached_sprite_tile_reuses_until_generation_bumps() {
+        let mut ppu = obj_test_ppu();
+        ppu.vram[0] = 0x00FF; // tile 0 row 0 -> index 1 across
+
+        let first = ppu.cached_sprite_tile(0);
+        assert_eq!(first[0], 1);
+        let second = ppu.cached_sprite_tile(0);
+        assert_eq!(first, second, "same generation -> identical cache hit");
+
+        // Poke VRAM without bumping the generation: the cache must keep
+        // serving the prior decode (coherence is generation-keyed, and
+        // real writes only land while the generation can move).
+        ppu.vram[0] = 0x0000;
+        assert_eq!(
+            ppu.cached_sprite_tile(0)[0],
+            1,
+            "stale VRAM poke under a frozen generation stays cached"
+        );
+
+        // A landed VRAM write bumps the generation -> re-decode.
+        ppu.vram_generation += 1;
+        assert_eq!(
+            ppu.cached_sprite_tile(0)[0],
+            0,
+            "generation bump forces a fresh decode"
+        );
+    }
+
+    #[test]
+    fn render_scanline_clears_sprite_overflow_at_frame_top() {
+        let mut ppu = Ppu::new();
+        ppu.display_disable = false;
+        ppu.display_brightness = 15;
+        // Push all 128 sprites off the tested scanlines (Y=224, the Y
+        // byte is OAM offset +1): an all-zero OAM otherwise parks 128 8x8
+        // sprites at Y=0, which the unconditional `eval_obj_overflow`
+        // would (correctly) count as a line-0 range overflow and re-set
+        // the flag right after the frame-top clear we're trying to
+        // observe.
+        for i in 0..128 {
+            ppu.oam[i * 4 + 1] = 0xE0;
+        }
+        ppu.sprite_range_over = true;
+        ppu.sprite_time_over = true;
+        let mut fb = Framebuffer::new(256, 224);
+
+        // Scanline 1 is the frame top -> both flags reset.
+        ppu.render_scanline(1, &mut fb);
+        assert!(!ppu.sprite_range_over);
+        assert!(!ppu.sprite_time_over);
+
+        // A mid-frame scanline must NOT touch them (they accumulate).
+        ppu.sprite_range_over = true;
+        ppu.render_scanline(50, &mut fb);
+        assert!(ppu.sprite_range_over, "only the frame top clears the flags");
+    }
+
+    #[test]
+    fn render_scanline_clears_overflow_even_in_forced_blank() {
+        let mut ppu = Ppu::new();
+        ppu.display_disable = true; // forced blank short-circuits below
+                                    // Off-screen OAM (Y byte at offset +1; see frame-top-clear test)
+                                    // so the unconditional overflow eval doesn't re-flag a line-0
+                                    // all-zero OAM.
+        for i in 0..128 {
+            ppu.oam[i * 4 + 1] = 0xE0;
+        }
+        ppu.sprite_range_over = true;
+        ppu.sprite_time_over = true;
+        let mut fb = Framebuffer::new(256, 224);
+        ppu.render_scanline(1, &mut fb);
+        assert!(
+            !ppu.sprite_range_over,
+            "frame-top clear precedes forced blank"
+        );
+        assert!(!ppu.sprite_time_over);
     }
 }

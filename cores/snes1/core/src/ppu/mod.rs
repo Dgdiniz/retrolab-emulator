@@ -54,6 +54,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+mod backgrounds;
 pub mod cgram;
 pub mod colormath;
 mod debug;
@@ -64,8 +65,10 @@ pub mod line_reads;
 pub mod mode7;
 pub use line_reads::{OffsetPerTileTable, WindowMasks};
 pub mod oam;
+mod picture;
 pub mod record;
 pub use record::LineState;
+mod redraw;
 pub mod regs;
 pub mod render;
 pub mod sprite;

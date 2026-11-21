@@ -1,5 +1,5 @@
 //! Mode 7 matrix + multiplier: `$211A` M7SEL, `$211B-$2120` M7A-M7Y,
-//! `$2134-$2136` MPYL/MPYM/MPYH.
+//! `$2134-$2136` MPYL/MPYM/MPYH; and the affine plane's rows.
 //!
 //! Mode 7 turns BG1 into an affine-transformed plane. The six
 //! coefficients (A, B, C, D, X, Y) are 16-bit each; the chip
@@ -23,7 +23,19 @@
 //!
 //! Each MPYL/M/H read updates [`Ppu::ppu1_mdr`] with the byte
 //! returned, so partial reads see the right "open bus" tail.
+//!
+//! ## The affine rows
+//!
+//! `Ppu::render_mode7_rows` fills BG1's row buffer from the plane, and
+//! BG2's with EXTBG, for the renderer's composite. The rows go through
+//! the same mosaic / snapshot / composite pipeline as the tile modes;
+//! only the BG fill differs.
 
+use retro_core::capture::PixelTrace;
+
+use super::render::{direct_color_word, BgRowBuffer, BgRowPixel, NORMAL_SCANLINE_WIDTH};
+use super::tile::{mode7_clip, mode7_sample, mode7_sample_at, sign_extend_13};
+use super::trace::{mode7_origin, FrameTrace};
 use super::Ppu;
 
 impl Ppu {
@@ -111,11 +123,145 @@ impl Ppu {
         self.ppu1_mdr = byte;
         byte
     }
+
+    // -- Rasteriser -------------------------------------------
+
+    /// Fill the Mode 7 BG row buffers from the affine plane.
+    ///
+    /// Mode 7 replaces the four tile BGs with one affine layer
+    /// (BG1). With EXTBG (`$2133` bit 6) the same sampled byte also
+    /// feeds BG2: its low 7 bits are the colour index and bit 7 is
+    /// the priority bit. Only `main_rows` is filled, Mode 7 is
+    /// non-hires so the sub plane never reaches the composite.
+    /// `bg1` and `bg2` say which of the two rows to fill: the compositor
+    /// fills the ones on the main screen (BG2 only with EXTBG), a
+    /// single-layer render the one it draws.
+    ///
+    /// The matrix math is the hardware's as Anomie's Mode 7 notes give
+    /// it (checked against bsnes-plus). Coefficients A-D are 8.8 fixed
+    /// point; the `& !63` truncation on the three base terms of each
+    /// axis is the chip's (the `(cx << 8)` centre term and the
+    /// per-pixel `A*xf` / `C*xf` terms are not truncated).
+    /// [`sign_extend_13`] reads the centre / scroll registers;
+    /// [`mode7_clip`] is the separate clip applied to the
+    /// scroll-minus-centre differences.
+    pub(super) fn render_mode7_rows<T: PixelTrace<Notes = FrameTrace>>(
+        &self,
+        scanline: u16,
+        main_rows: &mut [BgRowBuffer; 4],
+        bg1: bool,
+        bg2: bool,
+        trace: &mut T,
+    ) {
+        let a = self.m7a as i16 as i32;
+        let b = self.m7b as i16 as i32;
+        let c = self.m7c as i16 as i32;
+        let d = self.m7d as i16 as i32;
+        let cx = sign_extend_13(self.m7x);
+        let cy = sign_extend_13(self.m7y);
+        let hofs = sign_extend_13(self.mode7_hoffset);
+        let vofs = sign_extend_13(self.mode7_voffset);
+
+        // World line = the 1-indexed SNES vcounter (1 on the first
+        // visible scanline).
+        // The tile renderer feeds `scanline` straight into `screen_y`
+        // for the same reason, so Mode 7 must NOT subtract 1 or it
+        // would sit one row above every tile-mode BG. Vertical flip
+        // mirrors around 255, matching the hardware.
+        let line = i32::from(scanline);
+        let y = if self.mode7_vflip { 255 - line } else { line };
+
+        let sx0 = mode7_clip(hofs - cx);
+        let sy0 = mode7_clip(vofs - cy);
+        let base_x = (a.wrapping_mul(sx0) & !63)
+            .wrapping_add(b.wrapping_mul(sy0) & !63)
+            .wrapping_add(b.wrapping_mul(y) & !63)
+            .wrapping_add(cx << 8);
+        let base_y = (c.wrapping_mul(sx0) & !63)
+            .wrapping_add(d.wrapping_mul(sy0) & !63)
+            .wrapping_add(d.wrapping_mul(y) & !63)
+            .wrapping_add(cy << 8);
+
+        let direct = self.direct_color;
+        let bg1_main = bg1;
+        let bg2_main = bg2;
+
+        // Two independent row buffers (BG1 + EXTBG BG2) are written at the
+        // same x; zipping both through iterators would obscure the mode-7
+        // coordinate math for no gain.
+        #[allow(clippy::needless_range_loop)]
+        for x in 0..NORMAL_SCANLINE_WIDTH {
+            let xf = if self.mode7_hflip {
+                255 - x as i32
+            } else {
+                x as i32
+            };
+            let px = base_x.wrapping_add(a.wrapping_mul(xf)) >> 8;
+            let py = base_y.wrapping_add(c.wrapping_mul(xf)) >> 8;
+
+            // A traced redraw notes where the byte came from too.
+            let (byte, sample) = if T::ON {
+                let Some(sample) = mode7_sample_at(self.vram(), px, py, self.mode7_repeat) else {
+                    continue;
+                };
+                (sample.byte, Some(sample))
+            } else {
+                let Some(byte) = mode7_sample(self.vram(), px, py, self.mode7_repeat) else {
+                    continue;
+                };
+                (byte, None)
+            };
+
+            // BG1: the full 8-bit value indexes CGRAM, or runs
+            // through the direct-colour decode when CGWSEL bit 0 is
+            // set. Pixel 0 is transparent.
+            if bg1_main && byte != 0 {
+                let color = if direct {
+                    direct_color_word(byte, 0)
+                } else {
+                    self.cgram()[byte as usize]
+                };
+                main_rows[0][x] = BgRowPixel {
+                    color,
+                    opaque: true,
+                    priority: false,
+                };
+                if T::ON {
+                    if let Some(sample) = sample {
+                        trace.notes().fetch[0][x] = mode7_origin(sample, byte, direct, false);
+                    }
+                }
+            }
+
+            // BG2 (EXTBG): low 7 bits = colour index, bit 7 =
+            // priority. Direct colour never applies, BG2 has only
+            // 128 colours.
+            if bg2_main {
+                let idx = byte & 0x7F;
+                if idx != 0 {
+                    main_rows[1][x] = BgRowPixel {
+                        color: self.cgram()[idx as usize],
+                        opaque: true,
+                        priority: byte & 0x80 != 0,
+                    };
+                    if T::ON {
+                        if let Some(sample) = sample {
+                            trace.notes().fetch[1][x] =
+                                mode7_origin(sample, idx, false, byte & 0x80 != 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retro_core::capture::NoTrace;
+
+    use crate::ppu::render::MAX_SCANLINE_WIDTH;
 
     #[test]
     fn m7sel_decodes_flip_and_repeat_bits() {
@@ -216,5 +362,81 @@ mod tests {
         assert_eq!(ppu.read_2134(), 0x00);
         assert_eq!(ppu.read_2135(), 0xCE);
         assert_eq!(ppu.read_2136(), 0xFF);
+    }
+
+    // -- Rasteriser -------------------------------------------
+
+    /// Identity-matrix Mode 7 PPU (A = D = 1.0 in 8.8 fixed point).
+    fn mode7_identity_ppu() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.bgmode = 7;
+        ppu.m7a = 0x0100;
+        ppu.m7d = 0x0100;
+        ppu
+    }
+
+    #[test]
+    fn render_mode7_identity_fills_bg1_from_vram() {
+        let mut ppu = mode7_identity_ppu();
+        ppu.bg_main_enable[0] = true;
+        // Scanline 1 with the identity matrix samples world row 1
+        // (the vcounter is 1-indexed), so screen (0,0) maps to
+        // world (px=0, py=1): tilemap (0,0) = vram[0] low byte (tile
+        // 0), and the character pixel (cx=0, cy=1) lives at
+        // vram[tile*64 + 1*8 + 0] = vram[8] high byte = 0x42.
+        ppu.vram[8] = 0x4200;
+        ppu.cgram[0x42] = 0x1234;
+
+        let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
+        ppu.render_mode7_rows(1, &mut rows, true, false, &mut NoTrace::<FrameTrace>::new());
+
+        assert!(rows[0][0].opaque);
+        assert_eq!(rows[0][0].color, 0x1234);
+        assert!(!rows[0][0].priority);
+    }
+
+    #[test]
+    fn render_mode7_extbg_splits_byte_into_bg1_and_bg2() {
+        let mut ppu = mode7_identity_ppu();
+        ppu.mode7_extbg = true;
+        ppu.bg_main_enable[0] = true;
+        ppu.bg_main_enable[1] = true;
+        // Scanline 1 samples world (0,1) -> tile 0 pixel (cx=0, cy=1)
+        // at vram[8] high byte. Sampled byte 0x83: bit 7 set (high
+        // priority), index 0x03.
+        ppu.vram[8] = 0x8300;
+        ppu.cgram[0x83] = 0xAAAA;
+        ppu.cgram[0x03] = 0x5555;
+
+        let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
+        ppu.render_mode7_rows(1, &mut rows, true, true, &mut NoTrace::<FrameTrace>::new());
+
+        // BG1 uses the full 8-bit value at low priority.
+        assert!(rows[0][0].opaque);
+        assert_eq!(rows[0][0].color, 0xAAAA);
+        assert!(!rows[0][0].priority);
+        // BG2 uses the low 7 bits as colour + bit 7 as priority.
+        assert!(rows[1][0].opaque);
+        assert_eq!(rows[1][0].color, 0x5555);
+        assert!(rows[1][0].priority);
+    }
+
+    #[test]
+    fn render_mode7_direct_color_bg1_bypasses_cgram() {
+        let mut ppu = mode7_identity_ppu();
+        ppu.direct_color = true;
+        ppu.bg_main_enable[0] = true;
+        // Scanline 1 samples world (0,1) -> tile 0 pixel (cx=0, cy=1)
+        // at vram[8] high byte. Pixel byte 0x07 -> direct-colour
+        // decode (palette_number 0).
+        ppu.vram[8] = 0x0700;
+        // Poison cgram[0x07] so an accidental lookup would show.
+        ppu.cgram[0x07] = 0x7FFF;
+
+        let mut rows = [[BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH]; 4];
+        ppu.render_mode7_rows(1, &mut rows, true, false, &mut NoTrace::<FrameTrace>::new());
+
+        assert!(rows[0][0].opaque);
+        assert_eq!(rows[0][0].color, direct_color_word(0x07, 0));
     }
 }

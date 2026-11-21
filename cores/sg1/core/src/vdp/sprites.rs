@@ -1,9 +1,15 @@
 //! The sprites of the VDP's sprite table: their attributes, the link chain
-//! the chip walks, and the list the renderer parses once a frame.
+//! the chip walks, the list the renderer parses once a frame, and the
+//! drawing of each line's sprites.
 //!
 //! The table holds 80 sprites in the 40-cell mode, 64 in the 32-cell mode;
-//! a line shows at most 20 or 16 of them. The renderer
-//! (`Vdp::render_sprite_line`) draws them line by line from the list here.
+//! a line shows at most 20 or 16 of them. `Vdp::render_sprite_line` draws
+//! them line by line from the list here.
+
+use retro_core::capture::{PixelTrace, SpriteFate};
+
+use super::sources::LineTrace;
+use super::Vdp;
 
 /// Sprite data structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +228,237 @@ impl SpriteCache {
 impl Default for SpriteCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Vdp {
+    /// Render all sprite pixels for a given scanline into the sprite line buffer.
+    /// Called ONCE per scanline. The buffer is then read during compositing.
+    ///
+    /// Implements sprite masking per the Mega Drive VDP:
+    /// - When a sprite with raw X position = 0 is encountered AND at least one
+    ///   sprite with X > 0 was already seen, all remaining sprites on this
+    ///   scanline are masked (not drawn).
+    /// - Per-scanline pixel count limit (320 in H40, 256 in H32).
+    /// - The masking flag carries over to the next scanline when the pixel
+    ///   limit is reached.
+    ///
+    /// With a trace (`T::ON`) it also notes each sprite the evaluation met
+    /// and, where the line's sprite limit or its dots stop the evaluation,
+    /// the sprites on the line after, read without changing anything; and
+    /// the sprite each pixel of the line buffer came from.
+    pub(super) fn render_sprite_line<T: PixelTrace<Notes = LineTrace>>(
+        &mut self,
+        line: u16,
+        trace: &mut T,
+    ) {
+        let width = self.display_width() as usize;
+        let is_h40 = (self.registers[12] & 0x01) != 0;
+        let max_sprite_pixels: i32 = if is_h40 { 320 } else { 256 };
+        // Per-line sprite count limit: 20 in H40, 16 in H32 (viewport.w >> 4).
+        let max_sprites_per_line: u16 = if is_h40 { 20 } else { 16 };
+
+        // Ensure sprite line buffers are large enough
+        if self.sprite_line_color.len() < width {
+            self.sprite_line_color.resize(width, 0);
+            self.sprite_line_palette.resize(width, 0);
+            self.sprite_line_priority.resize(width, false);
+        }
+
+        // Clear sprite line buffers
+        for i in 0..width {
+            self.sprite_line_color[i] = 0;
+            self.sprite_line_palette[i] = 0;
+            self.sprite_line_priority[i] = false;
+        }
+
+        // Clear collision tracking
+        for i in 0..width {
+            self.sprite_pixel_buffer[i] = false;
+        }
+
+        if !self.sprite_cache_valid {
+            self.rebuild_sprite_cache();
+            if self.recording.is_some() {
+                self.record_sprite_list(line);
+            }
+        }
+
+        // Build list of sprites on this line with masking (reuse scratch buffer)
+        //
+        // Sprites are taken in link order (front to back). A sprite at raw
+        // X = 0 (screen X = -128) hides every sprite after it on the line,
+        // but only once the mask is armed: by an earlier sprite of this line
+        // at any other X, or by the line above having run out of sprite dots.
+        // (Both cases are documented from hardware tests; checked against
+        // Genesis Plus GX.)
+        self.sprites_on_line_buf.clear();
+        let scanline = line as i16;
+        let mut count = 0u16;
+        let mut masked = false;
+        let mut mask_armed = self.sprite_mask_overflow;
+        let mut pixel_count: i32 = 0;
+        // When the per-line dot budget is crossed mid-sprite, that one sprite
+        // is drawn clipped to the remaining dots. -1 = no sprite clipped.
+        let mut clip_sprite_idx: i32 = -1;
+        let mut clip_x_end: i16 = 0;
+        // For a trace: the first sprite of the list not taken when the
+        // evaluation stopped, and why it stopped.
+        let mut stopped_at: Option<(usize, SpriteFate)> = None;
+        if T::ON {
+            trace.notes().begin_sprites(self.sprite_mask_overflow);
+        }
+
+        for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate() {
+            let (_, y1, _, y2) = sprite.bounds();
+            if scanline >= y1 && scanline < y2 {
+                count += 1;
+                if count > max_sprites_per_line {
+                    self.sprite_overflow = true;
+                    if T::ON {
+                        trace.notes().over_sprite_limit();
+                        stopped_at = Some((idx, SpriteFate::OverLineLimit));
+                    }
+                    break;
+                }
+
+                // Raw SAT X position: sprite.x is screen-adjusted (raw - 128)
+                let raw_x = sprite.x + 128;
+                if raw_x != 0 {
+                    mask_armed = true;
+                } else if mask_armed {
+                    masked = true;
+                }
+
+                let sprite_width_px = sprite.width_tiles as i32 * 8;
+                let pixel_count_before = pixel_count;
+                pixel_count += sprite_width_px;
+
+                if !masked {
+                    self.sprites_on_line_buf.push(idx as u16);
+                }
+                if T::ON {
+                    let slot = self.sprite_cache.slot_at(idx);
+                    trace.notes().met_sprite(slot, idx as u8, sprite, masked);
+                }
+
+                if pixel_count >= max_sprite_pixels {
+                    // Dot limit crossed mid-sprite: that sprite is drawn clipped
+                    // to the remaining budget. The chip draws whole 8px tiles
+                    // measured from the sprite's left edge (off-screen dots still
+                    // count toward the budget, so clip in raw sprite space;
+                    // checked against Genesis Plus GX).
+                    if !masked {
+                        let allowed_tiles = (max_sprite_pixels - pixel_count_before).max(0) >> 3;
+                        clip_sprite_idx = idx as i32;
+                        clip_x_end = sprite.x + allowed_tiles as i16 * 8;
+                    }
+                    self.sprite_mask_overflow = pixel_count >= width as i32;
+                    if T::ON {
+                        trace.notes().dots_ran_out((!masked).then_some(clip_x_end));
+                        stopped_at = Some((idx + 1, SpriteFate::LeftOut));
+                    }
+                    // The limit was hit, so the flag is not cleared below.
+                    break;
+                }
+            }
+        }
+
+        // Clear masking for next line if pixel limit was NOT reached
+        if pixel_count < max_sprite_pixels {
+            self.sprite_mask_overflow = false;
+        }
+
+        // For a trace, the sprites on the line after the evaluation
+        // stopped: read, never taken.
+        if T::ON {
+            if let Some((first, fate)) = stopped_at {
+                for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate().skip(first) {
+                    let (_, y1, _, y2) = sprite.bounds();
+                    if scanline >= y1 && scanline < y2 {
+                        let slot = self.sprite_cache.slot_at(idx);
+                        trace.notes().left_out(slot, idx as u8, sprite, fate);
+                    }
+                }
+            }
+        }
+
+        // Render sprites in REVERSE order (lowest priority first) so that
+        // higher-priority sprites (earlier in list) overwrite lower ones.
+        let num_sprites = self.sprites_on_line_buf.len();
+        for si in (0..num_sprites).rev() {
+            let sprite_idx = self.sprites_on_line_buf[si] as usize;
+            let sprite = self.sprite_cache.sprites()[sprite_idx];
+            let slot = if T::ON {
+                self.sprite_cache.slot_at(sprite_idx)
+            } else {
+                0
+            };
+            let (sx1, sy1, sx2, _sy2) = sprite.bounds();
+
+            let local_y = (scanline - sy1) as u16;
+            let flipped_y = if sprite.flip_v {
+                sprite.height_tiles as u16 * 8 - 1 - local_y
+            } else {
+                local_y
+            };
+
+            let sprite_width_px = sprite.width_tiles as i16 * 8;
+
+            // Clip to screen (ensure bounds are valid)
+            let x_start = sx1.max(0) as usize;
+            let mut x_end_raw = sx2;
+            if sprite_idx as i32 == clip_sprite_idx {
+                x_end_raw = x_end_raw.min(clip_x_end);
+            }
+            let x_end = x_end_raw.clamp(0, width as i16) as usize;
+
+            for screen_x in x_start..x_end {
+                let local_x = (screen_x as i16 - sx1) as u16;
+                let flipped_x = if sprite.flip_h {
+                    sprite_width_px as u16 - 1 - local_x
+                } else {
+                    local_x
+                };
+
+                let tile_x = flipped_x / 8;
+                let tile_y = flipped_y / 8;
+                let pixel_x = (flipped_x % 8) as u8;
+                let pixel_y = (flipped_y % 8) as u8;
+
+                // Column-major tile layout
+                let tile_offset = tile_x * sprite.height_tiles as u16 + tile_y;
+                let pattern_index = sprite.pattern_base + tile_offset;
+
+                let color_index =
+                    Self::read_tile_pixel_from_vram(&self.vram, pattern_index, pixel_x, pixel_y);
+
+                if color_index == 0 {
+                    continue; // Transparent
+                }
+
+                // Track collision: if a sprite pixel already exists at this x
+                if self.sprite_line_color[screen_x] != 0 {
+                    self.sprite_collision = true;
+                }
+
+                // Write to line buffer (earlier sprites overwrite later ones)
+                self.sprite_line_color[screen_x] = color_index;
+                self.sprite_line_palette[screen_x] = sprite.palette;
+                self.sprite_line_priority[screen_x] = sprite.priority;
+                if T::ON {
+                    trace.notes().sprite_pixel(
+                        screen_x,
+                        slot,
+                        pattern_index,
+                        pixel_y,
+                        pixel_x,
+                        sprite.flip_h,
+                        sprite.flip_v,
+                    );
+                }
+            }
+        }
     }
 }
 
