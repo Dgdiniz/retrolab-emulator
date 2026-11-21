@@ -126,6 +126,29 @@ fn test_interlace_mode_register() {
 }
 
 #[test]
+fn the_status_reads_the_odd_field_only_while_interlace_is_on() {
+    let mut vdp = Vdp::new();
+    let odd_field = |vdp: &Vdp| vdp.get_status_register() & 0x0010 != 0;
+    vdp.odd_frame = true;
+
+    // Shadow and highlight (bit 3), the unused bit 4 and bit 2 alone are
+    // not interlace: an odd field reads clear.
+    for register_12 in [0x81, 0x89, 0x91, 0x99, 0x85] {
+        vdp.set_test_register(12, register_12);
+        assert!(!odd_field(&vdp), "register 12 = {register_12:#04X}");
+    }
+    // Interlace (bit 1): in normal resolution, in double resolution, and
+    // with shadow and highlight on.
+    for register_12 in [0x83, 0x87, 0x8B] {
+        vdp.set_test_register(12, register_12);
+        assert!(odd_field(&vdp), "register 12 = {register_12:#04X}");
+    }
+    // The even field reads clear with interlace on.
+    vdp.odd_frame = false;
+    assert!(!odd_field(&vdp));
+}
+
+#[test]
 fn test_sprite_overflow_flag() {
     let mut vdp = Vdp::new();
 

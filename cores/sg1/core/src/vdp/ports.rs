@@ -224,11 +224,11 @@ impl Vdp {
             status |= 0x0020;
         }
 
-        // Bit 4: Odd Frame (for interlace mode)
-        // Set in odd frames while register 12 bits 4-3 are non-zero, although
-        // the interlace mode is bits 2-1 (bit 3 is shadow/highlight)
-        let interlace_mode = (self.registers[12] >> 3) & 0x03;
-        if interlace_mode != 0 && self.odd_frame {
+        // Bit 4: Odd Frame. Set in odd fields while interlace is on
+        // (register 12 bit 1, in either interlace mode), and clear otherwise,
+        // as Genesis Plus GX and MAME report it.
+        let interlaced = (self.registers[12] & 0x02) != 0;
+        if interlaced && self.odd_frame {
             status |= 0x0010;
         }
 
