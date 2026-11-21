@@ -813,7 +813,7 @@ mod tests {
     use crate::debug::expr::{ByteOrder, CpuExprContext};
     use crate::types::{
         AudioInfo, BreakpointType, CpuArchitecture, CpuLocation, DisplayInfo, EventKind, InputInfo,
-        MemoryRegion, PixelFormat, BREAKPOINT_PARAM_ANY,
+        MemoryRegion, PictureGrid, PixelFormat, BREAKPOINT_PARAM_ANY,
     };
 
     /// A main CPU: 16 MiB of coverage, a 24-bit mask, 4-byte trace entries,
@@ -867,6 +867,7 @@ mod tests {
                 aspect_ratio: 1.0,
                 refresh_rate: 60.0,
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 1,

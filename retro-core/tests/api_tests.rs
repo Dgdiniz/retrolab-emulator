@@ -32,6 +32,7 @@ fn test_system_info_serialization() {
             aspect_ratio: 4.0 / 3.0,
             refresh_rate: 60.0,
             pixel_format: PixelFormat::RGBA8888,
+            grid: PictureGrid::ONE,
         },
         audio: AudioInfo {
             sample_rate: 44100,

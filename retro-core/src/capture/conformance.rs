@@ -125,6 +125,9 @@ macro_rules! capture_conformance_tests {
             a_debugger_edit_makes_the_line_table_inexact_until_the_next_frame,
             the_picture_from_the_line_table_needs_the_whole_frame,
             the_frame_number_names_the_picture_the_host_holds,
+            the_snapshot_s_grid_is_the_display_s,
+            the_picture_is_whole_lines_of_the_line_table,
+            a_sprite_s_picture_box_holds_where_its_lines_drew_it,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -910,6 +913,153 @@ pub fn the_frame_number_names_the_picture_the_host_holds<E: CaptureCore>(core: &
     numbers.are_those_of(Place::InVerticalBlank, "stopped in the vertical blank");
     core.numbers(&mut emu)
         .are_those_of(Place::Finished, "after the stopped frame ran to its end");
+}
+
+/// The grid a frame snapshot gives its picture is the one the core's
+/// display information gives, after a whole frame and held at the capture
+/// boundary.
+pub fn the_snapshot_s_grid_is_the_display_s<E: CaptureCore>(core: &CoreUnderTest<E>) {
+    let grids = |emu: &E| {
+        (
+            emu.capture_frame_snapshot().grid,
+            emu.get_display_info().grid,
+        )
+    };
+    let mut emu = core.warmed_up(CaptureRecording::default());
+    let (snapshot, display) = grids(&emu);
+    assert_eq!(
+        snapshot, display,
+        "after a whole frame: the snapshot's grid is not the display information's"
+    );
+    emu.run_to_capture_boundary();
+    let (snapshot, display) = grids(&emu);
+    assert_eq!(
+        snapshot, display,
+        "held at the capture boundary: the snapshot's grid is not the display information's"
+    );
+}
+
+/// Held at the capture boundary, the picture is a whole number of dots
+/// wide and of lines high on its grid, a woven grid gives a line more than
+/// one row, and every line the picture's rows show is a line of the frame's
+/// line table, which gives a line the rows the grid gives it.
+pub fn the_picture_is_whole_lines_of_the_line_table<E: CaptureCore>(core: &CoreUnderTest<E>) {
+    let mut emu = core.warmed_up(EVERY_RECORDER);
+    for _ in 0..FRAMES {
+        emu.run_to_capture_boundary();
+        let snapshot = emu.capture_frame_snapshot();
+        let (frame, grid) = (snapshot.frame, snapshot.grid);
+        let columns = u32::from(grid.columns_per_dot);
+        let rows = u32::from(grid.rows_per_line);
+        assert!(
+            columns >= 1 && rows >= 1,
+            "frame {frame}: the grid gives a dot {columns} columns and a line {rows} rows"
+        );
+        assert!(
+            !grid.woven || rows >= 2,
+            "frame {frame}: a woven grid gives a line one row"
+        );
+        assert!(
+            snapshot.width.is_multiple_of(columns) && snapshot.height.is_multiple_of(rows),
+            "frame {frame}: a {}x{} picture is not whole dots and lines of {columns} columns and \
+             {rows} rows",
+            snapshot.width,
+            snapshot.height
+        );
+        let table = emu.line_states().expect("the line table is kept");
+        assert!(
+            table.from_first_line && table.complete,
+            "frame {frame}: held at the boundary, the line table does not hold the whole frame"
+        );
+        assert_eq!(
+            table.rows_per_line, rows,
+            "frame {frame}: the line table gives a line other rows than the grid"
+        );
+        let width = table.columns.len().max(1);
+        let lines: BTreeSet<u32> = table.values.chunks(width).map(|row| row[0]).collect();
+        for shown in 0..snapshot.height / rows {
+            let line = table.first_row_line + shown;
+            assert!(
+                lines.contains(&line),
+                "frame {frame}: the picture's rows show line {line}, which the line table does not \
+                 hold"
+            );
+        }
+    }
+}
+
+/// Every sprite a line of the held frame drew lies inside the box the
+/// sprite list gives it on the picture: the box starts at the sprite's x
+/// and spans its width, each dot taking the grid's columns, and holds every
+/// row of each line the picture shows that drew it. The sprite table gives
+/// the same box.
+pub fn a_sprite_s_picture_box_holds_where_its_lines_drew_it<E: CaptureCore>(
+    core: &CoreUnderTest<E>,
+) {
+    let mut emu = core.warmed_up(EVERY_RECORDER);
+    core.hold_a_frame_with_sprites(&mut emu);
+    let snapshot = emu.capture_frame_snapshot();
+    let frame = snapshot.frame;
+    let columns = i64::from(snapshot.grid.columns_per_dot);
+    let rows = i64::from(snapshot.grid.rows_per_line);
+    let table = emu.line_states().expect("the line table is kept");
+    let sprites = emu.line_sprites().expect("a program is loaded");
+    let video = emu.video_debugger();
+    let list = video.get_sprite_data();
+    let entries = video.sprite_table();
+    let mut checked = 0;
+    for line in sprites.lines.as_chunks::<LINE_SPRITES_STRIDE>().0 {
+        let (number, first, count) = (line[0], usize::from(line[1]), usize::from(line[2]));
+        if line[3] & line_flags::NOT_SHOWN != 0 {
+            continue;
+        }
+        let top = (i64::from(number) - i64::from(table.first_row_line)) * rows;
+        if top < 0 || top >= i64::from(snapshot.height) {
+            continue;
+        }
+        for entry in first..first + count {
+            if sprites.drawn_width[entry] == 0 {
+                continue;
+            }
+            let slot = u32::from(sprites.slots[entry]);
+            let sprite = list
+                .iter()
+                .find(|sprite| sprite.index == slot)
+                .unwrap_or_else(|| {
+                    panic!("frame {frame}: line {number} drew sprite {slot}, which the list lacks")
+                });
+            let found = sprite.picture;
+            let (x, y) = (i64::from(found.x), i64::from(found.y));
+            assert_eq!(
+                (x, i64::from(found.width)),
+                (
+                    i64::from(sprites.x[entry]) * columns,
+                    i64::from(sprites.width[entry]) * columns
+                ),
+                "frame {frame}, line {number}: sprite {slot}'s box does not start at its x and \
+                 span its width"
+            );
+            assert!(
+                y <= top && top + rows <= y + i64::from(found.height),
+                "frame {frame}: line {number} drew sprite {slot} on rows {top} to {}, outside its \
+                 box's rows {y} to {}",
+                top + rows - 1,
+                y + i64::from(found.height) - 1
+            );
+            if let Some(listed) = entries.iter().find(|listed| listed.index == slot) {
+                assert_eq!(
+                    listed.picture, found,
+                    "frame {frame}: the sprite table and the sprite list give sprite {slot} two \
+                     boxes"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "frame {frame}: no line the picture shows drew a sprite"
+    );
 }
 
 // -- What the checks share -----------------------------------------------

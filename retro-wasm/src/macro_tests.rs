@@ -469,7 +469,21 @@ fn the_video_readers_answer_the_chip() {
     let layers = Array::from(&emu.get_layer_info());
     assert_eq!(get(&layers.get(1), "enabled").as_bool(), Some(false));
     assert_eq!(Array::from(&emu.get_sprite_data()).length(), 2);
+    assert_eq!(
+        shape(&Array::from(&emu.get_sprite_data()).get(1)),
+        "{flip_h: false, flip_v: true, height: 16, index: 1, palette: 1, picture: {height: 16, \
+         width: 16, x: 16, y: -4}, priority: 0, tile_index: 2, width: 8, x: 8, y: -4}"
+    );
+    let table = Array::from(&emu.get_sprite_table());
+    assert_eq!(
+        shape(&get(&table.get(1), "picture")),
+        "{height: 16, width: 16, x: 16, y: -4}"
+    );
     assert!(Array::is_array(&emu.resolved_sprite_render_order()));
+    assert_eq!(
+        shape(&emu.get_colour_levels()),
+        "{levels: [0, 85, 170, 255], name: \"fake-4\"}"
+    );
 
     let sprite = emu.export_sprite_image(0);
     assert_eq!(

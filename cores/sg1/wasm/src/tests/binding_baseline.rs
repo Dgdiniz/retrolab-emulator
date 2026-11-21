@@ -341,7 +341,7 @@ fn the_machine_calls_and_what_each_leaves() {
     found.value("after loadStateAnyRom", machine(&emu));
     found.check(
         r#"
-getSystemInfo, new => {audio: {bits_per_sample: 16, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (3193 chars, fnv1a64 0x8e24177d6e85b7f7)
+getSystemInfo, new => {audio: {bits_per_sample: 16, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (3253 chars, fnv1a64 0x1d8c4dec750bf140)
 getRomInfo, new => undefined
 after new => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu68k", "z80", "vdp", "psg", "ym2612", "io", "bus", "timing", "ram", "z80_ram", "cartridge", "frame_count", "extension"]}
 getBuildId, up to the commit => "sg1@0.1.0+"
@@ -391,9 +391,9 @@ fn what_the_display_readers_answer() {
     found.value("display, headless frame", display(&emu));
     found.check(
         r#"
-display, new => {data: Uint8ClampedArray(len 286720, fnv1a64 0xe97846eb7709a325), displayInfo: {aspect_ratio: 1.3333333730697632, height: 224, pixel_format: "RGBA8888", refresh_rate: 59.92274475097656, width: 320}, framebuffer: {data: "Array(len 286720, bytes fnv1a64 0xe97846eb7709a325)", height: 224, width: 320}, height: 224, length: 286720, pointerHoldsData: true, width: 320}
-display, six frames => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333333730697632, height: 224, pixel_format: "RGBA8888", refresh_rate: 59.92274475097656, width: 320}, framebuffer: {data: "Array(len 286720, bytes fnv1a64 0x90450a1e4b4824fc)", height: 224, width: 320}, height: 224, length: 286720, pointerHoldsData: true, width: 320}
-display, headless frame => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333333730697632, height: 224, pixel_format: "RGBA8888", refresh_rate: 59.92274475097656, width: 320}, framebuffer: {data: "Array(len 286720, bytes fnv1a64 0x90450a1e4b4824fc)", height: 224, width: 320}, height: 224, length: 286720, pointerHoldsData: true, width: 320}
+display, new => {data: Uint8ClampedArray(len 286720, fnv1a64 0xe97846eb7709a325), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x8c0fb41cddd1d928)
+display, six frames => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x0ade6390f6b35e18)
+display, headless frame => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x0ade6390f6b35e18)
 "#,
     );
 }
@@ -828,6 +828,7 @@ fn what_the_vdp_readers_answer() {
     found.value("getSpriteTable", table);
     found.value("getSpriteTable().length", count);
     found.value("getSpriteData", emu.get_sprite_data());
+    found.value("getColourLevels", emu.get_colour_levels());
     found.value("getVideoRegisters", emu.get_video_registers());
     found.value("getVdpStatus", emu.get_vdp_status());
     found.value("getLayerInfo", emu.get_layer_info());
@@ -868,9 +869,10 @@ getPaletteColours => Uint8Array(len 256, fnv1a64 0x04a222ae447406c7)
 getLayerLayout(0) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 0, kind: "tile_map", map_base: 49152, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
 getLayerLayout(1) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 1, kind: "tile_map", map_base: 57344, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
 getLayerLayout(2) => {bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, id: 2, kind: "window", map_base: 0, map_height: 32, map_width: 64, scroll_x: 0, scroll_y: 0}
-getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: 1, palette: 0, priority: 0,... (7802 chars, fnv1a64 0x175170bfd925c33d)
+getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: 1, palette: 0, picture: {he... (10109 chars, fnv1a64 0xe68eaad726e710e5)
 getSpriteTable().length => 48
-getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, priority: 0, tile_index: 1, width: ... (9653 chars, fnv1a64 0x545889a0580deee1)
+getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, picture: {height: 8, width: 8, x: 3... (13560 chars, fnv1a64 0xe17ae78d3f223d43)
+getColourLevels => {levels: [0, 36, 73, 109, 146, 182, 219, 255], name: "mega-drive-8"}
 getVideoRegisters => [{description: "", index: 0, name: "Mode Register 1", value: 20}, {description: "", index: 1, name: ... (1576 chars, fnv1a64 0xbef5942b44db4bf4)
 getVdpStatus => 13932
 getLayerInfo => [{enabled: true, height: 256, id: 0, name: "Plane A", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: true, height: 256, id: 1, name: "Plane B", scroll_x: 0, scroll_y: 0, width: 512}, {enabled: true, height: 224, id: 2, name: "Window", scroll_x: 0, scroll_y: 0, width: 320}, {enabled: true, height: 224, id: 3, name: "Sprites", scroll_x: 0, scroll_y: 0, width: 320}]

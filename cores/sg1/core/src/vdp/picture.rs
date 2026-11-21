@@ -1,6 +1,9 @@
-//! The picture's size: the framebuffer's columns and rows, the width and
-//! height the mode registers set, the lines drawn, and the first line of
-//! vertical blanking.
+//! The picture's size and shape: the framebuffer's columns and rows, the
+//! width and height the mode registers set, the lines drawn, the first
+//! line of vertical blanking, and how the picture lies over the dots and
+//! lines.
+
+use retro_core::PictureGrid;
 
 use super::Vdp;
 
@@ -40,5 +43,11 @@ impl Vdp {
         } else {
             224 // V28 mode
         }
+    }
+
+    /// How the picture lies over the dots and lines: one column a dot and
+    /// one row a line, in both widths and both heights.
+    pub fn picture_grid(&self) -> PictureGrid {
+        PictureGrid::ONE
     }
 }

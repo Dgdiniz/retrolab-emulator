@@ -800,6 +800,7 @@ mod binding_tests {
                 aspect_ratio: 1.0,
                 refresh_rate: 60.0,
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 1,

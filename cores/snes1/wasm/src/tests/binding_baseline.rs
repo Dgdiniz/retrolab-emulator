@@ -328,65 +328,65 @@ fn the_machine_calls_and_what_each_leaves() {
     after(&mut found, "setShowOverscan(false)", &emu);
     found.check(
         r#"
-getSystemInfo, new => {audio: {bits_per_sample: 32, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (891 chars, fnv1a64 0x501a248e3c382618)
+getSystemInfo, new => {audio: {bits_per_sample: 32, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (951 chars, fnv1a64 0x991c27304b198b2f)
 getRomInfo, new => undefined
 after new => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after new => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after new => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 getBuildId, up to the commit => "snes1@0.1.0+"
 loadRom, no bytes => throws "ROM is empty after SMC strip"
 loadRom, a staged manifest that fails => throws "manifest error: unsupported preset: bogus"
 after the refusals => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after the refusals => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after the refusals => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 loadRom, ten bytes => undefined
 getRomInfo, ten bytes => undefined
 loadRom => undefined
 getRomInfo => {checksum: 4660, mapper: "LoROM", region: "USA", size: 131072, title: "CAPTURE PROGRAM", title_confidence: "high"}
 after loadRom => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after loadRom => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after loadRom => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 after runFrame => {frame: 1n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after runFrame => {data: Uint8ClampedArray(len 229376, fnv1a64 0xb0f0ebe99fb6c2ac), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xca3056287939c2ac)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after runFrame => {data: Uint8ClampedArray(len 229376, fnv1a64 0xb0f0ebe99fb6c2ac), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xb2f7b367c9d3286b)
 after a second runFrame => {frame: 2n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after a second runFrame => {data: Uint8ClampedArray(len 229376, fnv1a64 0x784768a1b2b37560), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xf50506300da7c560)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after a second runFrame => {data: Uint8ClampedArray(len 229376, fnv1a64 0x784768a1b2b37560), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x61a863ae27cc97b1)
 after runUntilVBlank => {frame: 2n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after runUntilVBlank => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xab1c4c2caf3ccafa)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after runUntilVBlank => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x194867b673dff128)
 saveState, held => {core: "snes1", coreVersion: 4, envelope: 1, rom: "a5346783813b83c2b6d5f38fd6606b44678654a3b6f52de3a07d66d101841885", stamped: false, type: "Uint8Array"}
 after saveState => {frame: 3n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after saveState => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xab1c4c2caf3ccafa)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after saveState => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x194867b673dff128)
 after runFrameHeadless => {frame: 4n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after runFrameHeadless => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x1ec21dc1593ed372)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after runFrameHeadless => {data: Uint8ClampedArray(len 229376, fnv1a64 0x75f379eed654dafa), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xd74e17f3a0691db1)
 after runFrame after it => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after runFrame after it => {data: Uint8ClampedArray(len 229376, fnv1a64 0x99cbcd38246f0743), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x0e6395eba9bc4743)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after runFrame after it => {data: Uint8ClampedArray(len 229376, fnv1a64 0x99cbcd38246f0743), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x77c43b7132eb9c96)
 setRegion('PAL') => undefined
 after setRegion('PAL') => {frame: 0n, region: "pal", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setRegion('PAL') => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 50.00697708129883, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after setRegion('PAL') => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x742963b3a5f30912)
 setRegion('pal') again => undefined
 after setRegion('pal') again => {frame: 1n, region: "pal", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setRegion('pal') again => {data: Uint8ClampedArray(len 229376, fnv1a64 0xb0f0ebe99fb6c2ac), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 50.00697708129883, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xca3056287939c2ac)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after setRegion('pal') again => {data: Uint8ClampedArray(len 229376, fnv1a64 0xb0f0ebe99fb6c2ac), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xb711725bedae74c6)
 setRegion('ntsc') => undefined
 after setRegion('ntsc') => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setRegion('ntsc') => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after setRegion('ntsc') => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 after reset => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after reset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after reset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 after hardReset => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after hardReset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after hardReset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 after powerOnReset => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after powerOnReset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x790b440c7bce2325)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after powerOnReset => {data: Uint8ClampedArray(len 229376, fnv1a64 0xc9b1e505f9a82325), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xecc4bf100c6d15e3)
 loadState => undefined
 after loadState => {frame: 3n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after loadState => {data: Uint8ClampedArray(len 229376, fnv1a64 0x063c1408b7656372), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x1ec21dc1593ed372)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after loadState => {data: Uint8ClampedArray(len 229376, fnv1a64 0x063c1408b7656372), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xa9e1246aed996d1e)
 getStateHash after loadState, as saved => true
 loadStateAnyRom => undefined
 after loadStateAnyRom => {frame: 3n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after loadStateAnyRom => {data: Uint8ClampedArray(len 229376, fnv1a64 0x063c1408b7656372), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x1ec21dc1593ed372)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after loadStateAnyRom => {data: Uint8ClampedArray(len 229376, fnv1a64 0x063c1408b7656372), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xa9e1246aed996d1e)
 isShowOverscanEnabled => false
 after a frame of 239 lines => {frame: 4n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after a frame of 239 lines => {data: Uint8ClampedArray(len 229376, fnv1a64 0xab440d62f2dac5c3), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0xcde9cc358cd454c3)", height: 480, width: 512}, height: 224, length: 229376, pointerHoldsData: true, width: 256}
+display after a frame of 239 lines => {data: Uint8ClampedArray(len 229376, fnv1a64 0xab440d62f2dac5c3), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0xf9ef2b1486b088ee)
 isShowOverscanEnabled, shown => true
 after a frame of 239 lines shown => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after a frame of 239 lines shown => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428571939468384, height: 240, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x2c7246b32520d7ee)", height: 480, width: 512}, height: 240, length: 245760, pointerHoldsData: true, width: 256}
+display after a frame of 239 lines shown => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x39c467ddb0ad8e9f)
 isShowOverscanEnabled, cropped => false
 after setShowOverscan(false) => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setShowOverscan(false) => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428571939468384, height: 224, pixel_format: "RGBA8888", refresh_rate: 60.09846878051758, width: 256}, framebuffer: {data: "Array(len 983040, bytes fnv1a64 0x2c7246b32520d7ee)", height: 480, width: 512}, height: 240, length: 245760, pointerHoldsData: true, width: 256}
+display after setShowOverscan(false) => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428... (424 chars, fnv1a64 0x7bcc3a54b8cf9ad5)
 "#,
     );
 }
@@ -827,6 +827,7 @@ fn what_the_ppu_readers_answer() {
     found.value("getSpriteTileSettings", emu.get_sprite_tile_settings());
     found.value("getPpuSettings", emu.get_ppu_settings());
     found.value("getSpriteData", emu.get_sprite_data());
+    found.value("getColourLevels", emu.get_colour_levels());
     let order = emu.resolved_sprite_render_order();
     found.value("resolvedSpriteRenderOrder", order);
     found.value("getLayerInfo", emu.get_layer_info());
@@ -871,10 +872,11 @@ getLayerLayout(7) => null
 getPaletteColours => Uint8Array(len 1024, fnv1a64 0x5d511455216071f5)
 getTileColours(0, 0, 0, 256, 4, 0, 0) => {data: Uint8Array(len 65536, fnv1a64 0x02921180a32eed05), height: 2048, width: 8}
 getTileColours(0, 0, 0, 256, 4, 0, 128) => {data: Uint8Array(len 65536, fnv1a64 0xa39e25b8d8271f55), height: 2048, width: 8}
-getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: undefined, palette: 0, prio... (21015 chars, fnv1a64 0xbfe5ab50ce3e3153)
+getSpriteTable => [{flip_h: false, flip_v: false, height: 8, index: 0, large: false, next: undefined, palette: 0, pict... (26651 chars, fnv1a64 0x9fe579ad64766e24)
 getSpriteTileSettings => {first_table_base_word: 0, large_height: 16, large_width: 16, second_table_base_word: 4096, small_height: 8, small_width: 8}
 getPpuSettings => {addsub_mode: false, bg3_priority: false, bg_main_enable: [true, false, false, false], bg_main_windo... (1786 chars, fnv1a64 0x9abb0ff1dbc4e28b)
-getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, priority: 3, tile_index: 1, width: ... (14870 chars, fnv1a64 0x94cfb7197b8e9f20)
+getSpriteData => [{flip_h: false, flip_v: false, height: 8, index: 0, palette: 0, picture: {height: 8, width: 8, x: 3... (20506 chars, fnv1a64 0xfe9ed5eeadff4617)
+getColourLevels => {levels: [0, 8, 16, 24, 33, 41, 49, 57, 66, 74, 82, 90, 99, 107, 115, 123, 132, 140, 148, 156, 165, 173, 181, 189, 198, 206, 214, 222, 231, 239, 247, 255], name: "snes-32"}
 resolvedSpriteRenderOrder => [{index: 33, priority: 0}, {index: 32, priority: 0}, {index: 31, priority: 0}, {index: 30, priority:... (874 chars, fnv1a64 0x662689a95191546f)
 getLayerInfo => [{enabled: true, height: 256, id: 0, name: "BG1", scroll_x: 30, scroll_y: 0, width: 256}, {enabled: ... (441 chars, fnv1a64 0xa6148a1925de5d23)
 getLayerInfo, BG1 hidden => [{enabled: false, height: 256, id: 0, name: "BG1", scroll_x: 30, scroll_y: 0, width: 256}, {enabled:... (442 chars, fnv1a64 0xc4b8cb33035f14a4)

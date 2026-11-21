@@ -175,6 +175,7 @@ impl CaptureCore for SnesEmulator {
             at_boundary: self.held_at_capture_boundary,
             width,
             height,
+            grid: self.system_info.display.grid,
             framebuffer: crop_rgba(
                 &self.framebuffer.data,
                 self.framebuffer.width,

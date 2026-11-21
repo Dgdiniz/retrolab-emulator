@@ -688,8 +688,8 @@ mod tests {
     use retro_core::types::ExecutionMode;
     use retro_core::types::{
         AudioInfo, Breakpoint, BreakpointId, BreakpointType, CpuArchitecture, CpuInfo, CpuLocation,
-        CpuState, DisplayInfo, InputInfo, InstructionTrace, PixelFormat, RegisterValue, StackFrame,
-        BREAKPOINT_PARAM_ANY,
+        CpuState, DisplayInfo, InputInfo, InstructionTrace, PictureGrid, PixelFormat,
+        RegisterValue, StackFrame, BREAKPOINT_PARAM_ANY,
     };
     use retro_core::DebuggerCore;
 
@@ -721,6 +721,7 @@ mod tests {
                 aspect_ratio: 4.0 / 3.0,
                 refresh_rate: 60.0,
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 44100,

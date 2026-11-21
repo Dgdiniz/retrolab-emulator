@@ -883,7 +883,7 @@ impl Ppu {
 
     /// The line drawn into the picture's first row: 8 when the overscan
     /// lines above the TV window are cropped, else 1.
-    fn first_row_line(&self) -> u32 {
+    pub(super) fn first_row_line(&self) -> u32 {
         if self.overscan && !self.show_overscan {
             8
         } else {

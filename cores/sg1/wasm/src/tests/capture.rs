@@ -25,6 +25,7 @@ fn a_frame_held_at_its_capture_boundary_is_read_drawn_and_saved() {
             "atBoundary",
             "width",
             "height",
+            "grid",
             "framebuffer",
             "vram",
             "palette",
@@ -700,7 +701,8 @@ fn what_a_frame_snapshot_holds() {
             (
                 "held at the boundary",
                 "{atBoundary: true, frame: 6, framebuffer: Uint8Array(len 286720, \
-                     fnv1a64 0x90450a1e4b4824fc), height: 224, palette: Uint16Array(len 64, \
+                     fnv1a64 0x90450a1e4b4824fc), grid: {columns_per_dot: 1, rows_per_line: 1, \
+                     woven: false}, height: 224, palette: Uint16Array(len 64, \
                      fnv1a64 0xd9034ab48a655301), registers: [{description: \"\", index: 0, \
                      name: \"Mode Register 1\", value: 20}, {description: \"\", index: 1, \
                      name: \"Mode Register 2\", value: 116}, {description: \"\", index: 2, \
@@ -732,7 +734,8 @@ fn what_a_frame_snapshot_holds() {
             (
                 "after the frame",
                 "{atBoundary: false, frame: 6, framebuffer: Uint8Array(len 286720, \
-                     fnv1a64 0x90450a1e4b4824fc), height: 224, palette: Uint16Array(len 64, \
+                     fnv1a64 0x90450a1e4b4824fc), grid: {columns_per_dot: 1, rows_per_line: 1, \
+                     woven: false}, height: 224, palette: Uint16Array(len 64, \
                      fnv1a64 0x80a6cbe3ccc7196f), registers: [{description: \"\", index: 0, \
                      name: \"Mode Register 1\", value: 20}, {description: \"\", index: 1, \
                      name: \"Mode Register 2\", value: 116}, {description: \"\", index: 2, \

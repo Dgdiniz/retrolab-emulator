@@ -68,11 +68,13 @@ pub fn recording_to_js(recording: CaptureRecording) -> JsValue {
     plain_object(&entries)
 }
 
-/// `{ frame, atBoundary, width, height, framebuffer: Uint8Array, vram:
-/// Uint8Array, palette: Uint16Array, ..., registers }`: the snapshot's
-/// shared fields, in this order, with `console` writing the console's own
-/// keys into the object after `palette` and before `registers`. `registers`
-/// is an array of plain objects (`{ index, name, value, description }`).
+/// `{ frame, atBoundary, width, height, grid, framebuffer: Uint8Array,
+/// vram: Uint8Array, palette: Uint16Array, ..., registers }`: the
+/// snapshot's shared fields, in this order, with `console` writing the
+/// console's own keys into the object after `palette` and before
+/// `registers`. `grid` is a plain object (`{ columns_per_dot,
+/// rows_per_line, woven }`, as `getDisplayInfo` gives it) and `registers`
+/// an array of plain objects (`{ index, name, value, description }`).
 pub fn frame_snapshot_object<C>(
     snapshot: &FrameSnapshot<C>,
     console: impl FnOnce(&C, &Object),
@@ -90,6 +92,7 @@ pub fn frame_snapshot_object<C>(
         "height",
         &JsValue::from_f64(f64::from(snapshot.height)),
     );
+    set_property(&obj, "grid", &to_js(&snapshot.grid));
     set_property(&obj, "framebuffer", &uint8_array(&snapshot.framebuffer));
     set_property(&obj, "vram", &uint8_array(&snapshot.vram));
     set_property(&obj, "palette", &uint16_array(&snapshot.palette));
@@ -306,14 +309,16 @@ macro_rules! capture_bindings {
                 /// The frame's picture and the video memory, the palette and
                 /// the registers it was drawn from, all copies, never views
                 /// into this module's memory: `{ frame, atBoundary, width,
-                /// height, framebuffer: Uint8Array, vram: Uint8Array, palette:
-                /// Uint16Array, ..., registers }`, a plain object, with the
-                /// console's own keys (documented by the core) before
+                /// height, grid, framebuffer: Uint8Array, vram: Uint8Array,
+                /// palette: Uint16Array, ..., registers }`, a plain object,
+                /// with the console's own keys (documented by the core) before
                 /// `registers`. `framebuffer` is the picture, RGBA, `width *
-                /// height * 4` bytes, as `getDisplayInfo` sizes it; `vram` is
-                /// video memory as `getVram` returns it; `palette` the palette
-                /// memory's colour words; `registers` the video registers, an
-                /// array of `{ index, name, value, description }`.
+                /// height * 4` bytes, as `getDisplayInfo` sizes it, and `grid`
+                /// how it lies over the console's dots and lines, as
+                /// `getDisplayInfo` gives it; `vram` is video memory as
+                /// `getVram` returns it; `palette` the palette memory's colour
+                /// words; `registers` the video registers, an array of `{
+                /// index, name, value, description }`.
                 ///
                 /// At a capture boundary (`atBoundary`) the picture and the
                 /// memory belong to the same frame; anywhere else the memory
@@ -678,8 +683,8 @@ mod tests {
     use retro_core::video::PixelImage;
     use retro_core::video::VideoRegister;
     use retro_core::{
-        AudioInfo, DisplayInfo, Framebuffer, InputInfo, InputState, Instruction, RomInfo,
-        SystemInfo,
+        AudioInfo, DisplayInfo, Framebuffer, InputInfo, InputState, Instruction, PictureGrid,
+        RomInfo, SystemInfo,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen::JsCast;
@@ -820,6 +825,11 @@ mod tests {
             at_boundary: true,
             width: 2,
             height: 1,
+            grid: PictureGrid {
+                columns_per_dot: 2,
+                rows_per_line: 1,
+                woven: false,
+            },
             framebuffer: picture().rgba,
             vram: vec![0xAA, 0xBB],
             palette: vec![0x0EEE, 0x0002],
@@ -852,6 +862,7 @@ mod tests {
                 "atBoundary",
                 "width",
                 "height",
+                "grid",
                 "framebuffer",
                 "vram",
                 "palette",
@@ -862,9 +873,10 @@ mod tests {
         assert_eq!(
             shape(&value),
             format!(
-                "{{atBoundary: true, frame: 12, framebuffer: {}, height: 1, palette: {}, \
-                 registers: [{{description: \"display on\", index: 1, name: \"Mode\", \
-                 value: 68}}], vram: {}, vsram: {}, width: 2}}",
+                "{{atBoundary: true, frame: 12, framebuffer: {}, grid: {{columns_per_dot: 2, \
+                 rows_per_line: 1, woven: false}}, height: 1, palette: {}, registers: \
+                 [{{description: \"display on\", index: 1, name: \"Mode\", value: 68}}], vram: \
+                 {}, vsram: {}, width: 2}}",
                 typed("Uint8Array", 8, &picture().rgba),
                 typed("Uint16Array", 2, &le_bytes_16(&[0x0EEE, 0x0002])),
                 typed("Uint8Array", 2, &[0xAA, 0xBB]),

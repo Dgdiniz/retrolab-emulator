@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::PictureGrid;
+
 /// Tile data for tile-based graphics systems.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileData {
@@ -18,6 +20,55 @@ pub struct PaletteData {
     pub colors: Vec<u32>, // RGBA colors
 }
 
+/// The levels a console's colour channels take in the picture, as 8-bit
+/// values, and the name they are known by
+/// ([`VideoDebugger::colour_levels`]). Which level a colour word chooses
+/// is the console's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ColourLevels {
+    /// The name of the conversion the levels come from: the same while
+    /// the levels are the same, so a picture's colours can be told by it.
+    pub name: &'static str,
+    /// The 8-bit value of each level, darkest first.
+    pub levels: &'static [u8],
+}
+
+impl ColourLevels {
+    /// No levels: a chip that names none.
+    pub const NONE: Self = Self {
+        name: "",
+        levels: &[],
+    };
+}
+
+/// A box on a frame's picture, in picture pixels: `width` columns from
+/// column `x` and `height` rows from row `y`. Either edge may lie off the
+/// picture, so `x` and `y` may be negative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PictureRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PictureRect {
+    /// The box that dots `x` to `x + width` of lines `y` to `y + height`
+    /// cover on a picture laid on `grid`, the lines counted from the
+    /// picture's first: every dot is `grid.columns_per_dot` columns and
+    /// every line `grid.rows_per_line` rows.
+    pub fn on_grid(grid: PictureGrid, x: i32, y: i32, width: u32, height: u32) -> Self {
+        let columns = grid.columns_per_dot;
+        let rows = grid.rows_per_line;
+        Self {
+            x: x.saturating_mul(i32::from(columns)),
+            y: y.saturating_mul(i32::from(rows)),
+            width: width.saturating_mul(u32::from(columns)),
+            height: height.saturating_mul(u32::from(rows)),
+        }
+    }
+}
+
 /// Sprite data.
 ///
 /// `x`/`y` are **normalized signed screen-space** coordinates: the core
@@ -27,6 +78,11 @@ pub struct PaletteData {
 /// every sprite in one frame without re-deriving hardware quirks. This is
 /// the single canonical sprite list both cores expose for composite/object
 /// capture.
+///
+/// `x`, `y`, `width` and `height` count the console's dots and lines;
+/// `picture` is where the sprite lands on the picture the host holds, in
+/// its pixels, which differ from dots and lines where a dot takes two
+/// columns or a line two rows ([`PictureGrid`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteData {
     pub index: u32,
@@ -39,6 +95,8 @@ pub struct SpriteData {
     pub priority: u32,
     pub flip_h: bool,
     pub flip_v: bool,
+    /// The box the sprite covers on the picture.
+    pub picture: PictureRect,
 }
 
 /// One entry in the renderer's resolved sprite paint order.
@@ -406,6 +464,9 @@ pub struct SpriteTableEntry {
     /// The sprite takes the larger of the console's two sprite sizes;
     /// `false` on a console with one.
     pub large: bool,
+    /// The box the sprite covers on the picture, as [`SpriteData`] gives
+    /// it.
+    pub picture: PictureRect,
 }
 
 /// What a layer draws.
@@ -604,6 +665,14 @@ pub trait VideoDebugger {
     /// Where layer `layer_id` (as [`Self::get_layer_data`] numbers it)
     /// reads its map and its characters; `None` for a layer the chip lacks.
     fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout>;
+
+    /// The levels the picture's colour channels take, and their name
+    /// ([`ColourLevels`]).
+    ///
+    /// Default: [`ColourLevels::NONE`], for a chip that names none.
+    fn colour_levels(&self) -> ColourLevels {
+        ColourLevels::NONE
+    }
 
     /// The palette memory's colour words, in colour order: its bytes read
     /// in its byte order. Empty on a chip with no palette memory.
@@ -872,6 +941,43 @@ mod tests {
         assert_eq!(
             chip.tile_colours(&request(1), 0),
             Err(ExportError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_chip_that_names_no_levels_gives_none() {
+        let chip = Chip {
+            palette: [0; 4],
+            little_endian: false,
+        };
+        assert_eq!(chip.colour_levels(), ColourLevels::NONE);
+        assert!(ColourLevels::NONE.levels.is_empty());
+    }
+
+    #[test]
+    fn a_box_of_dots_and_lines_takes_the_grid_s_columns_and_rows() {
+        assert_eq!(
+            PictureRect::on_grid(PictureGrid::ONE, -4, 10, 16, 32),
+            PictureRect {
+                x: -4,
+                y: 10,
+                width: 16,
+                height: 32
+            }
+        );
+        let twice = PictureGrid {
+            columns_per_dot: 2,
+            rows_per_line: 2,
+            woven: true,
+        };
+        assert_eq!(
+            PictureRect::on_grid(twice, -4, 10, 16, 32),
+            PictureRect {
+                x: -8,
+                y: 20,
+                width: 32,
+                height: 64
+            }
         );
     }
 

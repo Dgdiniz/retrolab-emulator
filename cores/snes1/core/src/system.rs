@@ -50,7 +50,7 @@ use retro_core::savestate::{PayloadUse, RomIdentity};
 use retro_core::CpuArchitecture;
 use retro_core::{
     AudioInfo, DisasmRow, DisplayInfo, EmulatorCore, Framebuffer, InputInfo, InputState,
-    Instruction, PixelFormat, RomInfo, StepResult, SystemInfo, VideoRegion,
+    Instruction, PictureGrid, PixelFormat, RomInfo, StepResult, SystemInfo, VideoRegion,
 };
 
 use wdc65816::Wdc65816;
@@ -307,6 +307,7 @@ impl SnesEmulator {
                 aspect_ratio: 8.0 / 7.0,
                 refresh_rate: TimingProfile::NTSC.refresh_rate(),
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 44_100,
@@ -514,8 +515,9 @@ impl SnesEmulator {
 
     /// Synchronise the public `DisplayInfo` with the live PPU
     /// state. The PPU's `active_display_size` returns the current
-    /// (width, height) based on the bgmode + overscan bit; we
-    /// mirror that into [`Self::system_info`] so the trait-bound
+    /// (width, height) based on the bgmode + overscan bit, and its
+    /// `picture_grid` how that picture lies over the dots and lines; we
+    /// mirror both into [`Self::system_info`] so the trait-bound
     /// `get_display_info(&self)` stays accurate without needing
     /// interior mutability. Called at VBlankStart, on `reset`, and
     /// inside `load_rom`.
@@ -523,6 +525,7 @@ impl SnesEmulator {
         let (w, h) = self.bus.ppu().active_display_size();
         self.system_info.display.width = w;
         self.system_info.display.height = h;
+        self.system_info.display.grid = self.bus.ppu().picture_grid();
         // The refresh rate follows the timing profile, which `load_rom`
         // (header destination), `set_region` (the netplay handshake) and a
         // savestate restore can all change, every one of them ends here.

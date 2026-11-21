@@ -12,13 +12,14 @@ use retro_core::input::{GenericInputManager, PadDefaults};
 use retro_core::savestate::{PayloadUse, RomIdentity, SavestateFormat, SavestatePayload};
 use retro_core::types::{
     AudioInfo, CpuArchitecture, CpuInfo, CpuLocation, DisasmRow, DisasmRowKind, DisplayInfo,
-    Framebuffer, InputInfo, InputState, Instruction, PixelFormat, RomInfo, SystemInfo, VideoRegion,
+    Framebuffer, InputInfo, InputState, Instruction, PictureGrid, PixelFormat, RomInfo, SystemInfo,
+    VideoRegion,
 };
 use retro_core::video::{
-    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
-    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteTableEntry, TileData,
-    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
-    VideoRegister,
+    bytes_from_words, words_from_bytes, ColourLevels, ExportError, IndexedImage, LayerData,
+    LayerKind, LayerLayout, PaletteData, PictureRect, PixelImage, SpriteData, SpriteTableEntry,
+    TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId,
+    VideoMemoryInfo, VideoRegister,
 };
 use retro_core::{EmulatorCore, StepResult};
 use serde::{Deserialize, Serialize};
@@ -285,6 +286,12 @@ impl VideoDebugger for FakeVideo {
                 priority: 0,
                 flip_h: false,
                 flip_v: index == 1,
+                picture: PictureRect {
+                    x: index as i32 * 16,
+                    y: -4,
+                    width: 16,
+                    height: 16,
+                },
             })
             .collect()
     }
@@ -393,6 +400,7 @@ impl VideoDebugger for FakeVideo {
                 next: (sprite.index == 0).then_some(1),
                 tile_address: sprite.tile_index * 32,
                 large: sprite.index == 1,
+                picture: sprite.picture,
             })
             .collect()
     }
@@ -411,6 +419,12 @@ impl VideoDebugger for FakeVideo {
             scroll_x: 0,
             scroll_y: 0,
         })
+    }
+    fn colour_levels(&self) -> ColourLevels {
+        ColourLevels {
+            name: "fake-4",
+            levels: &[0, 85, 170, 255],
+        }
     }
 }
 
@@ -466,6 +480,7 @@ impl FakeMachine {
                 aspect_ratio: 2.0,
                 refresh_rate: 60.0,
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 44100,

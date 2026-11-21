@@ -5,12 +5,24 @@
 //! geometry.
 
 use retro_core::capture::{NoTrace, PixelTrace};
+use retro_core::video::ColourLevels;
 
 use super::sources::{self, LineTrace};
 use super::window::WindowArea;
 use super::{
     RenderLayerMode, Vdp, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
     TRANSPARENT_RGB,
+};
+
+/// The levels a channel of a colour the picture draws takes: a CRAM
+/// colour's 3 bits a channel, each level its bits repeated across the byte
+/// ([`Vdp::convert_genesis_color`]). Shadow and highlight are worked out
+/// from a colour on these levels, halved or raised by half and capped
+/// ([`Vdp::shadow_color`], [`Vdp::highlight_color`]), and need not land on
+/// one.
+pub(super) const COLOUR_LEVELS: ColourLevels = ColourLevels {
+    name: "mega-drive-8",
+    levels: &[0, 36, 73, 109, 146, 182, 219, 255],
 };
 
 impl Vdp {

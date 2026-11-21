@@ -47,7 +47,8 @@ pub fn tile_request(
 /// `readVideoMemory(id)` and `writeVideoMemory(id, offset, bytes)`; the
 /// palette, `getPaletteMemory()`, `writePaletteMemory(colour_index,
 /// colours)` and `getPaletteColours()`; `getTileColours(...)`, tiles in
-/// colour; `getSpriteTable()`; and `getLayerLayout(layer_id)`.
+/// colour; `getSpriteTable()`; `getLayerLayout(layer_id)`; and
+/// `getColourLevels()`, the levels the picture's colour channels take.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -115,7 +116,10 @@ macro_rules! video_bindings {
 
             /// Every sprite of the sprite table (`SpriteData[]`), in signed
             /// screen coordinates (the console's offsets undone), for an
-            /// object picker that works the same on every console.
+            /// object picker that works the same on every console: `x`, `y`,
+            /// `width` and `height` count the console's dots and lines, and
+            /// `picture` (`{ x, y, width, height }`) is the box the sprite
+            /// covers on the picture, in its pixels.
             #[wasm_bindgen(js_name = getSpriteData)]
             pub fn get_sprite_data(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
                 $crate::js::to_js(
@@ -313,8 +317,9 @@ macro_rules! video_bindings {
             /// sprite, and `next` (the slot the hardware takes after it on a
             /// table that links its entries, the Mega Drive's; `undefined`
             /// for the last one and on the SNES), `tile_address` (the VRAM
-            /// byte of its first character) and `large` (the larger of two
-            /// sprite sizes).
+            /// byte of its first character), `large` (the larger of two
+            /// sprite sizes) and `picture` (its box on the picture, as
+            /// `getSpriteData` gives it).
             #[wasm_bindgen(js_name = getSpriteTable)]
             pub fn get_sprite_table(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
                 $crate::js::to_js(
@@ -340,6 +345,19 @@ macro_rules! video_bindings {
                     ::core::option::Option::Some(layout) => $crate::js::to_js(&layout),
                     ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
                 }
+            }
+
+            /// The levels the picture's colour channels take, `{ name,
+            /// levels }`: `levels` the 8-bit value of each level, darkest
+            /// first, and `name` the conversion they come from, the same
+            /// while the levels are; an empty name and no levels on a chip
+            /// that names none.
+            #[wasm_bindgen(js_name = getColourLevels)]
+            pub fn get_colour_levels(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(
+                    &$crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                        .colour_levels(),
+                )
             }
         }
     };

@@ -34,6 +34,25 @@ fn test_color_conversion() {
 }
 
 #[test]
+fn the_colour_levels_are_those_a_cram_channel_converts_to() {
+    use retro_core::video::VideoDebugger;
+
+    let levels = crate::vdp::render::COLOUR_LEVELS;
+    assert_eq!(levels.name, "mega-drive-8");
+    assert_eq!(levels.levels.len(), 8);
+    for (channel, &level) in levels.levels.iter().enumerate() {
+        let bits = channel as u16;
+        let grey = (bits << 1) | (bits << 5) | (bits << 9);
+        assert_eq!(
+            Vdp::convert_genesis_color(grey),
+            (level, level, level),
+            "channel value {channel}"
+        );
+    }
+    assert_eq!(Vdp::new().colour_levels(), levels);
+}
+
+#[test]
 fn test_backdrop_rendering() {
     let mut vdp = Vdp::new();
 

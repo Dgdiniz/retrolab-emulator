@@ -1,5 +1,6 @@
-//! The picture a frame leaves for the host: its size, the normalisation
-//! that finishes it, the overscan crop, and the interlace field.
+//! The picture a frame leaves for the host: its size and how it lies over
+//! the dots and lines, the normalisation that finishes it, the overscan
+//! crop, and the interlace field.
 //!
 //! The renderer draws each line into the host framebuffer as it goes.
 //! Once the frame's last line is drawn, [`Ppu::finalize_frame`] gives
@@ -10,7 +11,7 @@
 //! host crops to. The field flips once a frame, at VBlank; STAT78
 //! reports it, and OBJ interlace reads it to choose a sprite's rows.
 
-use retro_core::Framebuffer;
+use retro_core::{Framebuffer, PictureGrid};
 
 use super::render::{MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH};
 use super::Ppu;
@@ -59,6 +60,24 @@ impl Ppu {
         };
         let h = if self.frame_hires { base_h * 2 } else { base_h };
         (w, h)
+    }
+
+    /// How the picture lies over the dots and lines, by the frame-global
+    /// flags [`Self::active_display_size`] reads: a frame with a hires line
+    /// is drawn at two columns a dot and two rows a line, its two rows of a
+    /// line two fields woven when the frame latched the interlace bit
+    /// ([`Self::frame_interlaced`]), else one drawing repeated; any other
+    /// frame at one column a dot and one row a line.
+    pub fn picture_grid(&self) -> PictureGrid {
+        if self.frame_hires {
+            PictureGrid {
+                columns_per_dot: 2,
+                rows_per_line: 2,
+                woven: self.render_interlace,
+            }
+        } else {
+            PictureGrid::ONE
+        }
     }
 
     /// Normalize the just-rendered frame so the host sees a uniform
@@ -371,6 +390,35 @@ mod tests {
         // Overscan hires with the toggle on: full 512x480.
         ppu.set_show_overscan(true);
         assert_eq!(ppu.active_display_size(), (512, 480));
+    }
+
+    #[test]
+    fn the_grid_follows_the_frame_s_hires_and_interlace() {
+        let mut ppu = Ppu::new();
+        assert_eq!(ppu.picture_grid(), PictureGrid::ONE);
+        for (interlace, woven) in [(false, false), (true, true)] {
+            ppu.frame_hires = true;
+            ppu.render_interlace = interlace;
+            let grid = ppu.picture_grid();
+            assert_eq!(
+                grid,
+                PictureGrid {
+                    columns_per_dot: 2,
+                    rows_per_line: 2,
+                    woven
+                }
+            );
+            let (width, height) = ppu.active_display_size();
+            assert_eq!(width, NORMAL_SCANLINE_WIDTH as u32 * 2);
+            assert_eq!(height, 224 * u32::from(grid.rows_per_line));
+        }
+        ppu.frame_hires = false;
+        ppu.render_interlace = true;
+        assert_eq!(
+            ppu.picture_grid(),
+            PictureGrid::ONE,
+            "a lo-res frame weaves nothing"
+        );
     }
 
     #[test]

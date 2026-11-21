@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 
+use crate::types::PictureGrid;
 use crate::video::{PixelImage, VideoRegister};
 
 /// What a capture reads, copied out of the core: a frame's picture, and the
@@ -30,6 +31,9 @@ pub struct FrameSnapshot<C> {
     pub width: u32,
     /// The picture's height in pixels.
     pub height: u32,
+    /// How the picture lies over the console's dots and lines, as the
+    /// core's display information gives it.
+    pub grid: PictureGrid,
     /// The picture, RGBA, `width * height * 4` bytes, row after row.
     pub framebuffer: Vec<u8>,
     /// The video memory, in the byte order the core's debugger gives it.

@@ -91,6 +91,14 @@ fn the_video_registers_are_the_ppu_s() {
 }
 
 #[wasm_bindgen_test]
+fn the_colour_levels_are_the_ppu_s() {
+    let mut emu = running();
+    let levels = emu.snes.video_debugger().colour_levels();
+    assert_eq!((levels.name, levels.levels.len()), ("snes-32", 32));
+    assert_eq!(shape(&emu.get_colour_levels()), shape(&to_js(&levels)));
+}
+
+#[wasm_bindgen_test]
 fn the_video_memories_are_vram_cgram_and_oam_low_byte_first() {
     let mut emu = running();
     assert_eq!(
@@ -190,6 +198,7 @@ fn the_sprite_table_is_oam_from_the_first_sprite() {
             "priority",
             "flip_h",
             "flip_v",
+            "picture",
         ] {
             assert_eq!(
                 shape(&property(&entry, key)),

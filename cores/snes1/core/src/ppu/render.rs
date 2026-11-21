@@ -43,6 +43,7 @@
 //! without rescheduling.
 
 use retro_core::capture::{NoTrace, PixelTrace};
+use retro_core::video::ColourLevels;
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
@@ -1015,6 +1016,19 @@ fn priority_layers(bgmode: u8, bg3_priority: bool) -> &'static [Layer] {
     }
 }
 
+/// The levels a channel of a colour the picture draws takes at full
+/// brightness: a CGRAM colour's 5 bits a channel, each level the bits moved
+/// up three places with their top two repeated below them
+/// ([`expand_channel_with_brightness`]). The master brightness scales the
+/// picture's colours down from these levels.
+pub(super) const COLOUR_LEVELS: ColourLevels = ColourLevels {
+    name: "snes-32",
+    levels: &[
+        0, 8, 16, 24, 33, 41, 49, 57, 66, 74, 82, 90, 99, 107, 115, 123, 132, 140, 148, 156, 165,
+        173, 181, 189, 198, 206, 214, 222, 231, 239, 247, 255,
+    ],
+};
+
 /// Expand a 5-bit channel to 8 bits and apply brightness inline.
 /// `(channel5 << 3) | (channel5 >> 2)` is the usual 5->8 expansion,
 /// then `(x * (brightness + 1)) >> 4` scales to the
@@ -1174,6 +1188,21 @@ mod tests {
         // Note: brightness 0 != forced black at the renderer level,
         // the caller has its own short-circuit. This test pins the
         // arithmetic: (255 * 1) >> 4 = 15.
+    }
+
+    #[test]
+    fn the_colour_levels_are_those_a_cgram_channel_converts_to() {
+        assert_eq!(COLOUR_LEVELS.name, "snes-32");
+        assert_eq!(COLOUR_LEVELS.levels.len(), 32);
+        for (channel, &level) in COLOUR_LEVELS.levels.iter().enumerate() {
+            let bits = channel as u16;
+            let grey = bits | (bits << 5) | (bits << 10);
+            assert_eq!(
+                bgr15_to_rgb8_with_brightness(grey, 15),
+                [level; 3],
+                "channel value {channel}"
+            );
+        }
     }
 
     #[test]

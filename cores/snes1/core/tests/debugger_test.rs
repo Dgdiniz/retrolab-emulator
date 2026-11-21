@@ -15,7 +15,7 @@ use retro_core::debug::{Access, ByteOrder, CpuExprContext, TraceEntry};
 use retro_core::{
     AudioInfo, Breakpoint, BreakpointType, CpuArchitecture, CpuInfo, CpuLocation, DebuggerCore,
     DisplayInfo, EmulatorCore, ExecutionMode, ExecutionTier, InputInfo, InstructionTrace,
-    MatchSpec, PixelFormat, StackFrame, SystemInfo,
+    MatchSpec, PictureGrid, PixelFormat, StackFrame, SystemInfo,
 };
 use wdc65816::addressing::AddressingMode;
 
@@ -68,6 +68,7 @@ fn test_sysinfo() -> SystemInfo {
             aspect_ratio: 8.0 / 7.0,
             refresh_rate: 60.0,
             pixel_format: PixelFormat::RGBA8888,
+            grid: PictureGrid::ONE,
         },
         audio: AudioInfo {
             sample_rate: 44_100,

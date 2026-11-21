@@ -116,6 +116,7 @@ impl CaptureCore for GenesisEmulator {
             at_boundary: self.at_capture_boundary(),
             width,
             height,
+            grid: self.system_info.display.grid,
             framebuffer,
             vram: vdp.get_vram().to_vec(),
             palette: vdp.get_cram().to_vec(),

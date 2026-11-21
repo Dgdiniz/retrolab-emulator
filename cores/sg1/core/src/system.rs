@@ -215,6 +215,7 @@ impl GenesisEmulator {
                 aspect_ratio: 4.0 / 3.0,
                 refresh_rate: VideoRegion::default().frame_rate(),
                 pixel_format: PixelFormat::RGBA8888,
+                grid: PictureGrid::ONE,
             },
             audio: AudioInfo {
                 sample_rate: 44100,
@@ -432,6 +433,7 @@ impl GenesisEmulator {
         self.cached_framebuffer = Framebuffer::new(320, 224);
         self.system_info.display.width = 320;
         self.system_info.display.height = 224;
+        self.system_info.display.grid = self.bus.vdp().picture_grid();
         self.mixed_waveform_buffer.clear();
         // A held button belongs to the outgoing session, never the incoming one.
         self.input_manager.clear_all_direct_overrides();
@@ -526,9 +528,11 @@ impl GenesisEmulator {
         }
 
         // The display info gives the picture this framebuffer holds: the
-        // mode's width, and its height cut to the lines the VDP draws.
+        // mode's width, its height cut to the lines the VDP draws, and how
+        // it lies over the dots and lines.
         self.system_info.display.width = display_width;
         self.system_info.display.height = self.bus.vdp().drawn_height();
+        self.system_info.display.grid = self.bus.vdp().picture_grid();
 
         // Safety check: ensure VDP framebuffer has expected size
         if vdp_fb.len() != expected_vdp_size {

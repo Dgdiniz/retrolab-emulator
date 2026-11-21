@@ -547,7 +547,126 @@ fn check_placements(overscan: bool, obj_interlace: bool, placements: &[Placement
         for &row in &painted {
             assert!(in_box(row) || in_box(row + 256), "{what}: row {row}");
         }
+
+        // On this picture of one row a line, from the frame's first line,
+        // the box on the picture is the sprite's dots and lines.
+        let on_picture = PictureRect {
+            x: 40,
+            y,
+            width: u32::from(size),
+            height: lines_covered as u32,
+        };
+        assert_eq!(sprite.picture, on_picture, "{what}: the box on the picture");
+        assert_eq!(entry.picture, on_picture, "{what}: the table's box");
     }
+}
+
+/// The box of picture pixels the renderer paints sprite 0 on, drawn alone:
+/// from its first column and row to its last; `None` when it paints none.
+fn box_sprite_0_paints(ppu: &mut Ppu) -> Option<PictureRect> {
+    let mut chosen = [false; 128];
+    chosen[0] = true;
+    let image = ppu.render_sprites(&chosen);
+    let mut corners: Option<(u32, u32, u32, u32)> = None;
+    for row in 0..image.height {
+        for column in 0..image.width {
+            if image.rgba[((row * image.width + column) * 4 + 3) as usize] == 0 {
+                continue;
+            }
+            let (left, top, right, bottom) = corners.get_or_insert((column, row, column, row));
+            *left = (*left).min(column);
+            *top = (*top).min(row);
+            *right = (*right).max(column);
+            *bottom = (*bottom).max(row);
+        }
+    }
+    corners.map(|(left, top, right, bottom)| PictureRect {
+        x: left as i32,
+        y: top as i32,
+        width: right - left + 1,
+        height: bottom - top + 1,
+    })
+}
+
+/// Sprite 0 at line 100, 16x16, on the picture `shape` makes, held to the
+/// box the renderer paints it on and the box the sprite list and the
+/// sprite table give.
+fn check_box(what: &str, shape: impl Fn(&mut Ppu), expected: PictureRect) {
+    let mut ppu = sprite_0_at(100, 16);
+    shape(&mut ppu);
+    assert_eq!(
+        box_sprite_0_paints(&mut ppu),
+        Some(expected),
+        "{what}: the box painted"
+    );
+    assert_eq!(
+        ppu.get_sprite_data()[0].picture,
+        expected,
+        "{what}: the list"
+    );
+    assert_eq!(ppu.sprite_table()[0].picture, expected, "{what}: the table");
+}
+
+#[test]
+fn a_sprite_s_box_on_the_picture_is_where_the_picture_shows_it() {
+    check_box(
+        "lo-res, 224 lines",
+        |_| {},
+        PictureRect {
+            x: 40,
+            y: 100,
+            width: 16,
+            height: 16,
+        },
+    );
+    // The picture starts at the line below the 7 overscan lines it crops.
+    check_box(
+        "overscan cropped",
+        |ppu| ppu.overscan = true,
+        PictureRect {
+            x: 40,
+            y: 93,
+            width: 16,
+            height: 16,
+        },
+    );
+    // Hires, its lines doubled or two fields woven: two columns a dot and
+    // two rows a line.
+    for interlace in [false, true] {
+        check_box(
+            &format!("hires, interlace {interlace}"),
+            |ppu| {
+                ppu.bgmode = 5;
+                ppu.interlace = interlace;
+                ppu.frame_hires = true;
+                ppu.render_interlace = interlace;
+            },
+            PictureRect {
+                x: 80,
+                y: 200,
+                width: 32,
+                height: 32,
+            },
+        );
+    }
+    // Hires with OBJ interlace: the sprite's 16 rows cover 8 lines, 16 rows
+    // of the woven picture.
+    check_box(
+        "hires, woven, OBJ interlace",
+        |ppu| {
+            ppu.bgmode = 5;
+            ppu.interlace = true;
+            ppu.obj_interlace = true;
+            ppu.frame_hires = true;
+            ppu.render_interlace = true;
+        },
+        PictureRect {
+            x: 80,
+            y: 200,
+            width: 32,
+            height: 16,
+        },
+    );
 }
 
 #[test]

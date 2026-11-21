@@ -20,13 +20,13 @@
 //! and keep the renderer's caches of VRAM in step.
 
 use retro_core::video::{
-    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
-    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteOrderEntry, SpriteTableEntry, TileData,
-    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
-    VideoRegister,
+    bytes_from_words, words_from_bytes, ColourLevels, ExportError, IndexedImage, LayerData,
+    LayerKind, LayerLayout, PaletteData, PictureRect, PixelImage, SpriteData, SpriteOrderEntry,
+    SpriteTableEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
+    VideoMemoryId, VideoMemoryInfo, VideoRegister,
 };
 
-use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg};
+use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg, COLOUR_LEVELS};
 use crate::ppu::sprite::{
     parse_sprite, sprite_row_in_sprite, sprite_size, sprite_tile_number, SpriteAttrs,
 };
@@ -112,6 +112,31 @@ fn sprite_position(sprite: &SpriteAttrs, overscan: bool, obj_interlace: bool) ->
         i32::from(sprite.y)
     };
     (normalize_obj_x(sprite.x), y)
+}
+
+impl Ppu {
+    /// The box sprite `s` covers on the picture, its position `(x, y)` as
+    /// [`sprite_position`] gives it: the lines it covers (its height,
+    /// halved under OBJ interlace, where a field shows every other row),
+    /// counted from the line drawn into the picture's first row, on the
+    /// picture's grid ([`Ppu::picture_grid`]).
+    fn sprite_picture(&self, s: &SpriteAttrs, x: i32, y: i32) -> PictureRect {
+        let lines = if self.obj_interlace {
+            s.height >> 1
+        } else {
+            s.height
+        };
+        // The lines of the frame above the picture's first row: the
+        // overscan lines a cropped frame leaves out.
+        let above = self.first_row_line() as i32 - 1;
+        PictureRect::on_grid(
+            self.picture_grid(),
+            x,
+            y - above,
+            u32::from(s.width),
+            u32::from(lines),
+        )
+    }
 }
 
 /// Which VRAM character region [`Ppu::export_tile_image`] decodes.
@@ -683,6 +708,7 @@ impl VideoDebugger for Ppu {
                     priority: u32::from(s.priority),
                     flip_h: s.hflip,
                     flip_v: s.vflip,
+                    picture: self.sprite_picture(&s, x, y),
                 }
             })
             .collect()
@@ -1046,6 +1072,7 @@ impl VideoDebugger for Ppu {
                     next: None,
                     tile_address: u32::from(first_tile) << 5,
                     large: s.large,
+                    picture: self.sprite_picture(&s, x, y),
                 }
             })
             .collect()
@@ -1119,6 +1146,12 @@ impl VideoDebugger for Ppu {
             },
             None => layout,
         })
+    }
+
+    /// The 32 levels of a CGRAM colour's channel at full brightness
+    /// ([`COLOUR_LEVELS`]).
+    fn colour_levels(&self) -> ColourLevels {
+        COLOUR_LEVELS
     }
 }
 

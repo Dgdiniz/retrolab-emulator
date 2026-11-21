@@ -87,6 +87,57 @@ pub struct DisplayInfo {
     pub aspect_ratio: f32,
     pub refresh_rate: f32,
     pub pixel_format: PixelFormat,
+    /// How the picture lies over the console's dots and lines.
+    pub grid: PictureGrid,
+}
+
+/// How a frame's picture lies over the console's grid of dots and lines:
+/// the picture columns a dot takes, the picture rows a line gives, and
+/// whether a line's rows are two fields woven together. The picture's
+/// first row is its first line's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PictureGrid {
+    /// Picture columns per dot: 2 on a picture drawn at two columns a dot
+    /// (the SNES's hires frames), else 1.
+    pub columns_per_dot: u8,
+    /// Picture rows per line: 2 when the frame is drawn at twice its
+    /// lines, else 1.
+    pub rows_per_line: u8,
+    /// The rows of a line are two fields woven: each was drawn from a
+    /// field of its own. `false` when a line's rows repeat one drawing of
+    /// it, and when a line gives one row.
+    pub woven: bool,
+}
+
+impl PictureGrid {
+    /// One picture column a dot and one row a line.
+    pub const ONE: Self = Self {
+        columns_per_dot: 1,
+        rows_per_line: 1,
+        woven: false,
+    };
+
+    /// The picture row that shows field `field` of line `line`, the line
+    /// counted from the picture's first. This is the one rule for which
+    /// field goes on which row: a woven picture draws field 0 of a line on
+    /// the line's first row (an even row) and field 1 on its second (an
+    /// odd row); on any other picture every field of a line is drawn on
+    /// the line's first row, and a doubled line repeats it on the next.
+    pub fn row(&self, line: u32, field: u8) -> u32 {
+        let rows = u32::from(self.rows_per_line.max(1));
+        let first = line.saturating_mul(rows);
+        if self.woven {
+            first.saturating_add(u32::from(field) % rows)
+        } else {
+            first
+        }
+    }
+}
+
+impl Default for PictureGrid {
+    fn default() -> Self {
+        Self::ONE
+    }
 }
 
 /// Pixel format for framebuffer
@@ -733,4 +784,54 @@ pub struct InstructionTrace {
     pub instruction: String,
     pub registers_before: Vec<RegisterValue>,
     pub cycle_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_of_one_row_a_line_puts_every_field_on_the_line_s_row() {
+        let grid = PictureGrid::ONE;
+        assert_eq!(PictureGrid::default(), grid);
+        for line in [0, 1, 223] {
+            assert_eq!(grid.row(line, 0), line);
+            assert_eq!(grid.row(line, 1), line);
+        }
+    }
+
+    #[test]
+    fn a_woven_picture_puts_field_0_on_even_rows_and_field_1_on_odd_ones() {
+        let grid = PictureGrid {
+            columns_per_dot: 1,
+            rows_per_line: 2,
+            woven: true,
+        };
+        assert_eq!([grid.row(0, 0), grid.row(0, 1)], [0, 1]);
+        assert_eq!([grid.row(5, 0), grid.row(5, 1)], [10, 11]);
+        assert_eq!([grid.row(223, 0), grid.row(223, 1)], [446, 447]);
+    }
+
+    #[test]
+    fn a_doubled_line_starts_on_its_first_row_whatever_the_field() {
+        let grid = PictureGrid {
+            columns_per_dot: 2,
+            rows_per_line: 2,
+            woven: false,
+        };
+        assert_eq!([grid.row(7, 0), grid.row(7, 1)], [14, 14]);
+    }
+
+    #[test]
+    fn the_grid_reads_as_a_host_receives_it() {
+        let grid = PictureGrid {
+            columns_per_dot: 2,
+            rows_per_line: 2,
+            woven: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&grid).unwrap(),
+            r#"{"columns_per_dot":2,"rows_per_line":2,"woven":true}"#
+        );
+    }
 }

@@ -25,12 +25,13 @@
 use std::ops::Range;
 
 use retro_core::video::{
-    bytes_from_words, words_from_bytes, ExportError, IndexedImage, LayerData, LayerKind,
-    LayerLayout, PaletteData, PixelImage, SpriteData, SpriteOrderEntry, SpriteTableEntry, TileData,
-    TileDecodeRequest, TileSize, TileSource, VideoDebugger, VideoMemoryId, VideoMemoryInfo,
-    VideoRegister,
+    bytes_from_words, words_from_bytes, ColourLevels, ExportError, IndexedImage, LayerData,
+    LayerKind, LayerLayout, PaletteData, PictureRect, PixelImage, SpriteData, SpriteOrderEntry,
+    SpriteTableEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
+    VideoMemoryId, VideoMemoryInfo, VideoRegister,
 };
 
+use super::render::COLOUR_LEVELS;
 use super::sprites::{link_chain, Sprite};
 use super::tiles::{build_rgba_palette, Tile};
 use super::{Vdp, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
@@ -116,6 +117,19 @@ impl Vdp {
     /// renderer stops it ([`link_chain`]).
     pub fn sprite_table_chain(&self) -> Vec<(u8, Sprite)> {
         link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).collect()
+    }
+
+    /// The box `sprite` covers on the picture: its cells from its screen
+    /// position, a dot and a line to a column and a row
+    /// ([`Self::picture_grid`]).
+    fn sprite_picture(&self, sprite: &Sprite) -> PictureRect {
+        PictureRect::on_grid(
+            self.picture_grid(),
+            i32::from(sprite.x),
+            i32::from(sprite.y),
+            u32::from(sprite.width_tiles) * 8,
+            u32::from(sprite.height_tiles) * 8,
+        )
     }
 
     /// Planes A and B's size in cells, from the plane-size register (16).
@@ -298,6 +312,7 @@ impl VideoDebugger for Vdp {
                     priority: u32::from(s.priority),
                     flip_h: s.flip_h,
                     flip_v: s.flip_v,
+                    picture: self.sprite_picture(&s),
                 })
             })
             .collect()
@@ -566,6 +581,7 @@ impl VideoDebugger for Vdp {
                 next: chain.get(position + 1).map(|(next, _)| u32::from(*next)),
                 tile_address: u32::from(sprite.pattern_base) * 32,
                 large: false,
+                picture: self.sprite_picture(sprite),
             })
             .collect()
     }
@@ -607,6 +623,11 @@ impl VideoDebugger for Vdp {
             scroll_x: 0,
             scroll_y: 0,
         })
+    }
+
+    /// The eight levels of a CRAM colour's channel ([`COLOUR_LEVELS`]).
+    fn colour_levels(&self) -> ColourLevels {
+        COLOUR_LEVELS
     }
 }
 
