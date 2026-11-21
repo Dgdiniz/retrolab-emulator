@@ -220,10 +220,12 @@ pub struct Vdp {
     // clear (the CPU is halted instead); only Fill/Copy assert that bit.
     pending_cpu_dma_mclks: u64,
 
-    // Approximate 68K beam position within the current scanline, refreshed each
-    // instruction by `set_hblank_approx`. Used to derive a meaningful H counter
-    // for `0xC00008` reads (instead of a constant ~0). Transient within-line
-    // state, so it is not part of the savestate.
+    // Approximate 68K beam position within the current scanline, set as the
+    // line starts and refreshed after each instruction by `set_hblank_approx`.
+    // Used to derive a meaningful H counter for `0xC00008` reads (instead of a
+    // constant ~0), the column a mid-line palette write colours from, and the
+    // position the write records give. The payload has no field for it: the
+    // savestate's extension holds it while it does not stand at a line's end.
     beam_cycles_into_line: u32,
     beam_cycles_per_line: u32,
 

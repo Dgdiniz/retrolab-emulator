@@ -112,7 +112,8 @@ impl GenesisEmulator {
     /// and the one the 68000's mask lets through is taken, the line's
     /// events are raised for the debugger, and up to a line of a transfer's
     /// stall is charged before the first step. The line's counters start
-    /// from zero.
+    /// from zero, and the beam's count from what the start took, so the
+    /// line's first instruction sees its own line.
     fn start_line<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
         let line = self.frame_line;
         hooks.chip_start("VDP");
@@ -180,6 +181,12 @@ impl GenesisEmulator {
             budget,
             ..LineRun::default()
         };
+        // The beam counts the line from its start: the cycles the line
+        // before ran past its end, the interrupt's entry and the transfer's
+        // stall are spent already. Each step sets it again after its
+        // instruction.
+        let spent = (self.master_cycles - self.line.grid) as u32;
+        self.bus.vdp_mut().set_hblank_approx(spent, budget);
     }
 
     /// The end of the line: the Z80 run to its line's share, the 68000's

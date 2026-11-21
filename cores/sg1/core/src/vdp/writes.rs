@@ -58,7 +58,7 @@
 //! |---|---|
 //! | 0 | the kind: [`WriteKind::Transfer`] (a transfer from 68000 memory into VRAM, CRAM or VSRAM; one into CRAM or the sprite table is this one record, not one for each colour or entry), [`WriteKind::PaletteStore`] (a colour the 68000 stored through the data port), [`WriteKind::SpriteTableStore`] (a word the 68000 stored into the sprite table through the data port), [`WriteKind::Fill`], [`WriteKind::Copy`]; for kinds 4 and 5, the writer, always [`Writer::Processor`] |
 //! | 1 | the frame, numbered as the origins' frames are |
-//! | 2 | the line the beam was on; as the position, the 68000 cycles into that line when the writing instruction began (for a write by a line's first instruction the cycles taken entering an interrupt or held by a transfer at the line's start are not counted) |
+//! | 2 | the line the beam was on; as the position, the 68000 cycles into that line when the writing instruction began, what the line's start took counted (the cycles the line before ran past its end, an interrupt's entry, a transfer's hold) |
 //! | 3 | a transfer: the 68000 address of its first byte; a fill: the value its cells wrote (a byte into VRAM, a word into CRAM or VSRAM); a copy: the VRAM address it copied from first, as its source register holds it; a store (kinds 4-5): its origin's source, as [`Writer::Processor`] describes it |
 //! | 4 | the memory written ([`WriteTarget`]) and the bytes written |
 //! | 5 | where the writes started: a VRAM byte address as the VDP's address register holds it (bit 0 set swaps a word's bytes), a CRAM colour index, a VSRAM word index, or, for kind 5, the byte's offset in the sprite table |
@@ -478,22 +478,13 @@ impl Vdp {
     }
 
     /// The frame being drawn and where the beam is on it, for a record or
-    /// an origin.
+    /// an origin: the beam's count, which the line's start sets and each
+    /// instruction moves on.
     fn write_stamp(&self) -> WriteStamp {
-        // The frame loops set the beam's position after each instruction,
-        // so during a line's first instruction it still counts the line
-        // before, past that line's length: take the length off.
-        let into = self.beam_cycles_into_line;
-        let per_line = self.beam_cycles_per_line;
-        let cycle = if per_line > 0 && into >= per_line {
-            into - per_line
-        } else {
-            into
-        };
         WriteStamp {
             frame: self.frame_being_drawn,
             line: self.timing.scanline,
-            position: cycle.min(0xFFFF) as u16,
+            position: self.beam_cycles_into_line.min(0xFFFF) as u16,
         }
     }
 

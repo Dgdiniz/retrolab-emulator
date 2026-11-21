@@ -16,6 +16,7 @@ mod helpers;
 use helpers::M68kProgram;
 use retro_core::capture::{
     layer, planes, CaptureCore, CaptureRecording, SpriteFate, NO_COLUMN, NO_PALETTE,
+    WORDS_PER_RECORD,
 };
 use retro_core::debug::DebugEvent;
 use retro_core::frame::{run_frame_on, run_to_capture_boundary_on};
@@ -210,6 +211,47 @@ fn direct_colour_program() -> Vec<u8> {
     program.build()
 }
 
+/// A program whose horizontal interrupt comes on line 119 of every frame,
+/// its handler's first instruction a palette store, which is the line's
+/// first instruction: colour 0, the backdrop, turns from red to yellow.
+/// The vertical interrupt makes it red again for the next frame.
+fn first_instruction_program() -> Vec<u8> {
+    let mut program = M68kProgram::new(0x1000, 0x200);
+    program.vector(28, 0x400).vector(30, 0x500);
+
+    #[rustfmt::skip]
+    program.org(0x200).words(&[
+        0x46FC, 0x2700,                 // MOVE.W #$2700,SR
+        0x41F9, 0x00C0, 0x0004,         // LEA $C00004,A0: control port
+        0x43F9, 0x00C0, 0x0000,         // LEA $C00000,A1: data port
+        0x30BC, 0x8014,                 // register 0: horizontal interrupt on
+        0x30BC, 0x8164,                 // register 1: display, vertical interrupt, mode 5
+        0x30BC, 0x8700,                 // register 7: backdrop colour 0
+        0x30BC, 0x8A77,                 // register 10: an interrupt on line 119
+        0x30BC, 0x8C81,                 // register 12: 40 cells
+        0x30BC, 0x8F00,                 // register 15: no auto-increment
+        0x20BC, 0xC000, 0x0000,         // MOVE.L #$C0000000,(A0): CRAM at colour 0
+        0x32BC, RED,                    // MOVE.W #RED,(A1)
+        0x3E3C, YELLOW,                 // MOVE.W #YELLOW,D7
+        0x46FC, 0x2000,                 // MOVE.W #$2000,SR: interrupts on
+    ]).label("idle").branch(0x6000, "idle");
+
+    // The horizontal interrupt: its first instruction is the line's first.
+    #[rustfmt::skip]
+    program.org(0x400).words(&[
+        0x3287,                         // MOVE.W D7,(A1): colour 0 yellow
+        0x4E73,                         // RTE
+    ]);
+
+    // The vertical interrupt: colour 0 red again.
+    #[rustfmt::skip]
+    program.org(0x500).words(&[
+        0x32BC, RED,                    // MOVE.W #RED,(A1)
+        0x4E73,                         // RTE
+    ]);
+    program.build()
+}
+
 /// A machine running `rom`, its audio on.
 fn running(rom: &[u8]) -> GenesisEmulator {
     let mut emu = GenesisEmulator::new();
@@ -393,6 +435,64 @@ fn the_table_says_what_each_line_was_drawn_with() {
     assert!(!colours_on_line[..from].contains(&yellow));
     assert!(colours_on_line[from..].contains(&yellow));
     assert!(!colours_on_line[from..].contains(&red));
+}
+
+#[test]
+fn a_palette_store_by_a_line_s_first_instruction_colours_that_line_from_the_beam() {
+    let mut emu = running(&first_instruction_program());
+    emu.set_capture_recording(CaptureRecording {
+        line_states: true,
+        frame_writes: true,
+        ..CaptureRecording::default()
+    });
+    for _ in 0..WARM_UP {
+        run_frame_on(&mut emu, ExecutionTier::Play);
+    }
+    let _ = emu.take_frame_writes();
+    emu.run_to_capture_boundary();
+
+    // The store's record names line 119, and as its position the cycles
+    // the line's start took: the interrupt's entry (44) after what the line
+    // before ran past its end.
+    let writes = emu.take_frame_writes().expect("frame writes on");
+    let records = writes.records.as_chunks::<WORDS_PER_RECORD>().0;
+    assert_eq!(records.len(), 1, "{records:X?}");
+    let (line, position) = (records[0][2] & 0xFFFF, records[0][2] >> 16);
+    assert_eq!(line, 119, "{records:X?}");
+    assert!(
+        (44..60).contains(&position),
+        "cycles into the line: {position}"
+    );
+
+    // The palette's record: the store coloured line 119 again from the
+    // beam's column, early in the line.
+    let palettes = emu.line_palettes().expect("line states on");
+    let changes = palettes.changes.as_ref().expect("this core records them");
+    let changes = changes.as_chunks::<5>().0;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let [row, from, index, colour, whole_line] = changes[0];
+    assert_eq!((row, index, colour, whole_line), (119, 0, YELLOW, 0));
+    assert!(from != NO_COLUMN && from > 0 && from < 80, "column {from}");
+
+    // And the picture: line 118 red, line 119 red left of the column and
+    // yellow from it, line 120 yellow.
+    let picture = shown(&emu);
+    let colours = |row: usize| -> Vec<(u8, u8, u8)> {
+        picture[row * 320 * 4..(row + 1) * 320 * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| (p[0], p[1], p[2]))
+            .collect()
+    };
+    let red = Vdp::convert_genesis_color(RED);
+    let yellow = Vdp::convert_genesis_color(YELLOW);
+    let from = usize::from(from);
+    assert!(colours(118).iter().all(|&c| c == red), "line 118");
+    let line_119 = colours(119);
+    assert!(line_119[..from].iter().all(|&c| c == red), "before {from}");
+    assert!(line_119[from..].iter().all(|&c| c == yellow), "from {from}");
+    assert!(colours(120).iter().all(|&c| c == yellow), "line 120");
 }
 
 #[test]

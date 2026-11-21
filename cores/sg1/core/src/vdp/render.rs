@@ -202,13 +202,14 @@ impl Vdp {
     /// be a raster effect for THIS line rather than setup for the next one.
     /// The window is the first 860 of the line's 3420 master clocks (the
     /// window Genesis Plus GX uses), expressed in the 68K-cycle beam
-    /// units SG1 tracks. Inert until a frame has run (`beam_cycles_per_line`
-    /// still 0), so pure-unit-test register pokes never trigger a re-render.
+    /// units SG1 tracks. Inert until the machine has started a line
+    /// (`beam_cycles_per_line` still 0), so register pokes in unit tests of
+    /// the VDP alone never trigger a re-render.
     ///
-    /// SG1 advances the beam *after* each instruction, so a write in the very
-    /// first instruction of a line still sees the previous line's high beam
-    /// value and is skipped. Under-triggering (a missed effect) is safe; the
-    /// alternative (a stale-low beam) would over-trigger and corrupt lines.
+    /// The beam's count is set as a line starts, from what its start took
+    /// (an interrupt's entry, a transfer's hold), and again after each
+    /// instruction, so a write in the line's first instruction sees its
+    /// own line's count.
     pub(super) fn midline_render_window(&self) -> bool {
         if self.beam_cycles_per_line == 0 {
             return false;
