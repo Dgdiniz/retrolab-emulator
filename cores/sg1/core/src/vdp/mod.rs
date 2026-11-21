@@ -19,7 +19,7 @@ pub mod timing;
 pub mod window;
 pub mod writes;
 
-use picture::{FRAMEBUFFER_LINES, FRAMEBUFFER_WIDTH};
+pub(crate) use picture::{FRAMEBUFFER_LINES, FRAMEBUFFER_WIDTH};
 pub use recording::LineKind;
 pub use sources::Shade;
 pub use writes::{VideoEvent, VideoEventWatch, WriteTarget};
@@ -659,6 +659,7 @@ impl Vdp {
         self.address = 0;
         self.code = 0;
         self.timing.reset();
+        self.timing.latch_lines_drawn(self.registers[1]);
         self.dma_pending = false;
         self.dma_busy = false;
         self.dma_remaining_clocks = 0;
@@ -748,6 +749,12 @@ impl Vdp {
         self.timing.scanline = line;
         self.timing.h_counter = 0; // Reset H counter at scanline start
         self.timing.in_hblank = false; // HBLANK is cleared at scanline start
+
+        // A frame's first line takes the lines the frame draws from
+        // register 1: a change shows from the next frame.
+        if line == 0 {
+            self.timing.latch_lines_drawn(self.registers[1]);
+        }
 
         // Update VBLANK/HBLANK status based on current scanline
         let visible = self.timing.visible_scanlines();

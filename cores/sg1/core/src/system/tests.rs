@@ -36,6 +36,43 @@ fn test_framebuffer() {
 }
 
 #[test]
+fn the_host_picture_holds_the_lines_the_frame_drew() {
+    // Register 1 bit 3 as a frame's first line finds it gives the frame's
+    // lines, 224 or 240. The framebuffer holds both; the host's picture and
+    // the display info are the frame's. Display on and empty video memory:
+    // every pixel is the backdrop.
+    use crate::vdp::Vdp;
+    let green = Vdp::convert_genesis_color(0x00E0);
+    let mut genesis = GenesisEmulator::new();
+    for (register_1, lines) in [(0x44, 224u32), (0x4C, 240), (0x44, 224)] {
+        let vdp = genesis.vdp_mut();
+        vdp.set_test_register(12, 0x81); // 40 cells
+        vdp.set_test_register(1, register_1); // display on, mode 5, 28 or 30 lines
+        vdp.write_word_port(0x04, 0xC000); // CRAM at colour 0
+        vdp.write_word_port(0x04, 0x0000);
+        vdp.write_word_port(0x00, 0x00E0);
+        for line in 0..262 {
+            vdp.scanline(line);
+        }
+        genesis.update_cached_framebuffer();
+        let display = genesis.get_display_info();
+        assert_eq!((display.width, display.height), (320, lines));
+        let picture = genesis.get_framebuffer();
+        assert_eq!((picture.width, picture.height), (320, lines));
+        let last_row = &picture.data[(lines as usize - 1) * 320 * 4..];
+        assert_eq!(last_row.len(), 320 * 4);
+        assert!(
+            last_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| (p[0], p[1], p[2]) == green),
+            "{lines} lines: the last row drawn"
+        );
+    }
+}
+
+#[test]
 fn repaint_held_frame_pushes_vdp_state_into_cached_framebuffer() {
     // A paused debugger edit (layer toggle, VRAM/CRAM write)
     // must reach the host. The browser reads get_framebuffer(), the

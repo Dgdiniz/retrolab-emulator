@@ -512,12 +512,13 @@ impl GenesisEmulator {
     fn update_cached_framebuffer(&mut self) {
         let vdp_fb = self.bus.get_vdp_framebuffer();
         let display_width = self.bus.get_vdp_display_width();
-        let display_height = self.bus.get_vdp_display_height();
+        // The lines this frame drew: 224 or 240.
+        let display_height = self.bus.vdp().drawn_height();
 
-        // VDP framebuffer is always 320x224 internally, but display_width can be 256 or 320
-        // We need to handle this mismatch carefully
-        let vdp_internal_width = 320u32;
-        let vdp_internal_height = 224u32;
+        // VDP framebuffer is always 320x240 internally, but display_width can be 256 or 320
+        // and the frame can draw 224 or 240 lines. We need to handle this mismatch carefully
+        let vdp_internal_width = crate::vdp::FRAMEBUFFER_WIDTH;
+        let vdp_internal_height = crate::vdp::FRAMEBUFFER_LINES;
         let expected_vdp_size = (vdp_internal_width * vdp_internal_height * 4) as usize;
 
         // Resize cached framebuffer to match display dimensions if needed
@@ -528,10 +529,10 @@ impl GenesisEmulator {
         }
 
         // The display info gives the picture this framebuffer holds: the
-        // mode's width, its height cut to the lines the VDP draws, and how
-        // it lies over the dots and lines.
+        // mode's width, the lines the frame drew, and how it lies over the
+        // dots and lines.
         self.system_info.display.width = display_width;
-        self.system_info.display.height = self.bus.vdp().drawn_height();
+        self.system_info.display.height = display_height;
         self.system_info.display.grid = self.bus.vdp().picture_grid();
 
         // Safety check: ensure VDP framebuffer has expected size

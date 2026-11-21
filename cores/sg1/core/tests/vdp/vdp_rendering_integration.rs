@@ -98,11 +98,13 @@ fn every_pair_of_sources_shows_the_one_nearer_the_front() {
 }
 
 #[test]
-fn the_framebuffer_holds_320_by_224() {
+fn the_framebuffer_holds_320_by_240() {
     let vdp = Vdp::new();
     assert_eq!(vdp.display_width(), 320);
     assert_eq!(vdp.display_height(), 224);
-    assert_eq!(vdp.framebuffer().len(), 320 * 224 * 4);
+    assert_eq!(vdp.drawn_height(), 224);
+    // The 30-line mode's rows, which the 28-line mode's 224 fit inside.
+    assert_eq!(vdp.framebuffer().len(), 320 * 240 * 4);
 }
 
 #[test]

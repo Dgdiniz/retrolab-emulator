@@ -924,13 +924,14 @@ fn the_display_info_gives_the_mode_s_width_and_the_lines_drawn() {
     assert_eq!(size(&emu), (256, 224));
     assert_eq!(emu.get_framebuffer().width, 256);
 
-    // 30-cell lines: the framebuffer draws 224 of them, so the picture is 224
-    // high whatever the mode asks.
+    // The 30-line mode: the frame after the write draws 240 lines, and the
+    // picture is 240 high.
     emu.vdp_mut().write_word_port(0x04, 0x816C);
     play(&mut emu);
-    assert_eq!(size(&emu), (256, 224));
+    assert_eq!(size(&emu), (256, 240));
+    assert_eq!(emu.get_framebuffer().height, 240);
     assert_eq!(
         emu.capture_frame_snapshot().framebuffer.len(),
-        256 * 224 * 4
+        256 * 240 * 4
     );
 }

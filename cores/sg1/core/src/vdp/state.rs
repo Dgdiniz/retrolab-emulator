@@ -99,6 +99,9 @@ impl Vdp {
         // after the load.
         self.timing.vint_request_delay_mclks = -1;
         self.timing.first_frame_after_reset = false;
+        // Nor for the lines the frame draws: a load takes them from
+        // register 1, as the next frame's first line does.
+        self.timing.latch_lines_drawn(self.registers[1]);
 
         self.dma_fill_value = s.dma_fill_value;
         self.dma_pending = s.dma_pending;

@@ -15,7 +15,7 @@ fn test_vdp_creation() {
     assert_eq!(vdp.vram.len(), 0x10000);
     assert_eq!(vdp.cram.len(), 64);
     assert_eq!(vdp.vsram.len(), 64);
-    assert_eq!(vdp.framebuffer.len(), 320 * 224 * 4);
+    assert_eq!(vdp.framebuffer.len(), 320 * 240 * 4);
 }
 
 #[test]
@@ -157,15 +157,54 @@ fn a_picture_drawn_again_puts_back_what_drawing_leaves() {
 }
 
 #[test]
-fn the_drawn_height_is_the_mode_s_cut_to_the_framebuffer() {
+fn the_lines_drawn_are_register_1_s_as_the_frame_began_on_either_region() {
+    for (region, total) in [
+        (timing::VideoRegion::Ntsc, 262),
+        (timing::VideoRegion::Pal, 313),
+    ] {
+        let mut vdp = Vdp::new();
+        vdp.set_region(region);
+        assert_eq!((vdp.drawn_height(), vdp.first_vblank_line()), (224, 224));
+
+        // Register 1 asks for 30 lines part of the way down a frame: the
+        // mode says so at once, the frame keeps the 28 it began with.
+        vdp.scanline(0);
+        vdp.registers[1] |= 0x08;
+        assert_eq!(vdp.display_height(), 240);
+        assert_eq!(vdp.drawn_height(), 224, "{region:?}");
+        vdp.scanline(223);
+        assert!(!vdp.in_vblank(), "{region:?}");
+        vdp.scanline(224);
+        assert!(vdp.in_vblank(), "{region:?}: blanking from line 224");
+
+        // The next frame draws 30.
+        vdp.scanline(0);
+        assert_eq!((vdp.drawn_height(), vdp.first_vblank_line()), (240, 240));
+        vdp.scanline(239);
+        assert!(!vdp.in_vblank(), "{region:?}: line 239 drawn");
+        vdp.scanline(240);
+        assert!(vdp.in_vblank(), "{region:?}: blanking from line 240");
+        // The region keeps the frame's line count.
+        assert_eq!(vdp.timing.total_scanlines(), total, "{region:?}");
+    }
+}
+
+#[test]
+fn a_load_and_a_reset_take_the_lines_drawn_from_register_1() {
     let mut vdp = Vdp::new();
+    vdp.registers[1] |= 0x08;
+    vdp.scanline(0);
+    assert_eq!(vdp.drawn_height(), 240);
+
+    // A state holds register 1, not the frame's lines: a load takes them
+    // from it.
+    let mut loaded = Vdp::new();
+    loaded.from_savestate(&vdp.to_savestate());
+    assert_eq!(loaded.drawn_height(), 240);
+
+    // A reset puts register 1 back in the 28-line mode.
+    vdp.reset();
     assert_eq!(vdp.drawn_height(), 224);
-    vdp.registers[1] |= 0x08; // 30-cell lines
-    assert_eq!(vdp.display_height(), 240);
-    assert_eq!(vdp.drawn_height(), 224);
-    assert_eq!(vdp.first_vblank_line(), 224);
-    vdp.set_region(timing::VideoRegion::Pal);
-    assert_eq!(vdp.first_vblank_line(), 240);
 }
 
 #[test]

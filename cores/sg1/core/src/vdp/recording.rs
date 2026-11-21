@@ -49,7 +49,7 @@ pub enum LineKind {
     DirectColour = 3,
 }
 
-/// The most lines a picture has: 240, the PAL console's 30-cell lines.
+/// The most lines a picture has: 240, the 30-line mode's.
 const MOST_LINES: usize = 240;
 
 /// The words of vertical scroll memory the renderer reads: two for each of

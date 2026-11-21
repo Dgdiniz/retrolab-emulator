@@ -120,13 +120,22 @@ pub struct VdpTiming {
     /// Cleared the instant the first VBLANK is reached. Transient boot state, not
     /// part of the savestate (always false by the time a game is savestated).
     pub first_frame_after_reset: bool,
+
+    /// The lines the frame draws, 224 or 240: register 1 bit 3 as the
+    /// frame's first line found it ([`Self::latch_lines_drawn`]), on either
+    /// region. The line it names starts vertical blanking; the region keeps
+    /// the frame's line count. Not part of the savestate: a load takes it
+    /// again from register 1.
+    pub lines_drawn: u16,
 }
 
 impl VdpTiming {
     /// Create new timing state for given region.
     pub fn new(region: VideoRegion) -> Self {
         // Genesis starts in VBLANK - games expect this
-        // Start at first VBLANK scanline (224 for NTSC) to match MAME's initial state
+        // Start at line 224 on NTSC, the first VBLANK line of the 28-line
+        // mode a reset selects, to match MAME's initial state; at line 240
+        // on PAL, in vertical blanking too
         let initial_scanline = match region {
             VideoRegion::Ntsc => ntsc::SCANLINES_VISIBLE, // 224
             VideoRegion::Pal => pal::SCANLINES_VISIBLE,
@@ -146,6 +155,8 @@ impl VdpTiming {
             h_counter_current: 0,
             vint_request_delay_mclks: -1,
             first_frame_after_reset: true,
+            // The 28-line mode: register 1 is clear.
+            lines_drawn: 224,
         }
     }
 
@@ -157,12 +168,18 @@ impl VdpTiming {
         }
     }
 
-    /// Get visible scanlines for current region.
+    /// The visible scanlines: the lines the frame draws
+    /// ([`Self::lines_drawn`]), on either region.
     pub fn visible_scanlines(&self) -> u16 {
-        match self.region {
-            VideoRegion::Ntsc => ntsc::SCANLINES_VISIBLE,
-            VideoRegion::Pal => pal::SCANLINES_VISIBLE,
-        }
+        self.lines_drawn
+    }
+
+    /// Take the lines the frame draws from register 1 (`register_1`): 240
+    /// with bit 3 set, the 30-line mode, else 224. A frame's first line
+    /// takes them, so a change shows from the next frame, as Genesis Plus
+    /// GX applies it; a reset and a savestate's load take them too.
+    pub fn latch_lines_drawn(&mut self, register_1: u8) {
+        self.lines_drawn = if (register_1 & 0x08) != 0 { 240 } else { 224 };
     }
 
     /// Get cycles per scanline.
@@ -217,7 +234,9 @@ impl VdpTiming {
     /// Reset timing to start of frame.
     /// The Genesis starts in VBLANK after reset.
     pub fn reset(&mut self) {
-        // Start at first VBLANK scanline (224 for NTSC) to match MAME's initial state
+        // Start at line 224 on NTSC, the first VBLANK line of the 28-line
+        // mode a reset selects, to match MAME's initial state; at line 240
+        // on PAL, in vertical blanking too
         self.scanline = match self.region {
             VideoRegion::Ntsc => ntsc::SCANLINES_VISIBLE, // 224
             VideoRegion::Pal => pal::SCANLINES_VISIBLE,
@@ -340,7 +359,8 @@ mod tests {
         let timing = VdpTiming::new(VideoRegion::Pal);
         assert_eq!(timing.region, VideoRegion::Pal);
         assert_eq!(timing.total_scanlines(), pal::SCANLINES_TOTAL);
-        assert_eq!(timing.visible_scanlines(), pal::SCANLINES_VISIBLE);
+        // The 28-line mode until register 1 asks for 30, on either region.
+        assert_eq!(timing.visible_scanlines(), 224);
     }
 
     #[test]
