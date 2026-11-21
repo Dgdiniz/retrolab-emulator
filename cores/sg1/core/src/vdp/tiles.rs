@@ -1,9 +1,12 @@
 //! Tile decoding for the VDP's debugger views and exports.
 //!
-//! Handles 8x8 tile patterns (4bpp) and conversion to indexed pixels. The
-//! renderer reads its pixels straight from VRAM as it draws
-//! (`Vdp::read_tile_pixel_from_vram`); this decode is for the views and
-//! exports that want a whole tile.
+//! Handles 8x8 tile patterns (4bpp) and conversion to indexed pixels, and
+//! a palette line's colours as the screen shows them
+//! ([`build_rgba_palette`]). The renderer reads its pixels straight from
+//! VRAM as it draws (`Vdp::read_tile_pixel_from_vram`); this decode is for
+//! the views and exports that want a whole tile.
+
+use super::Vdp;
 
 /// A decoded 8x8 tile (64 pixels, 4-bit indexed color per pixel).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,35 +72,8 @@ impl Tile {
     }
 }
 
-/// Convert Genesis 9-bit color to 24-bit RGB.
-///
-/// Genesis color format (CRAM):
-/// - Bits 1-3: Red (3 bits)
-/// - Bits 5-7: Green (3 bits)
-/// - Bits 9-11: Blue (3 bits)
-/// - Bit 0, 4, 8: Unused (not stored; shadow/highlight is register 12 bit 3)
-///
-/// # Arguments
-/// * `genesis_color` - 9-bit color value (stored as u16)
-///
-/// # Returns
-/// (R, G, B) tuple, each 0-255
-pub fn convert_genesis_color_to_rgb(genesis_color: u16) -> (u8, u8, u8) {
-    let r = ((genesis_color >> 1) & 0x07) as u8;
-    let g = ((genesis_color >> 5) & 0x07) as u8;
-    let b = ((genesis_color >> 9) & 0x07) as u8;
-
-    // Convert 3-bit (0-7) to 8-bit (0-255)
-    // Simple method: multiply by 36 (approx 255/7)
-    // More accurate: r * 255 / 7, but 36 is faster
-    let r = r * 36;
-    let g = g * 36;
-    let b = b * 36;
-
-    (r, g, b)
-}
-
-/// Build RGBA palette from CRAM palette.
+/// Build RGBA palette from CRAM palette: each colour as the screen shows
+/// it ([`Vdp::convert_genesis_color`]), opaque.
 ///
 /// # Arguments
 /// * `cram` - CRAM array (64 colors)
@@ -110,7 +86,7 @@ pub fn build_rgba_palette(cram: &[u16], palette_index: u8) -> [(u8, u8, u8, u8);
     let mut palette = [(0u8, 0u8, 0u8, 255u8); 16];
 
     for i in 0..16 {
-        let (r, g, b) = convert_genesis_color_to_rgb(cram[base + i]);
+        let (r, g, b) = Vdp::convert_genesis_color(cram[base + i]);
         palette[i] = (r, g, b, 255);
     }
 
@@ -198,52 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn test_color_convert_black() {
-        let (r, g, b) = convert_genesis_color_to_rgb(0x000);
-        assert_eq!((r, g, b), (0, 0, 0));
-    }
-
-    #[test]
-    fn test_color_convert_white() {
-        // Max values: R=7, G=7, B=7
-        // Encoded as: (7 << 1) | (7 << 5) | (7 << 9) = 0x0EEE
-        let (r, g, b) = convert_genesis_color_to_rgb(0x0EEE);
-        assert_eq!(r, 252); // 7 * 36 = 252
-        assert_eq!(g, 252);
-        assert_eq!(b, 252);
-    }
-
-    #[test]
-    fn test_color_convert_red() {
-        // Red = 7, Green = 0, Blue = 0
-        // Encoded as: (7 << 1) = 0x000E
-        let (r, g, b) = convert_genesis_color_to_rgb(0x000E);
-        assert_eq!(r, 252);
-        assert_eq!(g, 0);
-        assert_eq!(b, 0);
-    }
-
-    #[test]
-    fn test_color_convert_green() {
-        // Red = 0, Green = 7, Blue = 0
-        // Encoded as: (7 << 5) = 0x00E0
-        let (r, g, b) = convert_genesis_color_to_rgb(0x00E0);
-        assert_eq!(r, 0);
-        assert_eq!(g, 252);
-        assert_eq!(b, 0);
-    }
-
-    #[test]
-    fn test_color_convert_blue() {
-        // Red = 0, Green = 0, Blue = 7
-        // Encoded as: (7 << 9) = 0x0E00
-        let (r, g, b) = convert_genesis_color_to_rgb(0x0E00);
-        assert_eq!(r, 0);
-        assert_eq!(g, 0);
-        assert_eq!(b, 252);
-    }
-
-    #[test]
     fn test_build_rgba_palette() {
         let mut cram = [0u16; 64];
         // Palette 0: first 16 colors
@@ -254,7 +184,7 @@ mod tests {
         let palette = build_rgba_palette(&cram, 0);
 
         assert_eq!(palette[0], (0, 0, 0, 255)); // Black
-        assert_eq!(palette[1], (252, 0, 0, 255)); // Red
-        assert_eq!(palette[15], (252, 252, 252, 255)); // White
+        assert_eq!(palette[1], (255, 0, 0, 255)); // Red
+        assert_eq!(palette[15], (255, 255, 255, 255)); // White
     }
 }

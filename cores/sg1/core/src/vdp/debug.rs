@@ -31,7 +31,7 @@ use retro_core::video::{
     VideoMemoryId, VideoMemoryInfo, VideoRegister,
 };
 
-use super::render::COLOUR_LEVELS;
+use super::colour::COLOUR_LEVELS;
 use super::sprites::{link_chain, Sprite};
 use super::tiles::{build_rgba_palette, Tile};
 use super::{Vdp, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
@@ -394,11 +394,10 @@ impl VideoDebugger for Vdp {
     /// column-major, tile `x * height + y` from the sprite's pattern, the
     /// whole sprite flipped first, then each tile's pixels flipped inside
     /// it ([`Tile::get_pixel`]). So the crop holds the pixels the renderer
-    /// draws. Its colours come from [`build_rgba_palette`], which scales
-    /// each three-bit level by 36 (level 7 is 252), while the screen
-    /// replicates the bits (level 7 is 255). The buffer starts fully
-    /// transparent, so any pixel left untouched (index 0, or a pattern
-    /// address past VRAM) stays alpha 0.
+    /// draws. Its colours are the ones the screen shows
+    /// ([`build_rgba_palette`], through [`Vdp::convert_genesis_color`]).
+    /// The buffer starts fully transparent, so any pixel left untouched
+    /// (index 0, or a pattern address past VRAM) stays alpha 0.
     fn export_sprite_image(&self, index: u32) -> Result<PixelImage, ExportError> {
         // 80 is the hardware per-frame sprite cap (and the max SAT slot the
         // host's sprite list walks). Guard before the u8 cast so a bogus
@@ -1015,7 +1014,7 @@ mod tests {
         // index 0 (transparent), right pixel index 1 (coloured).
         vdp.vram[64] = 0x01;
 
-        // Palette 0, colour 1 = red (3-bit 7 -> 252).
+        // Palette 0, colour 1 = red (3-bit 7 -> 255).
         vdp.cram[1] = 0x000E;
 
         let img = vdp.export_sprite_image(0).expect("sprite 0 exports");
@@ -1026,7 +1025,7 @@ mod tests {
         // Pixel (0,0): index 0 -> fully transparent.
         assert_eq!(&img.rgba[0..4], &[0, 0, 0, 0]);
         // Pixel (1,0): index 1 -> opaque red.
-        assert_eq!(&img.rgba[4..8], &[252, 0, 0, 255]);
+        assert_eq!(&img.rgba[4..8], &[255, 0, 0, 255]);
     }
 
     #[test]

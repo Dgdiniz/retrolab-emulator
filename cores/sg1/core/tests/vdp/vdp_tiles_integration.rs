@@ -4,8 +4,10 @@
 
 use super::draw;
 use retro_core::cpu::Addressable;
+use retro_core::video::VideoDebugger;
 use sg1_core::bus::AddressBus;
-use sg1_core::vdp::tiles::{build_rgba_palette, convert_genesis_color_to_rgb, Tile};
+use sg1_core::vdp::tiles::{build_rgba_palette, Tile};
+use sg1_core::vdp::Vdp;
 
 #[test]
 fn test_tile_decode_from_vram() {
@@ -162,21 +164,22 @@ fn colour_0_of_a_tile_lets_the_backdrop_through() {
 
 #[test]
 fn test_color_conversion_all_values() {
-    // Test all possible 3-bit values for each channel
+    // Every colour a CRAM word holds, three bits each of red, green and
+    // blue, goes into the exports' palette on the levels the debugger
+    // names, as the screen shows it.
+    let levels = Vdp::new().colour_levels().levels;
+    let mut cram = [0u16; 64];
     for r in 0u16..8 {
         for g in 0u16..8 {
             for b in 0u16..8 {
                 let genesis_color = (r << 1) | (g << 5) | (b << 9);
-                let (r_out, g_out, b_out) = convert_genesis_color_to_rgb(genesis_color);
+                cram[0] = genesis_color;
+                let (r_out, g_out, b_out, alpha) = build_rgba_palette(&cram, 0)[0];
 
-                // Each 3-bit value should map to approximately value * 36
-                let r_expected = (r * 36) as u8;
-                let g_expected = (g * 36) as u8;
-                let b_expected = (b * 36) as u8;
-
-                assert!(r_out >= r_expected && r_out <= r_expected.saturating_add(36));
-                assert!(g_out >= g_expected && g_out <= g_expected.saturating_add(36));
-                assert!(b_out >= b_expected && b_out <= b_expected.saturating_add(36));
+                let expected = (levels[r as usize], levels[g as usize], levels[b as usize]);
+                assert_eq!((r_out, g_out, b_out), expected, "{genesis_color:#06X}");
+                assert_eq!(Vdp::convert_genesis_color(genesis_color), expected);
+                assert_eq!(alpha, 255);
             }
         }
     }

@@ -103,15 +103,16 @@ pub fn run(args: DumpVdpArgs<GenesisBoot>) -> Result<()> {
 }
 
 /// Render CRAM as a 16-wide x 4-tall swatch grid (each color a 16x16 px
-/// block), so all four palettes are visible at a glance.
+/// block), so all four palettes are visible at a glance, each colour as the
+/// screen shows it.
 fn export_palette_png(emu: &GenesisEmulator, path: &std::path::Path) -> Result<()> {
-    use sg1_core::vdp::tiles::convert_genesis_color_to_rgb;
+    use sg1_core::vdp::Vdp;
     const CELL: u32 = 16;
     let cram = emu.vdp().get_cram();
     let (w, h) = (16 * CELL, 4 * CELL);
     let mut img = image::RgbImage::new(w, h);
     for (idx, &raw) in cram.iter().enumerate().take(64) {
-        let (r, g, b) = convert_genesis_color_to_rgb(raw);
+        let (r, g, b) = Vdp::convert_genesis_color(raw);
         let (cx, cy) = ((idx % 16) as u32 * CELL, (idx / 16) as u32 * CELL);
         for dy in 0..CELL {
             for dx in 0..CELL {
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn colour_zero_is_painted_transparent() {
         let mut palette = [(0u8, 0u8, 0u8, 255u8); 16];
-        palette[0] = (36, 72, 108, 255); // what colour 0 holds does not matter
+        palette[0] = (36, 73, 109, 255); // what colour 0 holds does not matter
         palette[1] = (0, 0, 0, 255); // a black the tile really draws
         let (r, g, b) = TRANSPARENT_RGB;
         assert_eq!(pixel_rgb(&palette, 0), image::Rgb([r, g, b]));

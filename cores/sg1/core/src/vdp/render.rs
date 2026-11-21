@@ -5,24 +5,12 @@
 //! geometry.
 
 use retro_core::capture::{NoTrace, PixelTrace};
-use retro_core::video::ColourLevels;
 
 use super::sources::{self, LineTrace};
 use super::window::WindowArea;
 use super::{
     RenderLayerMode, Vdp, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
     TRANSPARENT_RGB,
-};
-
-/// The levels a channel of a colour the picture draws takes: a CRAM
-/// colour's 3 bits a channel, each level its bits repeated across the byte
-/// ([`Vdp::convert_genesis_color`]). Shadow and highlight are worked out
-/// from a colour on these levels, halved or raised by half and capped
-/// ([`Vdp::shadow_color`], [`Vdp::highlight_color`]), and need not land on
-/// one.
-pub(super) const COLOUR_LEVELS: ColourLevels = ColourLevels {
-    name: "mega-drive-8",
-    levels: &[0, 36, 73, 109, 146, 182, 219, 255],
 };
 
 impl Vdp {
@@ -44,22 +32,6 @@ impl Vdp {
             pixel[2] = b;
             pixel[3] = 255; // Alpha
         }
-    }
-
-    /// Convert 9-bit Genesis color to 24-bit RGB.
-    /// Genesis color format: 0000 BBB0 GGG0 RRR0 (3 bits per channel)
-    pub fn convert_genesis_color(color: u16) -> (u8, u8, u8) {
-        let r = ((color >> 1) & 0x7) as u8;
-        let g = ((color >> 5) & 0x7) as u8;
-        let b = ((color >> 9) & 0x7) as u8;
-
-        // Expand 3-bit to 8-bit: multiply by 36.42857... ~ (255/7)
-        // Using bit replication for accurate conversion: xyzxyzxy
-        let r8 = (r << 5) | (r << 2) | (r >> 1);
-        let g8 = (g << 5) | (g << 2) | (g >> 1);
-        let b8 = (b << 5) | (b << 2) | (b >> 1);
-
-        (r8, g8, b8)
     }
 
     /// Rebuild the CRAM RGB lookup table from current CRAM contents.

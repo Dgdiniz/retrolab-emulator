@@ -5,54 +5,6 @@
 use super::*;
 
 #[test]
-fn test_color_conversion() {
-    // Test black (000)
-    let (r, g, b) = Vdp::convert_genesis_color(0x0000);
-    assert_eq!((r, g, b), (0, 0, 0));
-
-    // Test white (777) -> 0x0EEE
-    let (r, g, b) = Vdp::convert_genesis_color(0x0EEE);
-    assert_eq!((r, g, b), (255, 255, 255));
-
-    // Test red (700) -> 0x000E
-    let (r, g, b) = Vdp::convert_genesis_color(0x000E);
-    assert_eq!(r, 255);
-    assert_eq!(g, 0);
-    assert_eq!(b, 0);
-
-    // Test green (070) -> 0x00E0
-    let (r, g, b) = Vdp::convert_genesis_color(0x00E0);
-    assert_eq!(r, 0);
-    assert_eq!(g, 255);
-    assert_eq!(b, 0);
-
-    // Test blue (007) -> 0x0E00
-    let (r, g, b) = Vdp::convert_genesis_color(0x0E00);
-    assert_eq!(r, 0);
-    assert_eq!(g, 0);
-    assert_eq!(b, 255);
-}
-
-#[test]
-fn the_colour_levels_are_those_a_cram_channel_converts_to() {
-    use retro_core::video::VideoDebugger;
-
-    let levels = crate::vdp::render::COLOUR_LEVELS;
-    assert_eq!(levels.name, "mega-drive-8");
-    assert_eq!(levels.levels.len(), 8);
-    for (channel, &level) in levels.levels.iter().enumerate() {
-        let bits = channel as u16;
-        let grey = (bits << 1) | (bits << 5) | (bits << 9);
-        assert_eq!(
-            Vdp::convert_genesis_color(grey),
-            (level, level, level),
-            "channel value {channel}"
-        );
-    }
-    assert_eq!(Vdp::new().colour_levels(), levels);
-}
-
-#[test]
 fn test_backdrop_rendering() {
     let mut vdp = Vdp::new();
 
@@ -303,7 +255,6 @@ fn a_layer_view_tells_black_from_transparent() {
 fn no_vdp_colour_is_the_transparent_colour() {
     for raw in 0..=0x0FFFu16 {
         assert_ne!(Vdp::convert_genesis_color(raw), TRANSPARENT_RGB);
-        assert_ne!(tiles::convert_genesis_color_to_rgb(raw), TRANSPARENT_RGB);
     }
 }
 

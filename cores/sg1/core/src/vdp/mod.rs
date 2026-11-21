@@ -2,6 +2,7 @@
 //!
 //! The VDP is responsible for graphics rendering on the Genesis.
 
+mod colour;
 pub mod debug;
 pub mod dma;
 mod picture;
