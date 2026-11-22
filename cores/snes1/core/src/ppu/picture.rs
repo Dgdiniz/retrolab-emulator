@@ -20,7 +20,7 @@ impl Ppu {
     /// Live display resolution in pixels as `(width, height)`.
     ///
     /// Width is 512 when *any* visible scanline of the frame just ended
-    /// used a hires mode (Mode 5/6), tracked frame-global via
+    /// used a hires mode (Mode 5/6) or pseudo-hires, tracked frame-global via
     /// `frame_hires` so an HDMA mid-frame mode sweep (lo-res + hires
     /// bands in one frame) still reports the 512 the hires bands force,
     /// and the lo-res bands are doubled to match by
@@ -63,8 +63,9 @@ impl Ppu {
     }
 
     /// How the picture lies over the dots and lines, by the frame-global
-    /// flags [`Self::active_display_size`] reads: a frame with a hires line
-    /// is drawn at two columns a dot and two rows a line, its two rows of a
+    /// flags [`Self::active_display_size`] reads: a frame with a hires or
+    /// pseudo-hires line is drawn at two columns a dot and two rows a line,
+    /// its two rows of a
     /// line two fields woven when the frame latched the interlace bit
     /// ([`Self::frame_interlaced`]), else one drawing repeated; any other
     /// frame at one column a dot and one row a line.

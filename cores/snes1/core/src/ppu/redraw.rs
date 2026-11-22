@@ -272,7 +272,8 @@ impl Ppu {
     /// pixels, the rest of the row transparent. Mirrors
     /// [`Self::render_output_line`] up to the composite: the same row
     /// fetch, the same mosaic replay (kept in `previous_bg_rows` for the
-    /// pass), the same 256-dot sprite row widened to a hires line.
+    /// pass), the same 256-dot sprite row widened to a hires line, and a
+    /// pseudo-hires line's dots each two columns wide.
     pub(super) fn render_isolated_line<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         layer: usize,
@@ -288,9 +289,16 @@ impl Ppu {
         } else {
             NORMAL_SCANLINE_WIDTH
         };
+        // A pseudo-hires line is written 512 columns wide, two a dot.
+        let pseudo = self.pseudo_hires && !hires;
+        let line_width = if pseudo {
+            MAX_SCANLINE_WIDTH
+        } else {
+            output_width
+        };
         let stride = fb.width as usize * 4;
         let base = stride * fb_row as usize;
-        let visible_w = (fb.width as usize).min(output_width);
+        let visible_w = (fb.width as usize).min(line_width);
         fb.data[base..base + visible_w * 4].fill(0);
 
         if self.display_disable {
@@ -314,7 +322,7 @@ impl Ppu {
             let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
             self.render_obj_row(obj_line, &mut obj_row, trace);
             for x in 0..visible_w {
-                let column = if hires { x >> 1 } else { x };
+                let column = if hires || pseudo { x >> 1 } else { x };
                 let pixel = obj_row[column];
                 // A sprite render draws the chosen sprites alone.
                 if pixel.opaque && (!T::ON || trace.notes().draws_sprite_at(column)) {
@@ -348,7 +356,8 @@ impl Ppu {
         if T::ON {
             trace.notes().keep_previous_row(layer);
         }
-        for (x, pixel) in row.iter().enumerate().take(visible_w) {
+        for x in 0..visible_w {
+            let pixel = row[if pseudo { x >> 1 } else { x }];
             if pixel.opaque {
                 put(x, pixel.color);
             }

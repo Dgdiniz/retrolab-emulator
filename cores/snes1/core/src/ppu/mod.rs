@@ -303,11 +303,10 @@ impl SpriteTileCache {
 
 /// Picture processing unit register file + memories.
 ///
-/// The struct holds **every** observable PPU register, even the ones
-/// whose visible side effects are not wired (`$2133` bit 3, pseudo-hires,
-/// is stored but not drawn). Keeping the surface complete means those
-/// effects drop in without having to extend the dispatch matrix or the
-/// test fixtures.
+/// The struct holds **every** observable PPU register, even any whose
+/// visible side effects are not wired. Keeping the surface complete means
+/// those effects drop in without having to extend the dispatch matrix or
+/// the test fixtures.
 ///
 /// A register the renderer reads must also be a setting of
 /// [`record::LineState`]: a frame drawn again from its line table sets
@@ -578,7 +577,7 @@ pub struct Ppu {
     /// Bit 6: Mode 7 BG2 (EXTBG) enable.
     mode7_extbg: bool,
     /// Bit 3: pseudo-hires (mode-5 style without enabling mode 5
-    /// proper).
+    /// proper): the line is 512 columns, the sub screen on the even ones.
     pseudo_hires: bool,
     /// Bit 2: overscan, extends visible scanlines from 224 to
     /// 240, shifts the VBlank gate accordingly.
@@ -666,10 +665,10 @@ pub struct Ppu {
     pub(crate) isolated_layer: Option<usize>,
 
     // -- Frame-global display-size state (transient, not savestated) --
-    /// ORs `is_hires_mode(bgmode)` across every visible scanline of the
-    /// current frame so [`render::Ppu::active_display_size`] reports 512
-    /// width if *any* line was hires (Mode 5/6), as bsnes-plus also
-    /// reports it. Reset at the frame top (`render_scanline`
+    /// ORs whether each visible scanline of the current frame is 512 wide
+    /// (a hires mode, Mode 5/6, or pseudo-hires) so
+    /// [`render::Ppu::active_display_size`] reports 512 width if *any*
+    /// line was, as bsnes-plus also reports it. Reset at the frame top (`render_scanline`
     /// scanline 1) and consumed by [`render::Ppu::finalize_frame`].
     pub(crate) frame_hires: bool,
     /// Interlace decision (`$2133` bit 0) latched for the whole frame at
@@ -678,8 +677,9 @@ pub struct Ppu {
     /// the display size can't disagree when the game toggles interlace
     /// mid-frame or during VBlank.
     pub(crate) render_interlace: bool,
-    /// Per-output-row hires record. `true` for rows a hires scanline
-    /// produced (already 512 wide); `false` for lo-res rows (256 wide)
+    /// Per-output-row hires record. `true` for rows a hires or
+    /// pseudo-hires scanline produced (already 512 wide); `false` for
+    /// lo-res rows (256 wide)
     /// that [`render::Ppu::finalize_frame`] expands to 512 when
     /// `frame_hires`. Sized for the worst case (240 overscan x 2
     /// interlace = 480 rows). Rebuilt every frame, never savestated.

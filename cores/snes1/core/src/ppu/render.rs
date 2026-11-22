@@ -33,6 +33,17 @@
 //! emulator construction; [`Ppu::active_display_size`] reports the
 //! live (width, height) that the host should crop to.
 //!
+//! ## Pseudo-hires
+//!
+//! With the pseudo-hires bit (`$2133` bit 3) set in Modes 0-4 and 7 a
+//! line is 512 columns wide as well, two a dot. The backgrounds, the
+//! sprites and the windows stay at their 256 dots; each dot's even
+//! column shows the sub screen, with the main screen as the addend, and
+//! its odd column the main screen, the hires rule at the dot the two
+//! columns share. The sub screen's empty pixels show colour 0, as in
+//! hires. A frame with such a line is 512 wide and 448 high, as a hires
+//! frame is.
+//!
 //! ## Overscan
 //!
 //! With `$2133` bit 2 set the visible region extends from 224 to
@@ -47,7 +58,7 @@ use retro_core::video::ColourLevels;
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
-use crate::ppu::trace::{pixel_layer, source_code, FrameTrace, MathOutcome};
+use crate::ppu::trace::{pixel_layer, source_code, FrameTrace, MathOutcome, RowColumns};
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::{window_layer, Ppu, LAYER_OBJ};
 
@@ -185,8 +196,8 @@ impl Ppu {
     /// In Mode 5/6 with interlace (`$2133` bit 0) the vertical
     /// resolution doubles: each scanline emits two woven output rows
     /// (the even/odd field lines) so the full 512x448 image is built
-    /// in a single frame. The per-row work lives in
-    /// [`Ppu::render_output_line`].
+    /// in a single frame; a pseudo-hires line emits two rows as well.
+    /// The per-row work lives in [`Ppu::render_output_line`].
     pub fn render_scanline(&mut self, scanline: u16, fb: &mut Framebuffer) {
         self.draw_scanline(scanline, fb, &mut NoTrace::<FrameTrace>::new());
     }
@@ -248,9 +259,11 @@ impl Ppu {
         self.eval_obj_overflow(scanline);
 
         // Accumulate the frame-global hires flag regardless of forced
-        // blank, a blanked hires line is still emitted 512 wide.
+        // blank, a blanked hires line is still emitted 512 wide. A
+        // pseudo-hires line is 512 wide too.
         let hires = is_hires_mode(self.bgmode);
-        self.frame_hires |= hires;
+        let wide = hires || self.pseudo_hires;
+        self.frame_hires |= wide;
 
         // Mode 5/6 interlace weaves both fields into a single complete
         // frame. `vy` is the BG vertical source (the value
@@ -261,16 +274,24 @@ impl Ppu {
         // across the field pair. The non-interlace path keeps the
         // plain mapping: output row N-1 <- scanline N (vy = N). The
         // weave is gated on the latched `render_interlace`, not the live
-        // bit, so the whole frame agrees with `active_display_size`.
-        if hires && self.render_interlace {
+        // bit, so the whole frame agrees with `active_display_size`. A
+        // pseudo-hires line of an interlaced frame gives its two rows
+        // too; its backgrounds keep their 256 dots and their lines, so
+        // both rows are drawn from the line itself (vy = N).
+        if wide && self.render_interlace {
             let r0 = u32::from(scanline - 1) * 2;
             self.mark_line_hires(r0, true);
             self.mark_line_hires(r0 + 1, true);
-            self.render_output_line(scanline * 2 - 1, scanline, r0, fb, trace);
-            self.render_output_line(scanline * 2, scanline, r0 + 1, fb, trace);
+            let (first_vy, second_vy) = if hires {
+                (scanline * 2 - 1, scanline * 2)
+            } else {
+                (scanline, scanline)
+            };
+            self.render_output_line(first_vy, scanline, r0, fb, trace);
+            self.render_output_line(second_vy, scanline, r0 + 1, fb, trace);
         } else {
             let fb_row = u32::from(scanline - 1);
-            self.mark_line_hires(fb_row, hires);
+            self.mark_line_hires(fb_row, wide);
             self.render_output_line(scanline, scanline, fb_row, fb, trace);
         }
     }
@@ -319,19 +340,28 @@ impl Ppu {
         } else {
             NORMAL_SCANLINE_WIDTH
         };
+        // A pseudo-hires line keeps its rows, composites and windows at
+        // the 256 dots of `output_width` and is written 512 columns wide,
+        // two a dot.
+        let pseudo = self.pseudo_hires && !hires;
+        let line_width = if hires || pseudo {
+            MAX_SCANLINE_WIDTH
+        } else {
+            NORMAL_SCANLINE_WIDTH
+        };
 
         // Forced blank or zero-brightness collapses to a black row.
         // The vertical-mosaic buffer also gets cleared so a later
         // unmask doesn't pull stale colour back into a mosaic block.
         if self.display_disable || self.display_brightness == 0 {
-            write_black_scanline(fb_row, fb, output_width);
+            write_black_scanline(fb_row, fb, line_width);
             for bg in 0..4 {
                 self.previous_bg_rows[bg] = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
             }
             if T::ON {
                 trace
                     .notes()
-                    .note_blank_row(fb_row, (fb.width as usize).min(output_width));
+                    .note_blank_row(fb_row, (fb.width as usize).min(line_width));
             }
             return;
         }
@@ -343,12 +373,13 @@ impl Ppu {
         // sub-screen build and the per-pixel colour-math pass, that's
         // the common case and keeps the Modes 0-7 BG/OBJ path as cheap as
         // a plain composite. Window *layer* clipping (TMW/TSW) is independent
-        // of colour math and is always honoured in the composite.
+        // of colour math and is always honoured in the composite. A
+        // pseudo-hires line shows the sub plane, as a hires one does.
         let color_math_possible = self.col_main_mask != 0
             || self.color_math_back_enable
             || self.color_math_oam_enable
             || self.color_math_bg_enable.iter().any(|&b| b);
-        let need_sub = hires || color_math_possible;
+        let need_sub = hires || pseudo || color_math_possible;
 
         // Per-BG row buffers. Always full-width (512) so the same
         // allocation services hires and non-hires; the cold tail
@@ -461,17 +492,27 @@ impl Ppu {
             self.write_scanline_normal(fb_row, &row, fb);
             if T::ON {
                 let width = (fb.width as usize).min(NORMAL_SCANLINE_WIDTH);
-                trace
-                    .notes()
-                    .note_row(fb_row, width, false, &main_composite, None, false);
+                trace.notes().note_row(
+                    fb_row,
+                    width,
+                    RowColumns::Dots,
+                    &main_composite,
+                    None,
+                    false,
+                );
             }
             return;
         }
 
         // Sub screen. Its backdrop default is the fixed colour in the
-        // normal modes (checked against bsnes-plus); hires uses the
-        // real backdrop because the sub plane is a displayed image.
-        let sub_backdrop = if hires { backdrop } else { self.fixed_color };
+        // normal modes (checked against bsnes-plus); hires and
+        // pseudo-hires use the real backdrop, colour 0, because the sub
+        // plane is a displayed image.
+        let sub_backdrop = if hires || pseudo {
+            backdrop
+        } else {
+            self.fixed_color
+        };
         let sub_clips = self.build_layer_clips(true);
         let sub_composite = composite_screen(
             &sub_rows,
@@ -530,7 +571,55 @@ impl Ppu {
                 trace.notes().note_row(
                     fb_row,
                     width,
+                    RowColumns::Hires,
+                    &main_composite,
+                    Some(&sub_composite),
                     true,
+                );
+            }
+        } else if pseudo {
+            // Pseudo-hires output: two columns a dot, both composited at
+            // the dot. The even column shows the sub screen with the main
+            // screen as the addend, the odd column the main screen with
+            // the sub screen as the addend: the hires rule, with the
+            // backgrounds at 256 dots.
+            let mut line = [0u16; MAX_SCANLINE_WIDTH];
+            let (pairs, _) = line.as_chunks_mut::<2>();
+            for (x, pair) in pairs.iter_mut().enumerate() {
+                if T::ON {
+                    let (even, even_outcome) = self.resolve_pixel_explained(
+                        x,
+                        &sub_composite,
+                        &main_composite,
+                        &col_main,
+                        &col_sub,
+                    );
+                    let (odd, odd_outcome) = self.resolve_pixel_explained(
+                        x,
+                        &main_composite,
+                        &sub_composite,
+                        &col_main,
+                        &col_sub,
+                    );
+                    let notes = trace.notes();
+                    notes.math[2 * x] = even_outcome;
+                    notes.math[2 * x + 1] = odd_outcome;
+                    pair[0] = even;
+                    pair[1] = odd;
+                } else {
+                    pair[0] =
+                        self.resolve_pixel(x, &sub_composite, &main_composite, &col_main, &col_sub);
+                    pair[1] =
+                        self.resolve_pixel(x, &main_composite, &sub_composite, &col_main, &col_sub);
+                }
+            }
+            self.write_scanline_hires(fb_row, &line, fb);
+            if T::ON {
+                let width = (fb.width as usize).min(MAX_SCANLINE_WIDTH);
+                trace.notes().note_row(
+                    fb_row,
+                    width,
+                    RowColumns::PseudoHires,
                     &main_composite,
                     Some(&sub_composite),
                     true,
@@ -559,7 +648,7 @@ impl Ppu {
                 trace.notes().note_row(
                     fb_row,
                     width,
-                    false,
+                    RowColumns::Dots,
                     &main_composite,
                     Some(&sub_composite),
                     true,
@@ -675,9 +764,9 @@ impl Ppu {
     /// screen's transparent backdrop.
     ///
     /// Normally the main screen is shown and the sub screen is the
-    /// addend; in a hires line the even columns show the sub screen with
-    /// the main screen as the addend, which is the same rule with the
-    /// two rows swapped.
+    /// addend; in a hires or pseudo-hires line the even columns show the
+    /// sub screen with the main screen as the addend, which is the same
+    /// rule with the two rows swapped.
     fn resolve_pixel(
         &self,
         x: usize,

@@ -650,6 +650,125 @@ fn a_hires_line_shows_the_sub_screen_on_its_even_columns_and_interlace_weaves_tw
 }
 
 #[test]
+fn a_pseudo_hires_line_shows_the_sub_screen_on_the_even_column_of_each_dot() {
+    // Mode 1 with pseudo-hires: BG1 on the main screen, a character whose
+    // column `c` is colour `c + 1`; BG2 on the sub screen, colour 9, but
+    // for its map's second entry, which is empty. Each dot is two columns:
+    // the even one shows the sub screen, the odd one the main screen, and
+    // the sub screen's empty dots show colour 0, not the fixed colour.
+    let mut bus = scene();
+    reg(&mut bus, 0x05, 0x01);
+    reg(&mut bus, 0x07, 0x04); // BG1 map at word $0400
+    reg(&mut bus, 0x08, 0x08); // BG2 map at word $0800
+    reg(&mut bus, 0x0B, 0x21); // BG1 characters at $1000, BG2 at $2000
+    rows_from_zero(&mut bus, 0);
+    rows_from_zero(&mut bus, 1);
+    vram(
+        &mut bus,
+        0x1010,
+        &character(4, |_, column| column as u8 + 1),
+    );
+    vram(&mut bus, 0x2010, &character(4, |_, _| 9));
+    vram(&mut bus, 0x0400, &[1; 1024]);
+    let mut map = [1u16; 1024];
+    map[1] = 0;
+    vram(&mut bus, 0x0800, &map);
+    for index in 0..10u8 {
+        colour(&mut bus, index, (u16::from(index) * 3) | 0x2800);
+    }
+    reg(&mut bus, 0x32, 0xFF); // the fixed colour: white
+    reg(&mut bus, 0x2C, 0x01);
+    reg(&mut bus, 0x2D, 0x02);
+    reg(&mut bus, 0x33, 0x08); // pseudo-hires
+    reg(&mut bus, 0x00, 0x0F);
+    let frame = draw_frame(&mut bus, |_, _| {});
+    assert_eq!((frame.width, frame.height), (512, 448));
+
+    let expand = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    let colour_of = |index: u16| [expand(index * 3), 0, expand(10)];
+    let rgb = |x: u32, y: u32| {
+        let at = ((y * frame.width + x) * 4) as usize;
+        [
+            frame.picture[at],
+            frame.picture[at + 1],
+            frame.picture[at + 2],
+        ]
+    };
+    for dot in 0..16u32 {
+        let main = colour_of(dot as u16 % 8 + 1);
+        let sub = if dot < 8 { colour_of(9) } else { colour_of(0) };
+        for y in 0..2 {
+            assert_eq!(
+                rgb(2 * dot + 1, y),
+                main,
+                "dot {dot}, row {y}: the main screen"
+            );
+            assert_eq!(rgb(2 * dot, y), sub, "dot {dot}, row {y}: the sub screen");
+        }
+    }
+
+    // The planes note each column at its dot.
+    let sources = read_sources(&mut bus, &frame);
+    let drew = |x, y| at(&sources.layer, &sources, x, y) & 0x0F;
+    let column_read = |x, y| (at(&sources.tile, &sources, x, y) >> 29) & 7;
+    for dot in 0..16u32 {
+        assert_eq!(drew(2 * dot + 1, 0), 1, "dot {dot}");
+        assert_eq!(column_read(2 * dot + 1, 0), dot % 8, "dot {dot}");
+        let sub = if dot < 8 { 2 } else { 0 };
+        assert_eq!(
+            drew(2 * dot, 0),
+            sub | pixel_layer::SUB_SCREEN_SHOWN,
+            "dot {dot}"
+        );
+    }
+
+    // BG1 alone covers both columns of each dot.
+    let alone = bus.ppu_mut().render_layer(0).unwrap();
+    assert_eq!((alone.width, alone.height), (512, 448));
+    for dot in 0..16usize {
+        for x in [2 * dot, 2 * dot + 1] {
+            let at = x * 4;
+            assert_eq!(
+                &alone.rgba[at..at + 3],
+                &colour_of(dot as u16 % 8 + 1),
+                "column {x}"
+            );
+            assert_eq!(alone.rgba[at + 3], 0xFF);
+        }
+    }
+}
+
+#[test]
+fn a_pseudo_hires_line_of_an_interlaced_frame_gives_both_of_its_rows() {
+    // Mode 1, pseudo-hires and interlace: a character whose row `r` is
+    // colour `r + 1` on the main screen. The frame is woven, 512 by 448;
+    // a pseudo-hires line's backgrounds keep their lines, so both rows of
+    // each line show that line's background row.
+    let mut bus = scene();
+    reg(&mut bus, 0x05, 0x01);
+    reg(&mut bus, 0x07, 0x04);
+    reg(&mut bus, 0x0B, 0x01);
+    rows_from_zero(&mut bus, 0);
+    vram(&mut bus, 0x1010, &character(4, |row, _| row as u8 + 1));
+    vram(&mut bus, 0x0400, &[1; 1024]);
+    for index in 0..9u8 {
+        colour(&mut bus, index, u16::from(index) * 3);
+    }
+    reg(&mut bus, 0x2C, 0x01);
+    reg(&mut bus, 0x33, 0x09); // pseudo-hires and interlace
+    reg(&mut bus, 0x00, 0x0F);
+    let frame = draw_frame(&mut bus, |_, _| {});
+    assert_eq!((frame.width, frame.height), (512, 448));
+    let red = |x: u32, y: u32| frame.picture[((y * frame.width + x) * 4) as usize];
+    let expand = |c: u32| ((c << 3) | (c >> 2)) as u8;
+    for row in 0..32u32 {
+        let line_row = row / 2;
+        assert_eq!(red(1, row), expand((line_row % 8 + 1) * 3), "row {row}");
+    }
+    read_sources(&mut bus, &frame);
+}
+
+#[test]
 fn a_mode7_pixel_names_its_character_and_its_plane_cell_and_says_when_it_lies_outside() {
     let mut bus = scene();
     reg(&mut bus, 0x05, 0x07);

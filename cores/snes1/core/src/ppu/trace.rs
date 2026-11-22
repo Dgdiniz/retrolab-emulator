@@ -31,7 +31,7 @@ use super::{Ppu, LAYER_OBJ};
 /// | Bits | Meaning |
 /// |---|---|
 /// | 0-2 | What drew the pixel: 0 the backdrop, 1-4 BG1-BG4, 5 the sprites (each layer's id plus one), 7 nothing (forced blank, brightness 0, or a line not drawn) |
-/// | 3 | The sub screen's pixel is shown (the even columns of a hires line) |
+/// | 3 | The sub screen's pixel is shown (the even columns of a hires or pseudo-hires line) |
 /// | 4-6 | What colour math combined it with: 0 the other screen's backdrop, 1-4 BG1-BG4, 5 the sprites, 6 the fixed colour, 7 nothing (no colour math) |
 /// | 7 | Colour math was applied |
 /// | 8 | Its result was halved |
@@ -286,6 +286,21 @@ pub const MODE7_OUTSIDE: u16 = 1 << 14;
 /// Rows of origins, one per background, as wide as the widest line.
 type OriginRows = [[BgOrigin; MAX_SCANLINE_WIDTH]; 4];
 
+/// How the columns of a noted row lie over its line's composites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowColumns {
+    /// One column a dot: a lo-res line.
+    Dots,
+    /// A hires line (Modes 5 and 6): 512 columns, each composited at its
+    /// own background position, its sprite at the dot (`x >> 1`); the even
+    /// columns show the sub screen.
+    Hires,
+    /// A pseudo-hires line: 512 columns, two a dot (`x >> 1`) for the
+    /// backgrounds and the sprites alike; the even column of a dot shows
+    /// the sub screen, the odd column the main screen.
+    PseudoHires,
+}
+
 /// A heap block of `N` copies of `value`, as a fixed-size array.
 fn boxed<T: Copy, const N: usize>(value: T) -> Box<[T; N]> {
     vec![value; N]
@@ -475,29 +490,37 @@ impl FrameTrace {
             .is_none_or(|filter| filter[usize::from(self.obj[column].slot & 0x7F)])
     }
 
-    /// Note output row `fb_row`, `width` wide: `main` the main screen's
-    /// composite, `sub` the sub screen's when the line built one (a hires
-    /// line shows it on its even columns), `math` whether colour math ran
-    /// (its outcome per column in [`Self::math`]).
+    /// Note output row `fb_row`, `width` wide, its columns lying over the
+    /// composites as `columns` says: `main` the main screen's composite,
+    /// `sub` the sub screen's when the line built one (a hires or
+    /// pseudo-hires line shows it on its even columns), `math` whether
+    /// colour math ran (its outcome per column in [`Self::math`]).
     pub(crate) fn note_row(
         &mut self,
         fb_row: u32,
         width: usize,
-        hires: bool,
+        columns: RowColumns,
         main: &ScreenRow,
         sub: Option<&ScreenRow>,
         math: bool,
     ) {
         let base = fb_row as usize * MAX_SCANLINE_WIDTH;
+        let hires = columns == RowColumns::Hires;
         for x in 0..width {
-            let sub_shown = hires && x & 1 == 0 && sub.is_some();
+            // The composite's column: the dot in a pseudo-hires line.
+            let at = if columns == RowColumns::PseudoHires {
+                x >> 1
+            } else {
+                x
+            };
+            let sub_shown = columns != RowColumns::Dots && x & 1 == 0 && sub.is_some();
             let (mut layer, colour, tile, cell) = match (sub_shown, sub) {
                 (true, Some(sub)) => {
                     let (layer, colour, tile, cell) =
-                        self.pixel_values(sub[x].source, x, hires, false);
+                        self.pixel_values(sub[at].source, at, hires, false);
                     (layer | pixel_layer::SUB_SCREEN_SHOWN, colour, tile, cell)
                 }
-                _ => self.pixel_values(main[x].source, x, hires, true),
+                _ => self.pixel_values(main[at].source, at, hires, true),
             };
             layer |= if math {
                 self.math[x].layer_bits()
@@ -505,7 +528,7 @@ impl FrameTrace {
                 MathOutcome::NONE.layer_bits()
             };
             let (sub_layer, sub_colour) = match sub {
-                Some(sub) => (source_code(sub[x].source) as u8, sub[x].color),
+                Some(sub) => (source_code(sub[at].source) as u8, sub[at].color),
                 None => (layer::NOTHING as u8, 0),
             };
             self.store(base + x, layer, colour, tile, cell, sub_layer, sub_colour);
@@ -513,8 +536,9 @@ impl FrameTrace {
     }
 
     /// The `layer` (its source and the pixel's own bits), `colour`, `tile`
-    /// and `cell` of a composited pixel from `source` at column `x`, of the
-    /// main screen (`on_main`, its backgrounds mosaicked) or the sub.
+    /// and `cell` of a composited pixel from `source` at column `x` of its
+    /// composite (a hires line's 512, its sprite at `x >> 1`), of the main
+    /// screen (`on_main`, its backgrounds mosaicked) or the sub.
     fn pixel_values(
         &self,
         source: PixelSource,

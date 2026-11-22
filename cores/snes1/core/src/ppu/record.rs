@@ -192,8 +192,7 @@ retro_core::line_state! {
         color_math_bg_enable: [bool; 4] = color_math_bg_enable,
         /// The fixed colour, BGR555 (COLDATA).
         fixed_color: u16 = fixed_color,
-        /// Pseudo-hires (SETINI bit 3). The renderer does not draw it; it is
-        /// kept so the line's state is whole.
+        /// Pseudo-hires (SETINI bit 3).
         pseudo_hires: bool = pseudo_hires,
         /// Overscan, 239 visible lines (SETINI bit 2).
         overscan: bool = overscan,

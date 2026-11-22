@@ -44,8 +44,8 @@ pub struct WindowMasks {
     /// whether or not the screens clip the layer there), the colour
     /// window's region, where the main screen keeps its pixels (outside it
     /// they are black) and where colour math may run. Bit `x & 7` of byte
-    /// `x >> 3` is dot `x`; in a hires line output column `k` is dot
-    /// `k >> 1`.
+    /// `x >> 3` is dot `x`; in a hires or pseudo-hires line output
+    /// column `k` is dot `k >> 1`.
     pub masks: Vec<u8>,
 }
 
@@ -70,7 +70,8 @@ pub struct OffsetPerTileTable {
     /// registers and the memory as they stand.
     pub from_line_states: bool,
     /// The line of each row, in the order drawn. A line of an interlaced
-    /// hires frame gives two rows, its two background lines.
+    /// hires frame gives two rows, its two background lines; a
+    /// pseudo-hires line of such a frame gives two rows as well.
     pub lines: Vec<u16>,
     /// Tile columns a row: 33 for a 256-dot line, 65 when a row is Mode 6,
     /// whose line is 512 dots.
@@ -373,9 +374,12 @@ impl Ppu {
             let hires = state.bgmode == 6;
             let line_width: u16 = if hires { 512 } else { 256 };
             // The background lines the line fetched: two in an interlaced
-            // hires frame, which weaves them into two rows.
+            // hires frame, which weaves them into two rows; a pseudo-hires
+            // line of such a frame draws both of its rows from its own line.
             let (rows, count) = if hires && interlace {
                 ([*line * 2 - 1, *line * 2], 2)
+            } else if state.pseudo_hires && interlace {
+                ([*line, *line], 2)
             } else {
                 ([*line, 0], 1)
             };
