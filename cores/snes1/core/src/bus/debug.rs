@@ -5,7 +5,7 @@
 //! synchronisation registers, the program counter and one WRAM cell.
 
 use retro_core::capture::WriteOrigin;
-use retro_core::debug::Access;
+use retro_core::debug::{Access, RaisedEvents};
 
 use super::{wram_offset, SnesBus};
 
@@ -78,7 +78,7 @@ pub(super) struct IoTraceBuf {
 /// read, and the emulator matches them after each instruction. DMA-engine
 /// traffic uses the internal typed read/write paths and is intentionally
 /// **not** recorded here, only CPU-initiated accesses are observed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BusDebugEvent {
     /// A write to PPU register `$2100 | reg` (`reg` is `$00-$3F`).
     PpuRegWrite { reg: u8 },
@@ -137,9 +137,10 @@ impl SnesBus {
     }
 
     /// The PPU-register and APU-port writes recorded since the last
-    /// [`SnesBus::clear_debug_events`].
-    pub fn debug_events(&self) -> &[BusDebugEvent] {
-        &self.debug_events
+    /// [`SnesBus::clear_debug_events`], each once: the debugger drains
+    /// them into its event breakpoints.
+    pub fn raised_debug_events(&mut self) -> &mut RaisedEvents<BusDebugEvent> {
+        &mut self.debug_events
     }
 
     /// Drop the access log and the recorded writes. The emulator clears

@@ -85,7 +85,7 @@ use std::sync::Arc;
 use retro_core::capture::{CaptureRecording, WriteOrigin};
 use retro_core::cartridge::{Cartridge, SlotShape, SourcePlace};
 use retro_core::cpu::Addressable;
-use retro_core::debug::{Access, AccessLog};
+use retro_core::debug::{Access, AccessLog, RaisedEvents};
 
 use crate::apu::Apu;
 use crate::cartridge::{BusSpeed, MapPlan, MapTarget, SnesCartridge, CX4_CHIP_ID};
@@ -107,6 +107,11 @@ const PPU2_VERSION: u8 = 1;
 
 /// Number of pages in the address space (16 MiB / 4 KiB = 4096).
 const PAGE_TABLE_LEN: usize = 0x1000;
+
+/// The write events the bus raises: one for each of the 64 PPU registers
+/// and the 4 APU ports. Each is kept once between two drains, so the list
+/// never holds more.
+const BUS_WRITE_EVENTS: usize = 0x40 + 4;
 
 /// Resolve a CPU address to its physical WRAM offset (`0..0x20000`), or
 /// `None` if it doesn't land in WRAM. Handles both the `$7E/$7F` direct
@@ -298,9 +303,9 @@ pub struct SnesBus {
     /// empty unless [`Self::debug_armed`] is set.
     accesses: AccessLog,
     /// The PPU-register and APU-port writes the CPU made this instruction,
-    /// for their event breakpoints. Always empty unless
+    /// each once, for their event breakpoints. Always empty unless
     /// [`Self::debug_armed`] is set.
-    debug_events: Vec<BusDebugEvent>,
+    debug_events: RaisedEvents<BusDebugEvent>,
     /// Master cycles accumulated by the CPU's memory accesses since the
     /// last [`Self::begin_cpu_instruction`]. Each `read`/`write` on the
     /// [`Addressable`] trait adds [`Self::cycles_for`] of the touched
@@ -422,7 +427,7 @@ impl SnesBus {
             controllers: [StandardPad::new(); 2],
             debug_armed: false,
             accesses: AccessLog::new(),
-            debug_events: Vec::new(),
+            debug_events: RaisedEvents::new(BUS_WRITE_EVENTS),
             instr_master_cycles: 0,
             instr_accesses: 0,
             next_irq_cycle: None,
@@ -1814,7 +1819,7 @@ impl Addressable for SnesBus {
                 value,
             });
             if let Some(ev) = classify_b_bus_write(addr) {
-                self.debug_events.push(ev);
+                self.debug_events.raise(ev);
             }
         }
         if self.io_trace.is_some() && is_watched_io(addr) {

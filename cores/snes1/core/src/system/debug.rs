@@ -20,7 +20,7 @@ use crate::debugger::{
 use crate::expr_ctx::wdc65816_register;
 use crate::trace_format::{effective_address, EffRegs};
 
-use crate::bus::{BusDebugEvent, SnesBus, SnesPeekBus};
+use crate::bus::{SnesBus, SnesPeekBus};
 
 impl SnesEmulator {
     /// Live Mode 7 matrix as signed `[A, B, C, D, X, Y]`, for the Mode 7 viewer.
@@ -378,13 +378,7 @@ impl SnesEmulator {
                 .debugger
                 .check_accesses(MAIN_CPU, self.bus.accesses(), &mut context);
         }
-        for event in self.bus.debug_events() {
-            let event = match *event {
-                BusDebugEvent::PpuRegWrite { reg } => SnesEvent::PpuRegisterWrite(reg),
-                BusDebugEvent::ApuPortWrite { port } => SnesEvent::ApuPortWrite(port),
-            };
-            hit |= self.debugger.check_event(event);
-        }
+        hit |= self.debugger.check_raised(self.bus.raised_debug_events());
         self.bus.clear_debug_events();
         hit
     }

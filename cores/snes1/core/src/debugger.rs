@@ -40,6 +40,7 @@ use spc700::Spc700;
 #[cfg(feature = "chip-superfx")]
 use superfx_gsu::Gsu;
 
+use crate::bus::BusDebugEvent;
 #[cfg(feature = "chip-cx4")]
 use crate::cartridge::chips::cx4::hg51b::Hg51b;
 use crate::ppu::PpuDebugEvent;
@@ -412,6 +413,15 @@ impl DebugEvent for SnesEvent {
 
 /// The PPU's events are the palette-write and tile-change events of
 /// [`SnesEvent`], with the same codes and params.
+impl DebugEvent for BusDebugEvent {
+    fn code_param(self) -> (u32, u32) {
+        match self {
+            BusDebugEvent::PpuRegWrite { reg } => SnesEvent::PpuRegisterWrite(reg).code_param(),
+            BusDebugEvent::ApuPortWrite { port } => SnesEvent::ApuPortWrite(port).code_param(),
+        }
+    }
+}
+
 impl DebugEvent for PpuDebugEvent {
     fn code_param(self) -> (u32, u32) {
         match self {

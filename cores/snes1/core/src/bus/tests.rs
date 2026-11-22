@@ -61,6 +61,29 @@ fn io_trace_ring_buffer_keeps_only_the_tail() {
 }
 
 #[test]
+fn the_recorded_writes_and_accesses_stay_bounded_however_long_nothing_drains_them() {
+    let mut bus = SnesBus::new();
+    bus.set_debug_armed(true);
+    for n in 0..10_000u32 {
+        Addressable::write(&mut bus, 0x00_2100 + (n % 0x44), n as u8);
+    }
+    let raised = bus.raised_debug_events();
+    assert_eq!(raised.len(), 0x40 + 4, "every register and port, once");
+    assert_eq!(raised.dropped(), 0);
+    let mut seen = Vec::new();
+    raised.drain(|event| seen.push(event));
+    assert_eq!(seen[0], BusDebugEvent::PpuRegWrite { reg: 0 });
+    assert_eq!(seen[0x40], BusDebugEvent::ApuPortWrite { port: 0 });
+    assert_eq!(
+        bus.accesses().len(),
+        AccessLog::CAPACITY,
+        "the log stops at its capacity"
+    );
+    bus.clear_debug_events();
+    assert!(bus.accesses().is_empty());
+}
+
+#[test]
 fn wram_offset_resolves_direct_banks_and_low_mirror() {
     // Direct $7E/$7F banks.
     assert_eq!(wram_offset(0x7E_0158), Some(0x0158));

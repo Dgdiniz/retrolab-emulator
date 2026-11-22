@@ -18,29 +18,49 @@ pub struct Access {
     pub value: u8,
 }
 
-/// The accesses one instruction made, in the order it made them. Kept
-/// across instructions and cleared between them, so recording allocates
-/// nothing once the log has grown to the largest instruction.
+/// The accesses one instruction made, in the order it made them, at most
+/// [`Self::CAPACITY`]: past it an access is not kept but counted
+/// ([`Self::dropped`]), as [`crate::debug::RaisedEvents`] keeps its
+/// events. Kept across instructions and cleared between them, so recording
+/// allocates nothing once the log has grown to the largest instruction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessLog {
     accesses: Vec<Access>,
+    dropped: u32,
 }
 
 impl AccessLog {
+    /// The most accesses the log keeps: far more than any one instruction
+    /// of these CPUs makes, so only a log nothing clears between
+    /// instructions reaches it.
+    pub const CAPACITY: usize = 4096;
+
     /// An empty log.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Forget every access, keeping the allocation.
+    /// Forget every access and the count of those dropped, keeping the
+    /// allocation.
     pub fn clear(&mut self) {
         self.accesses.clear();
+        self.dropped = 0;
     }
 
-    /// Record one byte.
+    /// Record one byte; past the capacity it is counted instead.
     #[inline]
     pub fn push(&mut self, access: Access) {
+        if self.accesses.len() >= Self::CAPACITY {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
         self.accesses.push(access);
+    }
+
+    /// How many accesses were not kept for want of room since the log was
+    /// made or last cleared.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     /// Record a 16-bit access as its two bytes, most significant first: the
@@ -74,6 +94,24 @@ impl AccessLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_keeps_its_capacity_and_counts_the_rest() {
+        let mut log = AccessLog::new();
+        for n in 0..AccessLog::CAPACITY + 3 {
+            log.push(Access {
+                address: n as u32,
+                write: false,
+                value: 0,
+            });
+        }
+        assert_eq!(log.as_slice().len(), AccessLog::CAPACITY);
+        assert_eq!(log.as_slice().last().unwrap().address, 4095);
+        assert_eq!(log.dropped(), 3);
+        log.clear();
+        assert!(log.is_empty());
+        assert_eq!(log.dropped(), 0);
+    }
 
     #[test]
     fn a_word_is_its_two_bytes_most_significant_first() {
