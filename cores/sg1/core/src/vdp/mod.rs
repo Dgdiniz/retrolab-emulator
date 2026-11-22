@@ -687,9 +687,10 @@ impl Vdp {
         self.registers[12] = 0x81; // Mode register 4 (H40 mode)
         self.registers[15] = 0x02; // Auto-increment
 
-        // Clear memory
+        // Clear memory, and the renderer's colours built from CRAM with it
         self.vram.fill(0);
         self.cram.fill(0);
+        self.rebuild_cram_rgb();
         self.vsram.fill(0);
 
         // Reset state

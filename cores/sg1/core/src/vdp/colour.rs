@@ -221,8 +221,8 @@ mod tests {
     /// The shadowed and highlighted colours are set with `cram_rgb` by
     /// every writer of CRAM, and stay with it through what leaves
     /// `cram_rgb` as it is: a new VDP, every write through the data port,
-    /// a debugger write, a savestate's load, a reset (which clears CRAM and
-    /// leaves the renderer's table as it was) and a redraw of the frame.
+    /// a debugger write, a savestate's load, a reset (which clears CRAM,
+    /// and the three tables with it) and a redraw of the frame.
     #[test]
     fn the_shaded_colours_follow_the_palette_wherever_it_changes() {
         let mut vdp = Vdp::new();
@@ -247,9 +247,9 @@ mod tests {
         assert_eq!(loaded.cram_rgb, vdp.cram_rgb);
         assert_shades_follow_cram_rgb(&loaded, "a load");
 
-        let before_reset = vdp.cram_rgb;
+        assert_ne!(vdp.cram_rgb, [(0, 0, 0); 64]);
         vdp.reset();
-        assert_eq!(vdp.cram_rgb, before_reset, "a reset leaves the table");
+        assert_eq!(vdp.cram_rgb, [(0, 0, 0); 64], "a reset clears the table");
         assert_shades_follow_cram_rgb(&vdp, "a reset");
 
         // A frame drawn with its line states, colour 0 changed through the
