@@ -19,14 +19,23 @@ use super::render::{
     BgRowPixel, Screen, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
 use super::tile::{
-    bg_tilemap_word_index, build_tilemap_row, compute_offset_per_tile, decode_tile_2bpp_row,
-    decode_tile_4bpp_row, decode_tile_8bpp_row, fetch_bg_tilemap_entry, hires_adjacent_tile_offset,
+    bg_entry_character, bg_tilemap_word_index, build_tilemap_row, compute_offset_per_tile,
+    decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row, fetch_bg_tilemap_entry,
     offset_per_tile, tilemap_masks, TilemapEntry,
 };
 use super::trace::{colour_value, pixel_layer, BgOrigin, FrameTrace};
 use super::Ppu;
 
 impl Ppu {
+    /// Background `bg`'s pixels take direct colour: BG1's 8-bit characters
+    /// in Modes 3 and 4 while CGWSEL's direct colour is on.
+    pub(super) fn bg_direct_colour(&self, bg: usize) -> bool {
+        bg == 0
+            && (self.bgmode == 3 || self.bgmode == 4)
+            && self.direct_color
+            && bpp_for_bg(self.bgmode, bg) == 8
+    }
+
     /// Fill a row buffer with a single BG's tile output. `hires`
     /// selects between the 256-wide normal path (Modes 0-4) and
     /// the 512-wide hires path (Modes 5/6); in hires every tilemap
@@ -77,8 +86,7 @@ impl Ppu {
         // `screen_y` makes that bottom-char pick follow the field
         // (`py = (y << 1) | field`).
         let tile16 = self.bg_tile_size[bg_id];
-        let direct_color =
-            bg_id == 0 && (self.bgmode == 3 || self.bgmode == 4) && self.direct_color && bpp == 8;
+        let direct_color = self.bg_direct_colour(bg_id);
         let row_width: u16 = if hires {
             MAX_SCANLINE_WIDTH as u16
         } else {
@@ -184,38 +192,9 @@ impl Ppu {
                 ),
             };
 
-            // A 16x16 entry names a 2x2 block of 8-px characters laid
-            // out in VRAM as TL=N, TR=N+1, BL=N+16, BR=N+17 (the char
-            // table is 16 tiles wide, so "down one tile" is +16). Pick
-            // the quadrant from the low scroll bits: bit 3 of X selects
-            // the right column, bit 3 of Y the bottom row, each
-            // inverted by the corresponding flip so a flipped 16x16 tile
-            // still reads its own four characters in mirror order. This
-            // arm serves 16x16 BGs in every mode, hires included: the
-            // 512-dot `screen_x` makes bit 3 land on the right 8-px half
-            // exactly like `hires_adjacent_tile_offset`, while bit 3 of
-            // the (interlace-doubled) `screen_y` adds the +16 the 8x8
-            // hires arm below can't reach. The `else if hires` arm is the
-            // 8x8 hires case: one entry per 16-px slot, neighbour tile for
-            // the second half. Both mask back to 10 bits to mirror the
-            // decoders' internal wrap.
-            let effective_tile = if tile16 {
-                let mut t = entry.tile;
-                if ((screen_x & 8) != 0) ^ entry.flip_h {
-                    t = t.wrapping_add(1);
-                }
-                if ((screen_y & 8) != 0) ^ entry.flip_v {
-                    t = t.wrapping_add(16);
-                }
-                t & 0x03FF
-            } else if hires {
-                entry
-                    .tile
-                    .wrapping_add(hires_adjacent_tile_offset(screen_x, entry.flip_h))
-                    & 0x03FF
-            } else {
-                entry.tile
-            };
+            // The 8-px character the entry names here: a 16x16 entry's
+            // quadrant, an 8x8 hires entry's half of its 16-px slot.
+            let effective_tile = bg_entry_character(entry, screen_x, screen_y, hires, tile16);
 
             let row_in_tile = (screen_y & 7) as u8;
             // The map entry's VRAM word, for a traced redraw's notes.

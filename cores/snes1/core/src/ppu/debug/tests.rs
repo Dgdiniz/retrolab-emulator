@@ -124,6 +124,181 @@ fn tilemap_image_dims_default_32x32() {
     assert_eq!(img.rgba.len(), 256 * 256 * 4);
 }
 
+// -- The tilemap still ------------------------------------------
+
+/// VRAM and CGRAM filled with values that look random and are the same on
+/// every run, so every map entry, character and colour is some value.
+fn scramble(ppu: &mut Ppu, seed: u32) {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for word in ppu.vram.iter_mut() {
+        *word = next() as u16;
+    }
+    for colour in ppu.cgram.iter_mut() {
+        *colour = next() as u16 & 0x7FFF;
+    }
+}
+
+/// Every pixel the renderer draws of background `bg` on 224 lines, with the
+/// scroll at each of `scrolls`, is the tilemap still's pixel at the same
+/// place of the map, and a pixel it leaves transparent is transparent there.
+fn assert_the_still_is_what_the_renderer_draws(ppu: &mut Ppu, bg: usize, scrolls: &[(u16, u16)]) {
+    use crate::ppu::render::{BgRowPixel, MAX_SCANLINE_WIDTH};
+    use crate::ppu::trace::FrameTrace;
+    use retro_core::capture::NoTrace;
+    let still = ppu.export_tilemap_image(bg);
+    let hires = is_hires_mode(ppu.bgmode);
+    let width: u16 = if hires { 512 } else { 256 };
+    for &(hoffset, voffset) in scrolls {
+        ppu.bg_hoffset[bg] = hoffset;
+        ppu.bg_voffset[bg] = voffset;
+        ppu.invalidate_tilemap_caches();
+        let h_scroll = if hires { hoffset << 1 } else { hoffset };
+        for scanline in 1..=224u16 {
+            let mut row = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
+            ppu.render_bg_row(
+                bg,
+                scanline,
+                &mut row,
+                hires,
+                &mut NoTrace::<FrameTrace>::new(),
+            );
+            let map_y = u32::from(scanline.wrapping_add(voffset)) % still.height;
+            for x in 0..width {
+                let map_x = u32::from(x.wrapping_add(h_scroll)) % still.width;
+                let at = ((map_y * still.width + map_x) * 4) as usize;
+                let pixel = row[usize::from(x)];
+                let expected = if pixel.opaque {
+                    bgr15_to_rgba8(pixel.color)
+                } else {
+                    [0; 4]
+                };
+                assert_eq!(
+                    still.rgba[at..at + 4],
+                    expected,
+                    "mode {} BG{} scroll ({hoffset}, {voffset}) line {scanline} x {x}",
+                    ppu.bgmode,
+                    bg + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_tilemap_still_draws_each_background_as_the_renderer_does() {
+    // Mode 0: four backgrounds of 2 bits, each with 32 colours of its own;
+    // every screen size.
+    for bg in 0..4 {
+        let mut ppu = Ppu::new();
+        scramble(&mut ppu, 11 + bg as u32);
+        ppu.bgmode = 0;
+        ppu.bg_screen_addr[bg] = 0x2000 * bg as u32;
+        ppu.bg_tiledata_addr[bg] = 0x4000;
+        ppu.bg_screen_size[bg] = bg as u8;
+        assert_the_still_is_what_the_renderer_draws(&mut ppu, bg, &[(0, 0), (300, 290)]);
+    }
+    // Mode 1: 4 bits on BG1 and BG2, 2 on BG3; 16x16 tiles on BG2.
+    let mut ppu = Ppu::new();
+    scramble(&mut ppu, 21);
+    ppu.bgmode = 1;
+    ppu.bg_screen_size[0] = 3;
+    ppu.bg_tiledata_addr[1] = 0x8000;
+    ppu.bg_tile_size[1] = true;
+    ppu.bg_screen_size[1] = 1;
+    for bg in 0..3 {
+        assert_the_still_is_what_the_renderer_draws(&mut ppu, bg, &[(0, 0), (700, 500)]);
+    }
+    // Mode 3: BG1's 8 bits through CGRAM, then in direct colour.
+    let mut ppu = Ppu::new();
+    scramble(&mut ppu, 31);
+    ppu.bgmode = 3;
+    ppu.bg_tile_size[0] = true;
+    assert_the_still_is_what_the_renderer_draws(&mut ppu, 0, &[(0, 0), (100, 200)]);
+    ppu.direct_color = true;
+    assert!(ppu.bg_direct_colour(0));
+    assert_the_still_is_what_the_renderer_draws(&mut ppu, 0, &[(0, 0)]);
+    // Mode 5: hires, its entries 16 dots wide; 16x16 tiles on BG2.
+    let mut ppu = Ppu::new();
+    scramble(&mut ppu, 41);
+    ppu.bgmode = 5;
+    ppu.bg_screen_size[0] = 1;
+    ppu.bg_tile_size[1] = true;
+    for bg in 0..2 {
+        assert_the_still_is_what_the_renderer_draws(&mut ppu, bg, &[(0, 0), (130, 70)]);
+    }
+}
+
+#[test]
+fn the_tilemap_still_s_size_follows_the_tiles_and_the_hires_modes() {
+    let mut ppu = Ppu::new();
+    let size = |ppu: &Ppu, bg: usize| {
+        let still = ppu.export_tilemap_image(bg);
+        assert_eq!(still.rgba.len(), (still.width * still.height * 4) as usize);
+        (still.width, still.height)
+    };
+    ppu.bgmode = 1;
+    ppu.bg_screen_size[0] = 1;
+    assert_eq!(size(&ppu, 0), (512, 256), "64 by 32 entries of 8 by 8");
+    ppu.bg_tile_size[0] = true;
+    assert_eq!(size(&ppu, 0), (1024, 512), "of 16 by 16");
+    ppu.bgmode = 5;
+    ppu.bg_tile_size[0] = false;
+    assert_eq!(size(&ppu, 0), (1024, 256), "hires: 16 dots by 8");
+    // A background the mode does not draw: the map's size, transparent.
+    scramble(&mut ppu, 51);
+    let off = ppu.export_tilemap_image(2);
+    assert_eq!((off.width, off.height), (512, 256));
+    assert!(off.rgba.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn the_tilemap_still_of_mode_7_is_its_plane() {
+    let mut ppu = Ppu::new();
+    ppu.bgmode = 7;
+    // Map cell (1, 0) names character 2; its pixel (3, 4) is colour 0x85,
+    // its pixel (4, 4) colour 0x80, and the rest of the map character 0,
+    // all colour 0 but its pixel (0, 0), colour 0x05.
+    ppu.vram[1] = 0x0002;
+    ppu.vram[2 * 64 + 4 * 8 + 3] |= 0x8500;
+    ppu.vram[2 * 64 + 4 * 8 + 4] |= 0x8000;
+    ppu.vram[0] |= 0x0500;
+    ppu.cgram[0x05] = 0x001F;
+    ppu.cgram[0x80] = 0x03E0;
+    ppu.cgram[0x85] = 0x7C00;
+    let pixel = |still: &ViewerImage, x: u32, y: u32| {
+        let at = ((y * still.width + x) * 4) as usize;
+        [
+            still.rgba[at],
+            still.rgba[at + 1],
+            still.rgba[at + 2],
+            still.rgba[at + 3],
+        ]
+    };
+    let plane = ppu.export_tilemap_image(0);
+    assert_eq!((plane.width, plane.height), (1024, 1024));
+    assert_eq!(pixel(&plane, 11, 4), bgr15_to_rgba8(0x7C00), "8 bits");
+    assert_eq!(pixel(&plane, 12, 4), bgr15_to_rgba8(0x03E0));
+    assert_eq!(pixel(&plane, 16, 0), bgr15_to_rgba8(0x001F), "character 0");
+    assert_eq!(pixel(&plane, 17, 0), [0; 4], "colour 0 is transparent");
+    ppu.direct_color = true;
+    let direct = ppu.export_tilemap_image(0);
+    assert_eq!(
+        pixel(&direct, 11, 4),
+        bgr15_to_rgba8(direct_color_word(0x85, 0))
+    );
+    // BG2 under EXTBG: the low 7 bits, colour 0 transparent.
+    ppu.mode7_extbg = true;
+    let extbg = ppu.export_tilemap_image(1);
+    assert_eq!(pixel(&extbg, 11, 4), bgr15_to_rgba8(0x001F), "0x85 as 0x05");
+    assert_eq!(pixel(&extbg, 12, 4), [0; 4], "0x80 as 0");
+}
+
 #[test]
 fn oam_sprites_export_all_128() {
     let ppu = Ppu::new();

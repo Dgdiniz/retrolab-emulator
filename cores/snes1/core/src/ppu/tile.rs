@@ -236,6 +236,49 @@ pub fn hires_adjacent_tile_offset(screen_x: u16, flip_h: bool) -> u16 {
     u16::from(in_second_half != flip_h)
 }
 
+/// The 8-pixel character a tilemap entry names at the pixel `(screen_x,
+/// screen_y)` of a background.
+///
+/// A 16x16 entry names a 2x2 block of 8-px characters laid out in VRAM as
+/// TL=N, TR=N+1, BL=N+16, BR=N+17 (the char table is 16 tiles wide, so
+/// "down one tile" is +16). The quadrant comes from the low scroll bits:
+/// bit 3 of X selects the right column, bit 3 of Y the bottom row, each
+/// inverted by the corresponding flip so a flipped 16x16 tile still reads
+/// its own four characters in mirror order. This serves 16x16 BGs in
+/// every mode, hires included: the 512-dot `screen_x` makes bit 3 land on
+/// the right 8-px half exactly like [`hires_adjacent_tile_offset`], while
+/// bit 3 of the (interlace-doubled) `screen_y` adds the +16 the 8x8 hires
+/// case can't reach. An 8x8 hires entry covers a 16-px slot, its neighbour
+/// tile for the second half; any other entry names its own tile. Both
+/// pairings mask back to 10 bits to mirror the decoders' internal wrap.
+#[inline(always)]
+#[must_use]
+pub fn bg_entry_character(
+    entry: TilemapEntry,
+    screen_x: u16,
+    screen_y: u16,
+    hires: bool,
+    tile16: bool,
+) -> u16 {
+    if tile16 {
+        let mut t = entry.tile;
+        if ((screen_x & 8) != 0) ^ entry.flip_h {
+            t = t.wrapping_add(1);
+        }
+        if ((screen_y & 8) != 0) ^ entry.flip_v {
+            t = t.wrapping_add(16);
+        }
+        t & 0x03FF
+    } else if hires {
+        entry
+            .tile
+            .wrapping_add(hires_adjacent_tile_offset(screen_x, entry.flip_h))
+            & 0x03FF
+    } else {
+        entry.tile
+    }
+}
+
 /// Decode one row (`0..=7`) of a 2bpp tile.
 ///
 /// `tile_index` is the 10-bit value from the tilemap (mapped via
