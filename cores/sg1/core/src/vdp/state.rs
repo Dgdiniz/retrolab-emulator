@@ -2,7 +2,7 @@
 //! savestate's extension the state within a frame the layout has no field
 //! for.
 
-use super::sprites::Sprite;
+use super::sprites::{Sprite, SpriteCache};
 use super::{timing, FillState, Vdp};
 use crate::savestate::{
     VdpBeamState, VdpExtension, VdpFillState, VdpSpriteState, VdpState, VdpTimingState,
@@ -128,8 +128,13 @@ impl Vdp {
         self.fifo_slot_mclks = s.fifo_slot_mclks;
         self.dma_fill_pending = s.dma_fill_pending;
 
-        // Rebuild derived state
+        // Rebuild derived state. The layout has no field for the VDP's copy
+        // of the sprite table's first words: a load takes it from the table
+        // at its base, which holds the same words unless the base moved
+        // after they were written.
         self.sprite_cache_valid = false;
+        self.take_sprite_heads_from_table();
+        self.sprite_list_stale = false;
         self.rebuild_cram_rgb();
         // What was recorded described the machine before the load; what is
         // armed stays armed.
@@ -141,9 +146,9 @@ impl Vdp {
     /// What the VDP holds that the layout has no field for: a fill in
     /// flight, the vertical interrupt held off, the first frame after a
     /// reset, the beam part of the way through its line, the sprite list
-    /// of the frame being drawn. What is drawn into the picture, and the
-    /// tables a CRAM transfer in active display tints it with, are the
-    /// picture's, not the machine's.
+    /// the frame's next line is drawn with. What is drawn into the picture,
+    /// and the tables a CRAM transfer in active display tints it with, are
+    /// the picture's, not the machine's.
     pub fn extension(&self) -> VdpExtension {
         let beam = VdpBeamState {
             into_line: self.beam_cycles_into_line,
@@ -210,6 +215,19 @@ impl Vdp {
                         link: sprite.link,
                     }));
                 self.sprite_cache_valid = true;
+                // A list the copy and the table no longer give is one that
+                // a change made in the table, while the line the state was
+                // saved in ran, made stale: the next line draws from it, and
+                // that line's end builds the list again.
+                let mut now = SpriteCache::new();
+                now.build(
+                    self.sprite_heads(),
+                    &self.vram,
+                    self.sat_base(),
+                    self.sprite_table_slots(),
+                    self.interlace,
+                );
+                self.sprite_list_stale = now.sprites() != self.sprite_cache.sprites();
             }
             None => self.sprite_cache_valid = false,
         }

@@ -201,18 +201,20 @@ fn test_sprite_count_debug_counts_the_link_chain() {
     let mut emu = setup_vdp_test();
     let vdp = emu.vdp_mut();
     vdp.set_test_register(5, 0b01111100); // SAT at 0xF800 (H40)
-    let sat = 0xF800;
+    let sat = 0xF800u32;
 
     // An empty table still holds sprite 0, whose link of 0 ends the chain.
     assert_eq!(vdp.get_sprite_count_debug(), 1);
 
     // Sprite 0 links to 1 and sprite 1 to 2; sprite 2's link of 0 ends it.
-    vdp.get_vram_mut()[sat + 3] = 1;
-    vdp.get_vram_mut()[sat + 8 + 3] = 2;
+    // The links go through the debugger's write, which reaches the VDP's
+    // copy of the table's first words, as a port write does.
+    vdp.write_vram_debug(sat + 3, &[1]);
+    vdp.write_vram_debug(sat + 8 + 3, &[2]);
     assert_eq!(vdp.get_sprite_count_debug(), 3);
 
     // A link past the table's 80 sprites ends the chain too.
-    vdp.get_vram_mut()[sat + 16 + 3] = 90;
+    vdp.write_vram_debug(sat + 16 + 3, &[90]);
     assert_eq!(vdp.get_sprite_count_debug(), 3);
 }
 

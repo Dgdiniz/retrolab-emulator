@@ -1,6 +1,7 @@
 //! Unit tests of the VDP: construction and reset, the picture's size, a
 //! picture drawn again, and the debugger's readers. The tests of the ports,
-//! the renderer, the DMA and the interrupts are in the files beside this one.
+//! the renderer, the DMA, the interrupts, interlace mode 2 and the VDP's
+//! copy of the sprite table are in the files beside this one.
 
 use super::*;
 
@@ -9,6 +10,7 @@ mod interlace;
 mod interrupts;
 mod ports;
 mod render;
+mod sprite_table;
 
 #[test]
 fn test_vdp_creation() {

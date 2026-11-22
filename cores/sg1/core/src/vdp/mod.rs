@@ -231,9 +231,23 @@ pub struct Vdp {
     beam_cycles_into_line: u32,
     beam_cycles_per_line: u32,
 
-    // Sprite cache (rebuilt when SAT changes or at frame start)
+    // The renderer's sprite list, and whether it holds one: dropped as the
+    // vertical blank begins, built as the next frame's first line with
+    // sprites is drawn.
     sprite_cache: sprites::SpriteCache,
     sprite_cache_valid: bool,
+    // The VDP's own copy of the first two words (the Y; the size and link)
+    // of each of the 80 sprite table entries: a write into them at the
+    // table's current base writes the copy too; moving the base leaves it.
+    // The renderer finds the sprites in it and reads their other words
+    // from VRAM. Boxed: its 320 bytes inside the struct moved the fields
+    // the renderer reads every line, and the play tier ran 2-4 % slower.
+    sprite_heads: Box<[u8; sprites::SPRITE_HEAD_BYTES]>,
+    // The sprite list is older than what it is built from (the copy, the
+    // table's other words, the table's base, the cell mode): it is built
+    // again at the end of the next line drawn, so a change made while a
+    // line runs shows from the line after next.
+    sprite_list_stale: bool,
 
     // Sprite status flags
     sprite_overflow: bool,  // Set when >20 sprites on a scanline (>16 in H32)
@@ -463,6 +477,7 @@ struct DrawState {
     sprite_mask_overflow: bool,
     sprite_cache: sprites::SpriteCache,
     sprite_cache_valid: bool,
+    sprite_list_stale: bool,
     sprite_pixel_buffer: Vec<bool>,
     sprite_line_color: Vec<u8>,
     sprite_line_palette: Vec<u8>,
@@ -488,6 +503,7 @@ impl DrawState {
             sprite_mask_overflow: vdp.sprite_mask_overflow,
             sprite_cache: vdp.sprite_cache.clone(),
             sprite_cache_valid: vdp.sprite_cache_valid,
+            sprite_list_stale: vdp.sprite_list_stale,
             sprite_pixel_buffer: vdp.sprite_pixel_buffer.clone(),
             sprite_line_color: vdp.sprite_line_color.clone(),
             sprite_line_palette: vdp.sprite_line_palette.clone(),
@@ -512,6 +528,7 @@ impl DrawState {
         vdp.sprite_mask_overflow = self.sprite_mask_overflow;
         vdp.sprite_cache = self.sprite_cache;
         vdp.sprite_cache_valid = self.sprite_cache_valid;
+        vdp.sprite_list_stale = self.sprite_list_stale;
         vdp.sprite_pixel_buffer = self.sprite_pixel_buffer;
         vdp.sprite_line_color = self.sprite_line_color;
         vdp.sprite_line_palette = self.sprite_line_palette;
@@ -615,6 +632,8 @@ impl Vdp {
             beam_cycles_per_line: 0,
             sprite_cache: sprites::SpriteCache::new(),
             sprite_cache_valid: false,
+            sprite_heads: Box::new([0; sprites::SPRITE_HEAD_BYTES]),
+            sprite_list_stale: false,
             sprite_overflow: false,
             sprite_collision: false,
             sprite_mask_overflow: false,
@@ -692,6 +711,9 @@ impl Vdp {
         self.beam_cycles_into_line = 0;
         self.beam_cycles_per_line = 0;
         self.sprite_cache_valid = false;
+        // VRAM is cleared above: so is the copy of the table's first words.
+        *self.sprite_heads = [0; sprites::SPRITE_HEAD_BYTES];
+        self.sprite_list_stale = false;
         self.sprite_overflow = false;
         self.sprite_collision = false;
         self.sprite_mask_overflow = false;
@@ -870,29 +892,29 @@ impl Vdp {
                 }
                 self.render_line(line);
             }
+            if display_on && line + 1 < visible {
+                self.refresh_stale_sprite_list(line);
+            }
         }
     }
 
-    /// Rebuild sprite cache from SAT.
+    /// Build the sprite list: the link chain of the table register 5 places
+    /// (bits 6-0 x 0x200, in the 40-cell mode bits 6-1 x 0x400), at most 80
+    /// sprites in the 40-cell mode and 64 in the 32-cell mode, each entry's
+    /// Y and size and link from the VDP's copy and its other words from
+    /// VRAM.
     fn rebuild_sprite_cache(&mut self) {
-        // Get SAT address from register 5
-        // Format: bits 6-0 x 0x200 (H40 mode: bits 6-1 x 0x400)
-        let reg5 = self.registers[5];
-        let is_h40 = (self.registers[12] & 0x01) != 0;
-
-        let sat_addr = if is_h40 {
-            // H40 mode: bits 6-1 x 0x400
-            ((reg5 & 0x7E) as u16) << 9
-        } else {
-            // H32 mode: bits 6-0 x 0x200
-            ((reg5 & 0x7F) as u16) << 9
-        };
-
-        // Total sprite limit: 80 in H40, 64 in H32 (max_sprite_pixels >> 2).
-        let max_sprites = if is_h40 { 80 } else { 64 };
-        self.sprite_cache
-            .build(&self.vram, sat_addr, max_sprites, self.interlace);
+        let sat_base = self.sat_base();
+        let slots = self.sprite_table_slots();
+        self.sprite_cache.build(
+            sprites::EntryHeads::Copy(&self.sprite_heads),
+            &self.vram,
+            sat_base,
+            slots,
+            self.interlace,
+        );
         self.sprite_cache_valid = true;
+        self.sprite_list_stale = false;
     }
 
     /// Invalidate sprite cache (call when SAT or VRAM changes).
@@ -1087,7 +1109,13 @@ impl Vdp {
     /// one past the table (80 sprites in H40, 64 in H32). Sprite 0 is always
     /// in the chain.
     pub fn get_sprite_count_debug(&self) -> usize {
-        sprites::link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).count()
+        sprites::link_chain(
+            self.sprite_heads(),
+            &self.vram,
+            self.sat_base(),
+            self.sprite_table_slots(),
+        )
+        .count()
     }
 
     /// Get VRAM for debugging (read-only access).
@@ -1095,7 +1123,9 @@ impl Vdp {
         &self.vram
     }
 
-    /// Get mutable VRAM for debugging/testing.
+    /// Get mutable VRAM for debugging/testing. A write through it reaches
+    /// neither the VDP's copy of the sprite table's first words nor the
+    /// sprite list; [`Self::write_vram_debug`] reaches both.
     pub fn get_vram_mut(&mut self) -> &mut [u8] {
         &mut self.vram
     }

@@ -2,7 +2,7 @@
 //! renderer walks, and sprites drawn by the renderer the console runs.
 
 use super::draw::{self, entry, put_sprite, put_tile, set_colour, shown, solid_tile, tile_with};
-use sg1_core::vdp::sprites::{Sprite, SpriteCache};
+use sg1_core::vdp::sprites::{EntryHeads, Sprite, SpriteCache};
 use sg1_core::vdp::Interlace;
 
 /// Where the parsing tests put the sprite attribute table.
@@ -78,7 +78,7 @@ fn the_list_follows_the_links() {
         write_sprite(&mut vram, i, 150 + i as u16 * 32, (1, 1), link, 0x0000, 160);
     }
     let mut cache = SpriteCache::new();
-    cache.build(&vram, SAT, 80, Interlace::Off);
+    cache.build(EntryHeads::Table, &vram, SAT, 80, Interlace::Off);
     assert_eq!(cache.len(), 3);
 }
 
@@ -89,7 +89,7 @@ fn a_chain_that_never_ends_stops_at_the_sprite_limit() {
     write_sprite(&mut vram, 0, 150, (1, 1), 1, 0x0000, 160);
     write_sprite(&mut vram, 1, 150, (1, 1), 1, 0x0000, 160);
     let mut cache = SpriteCache::new();
-    cache.build(&vram, SAT, 80, Interlace::Off);
+    cache.build(EntryHeads::Table, &vram, SAT, 80, Interlace::Off);
     assert_eq!(cache.len(), 80);
 }
 

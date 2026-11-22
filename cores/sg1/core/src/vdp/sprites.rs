@@ -1,18 +1,58 @@
 //! The sprites of the VDP's sprite table: their attributes, the link chain
-//! the chip walks, the list the renderer parses once a frame, and the
-//! drawing of each line's sprites.
+//! the chip walks, the VDP's own copy of the table's first words, the list
+//! the renderer draws from, and the drawing of each line's sprites.
 //!
 //! The table holds 80 sprites in the 40-cell mode, 64 in the 32-cell mode;
-//! a line shows at most 20 or 16 of them. `Vdp::render_sprite_line` draws
-//! them line by line from the list here. In interlace mode 2 a sprite's
-//! cells are 8 pixels by 16 and its Y counts the picture's rows, so each
-//! field's row of a line takes the sprites on that row.
+//! a line shows at most 20 or 16 of them. The VDP keeps a copy of the
+//! first two words of each entry, its Y and its size and link: a write
+//! into them at the table's current base writes the copy too, and moving
+//! the base leaves the copy as it is. The chip walks the link chain and
+//! finds a line's sprites in the copy, and reads an entry's other two
+//! words, its pattern and attributes and its X, from video memory.
+//! `Vdp::render_sprite_line` draws them line by line from the list here,
+//! which is built again, from the line after next, once the table, its
+//! base or the cell mode has changed. In interlace mode 2 a sprite's cells
+//! are 8 pixels by 16 and its Y counts the picture's rows, so each field's
+//! row of a line takes the sprites on that row.
 
 use retro_core::capture::{PixelTrace, SpriteFate};
 
 use super::picture::{Interlace, DOUBLE_CELL_ROWS, NORMAL_CELL_ROWS};
 use super::sources::{self, LineTrace};
 use super::Vdp;
+
+/// The bytes of the VDP's copy of the sprite table: the first four bytes
+/// of each of the 80 entries, in the order video memory holds them.
+pub const SPRITE_HEAD_BYTES: usize = 80 * 4;
+
+/// Where the first two words of a sprite table entry, its Y and its size
+/// and link, are read from. Its other two words always come from video
+/// memory.
+#[derive(Debug, Clone, Copy)]
+pub enum EntryHeads<'a> {
+    /// The VDP's own copy ([`SPRITE_HEAD_BYTES`]), which the chip reads.
+    Copy(&'a [u8; SPRITE_HEAD_BYTES]),
+    /// The table itself, in the video memory the other words come from.
+    Table,
+}
+
+impl EntryHeads<'_> {
+    /// The first four bytes of entry `slot` of the table at `sat_base` in
+    /// `vram`, or `None` past the copy's 80 entries or the end of `vram`.
+    fn of(self, vram: &[u8], sat_base: u16, slot: u8) -> Option<[u8; 4]> {
+        let bytes = match self {
+            EntryHeads::Copy(copy) => {
+                let at = usize::from(slot) * 4;
+                copy.get(at..at + 4)?
+            }
+            EntryHeads::Table => {
+                let at = usize::from(sat_base) + usize::from(slot) * 8;
+                vram.get(at..at + 4)?
+            }
+        };
+        Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+}
 
 /// Sprite data structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +92,8 @@ pub struct Sprite {
 }
 
 impl Sprite {
-    /// Parse sprite from SAT (Sprite Attribute Table).
+    /// Parse sprite from SAT (Sprite Attribute Table), every word of the
+    /// entry from `vram` ([`Self::read`] from the table).
     ///
     /// SAT format (8 bytes / 4 words per sprite):
     /// - Word 0 (bytes 0-1): Y position (bits 0-8)
@@ -64,15 +105,24 @@ impl Sprite {
     /// (The documented attribute layout; checked against MAME and Genesis
     /// Plus GX.)
     pub fn from_sat(vram: &[u8], sat_base: u16, index: u8) -> Option<Self> {
-        let addr = (sat_base + (index as u16 * 8)) as usize;
+        Self::read(EntryHeads::Table, vram, sat_base, index)
+    }
+
+    /// The sprite of slot `slot` of the table at `sat_base`: its first two
+    /// words from `heads`, its other two from `vram` ([`Self::from_sat`]
+    /// gives the layout). `None` when the entry runs past the end of video
+    /// memory, or past the copy's 80 entries.
+    pub fn read(heads: EntryHeads<'_>, vram: &[u8], sat_base: u16, slot: u8) -> Option<Self> {
+        let addr = usize::from(sat_base) + usize::from(slot) * 8;
 
         if addr + 8 > vram.len() {
             return None;
         }
 
-        // Read all 4 words (big-endian)
-        let word0 = ((vram[addr] as u16) << 8) | (vram[addr + 1] as u16);
-        let word1 = ((vram[addr + 2] as u16) << 8) | (vram[addr + 3] as u16);
+        // The 4 words (big-endian), the first two from `heads`.
+        let head = heads.of(vram, sat_base, slot)?;
+        let word0 = u16::from_be_bytes([head[0], head[1]]);
+        let word1 = u16::from_be_bytes([head[2], head[3]]);
         let word2 = ((vram[addr + 4] as u16) << 8) | (vram[addr + 5] as u16);
         let word3 = ((vram[addr + 6] as u16) << 8) | (vram[addr + 7] as u16);
 
@@ -123,13 +173,14 @@ impl Sprite {
         (self.y, self.y + height)
     }
 
-    /// Its Y as interlace mode 2 reads it from the table at `sat_base`,
-    /// where it is the sprite of slot `slot`: word 0's low 10 bits, which
-    /// count the picture's rows from 256. Outside that mode the table's Y
-    /// has 9 bits and counts lines from 128 ([`Self::from_sat`]).
-    pub fn double_resolution_y(vram: &[u8], sat_base: u16, slot: u8) -> i16 {
-        let addr = usize::from(sat_base) + usize::from(slot) * 8;
-        let word = u16::from_be_bytes([vram[addr], vram[addr + 1]]);
+    /// Its Y as interlace mode 2 reads it, where it is the sprite of slot
+    /// `slot` of the table at `sat_base`, its first word from `heads`: the
+    /// word's low 10 bits, which count the picture's rows from 256. Outside
+    /// that mode the Y has 9 bits and counts lines from 128
+    /// ([`Self::read`]).
+    pub fn double_resolution_y(heads: EntryHeads<'_>, vram: &[u8], sat_base: u16, slot: u8) -> i16 {
+        let head = heads.of(vram, sat_base, slot).unwrap_or_default();
+        let word = u16::from_be_bytes([head[0], head[1]]);
         (word & 0x03FF) as i16 - 256
     }
 }
@@ -140,13 +191,21 @@ impl Sprite {
 /// slot past the table (64 slots in the 32-cell mode, 80 in the 40-cell
 /// mode, given as `slots`), and after `slots` sprites, so a chain that loops
 /// back repeats its sprites up to that count, as the chip's own walk does.
-/// Each item is a slot and its sprite.
+/// Each item is a slot and its sprite, its first two words read from
+/// `heads` and its other two from `vram`.
 ///
 /// The renderer's sprite list, the sprite table the debugger shows and the
-/// paint order it reports all walk the chain through this, so the three
-/// never disagree on where it stops.
-pub fn link_chain(vram: &[u8], sat_base: u16, slots: u8) -> LinkChain<'_> {
+/// paint order it reports all walk the chain through this, from the VDP's
+/// copy of the table's first words, so the three never disagree on where
+/// it stops.
+pub fn link_chain<'a>(
+    heads: EntryHeads<'a>,
+    vram: &'a [u8],
+    sat_base: u16,
+    slots: u8,
+) -> LinkChain<'a> {
     LinkChain {
+        heads,
         vram,
         sat_base,
         slots,
@@ -157,6 +216,7 @@ pub fn link_chain(vram: &[u8], sat_base: u16, slots: u8) -> LinkChain<'_> {
 
 /// The walk of the sprite table's link chain [`link_chain`] returns.
 pub struct LinkChain<'a> {
+    heads: EntryHeads<'a>,
     vram: &'a [u8],
     sat_base: u16,
     slots: u8,
@@ -176,7 +236,7 @@ impl Iterator for LinkChain<'_> {
             self.next = None;
             return None;
         }
-        let Some(sprite) = Sprite::from_sat(self.vram, self.sat_base, slot) else {
+        let Some(sprite) = Sprite::read(self.heads, self.vram, self.sat_base, slot) else {
             self.next = None;
             return None;
         };
@@ -222,16 +282,23 @@ impl SpriteCache {
         self.sprites.is_empty()
     }
 
-    /// Build sprite cache from SAT, following link chain ([`link_chain`]),
-    /// each sprite's `y` as a frame drawn in `interlace` places it: a
-    /// picture row in interlace mode 2 ([`Sprite::double_resolution_y`]),
-    /// a line otherwise.
-    pub fn build(&mut self, vram: &[u8], sat_base: u16, max_sprites: u8, interlace: Interlace) {
+    /// Build sprite cache from SAT, following link chain ([`link_chain`],
+    /// each entry's first two words from `heads`), each sprite's `y` as a
+    /// frame drawn in `interlace` places it: a picture row in interlace
+    /// mode 2 ([`Sprite::double_resolution_y`]), a line otherwise.
+    pub fn build(
+        &mut self,
+        heads: EntryHeads<'_>,
+        vram: &[u8],
+        sat_base: u16,
+        max_sprites: u8,
+        interlace: Interlace,
+    ) {
         self.sprites.clear();
-        let chain = link_chain(vram, sat_base, max_sprites);
+        let chain = link_chain(heads, vram, sat_base, max_sprites);
         if interlace == Interlace::Double {
             self.sprites.extend(chain.map(|(slot, sprite)| Sprite {
-                y: Sprite::double_resolution_y(vram, sat_base, slot),
+                y: Sprite::double_resolution_y(heads, vram, sat_base, slot),
                 ..sprite
             }));
         } else {
@@ -261,6 +328,79 @@ impl SpriteCache {
 impl Default for SpriteCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Vdp {
+    /// The VDP's copy of the sprite table's first words, as the readers of
+    /// the table take it.
+    pub(super) fn sprite_heads(&self) -> EntryHeads<'_> {
+        EntryHeads::Copy(&self.sprite_heads)
+    }
+
+    /// A word was stored at VRAM bytes `at` and `at + 1`, `at` even: where
+    /// it lands in the sprite table at its current base, the copy of the
+    /// entries' first words takes its bytes there, and the sprite list is
+    /// stale. Every store of a word into VRAM calls this after it.
+    #[inline(always)]
+    pub(super) fn note_sprite_table_word(&mut self, at: usize) {
+        let offset = at.wrapping_sub(usize::from(self.sat_base()));
+        if offset < usize::from(self.sprite_table_slots()) * 8 {
+            self.store_sprite_table_bytes(at, offset, 2);
+        }
+    }
+
+    /// [`Self::note_sprite_table_word`] for one byte, stored at VRAM byte
+    /// `at`, as a fill, a copy or the debugger stores them.
+    #[inline(always)]
+    pub(super) fn note_sprite_table_byte(&mut self, at: usize) {
+        let offset = at.wrapping_sub(usize::from(self.sat_base()));
+        if offset < usize::from(self.sprite_table_slots()) * 8 {
+            self.store_sprite_table_bytes(at, offset, 1);
+        }
+    }
+
+    /// The `count` bytes stored from VRAM byte `at`, `offset` bytes into the
+    /// sprite table: the copy takes those of them that are an entry's first
+    /// four bytes, and the sprite list is stale.
+    #[cold]
+    #[inline(never)]
+    fn store_sprite_table_bytes(&mut self, at: usize, offset: usize, count: usize) {
+        for i in 0..count {
+            let byte = offset + i;
+            if byte & 4 == 0 {
+                self.sprite_heads[(byte >> 3) * 4 + (byte & 3)] = self.vram[at + i];
+            }
+        }
+        self.sprite_list_stale = true;
+    }
+
+    /// The copy taken from the table in video memory at its current base,
+    /// where a load and a reset find them alike: whatever was written into
+    /// the table was written into the copy, unless the base moved since.
+    pub(super) fn take_sprite_heads_from_table(&mut self) {
+        let base = usize::from(self.sat_base());
+        for slot in 0..SPRITE_HEAD_BYTES / 4 {
+            let at = base + slot * 8;
+            if let Some(bytes) = self.vram.get(at..at + 4) {
+                self.sprite_heads[slot * 4..slot * 4 + 4].copy_from_slice(bytes);
+            }
+        }
+    }
+
+    /// Line `line`, drawn with the display on, has its sprites: a stale
+    /// list is built again now, from the copy and video memory as they are
+    /// as the line starts, and the lines from the next one on draw from it.
+    /// Genesis Plus GX parses a line's sprites at the start of the line
+    /// before; so a change made in the table while a line runs shows from
+    /// the line after next.
+    pub(super) fn refresh_stale_sprite_list(&mut self, line: u16) {
+        if self.sprite_list_stale && self.sprite_cache_valid {
+            self.rebuild_sprite_cache();
+            if self.recording.is_some() {
+                self.record_sprite_list(line + 1);
+            }
+        }
     }
 }
 
@@ -686,7 +826,7 @@ mod tests {
         vram[7] = word3 as u8;
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80, Interlace::Off);
+        cache.build(EntryHeads::Table, &vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 1);
     }
@@ -736,7 +876,7 @@ mod tests {
         vram[15] = word3_2 as u8;
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80, Interlace::Off);
+        cache.build(EntryHeads::Table, &vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 2);
     }
@@ -771,7 +911,7 @@ mod tests {
         }
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80, Interlace::Off);
+        cache.build(EntryHeads::Table, &vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 80);
     }
@@ -790,14 +930,18 @@ mod tests {
 
         // 64 slots in the 32-cell mode: 70 is past the table, so the walk
         // ends at slot 5, as the renderer's does.
-        let slots: Vec<u8> = link_chain(&vram, 0, 64).map(|(slot, _)| slot).collect();
+        let slots: Vec<u8> = link_chain(EntryHeads::Table, &vram, 0, 64)
+            .map(|(slot, _)| slot)
+            .collect();
         assert_eq!(slots, [0, 5]);
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 64, Interlace::Off);
+        cache.build(EntryHeads::Table, &vram, 0, 64, Interlace::Off);
         assert_eq!(cache.len(), 2);
 
         // 80 slots in the 40-cell mode reach it.
-        let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
+        let slots: Vec<u8> = link_chain(EntryHeads::Table, &vram, 0, 80)
+            .map(|(slot, _)| slot)
+            .collect();
         assert_eq!(slots, [0, 5, 70]);
     }
 
@@ -809,8 +953,10 @@ mod tests {
         link_slot(&mut vram, 3, 79);
         link_slot(&mut vram, 79, 0);
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80, Interlace::Off);
-        let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
+        cache.build(EntryHeads::Table, &vram, 0, 80, Interlace::Off);
+        let slots: Vec<u8> = link_chain(EntryHeads::Table, &vram, 0, 80)
+            .map(|(slot, _)| slot)
+            .collect();
         assert_eq!(slots, [0, 7, 3, 79]);
         let from_list: Vec<u8> = (0..cache.len()).map(|i| cache.slot_at(i)).collect();
         assert_eq!(from_list, slots);
@@ -821,7 +967,7 @@ mod tests {
         let mut vram = vec![0u8; 0x10000];
         link_slot(&mut vram, 0, 1);
         link_slot(&mut vram, 1, 1); // slot 1 links to itself
-        assert_eq!(link_chain(&vram, 0, 64).count(), 64);
-        assert_eq!(link_chain(&vram, 0, 80).count(), 80);
+        assert_eq!(link_chain(EntryHeads::Table, &vram, 0, 64).count(), 64);
+        assert_eq!(link_chain(EntryHeads::Table, &vram, 0, 80).count(), 80);
     }
 }

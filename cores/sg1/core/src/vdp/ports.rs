@@ -484,6 +484,7 @@ impl Vdp {
                             self.vram[wa] = (value & 0xFF) as u8;
                             self.vram[wa + 1] = (value >> 8) as u8;
                         }
+                        self.note_sprite_table_word(wa);
                         self.trace_vram_write(wa as u16, value, "dma-fill");
                     }
                 }
@@ -572,6 +573,7 @@ impl Vdp {
                         self.vram[addr] = (value & 0xFF) as u8;
                         self.vram[addr + 1] = (value >> 8) as u8;
                     }
+                    self.note_sprite_table_word(addr);
                     self.trace_vram_write(addr as u16, value, "data-port");
                 }
                 self.address = self.address.wrapping_add(self.registers[15] as u16);
@@ -654,7 +656,15 @@ impl Vdp {
     pub(super) fn apply_register_write(&mut self, reg_num: usize, value: u8) {
         if reg_num < 24 {
             let prev = self.registers[reg_num];
+            let sprite_table = (self.sat_base(), self.sprite_table_slots());
             self.registers[reg_num] = value;
+            // The sprite table moved (register 5), or the cell mode changed
+            // its size (register 12): the VDP's copy of the entries' first
+            // words stays as it was, and the list is built again from it
+            // and the table now there.
+            if sprite_table != (self.sat_base(), self.sprite_table_slots()) {
+                self.sprite_list_stale = true;
+            }
 
             // Handle special cases
             if reg_num == 0 {

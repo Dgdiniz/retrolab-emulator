@@ -383,6 +383,7 @@ impl Vdp {
                                 self.vram[addr] = (word >> 8) as u8;
                                 self.vram[addr + 1] = (word & 0xFF) as u8;
                             }
+                            self.note_sprite_table_word(addr);
                             self.trace_vram_write(addr as u16, word, "dma-mem");
                         }
                     }
@@ -686,6 +687,7 @@ impl Vdp {
                         self.vram[vram_addr] = high;
                         self.vram[vram_addr + 1] = low;
                     }
+                    self.note_sprite_table_word(vram_addr);
                     self.trace_vram_write(
                         vram_addr as u16,
                         ((high as u16) << 8) | (low as u16),
@@ -773,9 +775,11 @@ impl Vdp {
                     let word_addr = vram_addr ^ 1;
                     if word_addr < self.vram.len() {
                         self.vram[word_addr] = fill_byte;
+                        self.note_sprite_table_byte(word_addr);
                     }
                 } else if vram_addr + 1 < self.vram.len() {
                     self.vram[vram_addr + 1] = fill_byte;
+                    self.note_sprite_table_byte(vram_addr + 1);
                 }
                 let wa = vram_addr & 0xFFFE;
                 if wa + 1 < self.vram.len() {
@@ -891,6 +895,7 @@ impl Vdp {
             let dst_addr = (dst ^ 1) as usize; // VRAM is kept byte-swapped
             if dst_addr < self.vram.len() {
                 self.vram[dst_addr] = byte;
+                self.note_sprite_table_byte(dst_addr);
                 let wa = dst_addr & 0xFFFE;
                 if wa + 1 < self.vram.len() {
                     let w = ((self.vram[wa] as u16) << 8) | (self.vram[wa + 1] as u16);

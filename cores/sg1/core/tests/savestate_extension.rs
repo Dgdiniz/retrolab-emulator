@@ -454,30 +454,47 @@ fn sprite_program() -> Vec<u8> {
 
 /// The sprite table's 21 sprites, linked in order, all at line `y`: one
 /// more than a 40-cell line shows, which raises the overflow flag there.
+/// Written as the debugger writes, which reaches the VDP's copy of the
+/// table's first words, as a port write does.
 fn put_sprites(emu: &mut GenesisEmulator, y: u16) {
-    let vram = emu.vdp_mut().get_vram_mut();
+    let mut table = Vec::new();
     for i in 0..21u16 {
-        let at = 0xF000 + 8 * i as usize;
         let link = if i == 20 { 0 } else { i + 1 };
-        let words = [y + 128, link, 0x0001, 128 + 12 * i];
-        for (k, word) in words.iter().enumerate() {
-            vram[at + 2 * k] = (word >> 8) as u8;
-            vram[at + 2 * k + 1] = *word as u8;
+        for word in [y + 128, link, 0x0001, 128 + 12 * i] {
+            table.extend_from_slice(&word.to_be_bytes());
         }
+    }
+    emu.vdp_mut().write_vram_debug(0xF000, &table);
+}
+
+/// The 21 sprites moved to line `y` through the VDP's ports, as the 68000
+/// writes them: register 15 set to step 8 bytes, a VRAM write from $F000,
+/// and each sprite's Y word.
+fn move_sprites_through_the_ports(emu: &mut GenesisEmulator, y: u16) {
+    let vdp = emu.vdp_mut();
+    vdp.write_word_port(0x04, 0x8F08);
+    vdp.write_word_port(0x04, 0x7000);
+    vdp.write_word_port(0x04, 0x0003);
+    for _ in 0..21 {
+        vdp.write_word_port(0x00, y + 128);
     }
 }
 
-/// The VDP reads the sprite table once a frame, at its first line, and
-/// draws the frame's lines from the list it read; the table changed later
-/// in the frame (here while the machine is stopped there) shows from the
-/// next frame. A load part of the way through the frame keeps the list
-/// the frame read, so the overflow its line 100 raises is raised after the
-/// load too.
+/// The VDP draws a line's sprites from a list it took as the line before
+/// began: a write into the sprite table while a line runs shows from the
+/// line after next. Stopped at line 50 with the sprites on line 51, the
+/// table written then takes them off the screen from line 52; line 51 still
+/// draws them from the list the extension carries, so the overflow they
+/// raise there is raised after a load too, and the list is built again at
+/// the same line.
 #[test]
-fn a_save_mid_frame_keeps_the_sprite_list_the_frame_read() {
+fn a_save_mid_frame_keeps_the_sprite_list_the_next_line_draws() {
     let rom = sprite_program();
     let mut live = booted(&rom);
-    put_sprites(&mut live, 100);
+    // The program places the sprite table at $F000 as it starts; the
+    // sprites are written after, so the VDP's copy takes them.
+    live.run_frame();
+    put_sprites(&mut live, 51);
     for _ in 0..2 {
         live.run_frame();
     }
@@ -488,15 +505,13 @@ fn a_save_mid_frame_keeps_the_sprite_list_the_frame_read() {
         ExecutionMode::Paused,
         "stopped at line 50"
     );
+    move_sprites_through_the_ports(&mut live, 400);
     let read = live.savestate_extension().vdp.sprites;
     assert_eq!(
-        read.map(|list| list.len()),
+        read.map(|list| list.iter().filter(|sprite| sprite.y == 51).count()),
         Some(21),
-        "the list the frame read"
+        "line 51 draws from the list taken before the write"
     );
-    // The sprites taken off the screen, as a write to the table in the
-    // middle of the frame would.
-    put_sprites(&mut live, 400);
     saved_and_loaded_go_on_alike(&rom, &mut live, 3);
 }
 

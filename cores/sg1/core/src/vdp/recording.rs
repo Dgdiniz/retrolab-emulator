@@ -29,7 +29,7 @@ use retro_core::capture::{
 };
 use retro_core::video::LineStateTable;
 
-use super::sprites::SpriteCache;
+use super::sprites::{EntryHeads, SpriteCache};
 use super::writes::LiveWrites;
 use super::Vdp;
 
@@ -637,8 +637,15 @@ impl Vdp {
                 let back_to = if list.frame == followed { list.line } else { 0 };
                 cursor = undo_journal(&table.journal, cursor, back_to, &mut memory);
             }
-            list.sprites
-                .build(&memory, list.table, list.slots, interlace);
+            // The entries' first words as the table held them then: the
+            // VDP's copy at that time is not kept.
+            list.sprites.build(
+                EntryHeads::Table,
+                &memory,
+                list.table,
+                list.slots,
+                interlace,
+            );
         }
     }
 

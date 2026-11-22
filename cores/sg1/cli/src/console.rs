@@ -70,15 +70,15 @@ fn parse_vram_patch(spec: &str) -> std::result::Result<(u16, u16), String> {
     Ok((addr, value))
 }
 
-/// Write each patch's word into VRAM, big-endian at its byte address, and
-/// say so on stderr; a patch past the end of VRAM is left out.
+/// Write each patch's word into VRAM, big-endian at its byte address, as
+/// the debugger writes it (a word in the sprite table reaches the VDP's
+/// copy of it too), and say so on stderr; a patch past the end of VRAM is
+/// left out.
 fn patch_vram(emu: &mut GenesisEmulator, patches: &[(u16, u16)]) {
     for &(addr, value) in patches {
-        let vram = emu.vdp_mut().get_vram_mut();
-        let at = usize::from(addr);
-        if at + 1 < vram.len() {
-            vram[at] = (value >> 8) as u8;
-            vram[at + 1] = (value & 0xFF) as u8;
+        if usize::from(addr) + 1 < emu.vdp().get_vram().len() {
+            emu.vdp_mut()
+                .write_vram_debug(u32::from(addr), &value.to_be_bytes());
             eprintln!("[patch-vram] addr=0x{addr:04X} = 0x{value:04X}");
         }
     }

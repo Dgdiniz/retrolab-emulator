@@ -472,6 +472,9 @@ fn test_debug_layer_disable_suppresses_sprites() {
     vdp.vram[sat + 5] = (attr & 0xFF) as u8;
     vdp.vram[sat + 6] = 0x00; // word3: X = 128 -> screen 0
     vdp.vram[sat + 7] = 0x80;
+    // Written into VRAM directly: the VDP's copy of the entries' first
+    // words taken from the table, as a load takes it.
+    vdp.take_sprite_heads_from_table();
     vdp.invalidate_sprite_cache();
 
     vdp.composite_scanline(0);

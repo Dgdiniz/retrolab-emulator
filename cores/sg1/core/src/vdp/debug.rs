@@ -86,6 +86,7 @@ const REGISTER_NAMES: [&str; 24] = [
 impl Vdp {
     /// Sprite Attribute Table base address in VRAM, derived from reg 5
     /// (H40 masks bit 0). Mirrors `rebuild_sprite_cache`.
+    #[inline]
     pub(super) fn sat_base(&self) -> u16 {
         let reg5 = self.registers[5];
         let is_h40 = (self.registers[12] & 0x01) != 0;
@@ -106,6 +107,7 @@ impl Vdp {
 
     /// Entries in the sprite table: 80 in the 40-cell mode, 64 in the
     /// 32-cell mode.
+    #[inline]
     pub(super) fn sprite_table_slots(&self) -> u8 {
         let is_h40 = (self.registers[12] & 0x01) != 0;
         if is_h40 {
@@ -117,9 +119,16 @@ impl Vdp {
 
     /// The sprites of the table in the order the renderer takes them, each
     /// with its slot: the link chain from slot 0, stopped where the
-    /// renderer stops it ([`link_chain`]).
+    /// renderer stops it ([`link_chain`]), each entry's Y and size and link
+    /// from the VDP's copy, as the renderer reads them.
     pub fn sprite_table_chain(&self) -> Vec<(u8, Sprite)> {
-        link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).collect()
+        link_chain(
+            self.sprite_heads(),
+            &self.vram,
+            self.sat_base(),
+            self.sprite_table_slots(),
+        )
+        .collect()
     }
 
     /// The box `sprite`, of slot `slot`, covers on the picture: its cells
@@ -138,6 +147,7 @@ impl Vdp {
             return PictureRect::on_grid(grid, x, i32::from(sprite.y), width, height);
         }
         let top = i32::from(Sprite::double_resolution_y(
+            self.sprite_heads(),
             &self.vram,
             self.sat_base(),
             slot,
@@ -156,7 +166,8 @@ impl Vdp {
     /// counts lines in either mode.
     fn sprite_line(&self, slot: u8, sprite: &Sprite) -> i32 {
         if self.interlace == Interlace::Double {
-            let top = Sprite::double_resolution_y(&self.vram, self.sat_base(), slot);
+            let top =
+                Sprite::double_resolution_y(self.sprite_heads(), &self.vram, self.sat_base(), slot);
             i32::from(top).div_euclid(2)
         } else {
             i32::from(sprite.y)
@@ -254,10 +265,12 @@ impl Vdp {
     /// to its size, so no byte is written twice; an empty one writes
     /// nothing.
     ///
-    /// The renderer draws sprites from a list it parses out of the sprite
-    /// table once a frame. A write that lands in the table marks that
-    /// list stale, so the next line drawn, or a repaint, reads the sprites
-    /// as they now are. A write elsewhere leaves the list alone.
+    /// The renderer draws sprites from a list it builds from the VDP's copy
+    /// of the sprite table's first words and the table's other words. A
+    /// write that lands in the table writes the copy too, as a port write
+    /// does, and marks that list stale, so the next line drawn, or a
+    /// repaint, reads the sprites as they now are. A write elsewhere leaves
+    /// the list alone.
     ///
     /// The write changes VRAM as it is now. While the line table is armed,
     /// a line drawn again from it reads VRAM as the line read it: the
@@ -273,6 +286,7 @@ impl Vdp {
         for (offset, &value) in bytes.iter().take(VRAM_BYTES).enumerate() {
             let at = (start + offset) % VRAM_BYTES;
             self.vram[at] = value;
+            self.note_sprite_table_byte(at);
             sprite_table_written |= sprite_table.contains(&at);
         }
         if self.recording.is_some() {
@@ -396,7 +410,7 @@ impl VideoDebugger for Vdp {
         let sat_base = self.sat_base();
         (0..count)
             .filter_map(|i| {
-                let s = Sprite::from_sat(&self.vram, sat_base, i as u8)?;
+                let s = Sprite::read(self.sprite_heads(), &self.vram, sat_base, i as u8)?;
                 Some(SpriteData {
                     index: i,
                     x: i32::from(s.x),
@@ -505,8 +519,13 @@ impl VideoDebugger for Vdp {
         if index >= 80 {
             return Err(ExportError::OutOfRange);
         }
-        let sprite = Sprite::from_sat(&self.vram, self.sat_base(), index as u8)
-            .ok_or(ExportError::OutOfRange)?;
+        let sprite = Sprite::read(
+            self.sprite_heads(),
+            &self.vram,
+            self.sat_base(),
+            index as u8,
+        )
+        .ok_or(ExportError::OutOfRange)?;
         if self.interlace == Interlace::Double {
             return Ok(self.double_resolution_sprite_image(&sprite));
         }
@@ -1164,6 +1183,9 @@ mod tests {
         place(&mut vdp, 1, 0xA0, 4, 0x0000);
         place(&mut vdp, 4, 0x10, 0, 0x0000);
         place(&mut vdp, 2, 0xB0, 0, 0x0000);
+        // Written into VRAM directly: the VDP's copy of the entries' first
+        // words taken from the table, as a load takes it.
+        vdp.take_sprite_heads_from_table();
 
         let order = vdp.resolved_sprite_render_order();
         let indices: Vec<u32> = order.iter().map(|e| e.index).collect();
@@ -1189,6 +1211,9 @@ mod tests {
                                // Slot 0 links to 70, past a table of 64.
         vdp.vram[3] = 70;
         vdp.vram[70 * 8 + 3] = 0;
+        // Written into VRAM directly: the VDP's copy of the entries' first
+        // words taken from the table, as a load takes it.
+        vdp.take_sprite_heads_from_table();
 
         let slots = |vdp: &Vdp| -> Vec<u8> {
             vdp.sprite_table_chain()
@@ -1208,6 +1233,7 @@ mod tests {
         vdp.registers[12] = 0;
         vdp.vram[3] = 1;
         vdp.vram[8 + 3] = 1; // slot 1 links to itself
+        vdp.take_sprite_heads_from_table();
         assert_eq!(vdp.sprite_table_chain().len(), 64);
     }
 
@@ -1220,6 +1246,10 @@ mod tests {
         vdp.vram[70 * 8 + 3] = 5; // slot 70 links to 5
         vdp.vram[70 * 8 + 4] = 0x80 | 0x20 | 0x01; // priority, palette 1, pattern 0x100
         vdp.vram[5 * 8 + 3] = 0; // slot 5 ends the chain
+
+        // Written into VRAM directly: the VDP's copy of the entries' first
+        // words taken from the table, as a load takes it.
+        vdp.take_sprite_heads_from_table();
 
         let table = vdp.sprite_table();
         let chain = vdp.sprite_table_chain();
@@ -1346,6 +1376,9 @@ mod tests {
         vdp.vram[13] = 0x03;
         vdp.vram[14] = 0x00;
         vdp.vram[15] = 0x80;
+        // Written into VRAM directly: the VDP's copy of the entries' first
+        // words taken from the table, as a load takes it.
+        vdp.take_sprite_heads_from_table();
 
         // Pattern 2 (byte 64): pixel (0,0) = index 1. Pattern 3 (byte 96):
         // pixel (0,0) = index 2. (4bpp: high nibble = even x.)
@@ -1616,6 +1649,9 @@ mod tests {
         vdp.set_layer_debug_disabled(LAYER_WINDOW, true);
         // Sprite 0: Y and X 0x80 (screen 0), one cell, link 0, pattern 2.
         vdp.vram[0xF000..0xF008].copy_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x80]);
+        // Written into VRAM directly: the VDP's copy of the entries' first
+        // words taken from the table, as a load takes it.
+        vdp.take_sprite_heads_from_table();
         // Pattern 2, bytes 64..96: every pixel colour 1.
         vdp.vram[64..96].fill(0x11);
         vdp
