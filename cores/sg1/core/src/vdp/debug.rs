@@ -602,15 +602,11 @@ impl VideoDebugger for Vdp {
         {
             return Err(ExportError::Unsupported);
         }
-        if request.count == 0 {
-            return Err(ExportError::Empty);
-        }
-        let base_addr = request.base_addr as usize;
-        let first = request.first_tile as usize;
+        // 32 bytes per 8x8 4bpp tile. The reads do not wrap, so the whole
+        // run must fit in VRAM too.
+        let start = request.first_character_byte(self.vram.len() as u32, 32)? as usize;
         let count = request.count as usize;
-        // 32 bytes per 8x8 4bpp tile. The whole run must fit in VRAM.
-        let end = base_addr + (first + count) * 32;
-        if end > self.vram.len() {
+        if start + count * 32 > self.vram.len() {
             return Err(ExportError::OutOfRange);
         }
 
@@ -618,7 +614,7 @@ impl VideoDebugger for Vdp {
         let height = request.count * 8;
         let mut pixels = vec![0u8; (width * height) as usize];
         for i in 0..count {
-            let tbase = base_addr + (first + i) * 32;
+            let tbase = start + i * 32;
             let tile = Tile::decode(&self.vram[tbase..tbase + 32]);
             let row0 = i * 8;
             for py in 0..8usize {
@@ -1513,6 +1509,20 @@ mod tests {
             bpp: 4,
             tile_size: TileSize::Px8,
         }
+    }
+
+    #[test]
+    fn decode_tiles_refuses_a_request_whose_numbers_pass_32_bits() {
+        let vdp = Vdp::new();
+        // Wrapped to 32 bits, 0x0800_0000 characters of 32 bytes would be
+        // character 0.
+        let mut request = vram_tile_request(0, 1);
+        request.first_tile = 0x0800_0000;
+        assert_eq!(vdp.decode_tiles(&request), Err(ExportError::OutOfRange));
+        let mut request = vram_tile_request(0, u32::MAX);
+        request.base_addr = 0x20;
+        assert_eq!(vdp.decode_tiles(&request), Err(ExportError::OutOfRange));
+        assert!(vdp.decode_tiles(&vram_tile_request(0, 2048)).is_ok());
     }
 
     #[test]

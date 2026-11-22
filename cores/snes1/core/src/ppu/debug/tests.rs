@@ -319,6 +319,37 @@ fn vram_decode_req(bpp: u8, count: u32) -> TileDecodeRequest {
 }
 
 #[test]
+fn decode_tiles_reads_no_more_characters_than_vram_holds() {
+    let ppu = Ppu::new();
+    let request = |source, count, bpp, tile_size| TileDecodeRequest {
+        source,
+        base_addr: 0,
+        first_tile: 0,
+        count,
+        bpp,
+        tile_size,
+    };
+    for (source, count, bpp, size) in [
+        (TileSource::Vram, 4096, 2, TileSize::Px8),
+        (TileSource::Vram, 2048, 4, TileSize::Px8),
+        (TileSource::Vram, 1024, 8, TileSize::Px8),
+        (TileSource::Vram, 1024, 4, TileSize::Px16),
+        (TileSource::Mode7, 512, 8, TileSize::Px8),
+    ] {
+        let at_most = request(source, count, bpp, size);
+        assert!(ppu.decode_tiles(&at_most).is_ok(), "{at_most:?}");
+        let one_more = request(source, count + 1, bpp, size);
+        assert_eq!(
+            ppu.decode_tiles(&one_more),
+            Err(ExportError::OutOfRange),
+            "{one_more:?}"
+        );
+    }
+    let huge = request(TileSource::Vram, u32::MAX, 4, TileSize::Px8);
+    assert_eq!(ppu.decode_tiles(&huge), Err(ExportError::OutOfRange));
+}
+
+#[test]
 fn decode_tiles_decodes_each_depth() {
     let mut ppu = Ppu::new();
     // Row 0 plane 0 = 0xFF (low byte of VRAM word 0) -> every column

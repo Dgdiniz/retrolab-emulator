@@ -279,6 +279,34 @@ pub struct TileDecodeRequest {
     pub tile_size: TileSize,
 }
 
+impl TileDecodeRequest {
+    /// The byte the request's first character starts at in a memory of
+    /// `memory_bytes` bytes whose characters take `bytes_per_tile` bytes
+    /// each, `base_addr + first_tile * bytes_per_tile`, when the request
+    /// keeps to the memory's characters: at least one, no more than the
+    /// memory holds (a reader that wraps at the memory's end would only
+    /// repeat them), the first starting inside the memory.
+    /// [`ExportError::Empty`] for none, [`ExportError::OutOfRange`]
+    /// otherwise. The arithmetic is checked, so a request whose numbers
+    /// pass 32 bits (a WebAssembly `usize`) is refused, never wrapped into
+    /// range.
+    pub fn first_character_byte(
+        &self,
+        memory_bytes: u32,
+        bytes_per_tile: u32,
+    ) -> Result<u32, ExportError> {
+        if self.count == 0 {
+            return Err(ExportError::Empty);
+        }
+        let characters = memory_bytes / bytes_per_tile.max(1);
+        self.first_tile
+            .checked_mul(bytes_per_tile)
+            .and_then(|offset| offset.checked_add(self.base_addr))
+            .filter(|&start| start < memory_bytes && self.count <= characters)
+            .ok_or(ExportError::OutOfRange)
+    }
+}
+
 /// The settings each line of a frame was drawn with, as a core recorded them
 /// while the lines were drawn: one column per setting, in the core's own
 /// names, one row per line. A core records it only while a host asks for it
@@ -648,7 +676,10 @@ pub trait VideoDebugger {
     ///
     /// The result stacks `count` tiles top-to-bottom (`width` = the tile
     /// width, `height` = `count * tile_height`), one palette index per
-    /// pixel, with `transparent_index` set to the hardware key. The host
+    /// pixel, with `transparent_index` set to the hardware key. A request
+    /// for more characters than the memory holds, or one starting past its
+    /// end, is out of range ([`TileDecodeRequest::first_character_byte`]).
+    /// The host
     /// walks a nametable, looks up each cell's tile block in the returned
     /// sheet, then applies the per-cell flip + palette and colours it,
     /// keeping colour and the transparency policy out of the core (see
@@ -777,6 +808,59 @@ fn palette_is_little_endian<V: VideoDebugger + ?Sized>(video: &V) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tile_request(base_addr: u32, first_tile: u32, count: u32) -> TileDecodeRequest {
+        TileDecodeRequest {
+            source: TileSource::Vram,
+            base_addr,
+            first_tile,
+            count,
+            bpp: 4,
+            tile_size: TileSize::Px8,
+        }
+    }
+
+    #[test]
+    fn a_request_keeps_to_the_memory_s_characters() {
+        let memory = 0x1_0000;
+        let start = |r: TileDecodeRequest| r.first_character_byte(memory, 32);
+        assert_eq!(start(tile_request(0, 0, 2048)), Ok(0), "every character");
+        assert_eq!(start(tile_request(0x20, 19, 2)), Ok(0x20 + 19 * 32));
+        assert_eq!(start(tile_request(0, 2047, 2)), Ok(0xFFE0), "a run to wrap");
+        assert_eq!(start(tile_request(0, 0, 0)), Err(ExportError::Empty));
+        assert_eq!(
+            start(tile_request(0, 0, 2049)),
+            Err(ExportError::OutOfRange),
+            "more characters than the memory holds"
+        );
+        assert_eq!(
+            start(tile_request(0x1_0000, 0, 1)),
+            Err(ExportError::OutOfRange)
+        );
+        assert_eq!(
+            start(tile_request(0, 2048, 1)),
+            Err(ExportError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_request_whose_numbers_pass_32_bits_is_refused_not_wrapped() {
+        let start = |r: TileDecodeRequest| r.first_character_byte(0x1_0000, 32);
+        // 0x0800_0000 characters of 32 bytes are 2^32 bytes: wrapped, the
+        // first would be character 0's.
+        assert_eq!(
+            start(tile_request(0, 0x0800_0000, 1)),
+            Err(ExportError::OutOfRange)
+        );
+        assert_eq!(
+            start(tile_request(u32::MAX, 1, 1)),
+            Err(ExportError::OutOfRange)
+        );
+        assert_eq!(
+            start(tile_request(0, u32::MAX, u32::MAX)),
+            Err(ExportError::OutOfRange)
+        );
+    }
 
     #[test]
     fn a_layer_mask_shows_every_layer_until_one_is_hidden() {

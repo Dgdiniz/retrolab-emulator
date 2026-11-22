@@ -566,7 +566,12 @@ impl Ppu {
         if request.count == 0 {
             return Err(ExportError::Empty);
         }
-        if request.first_tile >= CHARACTER_NUMBERS || (request.base_addr >> 1) as usize >= 0x8000 {
+        // The blocks are numbered as characters are, in ten bits: no more
+        // are read than there are numbers.
+        if request.first_tile >= CHARACTER_NUMBERS
+            || request.count > CHARACTER_NUMBERS
+            || (request.base_addr >> 1) as usize >= 0x8000
+        {
             return Err(ExportError::OutOfRange);
         }
         const SIDE: usize = 16;
@@ -608,16 +613,12 @@ impl Ppu {
         if request.bpp != 8 {
             return Err(ExportError::Unsupported);
         }
-        if request.count == 0 {
-            return Err(ExportError::Empty);
-        }
         const WORDS_PER_CHARACTER: usize = 64;
-        let start_word = u64::from(request.base_addr >> 1)
-            + u64::from(request.first_tile) * WORDS_PER_CHARACTER as u64;
-        if start_word >= 0x8000 {
-            return Err(ExportError::OutOfRange);
-        }
-        let start_word = start_word as usize;
+        // The reads wrap at the end of VRAM; the first character starts
+        // inside it, and no more are read than VRAM holds.
+        let start_byte =
+            request.first_character_byte(VRAM_BYTES as u32, 2 * WORDS_PER_CHARACTER as u32)?;
+        let start_word = start_byte as usize >> 1;
         let vram = self.vram();
         let count = request.count as usize;
         // Character after character, so pixel `n` of the sheet is the high
@@ -937,18 +938,12 @@ impl VideoDebugger for Ppu {
             8 => 32,
             _ => return Err(ExportError::Unsupported),
         };
-        if request.count == 0 {
-            return Err(ExportError::Empty);
-        }
         let vram = self.vram();
         let bytes_per_tile = words_per_tile * 2;
-        // A start word already past the 32 KiB-word bank is a bogus base
-        // (the per-tile reads wrap, but the *origin* must be in range).
-        let start_word = (request.base_addr >> 1) as usize
-            + (request.first_tile as usize) * (words_per_tile as usize);
-        if start_word >= vram.len() {
-            return Err(ExportError::OutOfRange);
-        }
+        // The per-tile reads wrap at the end of VRAM, as the PPU's do, but
+        // the first character must start inside it, and no more characters
+        // are read than VRAM holds at this depth.
+        request.first_character_byte(VRAM_BYTES as u32, bytes_per_tile)?;
 
         let width = 8u32;
         let count = request.count as usize;
