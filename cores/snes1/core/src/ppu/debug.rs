@@ -33,7 +33,7 @@ use crate::ppu::sprite::{
 use crate::ppu::tile::{
     decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row, sign_extend_13,
 };
-use crate::ppu::{Ppu, WindowEnable, LAYER_COUNT, LAYER_OBJ};
+use crate::ppu::{LineState, Ppu, WindowEnable, LAYER_COUNT, LAYER_OBJ};
 
 /// Number of 4bpp 8x8 tiles addressable in the 64 KiB VRAM word space
 /// (16 words per tile x 2048 tiles = 32768 words = the full bank).
@@ -738,6 +738,7 @@ impl VideoDebugger for Ppu {
                 height: 256,
                 scroll_x: 0,
                 scroll_y: 0,
+                line_scroll: Vec::new(),
                 // The checkbox mirrors the debugger's per-layer hide toggle
                 // only, not the game's TM/TS main/sub enable bits. Folding
                 // those in would make the checkbox read unchecked for a layer
@@ -757,15 +758,17 @@ impl VideoDebugger for Ppu {
             2 => (32, 64),
             _ => (64, 64),
         };
+        let (scroll_x, scroll_y) = LineState::capture(self).bg_scroll(id);
         Some(LayerData {
             id: layer_id,
             name: format!("BG{}", id + 1),
             width: w_tiles * 8,
             height: h_tiles * 8,
-            scroll_x: i32::from(self.bg_hoffset(id)),
-            scroll_y: i32::from(self.bg_voffset(id)),
+            scroll_x,
+            scroll_y,
             // Debug hide-toggle state only (see the OBJ branch above).
             enabled: !self.layer_debug_disabled(id),
+            line_scroll: self.bg_line_scroll(id),
         })
     }
 
@@ -1101,6 +1104,7 @@ impl VideoDebugger for Ppu {
                 first_colour: 128,
                 scroll_x: 0,
                 scroll_y: 0,
+                line_scroll: Vec::new(),
             });
         }
         if id >= 4 {
@@ -1113,6 +1117,7 @@ impl VideoDebugger for Ppu {
             _ => None,
         };
         let cell = if bg.tile_size16 { 16 } else { 8 };
+        let (scroll_x, scroll_y) = LineState::capture(self).bg_scroll(id);
         let layout = LayerLayout {
             id: layer_id,
             kind: if bg.bpp == 0 {
@@ -1128,8 +1133,9 @@ impl VideoDebugger for Ppu {
             cell_width: cell,
             cell_height: cell,
             first_colour: u32::from(bg.palette_base),
-            scroll_x: i32::from(bg.scroll_x),
-            scroll_y: i32::from(bg.scroll_y),
+            scroll_x,
+            scroll_y,
+            line_scroll: self.bg_line_scroll(id),
         };
         Some(match affine_bits {
             Some(bits_per_pixel) => LayerLayout {

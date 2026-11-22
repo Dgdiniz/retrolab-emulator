@@ -1356,6 +1356,39 @@ fn a_background_s_layout_is_its_registers_and_mode_7_its_own() {
 }
 
 #[test]
+fn a_layer_s_scroll_is_its_scroll_registers_or_mode_7_s_offsets() {
+    let mut ppu = Ppu::new();
+    ppu.bgmode = 1;
+    ppu.bg_hoffset[0] = 0x1FF;
+    ppu.bg_voffset[0] = 0x0AA;
+    ppu.mode7_hoffset = 0x1F00; // -256 in 13 bits
+    ppu.mode7_voffset = 0x0040;
+    let scroll = |ppu: &Ppu, id: u32| {
+        let data = ppu.get_layer_data(id).unwrap();
+        let layout = ppu.layer_layout(id).unwrap();
+        assert_eq!(
+            (data.scroll_x, data.scroll_y),
+            (layout.scroll_x, layout.scroll_y),
+            "the layout reports what the list does"
+        );
+        assert!(data.line_scroll.is_empty() && layout.line_scroll.is_empty());
+        (data.scroll_x, data.scroll_y)
+    };
+    assert_eq!(scroll(&ppu, 0), (0x1FF, 0x0AA), "BGnHOFS and BGnVOFS");
+    ppu.bgmode = 7;
+    assert_eq!(scroll(&ppu, 0), (-256, 0x40), "Mode 7's own, signed");
+    ppu.bg_hoffset[1] = 3;
+    assert_eq!(scroll(&ppu, 1), (3, 0), "BG2 is no plane of Mode 7's");
+    ppu.mode7_extbg = true;
+    assert_eq!(
+        scroll(&ppu, 1),
+        (-256, 0x40),
+        "EXTBG draws BG2 as the plane"
+    );
+    assert_eq!(scroll(&ppu, 4), (0, 0), "the sprites do not scroll");
+}
+
+#[test]
 fn a_video_memory_write_counts_bytes_from_any_byte() {
     let mut ppu = Ppu::new();
     assert!(ppu.write_video_memory(VideoMemoryId::Vram, 0x0201, &[0xAB, 0xCD]));

@@ -47,8 +47,9 @@
 use retro_core::capture::{
     arm_recorder, distinct_palettes, CaptureRecording, LinePalettes, TableColumns,
 };
-use retro_core::video::LineStateTable;
+use retro_core::video::{LineScroll, LineStateTable};
 
+use super::tile::sign_extend_13;
 use super::writes::LiveRecorders;
 use super::{Ppu, WindowEnable};
 
@@ -365,6 +366,27 @@ pub(crate) struct ReplayCursor {
     vram: usize,
     palette: usize,
     sprite_table: usize,
+}
+
+impl LineState {
+    /// The scroll background `bg` (0 to 3) is drawn with under these
+    /// settings, horizontal then vertical: BGnHOFS and BGnVOFS, or Mode 7's
+    /// own offsets, 13 bits signed, where the background is Mode 7's plane
+    /// (BG1 in Mode 7, and BG2 under EXTBG).
+    pub(crate) fn bg_scroll(&self, bg: usize) -> (i32, i32) {
+        let affine = self.bgmode & 0x07 == 7 && (bg == 0 || (bg == 1 && self.mode7_extbg));
+        if affine {
+            (
+                sign_extend_13(self.mode7_hoffset),
+                sign_extend_13(self.mode7_voffset),
+            )
+        } else {
+            (
+                i32::from(self.bg_hoffset[bg]),
+                i32::from(self.bg_voffset[bg]),
+            )
+        }
+    }
 }
 
 /// The line table: the settings of every line of the frame drawn last, and
@@ -946,6 +968,27 @@ impl Ppu {
             columns,
             values,
         })
+    }
+
+    /// The scroll background `bg` (0 to 3) was drawn with on each line the
+    /// line table holds, in the order drawn and numbered as the table
+    /// numbers them ([`LineState::bg_scroll`]). Empty when no table is kept.
+    pub(crate) fn bg_line_scroll(&self, bg: usize) -> Vec<LineScroll> {
+        let Some(table) = self.recorders.lines.as_deref() else {
+            return Vec::new();
+        };
+        table
+            .lines
+            .iter()
+            .map(|(line, state)| {
+                let (x, y) = state.bg_scroll(bg);
+                LineScroll {
+                    line: u32::from(*line),
+                    x,
+                    y,
+                }
+            })
+            .collect()
     }
 
     /// The palettes the lines of the table were drawn with: CGRAM wound

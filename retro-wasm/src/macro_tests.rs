@@ -947,8 +947,8 @@ fn the_sprite_table_the_layers_and_the_registers_answer_the_chip() {
     assert_eq!(
         shape(&emu.get_layer_layout(1)),
         "{bits_per_pixel: 2, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, \
-         id: 1, kind: \"tile_map\", map_base: 16, map_height: 2, map_width: 4, scroll_x: 0, \
-         scroll_y: 0}"
+         id: 1, kind: \"tile_map\", line_scroll: [], map_base: 16, map_height: 2, map_width: 4, \
+         scroll_x: 0, scroll_y: 0}"
     );
     assert!(emu.get_layer_layout(2).is_null(), "a layer the chip lacks");
     assert_eq!(shape(&emu.get_video_registers()), "[]");

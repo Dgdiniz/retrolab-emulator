@@ -405,6 +405,40 @@ fn the_hdma_path_is_recorded() {
 }
 
 #[test]
+fn the_layer_list_gives_each_line_s_scroll_and_the_scroll_as_the_chip_stands() {
+    let mut emu = hdma_scene_at_boundary();
+    let table = emu.line_states().expect("a line table");
+    let now = i32::from(emu.bus().ppu().bg_hoffset(0));
+    let data = emu.video_debugger().get_layer_data(0).expect("BG1");
+    assert_eq!(
+        (data.scroll_x, data.scroll_y),
+        (now, 0),
+        "as the chip stands"
+    );
+    let lines: Vec<u32> = data.line_scroll.iter().map(|s| s.line).collect();
+    assert_eq!(lines, column(&table, "line"), "each line the table holds");
+    for scroll in &data.line_scroll {
+        let line = scroll.line as u16;
+        assert_eq!(
+            (scroll.x, scroll.y),
+            (i32::from(hdma_scroll(line)), 0),
+            "line {line}"
+        );
+    }
+    let layout = emu.video_debugger().layer_layout(0).expect("BG1");
+    assert_eq!(
+        layout.line_scroll, data.line_scroll,
+        "the layout reports the same"
+    );
+    let sprites = emu.video_debugger().get_layer_data(4).expect("the sprites");
+    assert!(sprites.line_scroll.is_empty(), "the sprites do not scroll");
+
+    emu.set_capture_recording(CaptureRecording::default());
+    let data = emu.video_debugger().get_layer_data(0).expect("BG1");
+    assert!(data.line_scroll.is_empty(), "no line table, no lines");
+}
+
+#[test]
 fn the_pixel_sources_of_a_raster_effect_describe_its_picture() {
     let mut emu = hdma_scene_at_boundary();
     let state = emu.state_hash();

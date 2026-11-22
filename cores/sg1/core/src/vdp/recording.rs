@@ -27,7 +27,7 @@
 use retro_core::capture::{
     distinct_palettes, CaptureRecording, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE,
 };
-use retro_core::video::LineStateTable;
+use retro_core::video::{LineScroll, LineStateTable};
 
 use super::sprites::{EntryHeads, SpriteCache};
 use super::writes::LiveWrites;
@@ -454,12 +454,7 @@ impl Vdp {
             return;
         }
         let frame = self.frame_being_drawn;
-        let mode = self.registers[11] & 0x03;
-        let scroll_table = usize::from(self.registers[13] & 0x3F) << 10;
-        let horizontal_scroll = [
-            self.read_hscroll(scroll_table, 0, mode, line),
-            self.read_hscroll(scroll_table, 2, mode, line),
-        ];
+        let horizontal_scroll = [self.plane_hscroll(0, line), self.plane_hscroll(1, line)];
         let Some(table) = self.recording.as_deref_mut().and_then(|r| r.lines.as_mut()) else {
             return;
         };
@@ -718,6 +713,29 @@ impl Vdp {
             columns,
             values,
         })
+    }
+
+    /// The scroll plane A (`plane` 0) or plane B (`plane` 1) was drawn
+    /// with on each line of the picture the line table holds, numbered from
+    /// line 0: the horizontal scroll the line read from the scroll table,
+    /// and the vertical scroll memory's word for the plane's first column
+    /// (word 0 for plane A, word 1 for plane B). Empty while no line table
+    /// is kept.
+    pub(super) fn plane_line_scroll(&self, plane: usize) -> Vec<LineScroll> {
+        let Some(table) = self.line_table() else {
+            return Vec::new();
+        };
+        let rows = Self::picture_rows(table, self.timing.visible_scanlines());
+        table.rows[..rows]
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.recorded())
+            .map(|(line, row)| LineScroll {
+                line: line as u32,
+                x: i32::from(row.horizontal_scroll[plane]),
+                y: i32::from(row.vertical_scroll[plane]),
+            })
+            .collect()
     }
 
     /// The palettes the lines of the picture began with, each once, and

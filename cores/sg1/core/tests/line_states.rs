@@ -26,7 +26,7 @@ use retro_core::video::{LineStateTable, SpriteOrderEntry, VideoDebugger};
 use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode, ExecutionTier};
 use sg1_core::debugger::GenesisEvent;
 use sg1_core::vdp::sources::DRAWN_BY_SPRITE;
-use sg1_core::vdp::{LineKind, Vdp, LAYER_PLANE_A, LAYER_SPRITES};
+use sg1_core::vdp::{LineKind, Vdp, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
 use sg1_core::GenesisEmulator;
 
 /// Frames run before a check, so the program has set the VDP up.
@@ -435,6 +435,73 @@ fn the_table_says_what_each_line_was_drawn_with() {
     assert!(!colours_on_line[..from].contains(&yellow));
     assert!(colours_on_line[from..].contains(&yellow));
     assert!(!colours_on_line[from..].contains(&red));
+}
+
+#[test]
+fn the_layer_list_gives_each_line_s_scroll_and_the_scroll_as_the_chip_stands() {
+    let mut emu = recording(&raster_program());
+    emu.run_to_capture_boundary();
+    let table = emu.line_states().expect("line states on");
+    let as_u32 = |values: &[i32]| values.iter().map(|&v| v as u32).collect::<Vec<_>>();
+    for (layer, plane) in [(LAYER_PLANE_A, 0), (LAYER_PLANE_B, 1)] {
+        let data = emu.video_debugger().get_layer_data(layer as u32).unwrap();
+        let lines: Vec<u32> = data.line_scroll.iter().map(|s| s.line).collect();
+        assert_eq!(lines, (0..224).collect::<Vec<u32>>(), "every line");
+        let x: Vec<i32> = data.line_scroll.iter().map(|s| s.x).collect();
+        let y: Vec<i32> = data.line_scroll.iter().map(|s| s.y).collect();
+        assert_eq!(
+            as_u32(&x),
+            column(&table, &format!("horizontal_scroll[{plane}]"))
+        );
+        assert_eq!(
+            as_u32(&y),
+            column(&table, &format!("vertical_scroll[{plane}]"))
+        );
+        let layout = emu.video_debugger().layer_layout(layer as u32).unwrap();
+        assert_eq!(
+            (layout.scroll_x, layout.scroll_y, &layout.line_scroll),
+            (data.scroll_x, data.scroll_y, &data.line_scroll),
+            "the layout reports what the list does"
+        );
+    }
+    // Plane A moved right by 8 from line 101 and down by 16 from line 141;
+    // at the boundary the chip still holds the bottom lines' scroll.
+    let plane_a = emu
+        .video_debugger()
+        .get_layer_data(LAYER_PLANE_A as u32)
+        .unwrap();
+    assert_eq!((plane_a.line_scroll[0].x, plane_a.line_scroll[0].y), (0, 0));
+    assert_eq!(
+        (plane_a.line_scroll[223].x, plane_a.line_scroll[223].y),
+        (8, 16)
+    );
+    assert_eq!((plane_a.scroll_x, plane_a.scroll_y), (8, 16));
+
+    // The vertical interrupt puts the scroll back; the lines keep the frame's.
+    run_frame_on(&mut emu, ExecutionTier::Play);
+    let plane_a = emu
+        .video_debugger()
+        .get_layer_data(LAYER_PLANE_A as u32)
+        .unwrap();
+    assert_eq!((plane_a.scroll_x, plane_a.scroll_y), (0, 0));
+    assert_eq!(
+        (plane_a.line_scroll[223].x, plane_a.line_scroll[223].y),
+        (8, 16)
+    );
+
+    // The window and the sprites do not scroll; with no line table there
+    // are no lines.
+    for layer in [LAYER_WINDOW, LAYER_SPRITES] {
+        let data = emu.video_debugger().get_layer_data(layer as u32).unwrap();
+        assert_eq!((data.scroll_x, data.scroll_y), (0, 0));
+        assert!(data.line_scroll.is_empty());
+    }
+    emu.set_capture_recording(CaptureRecording::default());
+    let plane_a = emu
+        .video_debugger()
+        .get_layer_data(LAYER_PLANE_A as u32)
+        .unwrap();
+    assert!(plane_a.line_scroll.is_empty());
 }
 
 #[test]

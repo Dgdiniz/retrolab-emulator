@@ -228,8 +228,8 @@ fn the_layers_read_their_maps_where_the_plane_registers_say() {
     assert_eq!(
         shape(&emu.get_layer_layout(0)),
         "{bits_per_pixel: 4, cell_height: 8, cell_width: 8, character_base: 0, first_colour: 0, \
-         id: 0, kind: \"tile_map\", map_base: 49152, map_height: 32, map_width: 64, scroll_x: \
-         0, scroll_y: 0}"
+         id: 0, kind: \"tile_map\", line_scroll: [], map_base: 49152, map_height: 32, \
+         map_width: 64, scroll_x: 0, scroll_y: 4}"
     );
     assert_eq!(
         field(&emu.get_layer_layout(3), "kind")

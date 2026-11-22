@@ -111,6 +111,14 @@ impl Vdp {
         }
     }
 
+    /// The horizontal scroll plane A (`plane` 0) or plane B (`plane` 1)
+    /// reads on `line`, from the scroll table and the mode the registers
+    /// name now ([`Self::read_hscroll`]).
+    pub(super) fn plane_hscroll(&self, plane: usize, line: u16) -> u16 {
+        let table = usize::from(self.registers[13] & 0x3F) << 10;
+        self.read_hscroll(table, plane * 2, self.registers[11] & 0x03, line)
+    }
+
     /// Read horizontal scroll value from VRAM for a given plane and scanline.
     ///
     /// Modes (register 11, bits 0-1):

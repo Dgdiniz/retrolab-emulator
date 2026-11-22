@@ -129,9 +129,32 @@ pub struct LayerData {
     pub name: String,
     pub width: u32,
     pub height: u32,
+    /// Its horizontal scroll, in the console's own units: the value its
+    /// scroll register or scroll table holds for the picture's first line,
+    /// as the chip stands. 0 for a layer that does not scroll.
     pub scroll_x: i32,
+    /// Its vertical scroll, in the console's own units, as the chip stands.
+    /// 0 for a layer that does not scroll.
     pub scroll_y: i32,
     pub enabled: bool,
+    /// The scroll each line of the picture was drawn with, in line order,
+    /// for every line the core's line table holds (while line states are
+    /// recorded, [`crate::capture::CaptureCore::line_states`]); empty
+    /// otherwise, and for a layer that does not scroll.
+    pub line_scroll: Vec<LineScroll>,
+}
+
+/// The scroll a layer was drawn with on one line of the picture, as the
+/// core's line table holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineScroll {
+    /// The line, numbered as the core's line table numbers it (the `line`
+    /// column of [`LineStateTable`]).
+    pub line: u32,
+    /// The horizontal scroll, in the units of [`LayerData::scroll_x`].
+    pub x: i32,
+    /// The vertical scroll, in the units of [`LayerData::scroll_y`].
+    pub y: i32,
 }
 
 /// Video register.
@@ -490,7 +513,7 @@ pub enum LayerKind {
 /// Where a layer reads its map and its characters, as the chip's registers
 /// stand: what a host needs to draw the whole map itself from the video
 /// memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LayerLayout {
     /// The layer's id, as [`VideoDebugger::get_layer_data`] numbers it.
     pub id: u32,
@@ -518,6 +541,9 @@ pub struct LayerLayout {
     pub scroll_x: i32,
     /// Its vertical scroll, as [`LayerData`] reports it.
     pub scroll_y: i32,
+    /// The scroll each line of the picture was drawn with, as
+    /// [`LayerData`] reports it.
+    pub line_scroll: Vec<LineScroll>,
 }
 
 /// 16-bit words read from `bytes`, two bytes a word in the order given; an

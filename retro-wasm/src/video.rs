@@ -69,8 +69,9 @@ macro_rules! video_bindings {
             }
 
             /// Each layer the debugger can show or hide (`LayerData[]`: its
-            /// id, name, size, scroll and whether it is shown), for a layer
-            /// list.
+            /// id, name, size, scroll and whether it is shown, and
+            /// `line_scroll`, `{ line, x, y }[]`, the scroll each line the
+            /// line table holds was drawn with), for a layer list.
             #[wasm_bindgen(js_name = getLayerInfo)]
             pub fn get_layer_info(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
                 let video =
@@ -333,7 +334,8 @@ macro_rules! video_bindings {
             /// "window", "affine_map", "sprites" or "off"), map_base (a VRAM
             /// byte), map_width, map_height (cells), character_base (a VRAM
             /// byte), bits_per_pixel, cell_width, cell_height, first_colour,
-            /// scroll_x, scroll_y }`; `null` for a layer the chip lacks.
+            /// scroll_x, scroll_y, line_scroll }`; `null` for a layer the
+            /// chip lacks.
             #[wasm_bindgen(js_name = getLayerLayout)]
             pub fn get_layer_layout(
                 &mut self,

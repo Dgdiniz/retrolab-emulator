@@ -304,6 +304,7 @@ impl VideoDebugger for FakeVideo {
             scroll_y: 0,
             width: 32,
             height: 32,
+            line_scroll: Vec::new(),
         })
     }
     fn get_layer_count(&self) -> u32 {
@@ -418,6 +419,7 @@ impl VideoDebugger for FakeVideo {
             first_colour: 0,
             scroll_x: 0,
             scroll_y: 0,
+            line_scroll: Vec::new(),
         })
     }
     fn colour_levels(&self) -> ColourLevels {

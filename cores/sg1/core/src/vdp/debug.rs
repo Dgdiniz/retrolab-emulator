@@ -26,9 +26,9 @@ use std::ops::Range;
 
 use retro_core::video::{
     bytes_from_words, words_from_bytes, ColourLevels, ExportError, IndexedImage, LayerData,
-    LayerKind, LayerLayout, PaletteData, PictureRect, PixelImage, SpriteData, SpriteOrderEntry,
-    SpriteTableEntry, TileData, TileDecodeRequest, TileSize, TileSource, VideoDebugger,
-    VideoMemoryId, VideoMemoryInfo, VideoRegister,
+    LayerKind, LayerLayout, LineScroll, PaletteData, PictureRect, PixelImage, SpriteData,
+    SpriteOrderEntry, SpriteTableEntry, TileData, TileDecodeRequest, TileSize, TileSource,
+    VideoDebugger, VideoMemoryId, VideoMemoryInfo, VideoRegister,
 };
 
 use super::colour::COLOUR_LEVELS;
@@ -457,18 +457,16 @@ impl VideoDebugger for Vdp {
             LAYER_SPRITES => ("Sprites", self.display_width(), self.display_height()),
             _ => return None,
         };
-        // Scroll is reported as 0: the Genesis playfield scroll is
-        // per-line (H-scroll table) / per-column (VSRAM), so a single
-        // layer-wide value would be misleading. The dedicated scroll
-        // viewers expose the real values.
+        let (scroll_x, scroll_y, line_scroll) = self.layer_scroll(id);
         Some(LayerData {
             id: layer_id,
             name: name.to_string(),
             width,
             height,
-            scroll_x: 0,
-            scroll_y: 0,
+            scroll_x,
+            scroll_y,
             enabled: visible,
+            line_scroll,
         })
     }
 
@@ -709,8 +707,7 @@ impl VideoDebugger for Vdp {
 
     /// Planes A and B, the window and the sprites: 4 bits a pixel in 8 by
     /// 8 cells from VRAM byte 0, each cell naming its own palette; the
-    /// scroll as the layer list reports it (0: it is set per line and per
-    /// column).
+    /// scroll as the layer list reports it.
     fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout> {
         let (cols, rows) = self.plane_size_cells();
         let window_cols = if (self.registers[12] & 0x01) != 0 {
@@ -730,6 +727,7 @@ impl VideoDebugger for Vdp {
             LAYER_SPRITES => (LayerKind::Sprites, self.sat_base(), 0, 0),
             _ => return None,
         };
+        let (scroll_x, scroll_y, line_scroll) = self.layer_scroll(layer_id as usize);
         Some(LayerLayout {
             id: layer_id,
             kind,
@@ -741,8 +739,9 @@ impl VideoDebugger for Vdp {
             cell_width: 8,
             cell_height: 8,
             first_colour: 0,
-            scroll_x: 0,
-            scroll_y: 0,
+            scroll_x,
+            scroll_y,
+            line_scroll,
         })
     }
 
@@ -754,6 +753,24 @@ impl VideoDebugger for Vdp {
 }
 
 impl Vdp {
+    /// The scroll the layer list reports for layer `id`: for plane A and
+    /// plane B, the horizontal scroll the scroll table holds for line 0 and
+    /// the vertical scroll memory's word for the plane's first column, as
+    /// they stand, and the scroll each line the line table holds was drawn
+    /// with; nothing for the window and the sprites, which do not scroll.
+    fn layer_scroll(&self, id: usize) -> (i32, i32, Vec<LineScroll>) {
+        let plane = match id {
+            LAYER_PLANE_A => 0,
+            LAYER_PLANE_B => 1,
+            _ => return (0, 0, Vec::new()),
+        };
+        (
+            i32::from(self.plane_hscroll(plane, 0)),
+            i32::from(self.vsram[plane]),
+            self.plane_line_scroll(plane),
+        )
+    }
+
     /// Set a pixel coordinate to debug. During render_scanline, all composition
     /// candidates for this pixel will be logged to stderr.
     pub fn set_debug_pixel(&mut self, x: u16, y: u16) {
