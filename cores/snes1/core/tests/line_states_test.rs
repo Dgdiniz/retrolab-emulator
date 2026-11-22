@@ -438,6 +438,88 @@ fn the_layer_list_gives_each_line_s_scroll_and_the_scroll_as_the_chip_stands() {
     assert!(data.line_scroll.is_empty(), "no line table, no lines");
 }
 
+/// A 32x32 tilemap whose row `r` holds tile `r % 15 + 1` in every column:
+/// a background whose lines differ every 8 pixels down.
+fn row_tilemap() -> Vec<u8> {
+    (0..32 * 32u16)
+        .flat_map(|cell| ((cell / 32) % 15 + 1).to_le_bytes())
+        .collect()
+}
+
+/// Mode 5, BG1 of [`row_tilemap`] on the main screen: a hires frame,
+/// whose picture is finished by doubling its rows in place.
+fn hires_scene_rom() -> Vec<u8> {
+    const TILES: usize = 0x1_0000;
+    const MAP: usize = 0x1_4000;
+    const PALETTE: usize = 0x1_6000;
+    let mut code = vec![0x78]; // SEI
+    store(&mut code, 0x80, 0x2100); // forced blank
+    store(&mut code, 0x05, 0x2105); // Mode 5
+    store(&mut code, 0x04, 0x2107); // BG1 tilemap at word $0400
+    store_zero(&mut code, 0x210B); // BG1 characters at word 0
+    store(&mut code, 0x01, 0x212C); // BG1 on the main screen
+    vram_address(&mut code, 0x0000);
+    dma(&mut code, 0x01, 0x18, lorom(TILES), 16 * 32);
+    vram_address(&mut code, 0x0400);
+    dma(&mut code, 0x01, 0x18, lorom(MAP), 32 * 32 * 2);
+    store_zero(&mut code, 0x2121);
+    dma(&mut code, 0x00, 0x22, lorom(PALETTE), 32);
+    store(&mut code, 0x0F, 0x2100); // display on
+    code.extend_from_slice(&[0x80, 0xFE]); // BRA *
+    build_rom(
+        0x2_0000,
+        &code,
+        &[0x40],
+        &[0x40],
+        &[
+            (TILES, sixteen_tiles()),
+            (MAP, row_tilemap()),
+            (PALETTE, bg_palette()),
+        ],
+    )
+}
+
+#[test]
+fn overscan_turned_on_in_the_vertical_blank_draws_no_line_over_the_finished_picture() {
+    let mut emu = SnesEmulator::new();
+    emu.set_capture_recording(line_states_on());
+    emu.load_rom(&hires_scene_rom()).expect("the program loads");
+    emu.run_frame();
+    emu.run_frame();
+    emu.run_to_capture_boundary();
+    let finished = picture(&emu);
+    assert_eq!((finished.0, finished.1), (512, 448), "a hires picture");
+    assert!(
+        finished.2.chunks(4).any(|p| p != finished.2[..4].as_ref()),
+        "the picture is not one colour"
+    );
+
+    // Overscan on, as a game sets it in the vertical blank: lines 225-239
+    // pass the PPU's gate, but the picture is finished.
+    emu.write_memory_debug(0x00_2133, &[0x04]);
+    assert!(emu.bus().ppu().overscan());
+    emu.run_frame();
+    assert_eq!(picture(&emu), finished, "the picture as it was finished");
+    let table = emu.line_states().expect("a line table");
+    assert_eq!(
+        column(&table, "line"),
+        (1..=224).collect::<Vec<u32>>(),
+        "no line drawn after the picture"
+    );
+
+    // A lo-res frame: the lines would land in the framebuffer's rows below
+    // its 224-row picture.
+    let mut emu = hdma_scene_at_boundary();
+    let whole = emu.get_framebuffer().data.clone();
+    emu.write_memory_debug(0x00_2133, &[0x04]);
+    emu.run_frame();
+    assert_eq!(
+        emu.get_framebuffer().data,
+        whole,
+        "no row of the framebuffer moves"
+    );
+}
+
 #[test]
 fn the_pixel_sources_of_a_raster_effect_describe_its_picture() {
     let mut emu = hdma_scene_at_boundary();

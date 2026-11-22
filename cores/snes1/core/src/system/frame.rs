@@ -122,11 +122,16 @@ impl SnesEmulator {
                 // RenderPos lands at dot 22, the active display has
                 // resumed, so the line is no longer in horizontal blank.
                 self.bus.system_regs_mut().set_hblank(false);
-                hooks.chip_start("PPU");
-                self.bus
-                    .ppu_mut()
-                    .render_scanline(scanline, &mut self.framebuffer);
-                hooks.chip_finish(0);
+                // Once the vertical blank has begun the picture is
+                // finished: overscan turned on after line 224 opens the
+                // PPU's gate to lines 225-239, which would draw over it.
+                if !self.bus.system_regs().in_vblank() {
+                    hooks.chip_start("PPU");
+                    self.bus
+                        .ppu_mut()
+                        .render_scanline(scanline, &mut self.framebuffer);
+                    hooks.chip_finish(0);
+                }
                 hooks.raised(self, |m| {
                     m.debugger.check_event(SnesEvent::Scanline(scanline))
                 });

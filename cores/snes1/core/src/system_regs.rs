@@ -573,6 +573,13 @@ impl SystemRegs {
         self.hvbjoy = value;
     }
 
+    /// The VBlank flag (`$4212` bit 7): raised as the vertical blank
+    /// begins, once the frame's picture is finished, and lowered as the
+    /// next frame begins.
+    pub fn in_vblank(&self) -> bool {
+        self.hvbjoy & 0x80 != 0
+    }
+
     /// Set or clear the VBlank flag (`$4212` bit 7) without disturbing
     /// the HBlank or auto-joypad bits. Driven by the `VBlankStart` /
     /// `VBlankEnd` scheduler events.
