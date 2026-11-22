@@ -520,18 +520,21 @@ impl Vdp {
     /// pictures the same way.)
     /// This resolves the streamed picture (the spaceship) that a whole-line
     /// remap can only render as horizontal bands, with no cycle-accurate CPU.
+    ///
+    /// The line's every row of the picture shows the same colours: in
+    /// interlace mode 2 both fields' rows ([`Vdp::line_rows`]).
     pub(super) fn render_dcdma_line_beamx(&mut self, line: u16) {
         let mut prog = match self.progressive_cram.take() {
             Some(p) => p,
             None => {
-                self.render_scanline(line);
+                self.render_line(line);
                 return;
             }
         };
 
         let width = self.display_width() as usize;
         let internal_width = 320usize;
-        let fb_offset = (line as usize) * internal_width * 4;
+        let rows = self.line_rows(line);
         // The first word of this line sits at the running cursor. Two pixels per
         // word.
         let base = prog.cursor;
@@ -553,12 +556,14 @@ impl Vdp {
             } else {
                 backdrop
             };
-            let idx = fb_offset + x * 4;
-            if idx + 3 < self.framebuffer.len() {
-                self.framebuffer[idx] = r;
-                self.framebuffer[idx + 1] = g;
-                self.framebuffer[idx + 2] = b;
-                self.framebuffer[idx + 3] = 255;
+            for row in rows.clone() {
+                let idx = (row * internal_width + x) * 4;
+                if idx + 3 < self.framebuffer.len() {
+                    self.framebuffer[idx] = r;
+                    self.framebuffer[idx + 1] = g;
+                    self.framebuffer[idx + 2] = b;
+                    self.framebuffer[idx + 3] = 255;
+                }
             }
         }
         // Keep the index buffers consistent (backdrop) so any later mid-line

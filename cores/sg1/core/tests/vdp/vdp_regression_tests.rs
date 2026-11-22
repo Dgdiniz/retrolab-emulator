@@ -42,8 +42,9 @@ fn test_vdp_initialization() {
     // DMA idle
     assert!(!vdp.is_dma_active());
 
-    // Framebuffer allocated: 320 by 240, the 30-line mode's rows
-    assert_eq!(vdp.framebuffer().len(), 320 * 240 * 4);
+    // Framebuffer allocated: 320 by 480, the 30-line mode's 240 lines, two
+    // rows each in interlace mode 2
+    assert_eq!(vdp.framebuffer().len(), 320 * 480 * 4);
 }
 
 /// Test VDP reset.
@@ -315,7 +316,7 @@ fn test_framebuffer_size_stability() {
 
     // Initial size
     let initial_size = vdp.framebuffer().len();
-    assert_eq!(initial_size, 320 * 240 * 4);
+    assert_eq!(initial_size, 320 * 480 * 4);
 
     // After various operations
     vdp.scanline(100);

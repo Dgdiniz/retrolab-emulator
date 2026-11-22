@@ -4,11 +4,14 @@
 //!
 //! The table holds 80 sprites in the 40-cell mode, 64 in the 32-cell mode;
 //! a line shows at most 20 or 16 of them. `Vdp::render_sprite_line` draws
-//! them line by line from the list here.
+//! them line by line from the list here. In interlace mode 2 a sprite's
+//! cells are 8 pixels by 16 and its Y counts the picture's rows, so each
+//! field's row of a line takes the sprites on that row.
 
 use retro_core::capture::{PixelTrace, SpriteFate};
 
-use super::sources::LineTrace;
+use super::picture::{Interlace, DOUBLE_CELL_ROWS, NORMAL_CELL_ROWS};
+use super::sources::{self, LineTrace};
 use super::Vdp;
 
 /// Sprite data structure.
@@ -17,7 +20,10 @@ pub struct Sprite {
     /// X position (screen coordinates)
     pub x: i16,
 
-    /// Y position (screen coordinates, offset by 128)
+    /// Y position: the screen line its top row is on, the table's 9 bits
+    /// less 128. In the renderer's list of a frame in interlace mode 2, the
+    /// picture row its top row is on, the table's 10 bits less 256
+    /// ([`SpriteCache::build`]).
     pub y: i16,
 
     /// Width in tiles (1-4)
@@ -109,6 +115,23 @@ impl Sprite {
         let height = (self.height_tiles as i16) * 8;
         (self.x, self.y, self.x + width, self.y + height)
     }
+
+    /// The first row it covers and the row past its last, from its `y`,
+    /// its cells `cell_rows` rows tall: 8, or 16 in interlace mode 2.
+    pub fn rows(&self, cell_rows: u16) -> (i16, i16) {
+        let height = self.height_tiles as i16 * cell_rows as i16;
+        (self.y, self.y + height)
+    }
+
+    /// Its Y as interlace mode 2 reads it from the table at `sat_base`,
+    /// where it is the sprite of slot `slot`: word 0's low 10 bits, which
+    /// count the picture's rows from 256. Outside that mode the table's Y
+    /// has 9 bits and counts lines from 128 ([`Self::from_sat`]).
+    pub fn double_resolution_y(vram: &[u8], sat_base: u16, slot: u8) -> i16 {
+        let addr = usize::from(sat_base) + usize::from(slot) * 8;
+        let word = u16::from_be_bytes([vram[addr], vram[addr + 1]]);
+        (word & 0x03FF) as i16 - 256
+    }
 }
 
 /// The sprites the VDP draws in a frame, in the order it takes them: the
@@ -199,11 +222,21 @@ impl SpriteCache {
         self.sprites.is_empty()
     }
 
-    /// Build sprite cache from SAT, following link chain ([`link_chain`]).
-    pub fn build(&mut self, vram: &[u8], sat_base: u16, max_sprites: u8) {
+    /// Build sprite cache from SAT, following link chain ([`link_chain`]),
+    /// each sprite's `y` as a frame drawn in `interlace` places it: a
+    /// picture row in interlace mode 2 ([`Sprite::double_resolution_y`]),
+    /// a line otherwise.
+    pub fn build(&mut self, vram: &[u8], sat_base: u16, max_sprites: u8, interlace: Interlace) {
         self.sprites.clear();
-        self.sprites
-            .extend(link_chain(vram, sat_base, max_sprites).map(|(_, sprite)| sprite));
+        let chain = link_chain(vram, sat_base, max_sprites);
+        if interlace == Interlace::Double {
+            self.sprites.extend(chain.map(|(slot, sprite)| Sprite {
+                y: Sprite::double_resolution_y(vram, sat_base, slot),
+                ..sprite
+            }));
+        } else {
+            self.sprites.extend(chain.map(|(_, sprite)| sprite));
+        }
     }
 
     /// The list made `sprites`, in their order, as a savestate holds it.
@@ -247,11 +280,32 @@ impl Vdp {
     /// and, where the line's sprite limit or its dots stop the evaluation,
     /// the sprites on the line after, read without changing anything; and
     /// the sprite each pixel of the line buffer came from.
+    ///
+    /// In interlace mode 2 the line is the picture row of the field being
+    /// drawn ([`Vdp::picture_row`]), the limits and the mask count rows,
+    /// and the cells are 16 rows tall.
     pub(super) fn render_sprite_line<T: PixelTrace<Notes = LineTrace>>(
         &mut self,
         line: u16,
         trace: &mut T,
     ) {
+        if self.interlace == Interlace::Double {
+            self.render_sprite_row::<T, DOUBLE_CELL_ROWS>(line, trace);
+        } else {
+            self.render_sprite_row::<T, NORMAL_CELL_ROWS>(line, trace);
+        }
+    }
+
+    /// The body of [`Self::render_sprite_line`] for cells of `CELL_ROWS`
+    /// rows: 8, or 16 in interlace mode 2, where a cell's number is the
+    /// index's low 10 bits and a row is the picture's. Built for each, so a
+    /// line of either draws with no test of the mode.
+    pub(super) fn render_sprite_row<T: PixelTrace<Notes = LineTrace>, const CELL_ROWS: u16>(
+        &mut self,
+        line: u16,
+        trace: &mut T,
+    ) {
+        let double = CELL_ROWS == DOUBLE_CELL_ROWS;
         let width = self.display_width() as usize;
         let is_h40 = (self.registers[12] & 0x01) != 0;
         let max_sprite_pixels: i32 = if is_h40 { 320 } else { 256 };
@@ -293,7 +347,13 @@ impl Vdp {
         // (Both cases are documented from hardware tests; checked against
         // Genesis Plus GX.)
         self.sprites_on_line_buf.clear();
-        let scanline = line as i16;
+        // The row the sprites are taken for: the line, or in interlace mode
+        // 2 the picture row of the field being drawn.
+        let scanline = if double {
+            self.picture_row(line) as i16
+        } else {
+            line as i16
+        };
         let mut count = 0u16;
         let mut masked = false;
         let mut mask_armed = self.sprite_mask_overflow;
@@ -310,7 +370,7 @@ impl Vdp {
         }
 
         for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate() {
-            let (_, y1, _, y2) = sprite.bounds();
+            let (y1, y2) = sprite.rows(CELL_ROWS);
             if scanline >= y1 && scanline < y2 {
                 count += 1;
                 if count > max_sprites_per_line {
@@ -374,7 +434,7 @@ impl Vdp {
         if T::ON {
             if let Some((first, fate)) = stopped_at {
                 for (idx, sprite) in self.sprite_cache.sprites().iter().enumerate().skip(first) {
-                    let (_, y1, _, y2) = sprite.bounds();
+                    let (y1, y2) = sprite.rows(CELL_ROWS);
                     if scanline >= y1 && scanline < y2 {
                         let slot = self.sprite_cache.slot_at(idx);
                         trace.notes().left_out(slot, idx as u8, sprite, fate);
@@ -394,11 +454,11 @@ impl Vdp {
             } else {
                 0
             };
-            let (sx1, sy1, sx2, _sy2) = sprite.bounds();
+            let (sx1, _, sx2, _) = sprite.bounds();
 
-            let local_y = (scanline - sy1) as u16;
+            let local_y = (scanline - sprite.y) as u16;
             let flipped_y = if sprite.flip_v {
-                sprite.height_tiles as u16 * 8 - 1 - local_y
+                sprite.height_tiles as u16 * CELL_ROWS - 1 - local_y
             } else {
                 local_y
             };
@@ -422,16 +482,27 @@ impl Vdp {
                 };
 
                 let tile_x = flipped_x / 8;
-                let tile_y = flipped_y / 8;
+                let tile_y = flipped_y / CELL_ROWS;
                 let pixel_x = (flipped_x % 8) as u8;
-                let pixel_y = (flipped_y % 8) as u8;
+                let pixel_y = (flipped_y % CELL_ROWS) as u8;
 
-                // Column-major tile layout
+                // Column-major tile layout; a cell of 16 rows is numbered by
+                // the index's low 10 bits.
                 let tile_offset = tile_x * sprite.height_tiles as u16 + tile_y;
-                let pattern_index = sprite.pattern_base + tile_offset;
+                let pattern_index = if double {
+                    ((sprite.pattern_base & 0x03FF) + tile_offset) & 0x03FF
+                } else {
+                    sprite.pattern_base + tile_offset
+                };
 
-                let color_index =
-                    Self::read_tile_pixel_from_vram(&self.vram, pattern_index, pixel_x, pixel_y);
+                let color_index = Self::read_cell_pixel::<CELL_ROWS>(
+                    &self.vram,
+                    pattern_index,
+                    pixel_x,
+                    pixel_y,
+                    false,
+                    false,
+                );
 
                 if color_index == 0 {
                     continue; // Transparent
@@ -450,9 +521,7 @@ impl Vdp {
                     trace.notes().sprite_pixel(
                         screen_x,
                         slot,
-                        pattern_index,
-                        pixel_y,
-                        pixel_x,
+                        sources::cell_tile::<CELL_ROWS>(pattern_index, pixel_y, pixel_x),
                         sprite.flip_h,
                         sprite.flip_v,
                     );
@@ -617,7 +686,7 @@ mod tests {
         vram[7] = word3 as u8;
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80);
+        cache.build(&vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 1);
     }
@@ -667,7 +736,7 @@ mod tests {
         vram[15] = word3_2 as u8;
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80);
+        cache.build(&vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 2);
     }
@@ -702,7 +771,7 @@ mod tests {
         }
 
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80);
+        cache.build(&vram, 0, 80, Interlace::Off);
 
         assert_eq!(cache.sprites.len(), 80);
     }
@@ -724,7 +793,7 @@ mod tests {
         let slots: Vec<u8> = link_chain(&vram, 0, 64).map(|(slot, _)| slot).collect();
         assert_eq!(slots, [0, 5]);
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 64);
+        cache.build(&vram, 0, 64, Interlace::Off);
         assert_eq!(cache.len(), 2);
 
         // 80 slots in the 40-cell mode reach it.
@@ -740,7 +809,7 @@ mod tests {
         link_slot(&mut vram, 3, 79);
         link_slot(&mut vram, 79, 0);
         let mut cache = SpriteCache::new();
-        cache.build(&vram, 0, 80);
+        cache.build(&vram, 0, 80, Interlace::Off);
         let slots: Vec<u8> = link_chain(&vram, 0, 80).map(|(slot, _)| slot).collect();
         assert_eq!(slots, [0, 7, 3, 79]);
         let from_list: Vec<u8> = (0..cache.len()).map(|i| cache.slot_at(i)).collect();

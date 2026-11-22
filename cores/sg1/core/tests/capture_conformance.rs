@@ -10,6 +10,11 @@
 //! one frame of four. Its horizontal interrupt, every hundred lines, moves
 //! plane A's horizontal scroll through the port again, part of the way down
 //! the picture.
+//!
+//! The suite runs twice: on the program as it is, and on the same program in
+//! interlace mode 2 (`double_resolution`), where each line is drawn into two
+//! rows of the picture, its cells 8 pixels by 16 and its sprites' Y counted
+//! in rows.
 
 mod helpers;
 
@@ -26,9 +31,13 @@ use sg1_core::GenesisEmulator;
 /// Where the vertical interrupt's handler starts.
 const VERTICAL_BLANK_HANDLER: u32 = 0x500;
 
-/// The program of the module's notes.
-fn program() -> Vec<u8> {
+/// The program of the module's notes, in interlace mode 2 when `double`:
+/// register 12 selects the mode, the sprites' Y is a row (odd for sprites 0
+/// and 2, even for 1 and 3), and their pattern is cell 0, whose 16-row
+/// cells are the 8 by 8 tiles 0 to 7.
+fn program_of(double: bool) -> Vec<u8> {
     let mut program = M68kProgram::new(0x8000, 0x200);
+    let register_12 = if double { 0x8C87 } else { 0x8C81 };
     program.vector(28, 0x400).vector(30, VERTICAL_BLANK_HANDLER);
 
     #[rustfmt::skip]
@@ -45,7 +54,7 @@ fn program() -> Vec<u8> {
         0x30BC, 0x8700,                 // register 7: backdrop colour 0
         0x30BC, 0x8A63,                 // register 10: a horizontal interrupt every 100 lines
         0x30BC, 0x8B00,                 // register 11: whole-screen scrolls
-        0x30BC, 0x8C81,                 // register 12: 40 cells
+        0x30BC, register_12,            // register 12: 40 cells (interlace mode 2)
         0x30BC, 0x8D3F,                 // register 13: horizontal scroll at $FC00
         0x30BC, 0x8F02,                 // register 15: auto-increment 2
         0x30BC, 0x9001,                 // register 16: planes of 64 by 32 cells
@@ -159,13 +168,14 @@ fn program() -> Vec<u8> {
     let mut sprites = Vec::new();
     for sprite in 0..4u16 {
         let link = if sprite < 3 { sprite + 1 } else { 0 };
-        let attributes = ((sprite % 2) << 15) | ((sprite % 4) << 13) | 5;
-        for word in [
-            128 + 64 + 6 * sprite,
-            0x0500 | link,
-            attributes,
-            228 + 10 * sprite,
-        ] {
+        let pattern = if double { 0 } else { 5 };
+        let attributes = ((sprite % 2) << 15) | ((sprite % 4) << 13) | pattern;
+        let y = if double {
+            256 + 129 + 13 * sprite
+        } else {
+            128 + 64 + 6 * sprite
+        };
+        for word in [y, 0x0500 | link, attributes, 228 + 10 * sprite] {
             sprites.extend_from_slice(&word.to_be_bytes());
         }
     }
@@ -196,8 +206,19 @@ fn colour(index: u16) -> u16 {
 
 /// A machine running the program, its audio on.
 fn build() -> GenesisEmulator {
+    build_of(false)
+}
+
+/// A machine running the program in interlace mode 2, its audio on.
+fn build_double() -> GenesisEmulator {
+    build_of(true)
+}
+
+/// A machine running [`program_of`] `double`, its audio on.
+fn build_of(double: bool) -> GenesisEmulator {
     let mut emu = GenesisEmulator::new();
-    emu.load_rom(&program()).expect("the program loads");
+    emu.load_rom(&program_of(double))
+        .expect("the program loads");
     emu.set_execution_mode(ExecutionMode::Running);
     emu.set_audio_enabled(true);
     emu
@@ -216,9 +237,15 @@ fn on_line(line: u16) -> Breakpoint {
 
 /// The Mega Drive core, as the suite takes it.
 fn genesis() -> CoreUnderTest<GenesisEmulator> {
+    genesis_of(false)
+}
+
+/// The Mega Drive core running [`program_of`] `double`, as the suite takes
+/// it.
+fn genesis_of(double: bool) -> CoreUnderTest<GenesisEmulator> {
     CoreUnderTest {
-        build,
-        rom: program(),
+        build: if double { build_double } else { build },
+        rom: program_of(double),
         run_frame: |emu| EmulatorCore::run_frame(emu),
         state_hash: GenesisEmulator::state_hash,
         frame_count: GenesisEmulator::frame_count,
@@ -258,3 +285,41 @@ fn genesis() -> CoreUnderTest<GenesisEmulator> {
 }
 
 retro_core::capture_conformance_tests!(genesis());
+
+/// The suite on the program in interlace mode 2.
+mod double_resolution {
+    use super::*;
+    use retro_core::capture::CaptureCore;
+    use retro_core::PictureGrid;
+
+    retro_core::capture_conformance_tests!(genesis_of(true));
+
+    /// The picture the host is given is the lines drawn, two rows each,
+    /// woven: 320 by 448, in the display information, the framebuffer and
+    /// a frame snapshot alike.
+    #[test]
+    fn the_picture_is_two_rows_a_line() {
+        let mut emu = build_double();
+        for _ in 0..4 {
+            emu.run_frame();
+        }
+        let woven = PictureGrid {
+            columns_per_dot: 1,
+            rows_per_line: 2,
+            woven: true,
+        };
+        let display = emu.get_display_info();
+        assert_eq!(
+            (display.width, display.height, display.grid),
+            (320, 448, woven)
+        );
+        let framebuffer = emu.get_framebuffer();
+        assert_eq!((framebuffer.width, framebuffer.height), (320, 448));
+        assert_eq!(framebuffer.data.len(), 320 * 448 * 4);
+        let snapshot = emu.capture_frame_snapshot();
+        assert_eq!(
+            (snapshot.width, snapshot.height, snapshot.grid),
+            (320, 448, woven)
+        );
+    }
+}

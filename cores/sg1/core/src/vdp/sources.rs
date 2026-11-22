@@ -38,7 +38,9 @@
 //!   a line the table holds no record of, 0.
 //! - `tile`: [`tile_value`] of the character read (which starts at VRAM
 //!   word character * 16) and of the row and column read in it, after
-//!   flips; 0 where no character drew the pixel.
+//!   flips; 0 where no character drew the pixel. In interlace mode 2 a cell
+//!   is two characters, the second under the first, and the value names
+//!   the one the row read is in ([`cell_tile`]).
 //! - `cell`: for a plane or window pixel, the VRAM word of its map entry;
 //!   for a sprite pixel, the sprite's slot in the sprite table (0-79);
 //!   [`NO_CELL`] otherwise.
@@ -59,7 +61,13 @@
 //!   arms the sprite mask for this one from its first sprite); this core
 //!   never sets [`line_flags::NOT_SHOWN`]. A line drawn with the display off
 //!   evaluates no sprite: it has no entries.
+//!
+//! In interlace mode 2 a line is two rows of the picture, its two fields'
+//! ([`Vdp::draw_line_rows`]): the planes give every row, the line sprites
+//! give each line the evaluation of its own field's row, the one whose
+//! flags a game reads.
 
+use super::picture::DOUBLE_CELL_ROWS;
 use super::recording::{LineKind, LineRecord};
 use super::sprites::Sprite;
 use super::{
@@ -203,6 +211,20 @@ fn character_tile(pattern: u16, row: u8, column: u8) -> u32 {
     tile_value(character * 16, character, u32::from(row), u32::from(column))
 }
 
+/// The `tile` plane's value for a pixel read from cell `cell`, a cell of
+/// `CELL_ROWS` rows, at row `row` and column `column` of it, both after
+/// flips: the character itself ([`character_tile`]), or in interlace mode 2
+/// (16 rows) the character of the cell's two, numbered by the index's low
+/// 10 bits, that the row is in, and the row in it.
+pub(super) fn cell_tile<const CELL_ROWS: u16>(cell: u16, row: u8, column: u8) -> u32 {
+    if CELL_ROWS == DOUBLE_CELL_ROWS {
+        let character = (cell & 0x03FF) * 2 + u16::from(row >> 3);
+        character_tile(character, row & 7, column)
+    } else {
+        character_tile(cell, row, column)
+    }
+}
+
 /// The flip bits of the `layer` plane for a character read flipped
 /// `across` and `down`.
 fn flip_bits(across: bool, down: bool) -> u16 {
@@ -265,16 +287,26 @@ impl PenOrigin {
 
     /// A pixel of a plane or the window, `drawn_by`, read from the map
     /// entry `word` at byte `address` of VRAM, at column `column` and row
-    /// `row` of the character before flips.
+    /// `row` of its cell, `CELL_ROWS` rows tall, before flips.
     #[inline(always)]
-    pub(super) fn character(drawn_by: u16, word: u16, address: usize, column: u8, row: u8) -> Self {
+    pub(super) fn character<const CELL_ROWS: u16>(
+        drawn_by: u16,
+        word: u16,
+        address: usize,
+        column: u8,
+        row: u8,
+    ) -> Self {
         let across = (word & 0x0800) != 0;
         let down = (word & 0x1000) != 0;
         let column = if across { 7 - column } else { column };
-        let row = if down { 7 - row } else { row };
+        let row = if down {
+            (CELL_ROWS - 1) as u8 - row
+        } else {
+            row
+        };
         Self {
             layer: drawn_by | flip_bits(across, down),
-            tile: character_tile(word & 0x07FF, row, column),
+            tile: cell_tile::<CELL_ROWS>(word & 0x07FF, row, column),
             cell: ((address >> 1) & 0x7FFF) as u16,
         }
     }
@@ -404,21 +436,12 @@ impl LineTrace {
     }
 
     /// The sprite of slot `slot` drew column `x` of the sprite layer, from
-    /// character `pattern` at `row` and `column` after flips.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn sprite_pixel(
-        &mut self,
-        x: usize,
-        slot: u8,
-        pattern: u16,
-        row: u8,
-        column: u8,
-        across: bool,
-        down: bool,
-    ) {
+    /// the character and the row and column in it that `tile` gives
+    /// ([`cell_tile`]), the sprite flipped `across` and `down`.
+    pub(super) fn sprite_pixel(&mut self, x: usize, slot: u8, tile: u32, across: bool, down: bool) {
         if x < LINE_WIDTH {
             self.sprite_slot[x] = slot;
-            self.sprite_tile[x] = character_tile(pattern, row, column);
+            self.sprite_tile[x] = tile;
             self.sprite_flips[x] = flip_bits(across, down);
         }
     }
@@ -534,7 +557,8 @@ impl Vdp {
     /// packed as the module's notes say), in the planes `planes` asks for
     /// ([`planes::LAYER`], [`planes::COLOUR`], [`planes::TILE`],
     /// [`planes::CELL`]; other bits are ignored), the mode's width (256 or
-    /// 320) by [`Self::drawn_height`] lines, cut as the framebuffer is.
+    /// 320) by the picture's rows ([`Self::picture_height`]: two a line in
+    /// interlace mode 2), cut as the framebuffer is.
     /// `frame` is the frame being drawn ([`Self::set_frame_being_drawn`]).
     ///
     /// The frame is drawn again as a repaint draws it
@@ -548,7 +572,8 @@ impl Vdp {
     /// stay as they were.
     pub fn pixel_sources(&mut self, planes: u32) -> PixelSources {
         let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
+        let lines = self.drawn_height() as u16;
+        let height = self.picture_height() as usize;
         let with_table = self.line_table().is_some();
         let mut layer = vec![layer::NOTHING; width * height];
         let mut colour = vec![0u16; width * height];
@@ -557,7 +582,7 @@ impl Vdp {
         let kept = DrawState::keep(self);
         let framebuffer = self.framebuffer.clone();
         let mut trace = LineTrace::new();
-        let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
+        let from_line_states = self.redraw_rows(lines, |vdp, line, row| {
             trace.begin_line();
             vdp.draw_row(line, row, &mut *trace);
             if row.is_none() && with_table {
@@ -566,7 +591,7 @@ impl Vdp {
                 // it in the frame.
                 return;
             }
-            let start = usize::from(line) * width;
+            let start = vdp.picture_row(line) * width;
             layer[start..start + width].copy_from_slice(&trace.layer[..width]);
             colour[start..start + width].copy_from_slice(&trace.colour[..width]);
             tile[start..start + width].copy_from_slice(&trace.tile[..width]);
@@ -722,7 +747,8 @@ impl Vdp {
     /// from its own state, the line table's where it holds the line, after
     /// the line's sprite limit and dots and after priority among sprites,
     /// so a chosen sprite behind another shows only where the one in front
-    /// is transparent. The picture is the screen in RGBA, as
+    /// is transparent. The picture is the screen in RGBA (both fields' rows
+    /// of each line in interlace mode 2), as
     /// [`Self::render_layer_image`] draws the sprite layer: a pixel a chosen
     /// sprite drew has its palette colour, before shadow and highlight, and
     /// alpha 255; every other pixel is 0 in all four bytes. With every slot
@@ -732,19 +758,20 @@ impl Vdp {
         let chosen: [bool; SPRITE_TABLE_SLOTS] =
             std::array::from_fn(|slot| selection.get(slot).is_some_and(|&flag| flag != 0));
         let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
+        let lines = self.drawn_height() as u16;
+        let height = self.picture_height() as usize;
         let mut rgba = vec![0u8; width * height * 4];
         let kept = DrawState::keep(self);
         let hidden = self.debug_layer_disable.take();
         let debug_pixel = self.debug_pixel.take();
         let mut trace = LineTrace::new();
-        let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
+        let from_line_states = self.redraw_rows(lines, |vdp, line, row| {
             if !vdp.row_is_drawn(row) {
                 return;
             }
             vdp.composite_scanline_with(line, &mut *trace);
             let slots = &trace.sprite_slot;
-            let start = usize::from(line) * width * 4;
+            let start = vdp.picture_row(line) * width * 4;
             vdp.colour_row(row, &mut rgba[start..start + width * 4], |vdp, x| {
                 vdp.layer_pixel(LAYER_SPRITES, x)
                     .filter(|_| chosen[usize::from(slots[x])])
@@ -795,7 +822,7 @@ mod tests {
     #[test]
     fn a_map_entry_s_flips_turn_the_row_and_column_read() {
         // Character 3, flipped across and down, at byte 0xC010.
-        let origin = PenOrigin::character(DRAWN_BY_PLANE_B, 0x1803, 0xC010, 1, 2);
+        let origin = PenOrigin::character::<8>(DRAWN_BY_PLANE_B, 0x1803, 0xC010, 1, 2);
         assert_eq!(
             origin.layer,
             DRAWN_BY_PLANE_B | FLIPPED_ACROSS | FLIPPED_DOWN

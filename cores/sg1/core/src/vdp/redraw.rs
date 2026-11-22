@@ -9,15 +9,22 @@
 //! The lines nothing was recorded of are drawn from the state as it is now,
 //! as every line was before the table existed. Either way nothing a
 //! savestate holds moves: what drawing changes is kept and put back.
+//!
+//! In interlace mode 2 every line is drawn into both fields' rows, as the
+//! frame drew it ([`Vdp::draw_line_rows`]), and the palette writes made
+//! while it was on screen colour again the row of its own field, the one
+//! the beam was drawing.
 
 use retro_core::capture::{NoTrace, PixelTrace, RenderedLayer};
 use retro_core::video::{crop_rgba, PixelImage};
 
-use super::recording::{undo_journal, LineKind, LineRecord, LineTable, PaletteRedraw};
+use super::recording::{
+    undo_journal, LineKind, LineRecord, LineTable, PaletteChange, PaletteRedraw,
+};
 use super::sources::LineTrace;
 use super::{
-    DrawState, RenderLayerMode, Vdp, FRAMEBUFFER_WIDTH, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B,
-    LAYER_WINDOW,
+    DrawState, Interlace, RenderLayerMode, Vdp, FRAMEBUFFER_WIDTH, LAYER_COUNT, LAYER_PLANE_A,
+    LAYER_PLANE_B, LAYER_WINDOW,
 };
 
 /// The state a line drawn from its record replaces: kept before, put back
@@ -101,11 +108,12 @@ impl Vdp {
 
     /// One layer of the frame drawn again: `layer` is one of the debugger's
     /// layers (0 plane A, 1 plane B, 2 the window, 3 the sprites), `None`
-    /// for any other. The picture is the screen, the mode's width by
-    /// [`Self::drawn_height`] lines, in RGBA: a pixel the layer covers has
-    /// its palette colour, before shadow and highlight, and alpha 255;
-    /// every other pixel is 0 in all four bytes, never the backdrop nor a
-    /// colour key. A line drawn with the display off covers nothing.
+    /// for any other. The picture is the screen, the mode's width by the
+    /// picture's rows ([`Self::picture_height`]), in RGBA: a pixel the
+    /// layer covers has its palette colour, before shadow and highlight,
+    /// and alpha 255; every other pixel is 0 in all four bytes, never the
+    /// backdrop nor a colour key. A line drawn with the display off covers
+    /// nothing.
     ///
     /// A line the line table holds is drawn from the state it was drawn
     /// with, and its colours follow the palette writes made while it was
@@ -119,13 +127,14 @@ impl Vdp {
             return None;
         }
         let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
+        let lines = self.drawn_height() as u16;
+        let height = self.picture_height() as usize;
         let mut rgba = vec![0u8; width * height * 4];
         let kept = DrawState::keep(self);
         let hidden = self.debug_layer_disable.take();
         let debug_pixel = self.debug_pixel.take();
-        let from_line_states = self.redraw_rows(height as u16, |vdp, line, row| {
-            let start = usize::from(line) * width * 4;
+        let from_line_states = self.redraw_rows(lines, |vdp, line, row| {
+            let start = vdp.picture_row(line) * width * 4;
             vdp.draw_layer_row(layer, line, row, &mut rgba[start..start + width * 4]);
         });
         self.debug_pixel = debug_pixel;
@@ -142,17 +151,17 @@ impl Vdp {
     }
 
     /// The frame drawn again in `mode`, as an opaque RGBA picture of the
-    /// screen (the mode's width by [`Self::drawn_height`] lines), from the
-    /// line table where it holds a line. The framebuffer, the mode and the
-    /// rest of `DrawState` are put back after, so nothing the game shows or
-    /// a savestate holds changes.
+    /// screen (the mode's width by the picture's rows,
+    /// [`Self::picture_height`]), from the line table where it holds a
+    /// line. The framebuffer, the mode and the rest of `DrawState` are put
+    /// back after, so nothing the game shows or a savestate holds changes.
     pub fn render_mode_image(&mut self, mode: RenderLayerMode) -> PixelImage {
         let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
+        let height = self.picture_height() as usize;
         let kept = DrawState::keep(self);
         let framebuffer = self.framebuffer.clone();
         let previous_mode = std::mem::replace(&mut self.render_layer_mode, mode);
-        self.redraw_rows(height as u16, |vdp, line, row| {
+        self.redraw_rows(self.drawn_height() as u16, |vdp, line, row| {
             vdp.draw_row(line, row, &mut NoTrace::new())
         });
         let rgba = self.framebuffer_picture(width, height);
@@ -167,11 +176,12 @@ impl Vdp {
     }
 
     /// The picture drawn again from the line table into a buffer of its
-    /// own, cut as the host's framebuffer is (the mode's width by
-    /// [`Self::drawn_height`] lines), RGBA: only while the table holds the
-    /// frame its journal follows from its first line to its finished
-    /// picture, `None` otherwise (line states not armed, armed part of the
-    /// way through the frame, or the frame stopped part of the way down).
+    /// own, cut as the host's framebuffer is (the mode's width by the
+    /// picture's rows, [`Self::picture_height`]), RGBA: only while the
+    /// table holds the frame its journal follows from its first line to its
+    /// finished picture, `None` otherwise (line states not armed, armed
+    /// part of the way through the frame, or the frame stopped part of the
+    /// way down).
     /// Where the journal had room and the debugger has written no video
     /// memory since the frame began, this is the picture the frame drew,
     /// byte for byte: what a host can compare the framebuffer with. The
@@ -181,10 +191,10 @@ impl Vdp {
             return None;
         }
         let width = self.display_width() as usize;
-        let height = self.drawn_height() as usize;
+        let height = self.picture_height() as usize;
         let kept = DrawState::keep(self);
         let framebuffer = self.framebuffer.clone();
-        self.redraw_rows(height as u16, |vdp, line, row| {
+        self.redraw_rows(self.drawn_height() as u16, |vdp, line, row| {
             vdp.draw_row(line, row, &mut NoTrace::new())
         });
         let rgba = self.framebuffer_picture(width, height);
@@ -210,7 +220,11 @@ impl Vdp {
     /// Draw the lines `0..rows` again with `draw`, each from its record in
     /// the line table while one is armed (`Some`), otherwise from the state
     /// as it is now (`None`), and return whether every line had a record.
-    /// Nothing is recorded meanwhile: the recording is set aside.
+    /// Nothing is recorded meanwhile: the recording is set aside. `draw`
+    /// draws one row of a line, that of the field being drawn: it is called
+    /// for each row of the line, both fields' in interlace mode 2, the
+    /// line's own field last ([`Self::draw_line_rows`]), the field the
+    /// record names or, for a line drawn from the state now, the frame's.
     pub(super) fn redraw_rows(
         &mut self,
         rows: u16,
@@ -223,8 +237,9 @@ impl Vdp {
                 // The sprite list is parsed again from video memory as it
                 // is now: an edit while paused may have changed the table.
                 self.sprite_cache_valid = false;
+                let field = u8::from(self.odd_frame);
                 for line in 0..rows {
-                    draw(self, line, None);
+                    self.draw_line_rows(field, |vdp| draw(vdp, line, None));
                 }
                 false
             }
@@ -273,7 +288,7 @@ impl Vdp {
             }
             let write_scroll = table.journal_full;
             self.install_row(table, line as u16, row, write_scroll, &mut installed_list);
-            draw(self, line as u16, Some(row));
+            self.draw_line_rows(row.field, |vdp| draw(vdp, line as u16, Some(row)));
         }
 
         if earlier {
@@ -284,7 +299,7 @@ impl Vdp {
                 let row = &table.rows[line];
                 if of_earlier_frame(row) {
                     self.install_row(table, line as u16, row, true, &mut installed_list);
-                    draw(self, line as u16, Some(row));
+                    self.draw_line_rows(row.field, |vdp| draw(vdp, line as u16, Some(row)));
                 }
             }
         }
@@ -295,9 +310,10 @@ impl Vdp {
             return true;
         }
         self.sprite_cache_valid = false;
+        let field = u8::from(self.odd_frame);
         for line in 0..rows {
             if unrecorded(&table.rows[line]) {
-                draw(self, line as u16, None);
+                self.draw_line_rows(field, |vdp| draw(vdp, line as u16, None));
             }
         }
         false
@@ -358,11 +374,12 @@ impl Vdp {
         }
     }
 
-    /// Draw line `line` into the framebuffer: from its record, then the
-    /// palette writes made while it was on screen, or from the state as it
-    /// is now. With a trace (`T::ON`) it notes where each pixel the line
-    /// shows came from ([`super::sources`]); the redraws that only draw pass
-    /// [`NoTrace`].
+    /// Draw line `line` into the framebuffer, its row of the field being
+    /// drawn ([`Self::picture_row`]): from its record, then, on the row of
+    /// the line's own field, the palette writes made while it was on
+    /// screen; or from the state as it is now. With a trace (`T::ON`) it
+    /// notes where each pixel the row shows came from ([`super::sources`]);
+    /// the redraws that only draw pass [`NoTrace`].
     pub(super) fn draw_row<T: PixelTrace<Notes = LineTrace>>(
         &mut self,
         line: u16,
@@ -376,7 +393,7 @@ impl Vdp {
         if row.kind == LineKind::DirectColour {
             // The backdrop, then the colours the transfer painted.
             self.render_blanked_line(line);
-            let offset = usize::from(line) * FRAMEBUFFER_WIDTH as usize * 4;
+            let offset = self.picture_row(line) * FRAMEBUFFER_WIDTH as usize * 4;
             let width = self.display_width() as usize;
             if T::ON {
                 trace.notes().blanked(width, self.backdrop_index());
@@ -396,7 +413,7 @@ impl Vdp {
         } else {
             self.render_scanline_with(line, trace);
         }
-        for change in &row.palette_changes {
+        for change in self.writes_coloured(row) {
             self.set_palette_colour(usize::from(change.index), change.colour);
             match change.redraw {
                 PaletteRedraw::Nothing => {}
@@ -460,7 +477,7 @@ impl Vdp {
     ) {
         let columns = (pixels.len() / 4).min(self.display_width() as usize);
         self.colour_columns(pixels, 0, columns, &pixel);
-        for change in row.map_or(&[][..], |row| row.palette_changes.as_slice()) {
+        for change in row.map_or(&[][..], |row| self.writes_coloured(row)) {
             self.set_palette_colour(usize::from(change.index), change.colour);
             match change.redraw {
                 PaletteRedraw::Nothing => {}
@@ -475,6 +492,17 @@ impl Vdp {
                     return;
                 }
             }
+        }
+    }
+
+    /// The palette writes made while line `row` was on screen that colour
+    /// again the row being drawn: all of them, but in interlace mode 2 only
+    /// on the row of the line's own field, the one the beam was drawing.
+    fn writes_coloured<'a>(&self, row: &'a LineRecord) -> &'a [PaletteChange] {
+        if self.interlace == Interlace::Double && self.field_drawn != row.field {
+            &[]
+        } else {
+            &row.palette_changes
         }
     }
 

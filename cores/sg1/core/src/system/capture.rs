@@ -35,7 +35,8 @@ impl GenesisEmulator {
     }
 
     /// The picture the host shows, as [`EmulatorCore::get_display_info`]
-    /// sizes it: the framebuffer's rows cut to the lines the VDP draws.
+    /// sizes it: the framebuffer cut to the rows the VDP draws (its lines,
+    /// two rows each in interlace mode 2).
     fn shown_picture(&self) -> (u32, u32, Vec<u8>) {
         let fb = &self.cached_framebuffer;
         let display = &self.system_info.display;
@@ -103,7 +104,8 @@ impl CaptureCore for GenesisEmulator {
     }
 
     /// The picture cut to the display info (the mode's width by
-    /// [`crate::vdp::Vdp::drawn_height`]), VRAM, CRAM's 64 colours of
+    /// [`crate::vdp::Vdp::picture_height`]: the lines drawn, two rows each
+    /// in interlace mode 2), VRAM, CRAM's 64 colours of
     /// `0000 BBB0 GGG0 RRR0`, the 24 VDP registers, and, as the console's
     /// part, the vertical scroll RAM's 64 words.
     fn capture_frame_snapshot(&self) -> FrameSnapshot<GenesisSnapshotConsole> {

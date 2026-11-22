@@ -5,6 +5,7 @@
 use super::*;
 
 mod dma;
+mod interlace;
 mod interrupts;
 mod ports;
 mod render;
@@ -15,7 +16,8 @@ fn test_vdp_creation() {
     assert_eq!(vdp.vram.len(), 0x10000);
     assert_eq!(vdp.cram.len(), 64);
     assert_eq!(vdp.vsram.len(), 64);
-    assert_eq!(vdp.framebuffer.len(), 320 * 240 * 4);
+    // 320 by 480 rows: 240 lines, two rows each in interlace mode 2.
+    assert_eq!(vdp.framebuffer.len(), 320 * 480 * 4);
 }
 
 #[test]

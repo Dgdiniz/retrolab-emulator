@@ -19,7 +19,8 @@ pub mod timing;
 pub mod window;
 pub mod writes;
 
-pub(crate) use picture::{FRAMEBUFFER_LINES, FRAMEBUFFER_WIDTH};
+pub use picture::Interlace;
+pub(crate) use picture::{FRAMEBUFFER_ROWS, FRAMEBUFFER_WIDTH};
 pub use recording::LineKind;
 pub use sources::Shade;
 pub use writes::{VideoEvent, VideoEventWatch, WriteTarget};
@@ -195,8 +196,9 @@ pub struct Vdp {
     // Registers (24 total)
     registers: [u8; 24],
 
-    // Framebuffer (RGBA format)
-    framebuffer: Vec<u8>, // 320x224x4 bytes
+    // Framebuffer (RGBA format): 320 by 480 rows (`FRAMEBUFFER_ROWS`), of
+    // which a frame draws its picture's first 224, 240, 448 or 480.
+    framebuffer: Vec<u8>,
 
     // Access state
     control_word: u32,
@@ -245,6 +247,19 @@ pub struct Vdp {
 
     // Interlace state
     odd_frame: bool, // For interlace mode: true = odd field, false = even field
+
+    /// The interlace mode the frame draws with: register 12 bits 1 and 2
+    /// as the frame's first line found it (`latch_interlace`). Not part of
+    /// the savestate: a load takes it from register 12 again.
+    interlace: Interlace,
+
+    /// The field whose row of a line is being drawn, 0 even or 1 odd: in
+    /// interlace mode 2 each line is drawn into both fields' rows, its own
+    /// field's last (`draw_line_rows`), so after a line it names the
+    /// line's own field. A frame of any other mode draws one row a line,
+    /// whichever field this names. Not part of the savestate: a load takes
+    /// it from the odd field.
+    field_drawn: u8,
 
     // VDP Write FIFO (4 entries deep)
     // The VDP has a 4-word FIFO for data port writes. When the CPU writes to the
@@ -437,11 +452,11 @@ struct ProgressiveCramDma {
 
 /// What drawing a line leaves in the VDP besides its pixels: the sprite
 /// status flags (part of a savestate), the sprite list parsed from the
-/// sprite table, and the line's own buffers, from which a palette write
-/// later in the line re-tints it. A picture drawn again on demand (a
-/// repaint, a single layer) keeps these and puts them back after, so the
-/// next line the game draws, and the next savestate, find them as the
-/// frame left them.
+/// sprite table, and the line's own buffers and the field it was drawn
+/// for, from which a palette write later in the line re-tints it. A
+/// picture drawn again on demand (a repaint, a single layer) keeps these
+/// and puts them back after, so the next line the game draws, and the next
+/// savestate, find them as the frame left them.
 struct DrawState {
     sprite_overflow: bool,
     sprite_collision: bool,
@@ -461,6 +476,7 @@ struct DrawState {
     line_plane_a: Vec<i16>,
     line_window: Vec<i16>,
     line_plane_b: Vec<i16>,
+    field_drawn: u8,
 }
 
 impl DrawState {
@@ -485,6 +501,7 @@ impl DrawState {
             line_plane_a: vdp.line_plane_a.clone(),
             line_window: vdp.line_window.clone(),
             line_plane_b: vdp.line_plane_b.clone(),
+            field_drawn: vdp.field_drawn,
         }
     }
 
@@ -508,6 +525,7 @@ impl DrawState {
         vdp.line_plane_a = self.line_plane_a;
         vdp.line_window = self.line_window;
         vdp.line_plane_b = self.line_plane_b;
+        vdp.field_drawn = self.field_drawn;
     }
 }
 
@@ -577,7 +595,7 @@ impl Vdp {
             cram: vec![0; 64],      // 64 colors
             vsram: vec![0; 64],     // Vertical scroll (64 addressable words)
             registers: [0; 24],
-            framebuffer: vec![0; (FRAMEBUFFER_WIDTH * FRAMEBUFFER_LINES * 4) as usize], // RGBA
+            framebuffer: vec![0; (FRAMEBUFFER_WIDTH * FRAMEBUFFER_ROWS * 4) as usize], // RGBA
             control_word: 0,
             pending_write: false,
             address: 0,
@@ -601,6 +619,8 @@ impl Vdp {
             sprite_collision: false,
             sprite_mask_overflow: false,
             odd_frame: false,
+            interlace: Interlace::Off,
+            field_drawn: 0,
             fifo_entries: 0,
             fifo_mclk_counter: 0,
             fifo: [0; 4],
@@ -660,6 +680,7 @@ impl Vdp {
         self.code = 0;
         self.timing.reset();
         self.timing.latch_lines_drawn(self.registers[1]);
+        self.latch_interlace();
         self.dma_pending = false;
         self.dma_busy = false;
         self.dma_remaining_clocks = 0;
@@ -682,6 +703,7 @@ impl Vdp {
         self.fifo_slot_mclks = [0; 4];
         self.pending_cpu_wait_cycles = 0;
         self.odd_frame = false;
+        self.field_drawn = 0;
         // What was recorded described the machine before the reset; what is
         // armed stays armed.
         self.clear_recorded_frames();
@@ -754,6 +776,7 @@ impl Vdp {
         // register 1: a change shows from the next frame.
         if line == 0 {
             self.timing.latch_lines_drawn(self.registers[1]);
+            self.latch_interlace();
         }
 
         // Update VBLANK/HBLANK status based on current scanline
@@ -834,7 +857,7 @@ impl Vdp {
                     if self.recording.is_some() {
                         self.record_line(line, LineKind::Drawn);
                     }
-                    self.render_scanline(line);
+                    self.render_line(line);
                 }
             } else {
                 if self.recording.is_some() {
@@ -845,7 +868,7 @@ impl Vdp {
                     };
                     self.record_line(line, kind);
                 }
-                self.render_scanline(line);
+                self.render_line(line);
             }
         }
     }
@@ -867,7 +890,8 @@ impl Vdp {
 
         // Total sprite limit: 80 in H40, 64 in H32 (max_sprite_pixels >> 2).
         let max_sprites = if is_h40 { 80 } else { 64 };
-        self.sprite_cache.build(&self.vram, sat_addr, max_sprites);
+        self.sprite_cache
+            .build(&self.vram, sat_addr, max_sprites, self.interlace);
         self.sprite_cache_valid = true;
     }
 

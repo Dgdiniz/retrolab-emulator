@@ -32,9 +32,12 @@ use retro_core::video::{
 };
 
 use super::colour::COLOUR_LEVELS;
+use super::picture::DOUBLE_CELL_ROWS;
 use super::sprites::{link_chain, Sprite};
 use super::tiles::{build_rgba_palette, Tile};
-use super::{Vdp, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW};
+use super::{
+    Interlace, Vdp, LAYER_COUNT, LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES, LAYER_WINDOW,
+};
 
 /// 4bpp 8x8 tiles addressable across the 64 KiB VRAM (32 bytes/tile).
 const VRAM_TILE_COUNT: u32 = 0x1_0000 / 32; // 2048
@@ -119,17 +122,110 @@ impl Vdp {
         link_chain(&self.vram, self.sat_base(), self.sprite_table_slots()).collect()
     }
 
-    /// The box `sprite` covers on the picture: its cells from its screen
-    /// position, a dot and a line to a column and a row
-    /// ([`Self::picture_grid`]).
-    fn sprite_picture(&self, sprite: &Sprite) -> PictureRect {
-        PictureRect::on_grid(
-            self.picture_grid(),
-            i32::from(sprite.x),
-            i32::from(sprite.y),
-            u32::from(sprite.width_tiles) * 8,
-            u32::from(sprite.height_tiles) * 8,
-        )
+    /// The box `sprite`, of slot `slot`, covers on the picture: its cells
+    /// from its screen position, a dot and a line to a column and a row
+    /// ([`Self::picture_grid`]). In interlace mode 2 its Y counts the
+    /// picture's rows from 256 ([`Sprite::double_resolution_y`]) and its
+    /// cells are 16 rows tall; the box takes every line one of its rows is
+    /// on, both rows of each, so it holds the rows of every line that draws
+    /// it, in either field.
+    fn sprite_picture(&self, slot: u8, sprite: &Sprite) -> PictureRect {
+        let grid = self.picture_grid();
+        let x = i32::from(sprite.x);
+        let width = u32::from(sprite.width_tiles) * 8;
+        if self.interlace != Interlace::Double {
+            let height = u32::from(sprite.height_tiles) * 8;
+            return PictureRect::on_grid(grid, x, i32::from(sprite.y), width, height);
+        }
+        let top = i32::from(Sprite::double_resolution_y(
+            &self.vram,
+            self.sat_base(),
+            slot,
+        ));
+        let bottom = top + i32::from(sprite.height_tiles) * i32::from(DOUBLE_CELL_ROWS);
+        // The lines of the first row and of the row past the last, rounded
+        // out to whole lines.
+        let first_line = top.div_euclid(2);
+        let end_line = (bottom + 1).div_euclid(2);
+        PictureRect::on_grid(grid, x, first_line, width, (end_line - first_line) as u32)
+    }
+
+    /// The screen line the top row of `sprite`, of slot `slot`, is on: its
+    /// `y`; in interlace mode 2, the line of the picture row its 10-bit Y
+    /// names ([`Sprite::double_resolution_y`]), so the debugger's `y`
+    /// counts lines in either mode.
+    fn sprite_line(&self, slot: u8, sprite: &Sprite) -> i32 {
+        if self.interlace == Interlace::Double {
+            let top = Sprite::double_resolution_y(&self.vram, self.sat_base(), slot);
+            i32::from(top).div_euclid(2)
+        } else {
+            i32::from(sprite.y)
+        }
+    }
+
+    /// The VRAM byte where cell `pattern` starts: 32 bytes a cell, or in
+    /// interlace mode 2 64, the cell's number the index's low 10 bits.
+    fn cell_address(&self, pattern: u16) -> u32 {
+        if self.interlace == Interlace::Double {
+            u32::from(pattern & 0x03FF) * 64
+        } else {
+            u32::from(pattern) * 32
+        }
+    }
+
+    /// `sprite` as interlace mode 2 draws it, a tight RGBA crop its width
+    /// by its cells' 16 rows each (its height in lines times two): the
+    /// cells taken as the renderer takes them (`Vdp::render_sprite_line`),
+    /// column-major, cell `x * height + y` from the pattern's low 10 bits,
+    /// the whole sprite flipped first and each cell's 16 rows inside it,
+    /// in the screen's colours, a pixel of colour 0 left alpha 0.
+    fn double_resolution_sprite_image(&self, sprite: &Sprite) -> PixelImage {
+        let cell_rows = u32::from(DOUBLE_CELL_ROWS);
+        let width = u32::from(sprite.width_tiles) * 8;
+        let height = u32::from(sprite.height_tiles) * cell_rows;
+        let palette = build_rgba_palette(&self.cram, sprite.palette);
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for ty in 0..sprite.height_tiles {
+            for tx in 0..sprite.width_tiles {
+                let src_tx = if sprite.flip_h {
+                    sprite.width_tiles - 1 - tx
+                } else {
+                    tx
+                };
+                let src_ty = if sprite.flip_v {
+                    sprite.height_tiles - 1 - ty
+                } else {
+                    ty
+                };
+                let offset = u16::from(src_tx) * u16::from(sprite.height_tiles) + u16::from(src_ty);
+                let cell = ((sprite.pattern_base & 0x03FF) + offset) & 0x03FF;
+                for py in 0..DOUBLE_CELL_ROWS as u8 {
+                    for px in 0..8u8 {
+                        let pixel = Vdp::read_cell_pixel::<DOUBLE_CELL_ROWS>(
+                            &self.vram,
+                            cell,
+                            px,
+                            py,
+                            sprite.flip_h,
+                            sprite.flip_v,
+                        );
+                        if pixel == 0 {
+                            continue;
+                        }
+                        let dst_x = u32::from(tx) * 8 + u32::from(px);
+                        let dst_y = u32::from(ty) * cell_rows + u32::from(py);
+                        let at = ((dst_y * width + dst_x) * 4) as usize;
+                        let (r, g, b, a) = palette[pixel as usize];
+                        rgba[at..at + 4].copy_from_slice(&[r, g, b, a]);
+                    }
+                }
+            }
+        }
+        PixelImage {
+            width,
+            height,
+            rgba,
+        }
     }
 
     /// Planes A and B's size in cells, from the plane-size register (16).
@@ -304,7 +400,7 @@ impl VideoDebugger for Vdp {
                 Some(SpriteData {
                     index: i,
                     x: i32::from(s.x),
-                    y: i32::from(s.y),
+                    y: self.sprite_line(i as u8, &s),
                     width: u32::from(s.width_tiles) * 8,
                     height: u32::from(s.height_tiles) * 8,
                     tile_index: u32::from(s.pattern_base),
@@ -312,7 +408,7 @@ impl VideoDebugger for Vdp {
                     priority: u32::from(s.priority),
                     flip_h: s.flip_h,
                     flip_v: s.flip_v,
-                    picture: self.sprite_picture(&s),
+                    picture: self.sprite_picture(i as u8, &s),
                 })
             })
             .collect()
@@ -398,6 +494,10 @@ impl VideoDebugger for Vdp {
     /// ([`build_rgba_palette`], through [`Vdp::convert_genesis_color`]).
     /// The buffer starts fully transparent, so any pixel left untouched
     /// (index 0, or a pattern address past VRAM) stays alpha 0.
+    ///
+    /// In interlace mode 2 the sprite is drawn as the picture shows it
+    /// ([`Self::double_resolution_sprite_image`]): its cells 8 pixels by
+    /// 16, the crop its width by its height in lines times two rows.
     fn export_sprite_image(&self, index: u32) -> Result<PixelImage, ExportError> {
         // 80 is the hardware per-frame sprite cap (and the max SAT slot the
         // host's sprite list walks). Guard before the u8 cast so a bogus
@@ -407,6 +507,9 @@ impl VideoDebugger for Vdp {
         }
         let sprite = Sprite::from_sat(&self.vram, self.sat_base(), index as u8)
             .ok_or(ExportError::OutOfRange)?;
+        if self.interlace == Interlace::Double {
+            return Ok(self.double_resolution_sprite_image(&sprite));
+        }
 
         let width = u32::from(sprite.width_tiles) * 8;
         let height = u32::from(sprite.height_tiles) * 8;
@@ -569,7 +672,7 @@ impl VideoDebugger for Vdp {
             .map(|(position, (slot, sprite))| SpriteTableEntry {
                 index: u32::from(*slot),
                 x: i32::from(sprite.x),
-                y: i32::from(sprite.y),
+                y: self.sprite_line(*slot, sprite),
                 width: u32::from(sprite.width_tiles) * 8,
                 height: u32::from(sprite.height_tiles) * 8,
                 tile_index: u32::from(sprite.pattern_base),
@@ -578,9 +681,9 @@ impl VideoDebugger for Vdp {
                 flip_h: sprite.flip_h,
                 flip_v: sprite.flip_v,
                 next: chain.get(position + 1).map(|(next, _)| u32::from(*next)),
-                tile_address: u32::from(sprite.pattern_base) * 32,
+                tile_address: self.cell_address(sprite.pattern_base),
                 large: false,
-                picture: self.sprite_picture(sprite),
+                picture: self.sprite_picture(*slot, sprite),
             })
             .collect()
     }

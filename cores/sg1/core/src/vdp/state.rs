@@ -99,9 +99,11 @@ impl Vdp {
         // after the load.
         self.timing.vint_request_delay_mclks = -1;
         self.timing.first_frame_after_reset = false;
-        // Nor for the lines the frame draws: a load takes them from
-        // register 1, as the next frame's first line does.
+        // Nor for the lines the frame draws and its interlace mode: a load
+        // takes them from registers 1 and 12, as the next frame's first
+        // line does.
         self.timing.latch_lines_drawn(self.registers[1]);
+        self.latch_interlace();
 
         self.dma_fill_value = s.dma_fill_value;
         self.dma_pending = s.dma_pending;
@@ -114,6 +116,7 @@ impl Vdp {
         self.sprite_collision = s.sprite_collision;
         self.sprite_mask_overflow = s.sprite_mask_overflow;
         self.odd_frame = s.odd_frame;
+        self.field_drawn = u8::from(self.odd_frame);
         self.fifo_entries = s.fifo_entries;
         self.fifo_mclk_counter = s.fifo_mclk_counter;
         self.pending_cpu_dma_mclks = s.pending_cpu_dma_mclks;

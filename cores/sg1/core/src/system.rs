@@ -512,13 +512,15 @@ impl GenesisEmulator {
     fn update_cached_framebuffer(&mut self) {
         let vdp_fb = self.bus.get_vdp_framebuffer();
         let display_width = self.bus.get_vdp_display_width();
-        // The lines this frame drew: 224 or 240.
-        let display_height = self.bus.vdp().drawn_height();
+        // The rows this frame drew: 224 or 240 lines, two rows each in
+        // interlace mode 2.
+        let display_height = self.bus.vdp().picture_height();
 
-        // VDP framebuffer is always 320x240 internally, but display_width can be 256 or 320
-        // and the frame can draw 224 or 240 lines. We need to handle this mismatch carefully
+        // VDP framebuffer is always 320x480 internally, but display_width can be 256 or 320
+        // and the frame can draw 224, 240, 448 or 480 rows. We need to handle this mismatch
+        // carefully
         let vdp_internal_width = crate::vdp::FRAMEBUFFER_WIDTH;
-        let vdp_internal_height = crate::vdp::FRAMEBUFFER_LINES;
+        let vdp_internal_height = crate::vdp::FRAMEBUFFER_ROWS;
         let expected_vdp_size = (vdp_internal_width * vdp_internal_height * 4) as usize;
 
         // Resize cached framebuffer to match display dimensions if needed
@@ -529,7 +531,7 @@ impl GenesisEmulator {
         }
 
         // The display info gives the picture this framebuffer holds: the
-        // mode's width, the lines the frame drew, and how it lies over the
+        // mode's width, the rows the frame drew, and how it lies over the
         // dots and lines.
         self.system_info.display.width = display_width;
         self.system_info.display.height = display_height;
@@ -546,8 +548,8 @@ impl GenesisEmulator {
             return;
         }
 
-        // Copy each line's visible pixels: all 320 in the 40-cell mode, the
-        // first 256 in the 32-cell mode, down to the last line both hold.
+        // Copy each row's visible pixels: all 320 in the 40-cell mode, the
+        // first 256 in the 32-cell mode, down to the last row both hold.
         // A line at a time in both modes: the C library hands a copy as
         // long as the whole frame to the processor's string move (`rep
         // movsb`), which an AMD Zen 4 runs about fifteen times slower when
@@ -1062,8 +1064,9 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     /// The size of the picture [`EmulatorCore::get_framebuffer`] holds: the
-    /// mode's width, 256 or 320, and its height cut to the lines the VDP
-    /// draws ([`crate::vdp::Vdp::drawn_height`]). It follows the framebuffer,
+    /// mode's width, 256 or 320, and its height cut to the rows the VDP
+    /// draws ([`crate::vdp::Vdp::picture_height`]: the lines drawn, two rows
+    /// each in interlace mode 2), and its grid. It follows the framebuffer,
     /// refreshed with it each frame shown.
     fn get_display_info(&self) -> &DisplayInfo {
         &self.system_info.display

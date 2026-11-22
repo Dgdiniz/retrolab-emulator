@@ -4,7 +4,8 @@
 use super::recording::PaletteRedraw;
 use super::writes::PaletteStore;
 use super::{
-    DmaTransfer, FillState, Vdp, FIFO_TIMING_H32, FIFO_TIMING_H40, MASTER_CLOCKS_PER_LINE,
+    DmaTransfer, FillState, Interlace, Vdp, FIFO_TIMING_H32, FIFO_TIMING_H40,
+    MASTER_CLOCKS_PER_LINE,
 };
 
 /// VDP access codes (CD0-CD5 bits from control port)
@@ -743,6 +744,11 @@ impl Vdp {
     /// with the hardware's mid-frame counter jump (the byte is not a plain
     /// `line & 0xFF`): once the line passes `vc_max`, the counter wraps by the
     /// total line count so e.g. NTSC 224-line reads 0x00..0xEA then 0xE5..0xFF.
+    ///
+    /// In an interlace mode (the frame's, [`Vdp::interlace`]) the counter's
+    /// bit 0 shows its bit 8, and in mode 2 the counter is doubled first,
+    /// counting the picture's rows: there the byte is the line's low byte
+    /// turned one bit left. As Genesis Plus GX gives it.
     pub(super) fn hv_v_counter(&self) -> u8 {
         let lines_per_frame = self.timing.total_scanlines() as i32;
         let vc_max = self.vc_max();
@@ -750,6 +756,14 @@ impl Vdp {
         if vc > vc_max {
             vc -= lines_per_frame;
         }
+        let vc = match self.interlace {
+            Interlace::Off => vc,
+            Interlace::Normal => (vc & !1) | ((vc >> 8) & 1),
+            Interlace::Double => {
+                let rows = vc << 1;
+                (rows & !1) | ((rows >> 8) & 1)
+            }
+        };
         (vc & 0xFF) as u8
     }
 

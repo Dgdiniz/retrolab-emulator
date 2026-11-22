@@ -116,6 +116,10 @@ pub(super) struct LineRecord {
     pub(super) frame: u64,
     /// How it was drawn.
     pub(super) kind: LineKind,
+    /// The field it was drawn in, 0 even or 1 odd: in interlace mode 2 its
+    /// row of that field is the one the beam drew, which its palette writes
+    /// coloured again.
+    pub(super) field: u8,
     /// The sprite mask the line above carried into it.
     pub(super) sprite_mask_carried_in: bool,
     /// The 24 registers.
@@ -196,6 +200,7 @@ impl LineRecord {
         Self {
             frame: 0,
             kind: LineKind::NotRecorded,
+            field: 0,
             sprite_mask_carried_in: false,
             registers: [0; 24],
             horizontal_scroll: [0; 2],
@@ -466,6 +471,7 @@ impl Vdp {
         };
         row.frame = frame;
         row.kind = kind;
+        row.field = u8::from(self.odd_frame);
         row.sprite_mask_carried_in = self.sprite_mask_overflow;
         row.registers = self.registers;
         row.horizontal_scroll = horizontal_scroll;
@@ -615,6 +621,7 @@ impl Vdp {
     /// parsed on, with the debugger's bytes in place where the frame did
     /// not write over them later.
     pub(super) fn reparse_recorded_sprite_lists(&mut self) {
+        let interlace = self.interlace;
         let Some(table) = self.recording.as_deref_mut().and_then(|r| r.lines.as_mut()) else {
             return;
         };
@@ -630,7 +637,8 @@ impl Vdp {
                 let back_to = if list.frame == followed { list.line } else { 0 };
                 cursor = undo_journal(&table.journal, cursor, back_to, &mut memory);
             }
-            list.sprites.build(&memory, list.table, list.slots);
+            list.sprites
+                .build(&memory, list.table, list.slots, interlace);
         }
     }
 
@@ -660,7 +668,9 @@ impl Vdp {
     ///   [`Self::line_palettes`], or [`NO_PALETTE`] (65535).
     ///
     /// A line nothing was recorded of holds 0 in every column but `line`
-    /// and `palette`.
+    /// and `palette`. A line is one row of the table however many rows of
+    /// the picture it is drawn into: `rows_per_line` is the picture's grid's
+    /// (2 in interlace mode 2, its two fields' rows; 1 otherwise).
     ///
     /// `memory_exact` is false while a row belongs to an earlier frame (the
     /// lines below a stop part of the way down), once the journal ran out
@@ -696,7 +706,7 @@ impl Vdp {
             from_first_line: table.rows[0].recorded() && table.rows[0].frame == table.frame,
             complete: table.holds_frame(rows),
             memory_exact: table.memory_followed() && !earlier,
-            rows_per_line: 1,
+            rows_per_line: u32::from(self.picture_grid().rows_per_line),
             first_row_line: 0,
             columns,
             values,

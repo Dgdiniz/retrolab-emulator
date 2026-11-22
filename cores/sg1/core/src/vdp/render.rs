@@ -2,10 +2,12 @@
 //! scanline render, the compositor (the planes, the window and the line's
 //! sprites, their priorities and the shadow/highlight operators), the remap
 //! from palette indices to colours, the blanked lines, and the planes'
-//! geometry.
+//! geometry. In interlace mode 2 a line is drawn into both fields' rows,
+//! its cells 8 pixels by 16 ([`super::picture`]).
 
 use retro_core::capture::{NoTrace, PixelTrace};
 
+use super::picture::{Interlace, DOUBLE_CELL_ROWS, NORMAL_CELL_ROWS};
 use super::sources::{self, LineTrace};
 use super::window::WindowArea;
 use super::{
@@ -78,6 +80,37 @@ impl Vdp {
         Self::read_tile_pixel_from_vram(vram, pattern_index, px, py)
     }
 
+    /// Read a pixel of a cell `CELL_ROWS` rows tall, at column `px` and row
+    /// `py` before flips: an 8 by 8 pattern ([`Self::read_tile_pixel_flipped`]),
+    /// or in interlace mode 2 a cell of 16 rows, two patterns, numbered by
+    /// the index's low 10 bits and 64 bytes long, flipped down whole.
+    #[inline(always)]
+    pub(super) fn read_cell_pixel<const CELL_ROWS: u16>(
+        vram: &[u8],
+        pattern_index: u16,
+        px: u8,
+        py: u8,
+        flip_h: bool,
+        flip_v: bool,
+    ) -> u8 {
+        if CELL_ROWS != DOUBLE_CELL_ROWS {
+            return Self::read_tile_pixel_flipped(vram, pattern_index, px, py, flip_h, flip_v);
+        }
+        let px = if flip_h { 7 - px } else { px };
+        let py = if flip_v { 15 - py } else { py };
+        let addr =
+            usize::from(pattern_index & 0x03FF) * 64 + usize::from(py) * 4 + usize::from(px) / 2;
+        if addr >= vram.len() {
+            return 0;
+        }
+        let byte = vram[addr];
+        if px & 1 == 0 {
+            byte >> 4
+        } else {
+            byte & 0x0F
+        }
+    }
+
     /// Read horizontal scroll value from VRAM for a given plane and scanline.
     ///
     /// Modes (register 11, bits 0-1):
@@ -137,6 +170,14 @@ impl Vdp {
             }
             _ => None,
         }
+    }
+
+    /// Draw line `line` into its rows of the framebuffer: its one row, or in
+    /// interlace mode 2 both fields' rows, the frame's own field last
+    /// ([`Self::draw_line_rows`]).
+    pub(super) fn render_line(&mut self, line: u16) {
+        let field = u8::from(self.odd_frame);
+        self.draw_line_rows(field, |vdp| vdp.render_scanline(line));
     }
 
     /// Render a single scanline. Two-stage pipeline: `composite_scanline`
@@ -247,7 +288,7 @@ impl Vdp {
     /// backdrop given, as a line drawn again from its record gives them.
     pub(super) fn render_blanked_columns(&mut self, line: u16, width: usize, backdrop: usize) {
         let internal_width = 320usize;
-        let fb_offset = (line as usize) * internal_width * 4;
+        let fb_offset = self.picture_row(line) * internal_width * 4;
         let backdrop_color = if backdrop < 64 {
             self.cram_rgb[backdrop]
         } else {
@@ -295,25 +336,40 @@ impl Vdp {
     /// whole line, and the line is composited by a body built for each:
     /// with them on, each pixel's shade is resolved into `line_shade`;
     /// with them off, none is, and `line_shaded` says every pixel of the
-    /// line is as it is.
+    /// line is as it is. The cell's shape, 8 by 8 or in interlace mode 2
+    /// 8 by 16, is the frame's, and the body is built for each too.
     pub(super) fn composite_scanline_with<T: PixelTrace<Notes = LineTrace>>(
         &mut self,
         line: u16,
         trace: &mut T,
     ) {
         let shaded = (self.registers[12] & 0x08) != 0;
-        if shaded {
-            self.composite_line::<T, true>(line, trace);
-        } else {
-            self.composite_line::<T, false>(line, trace);
+        let double = self.interlace == Interlace::Double;
+        match (shaded, double) {
+            (true, false) => self.composite_line::<T, true, NORMAL_CELL_ROWS>(line, trace),
+            (false, false) => self.composite_line::<T, false, NORMAL_CELL_ROWS>(line, trace),
+            (true, true) => self.composite_line::<T, true, DOUBLE_CELL_ROWS>(line, trace),
+            (false, true) => self.composite_line::<T, false, DOUBLE_CELL_ROWS>(line, trace),
         }
         self.line_shaded = shaded;
     }
 
     /// The body of [`Self::composite_scanline_with`], with shadow and
-    /// highlight on (`SHADED`) or off: built twice, so a line with them off
-    /// does no work for them at all.
-    fn composite_line<T: PixelTrace<Notes = LineTrace>, const SHADED: bool>(
+    /// highlight on (`SHADED`) or off, for cells of `CELL_ROWS` rows: built
+    /// for each, so a line with them off does no work for them at all, and
+    /// a line of either cell shape draws with no test of the mode.
+    ///
+    /// In interlace mode 2 (`CELL_ROWS` 16) the planes and the window read
+    /// the picture row of the field being drawn ([`Vdp::picture_row`]) in
+    /// place of the line: a plane's row is that row plus an 11-bit
+    /// vertical scroll, wrapped at twice the plane's height, and a cell's
+    /// row runs 0-15. The horizontal scroll and the window's lines are the
+    /// line's.
+    fn composite_line<
+        T: PixelTrace<Notes = LineTrace>,
+        const SHADED: bool,
+        const CELL_ROWS: u16,
+    >(
         &mut self,
         line: u16,
         trace: &mut T,
@@ -321,6 +377,16 @@ impl Vdp {
         let width = self.display_width() as usize;
         let shadow_highlight = SHADED;
         let bd_idx = self.backdrop_index().min(63) as u8;
+        let double = CELL_ROWS == DOUBLE_CELL_ROWS;
+        // The row of the planes and the window this line draws: the line,
+        // or in interlace mode 2 the field's picture row.
+        let row = if double {
+            self.picture_row(line) as u32
+        } else {
+            u32::from(line)
+        };
+        // The vertical scroll's bits: 10, or 11 in interlace mode 2.
+        let scroll_mask: u16 = if double { 0x07FF } else { 0x03FF };
 
         // Debugger per-layer force-disable mask (read once per line).
         let dis_plane_a = self.debug_layer_disable.is_hidden(LAYER_PLANE_A);
@@ -329,7 +395,7 @@ impl Vdp {
         let dis_sprites = self.debug_layer_disable.is_hidden(LAYER_SPRITES);
 
         // Render sprites for this scanline into the line buffer (ONCE)
-        self.render_sprite_line(line, trace);
+        self.render_sprite_row::<T, CELL_ROWS>(line, trace);
 
         // Pre-compute plane parameters to avoid repeated register reads
         let plane_a_nametable = ((self.registers[2] & 0x38) as u16) << 10;
@@ -338,6 +404,12 @@ impl Vdp {
         // horizontal size 0b10 (rows repeat); the masks wrap the tile
         // column / pixel row exactly like real hardware.
         let (pf_shift, pf_col_mask, pf_row_mask) = self.playfield_geometry();
+        // Interlace mode 2 wraps a plane at twice its height in rows.
+        let pf_row_mask = if double {
+            (pf_row_mask << 1) | 1
+        } else {
+            pf_row_mask
+        };
         let reg11 = self.registers[11];
         let h_scroll_mode = reg11 & 0x03;
         let v_scroll_mode = (reg11 >> 2) & 0x01;
@@ -363,7 +435,7 @@ impl Vdp {
         // Read vertical scroll for full-screen mode (mode 0)
         let v_scroll_a_full = if v_scroll_mode == 0 {
             if !self.vsram.is_empty() {
-                self.vsram[0] & 0x03FF
+                self.vsram[0] & scroll_mask
             } else {
                 0
             }
@@ -372,7 +444,7 @@ impl Vdp {
         };
         let v_scroll_b_full = if v_scroll_mode == 0 {
             if 1 < self.vsram.len() {
-                self.vsram[1] & 0x03FF
+                self.vsram[1] & scroll_mask
             } else {
                 0
             }
@@ -389,7 +461,7 @@ impl Vdp {
         // the picture Genesis Plus GX gives. The fine shift is the hscroll's low 4 bits (the
         // offset within a 16px column); only the first `shift` pixels are special.
         let left_col_vs: u16 = if is_h40 && 39 < self.vsram.len() {
-            (self.vsram[38] & self.vsram[39]) & 0x03FF
+            (self.vsram[38] & self.vsram[39]) & scroll_mask
         } else {
             0
         };
@@ -414,18 +486,18 @@ impl Vdp {
                 let col = (xu16 / 16) as usize;
                 let vi = col * 2 + 1;
                 if vi < self.vsram.len() {
-                    self.vsram[vi] & 0x03FF
+                    self.vsram[vi] & scroll_mask
                 } else {
                     0
                 }
             };
 
             let scrolled_x_b = (xu16 as i32 - h_scroll_b as i32).rem_euclid(plane_w_px) as u16;
-            let v_line_b = (line as u32 + v_scroll_b as u32) & pf_row_mask as u32;
+            let v_line_b = (row + v_scroll_b as u32) & pf_row_mask as u32;
             let tile_col_b = (scrolled_x_b / 8) & pf_col_mask;
-            let tile_row_b = (v_line_b >> 3) as u16;
+            let tile_row_b = (v_line_b / u32::from(CELL_ROWS)) as u16;
             let px_b = (scrolled_x_b % 8) as u8;
-            let py_b = (v_line_b & 7) as u8;
+            let py_b = (v_line_b % u32::from(CELL_ROWS)) as u8;
 
             let row_off_b = (((tile_row_b as u32) << pf_shift) & 0x1FC0) as u16;
             let nt_off_b = row_off_b + tile_col_b * 2;
@@ -443,12 +515,12 @@ impl Vdp {
                     let palette_b = ((word_b >> 13) & 0x03) as usize;
                     let priority_b = (word_b & 0x8000) != 0;
 
-                    let ci_b = Self::read_tile_pixel_flipped(
+                    let ci_b = Self::read_cell_pixel::<CELL_ROWS>(
                         &self.vram, pattern_b, px_b, py_b, flip_h_b, flip_v_b,
                     );
                     if ci_b != 0 {
                         if T::ON {
-                            origin_b = sources::PenOrigin::character(
+                            origin_b = sources::PenOrigin::character::<CELL_ROWS>(
                                 sources::DRAWN_BY_PLANE_B,
                                 word_b,
                                 addr_b,
@@ -472,9 +544,9 @@ impl Vdp {
             let (plane_a_idx, plane_a_pri, plane_a_bit) = if in_window {
                 // Window plane (no scrolling)
                 let wtx = xu16 / 8;
-                let wty = line / 8;
+                let wty = (row / u32::from(CELL_ROWS)) as u16;
                 let wpx = (xu16 % 8) as u8;
-                let wpy = (line % 8) as u8;
+                let wpy = (row % u32::from(CELL_ROWS)) as u8;
                 let wnt_off = (wty * window_width_tiles + wtx) * 2;
                 let waddr = (window_nametable + wnt_off) as usize;
 
@@ -486,10 +558,11 @@ impl Vdp {
                     let wpal = ((wword >> 13) & 0x03) as usize;
                     let wpri = (wword & 0x8000) != 0;
 
-                    let wci = Self::read_tile_pixel_flipped(&self.vram, wpat, wpx, wpy, wfh, wfv);
+                    let wci =
+                        Self::read_cell_pixel::<CELL_ROWS>(&self.vram, wpat, wpx, wpy, wfh, wfv);
                     if wci != 0 {
                         if T::ON {
-                            origin_a = sources::PenOrigin::character(
+                            origin_a = sources::PenOrigin::character::<CELL_ROWS>(
                                 sources::DRAWN_BY_WINDOW,
                                 wword,
                                 waddr,
@@ -516,18 +589,18 @@ impl Vdp {
                     let col = (xu16 / 16) as usize;
                     let vi = col * 2;
                     if vi < self.vsram.len() {
-                        self.vsram[vi] & 0x03FF
+                        self.vsram[vi] & scroll_mask
                     } else {
                         0
                     }
                 };
 
                 let scrolled_x_a = (xu16 as i32 - h_scroll_a as i32).rem_euclid(plane_w_px) as u16;
-                let v_line_a = (line as u32 + v_scroll_a as u32) & pf_row_mask as u32;
+                let v_line_a = (row + v_scroll_a as u32) & pf_row_mask as u32;
                 let tile_col_a = (scrolled_x_a / 8) & pf_col_mask;
-                let tile_row_a = (v_line_a >> 3) as u16;
+                let tile_row_a = (v_line_a / u32::from(CELL_ROWS)) as u16;
                 let px_a = (scrolled_x_a % 8) as u8;
-                let py_a = (v_line_a & 7) as u8;
+                let py_a = (v_line_a % u32::from(CELL_ROWS)) as u8;
 
                 let row_off_a = (((tile_row_a as u32) << pf_shift) & 0x1FC0) as u16;
                 let nt_off_a = row_off_a + tile_col_a * 2;
@@ -541,12 +614,12 @@ impl Vdp {
                     let palette_a = ((word_a >> 13) & 0x03) as usize;
                     let priority_a = (word_a & 0x8000) != 0;
 
-                    let ci_a = Self::read_tile_pixel_flipped(
+                    let ci_a = Self::read_cell_pixel::<CELL_ROWS>(
                         &self.vram, pattern_a, px_a, py_a, flip_h_a, flip_v_a,
                     );
                     if ci_a != 0 {
                         if T::ON {
-                            origin_a = sources::PenOrigin::character(
+                            origin_a = sources::PenOrigin::character::<CELL_ROWS>(
                                 sources::DRAWN_BY_PLANE_A,
                                 word_a,
                                 addr_a,
@@ -647,7 +720,7 @@ impl Vdp {
             }
 
             if let Some((dbg_x, dbg_y)) = self.debug_pixel {
-                if xu16 == dbg_x && line == dbg_y {
+                if xu16 == dbg_x && row == u32::from(dbg_y) {
                     let plane_b_color = plane_b_idx.map(|i| self.cram_rgb[i as usize]);
                     let plane_a_color = plane_a_idx.map(|i| self.cram_rgb[i as usize]);
                     let merged_color = merged_idx.map(|i| self.cram_rgb[i as usize]);
@@ -748,7 +821,7 @@ impl Vdp {
         shadow_highlight: bool,
     ) {
         let internal_width = 320usize;
-        let fb_offset = (line as usize) * internal_width * 4;
+        let fb_offset = self.picture_row(line) * internal_width * 4;
 
         for x in x_start..x_end {
             let final_index = self.line_index[x];
