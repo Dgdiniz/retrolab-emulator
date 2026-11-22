@@ -803,6 +803,92 @@ fn a_woven_frame_draws_each_row_s_sprite_row_for_the_field_it_shows() {
     read_sources(&mut bus, &frame);
 }
 
+/// Mode 1 with pseudo-hires, which shows the sub screen on its even
+/// columns: BG2 on the sub screen alone, a character whose pixel at (row,
+/// column) is colour `row + column + 1`, under a mosaic of four set before
+/// line `mosaic_from` is drawn. Line `n` shows background row `n - 1`.
+fn sub_screen_mosaic_scene(mosaic_from: u16) -> (SnesBus, Frame) {
+    let mut bus = scene();
+    reg(&mut bus, 0x05, 0x01);
+    reg(&mut bus, 0x08, 0x08); // BG2 map at word $0800
+    reg(&mut bus, 0x0B, 0x20); // BG2 characters at $2000
+    rows_from_zero(&mut bus, 1);
+    vram(
+        &mut bus,
+        0x2010,
+        &character(4, |row, column| (row + column + 1) as u8),
+    );
+    vram(&mut bus, 0x0800, &[1; 1024]);
+    for index in 0..16u8 {
+        colour(&mut bus, index, u16::from(index) * 2);
+    }
+    reg(&mut bus, 0x2D, 0x02); // BG2 on the sub screen
+    reg(&mut bus, 0x33, 0x08); // pseudo-hires
+    reg(&mut bus, 0x00, 0x0F);
+    let frame = draw_frame(&mut bus, |bus, line| {
+        if line == mosaic_from {
+            reg(bus, 0x06, 0x32); // a mosaic of four on BG2
+        }
+    });
+    (bus, frame)
+}
+
+/// The red of the sub screen's pixel at `(dot, line)` of
+/// [`sub_screen_mosaic_scene`]'s frame: line `line`'s first row is
+/// `2 * (line - 1)`, and dot `dot`'s sub screen pixel column `2 * dot`.
+fn sub_screen_red(frame: &Frame, dot: u32, line: u32) -> u8 {
+    frame.picture[((2 * (line - 1) * frame.width + 2 * dot) * 4) as usize]
+}
+
+#[test]
+fn the_sub_screen_s_backgrounds_are_mosaicked_as_the_main_screen_s_are() {
+    // Each four-by-four block of the sub screen shows its first pixel, as
+    // the main screen's would, and the planes name that pixel.
+    let (mut bus, frame) = sub_screen_mosaic_scene(1);
+    let expand = |c: u32| ((c << 3) | (c >> 2)) as u8;
+    for line in 1..=8u32 {
+        for dot in 0..8u32 {
+            let first = ((line - 1) / 4 * 4) + (dot / 4 * 4) + 1;
+            assert_eq!(
+                sub_screen_red(&frame, dot, line),
+                expand(first * 2),
+                "dot {dot}, line {line}"
+            );
+        }
+    }
+    let sources = read_sources(&mut bus, &frame);
+    let layer = |dot: u32, line: u32| at(&sources.layer, &sources, 2 * dot, 2 * (line - 1));
+    let tile = |dot: u32, line: u32| at(&sources.tile, &sources, 2 * dot, 2 * (line - 1));
+    let repeats = |dot, line| layer(dot, line) & pixel_layer::MOSAIC_REPEAT != 0;
+    assert_eq!(layer(0, 1) & 0x0F, 2 | pixel_layer::SUB_SCREEN_SHOWN);
+    assert!(!repeats(0, 1) && !repeats(4, 1) && !repeats(0, 5));
+    assert!(repeats(1, 1) && repeats(3, 1) && repeats(0, 2) && repeats(5, 7));
+    // The row and the column read are the block's first pixel's.
+    let read = |dot, line| ((tile(dot, line) >> 26) & 7, tile(dot, line) >> 29);
+    assert_eq!(read(3, 3), (0, 0));
+    assert_eq!(read(6, 6), (4, 4));
+
+    // Set before line 3, inside the block of lines 1-4, the mosaic finds no
+    // sub screen rows kept by line 2, drawn without it: line 3 starts a
+    // block of its own, line 4 repeats it, and line 5 starts the next.
+    let (mut bus, frame) = sub_screen_mosaic_scene(3);
+    for (line, background_row) in [(1, 0), (2, 1), (3, 2), (4, 2), (5, 4)] {
+        for dot in 0..8u32 {
+            let first = if line < 3 {
+                background_row + dot + 1
+            } else {
+                background_row + (dot / 4 * 4) + 1
+            };
+            assert_eq!(
+                sub_screen_red(&frame, dot, line),
+                expand(first * 2),
+                "mosaic from line 3: dot {dot}, line {line}"
+            );
+        }
+    }
+    read_sources(&mut bus, &frame);
+}
+
 #[test]
 fn a_mode7_pixel_names_its_character_and_its_plane_cell_and_says_when_it_lies_outside() {
     let mut bus = scene();

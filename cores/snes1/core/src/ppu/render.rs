@@ -134,6 +134,15 @@ impl ObjRowPixel {
     };
 }
 
+/// One of the two screens a line composites: the main screen, shown, and
+/// the sub screen, the colour math's addend (shown on the even columns of
+/// a hires or pseudo-hires line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Screen {
+    Main,
+    Sub,
+}
+
 /// Per-scanline sprite output buffer. Always 256 columns wide, OBJ
 /// never renders at hires resolution; the hires compositor maps each
 /// OBJ column into both display sub-pixels.
@@ -366,6 +375,7 @@ impl Ppu {
             for bg in 0..4 {
                 self.previous_bg_rows[bg] = [BgRowPixel::TRANSPARENT; MAX_SCANLINE_WIDTH];
             }
+            self.sub_rows_kept = false;
             if T::ON {
                 trace
                     .notes()
@@ -435,14 +445,12 @@ impl Ppu {
         }
 
         // Step 2: per-BG horizontal + vertical mosaic on the main
-        // plane. The sub plane is intentionally not mosaicked, the
-        // vertical-mosaic replay buffer tracks the main plane only and
-        // mosaicked-sub-screen colour math is vanishingly rare.
+        // plane.
         if T::ON {
             trace.notes().begin_main_screen();
         }
         for (bg_id, row) in main_rows.iter_mut().enumerate() {
-            self.apply_mosaic_for_bg(bg_id, vy, row, output_width, trace);
+            self.apply_mosaic_for_bg(Screen::Main, bg_id, vy, row, output_width, trace);
         }
 
         // Step 3: snapshot each main BG row for next-line vmosaic.
@@ -453,6 +461,25 @@ impl Ppu {
         if T::ON {
             trace.notes().keep_previous();
         }
+
+        // Steps 2 and 3 on the sub plane, when the line builds it: the
+        // same mosaic, its vertical replay from rows of its own, which a
+        // line keeps only while the mosaic is on (`sub_rows_kept`).
+        if need_sub && T::ON {
+            trace.notes().begin_sub_screen();
+        }
+        let keep_sub_rows =
+            need_sub && self.mosaic_size > 1 && self.bg_mosaic_enable.iter().any(|&on| on);
+        if keep_sub_rows {
+            for (bg_id, row) in sub_rows.iter_mut().enumerate() {
+                self.apply_mosaic_for_bg(Screen::Sub, bg_id, vy, row, output_width, trace);
+            }
+            self.previous_sub_rows.copy_from_slice(&sub_rows);
+            if T::ON {
+                trace.notes().keep_previous_sub();
+            }
+        }
+        self.sub_rows_kept = keep_sub_rows;
 
         // Step 3.5: evaluate sprites once into a 256-wide OBJ row. The
         // walk is skipped entirely when OBJ is off on both screens.

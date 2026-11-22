@@ -631,6 +631,14 @@ pub struct Ppu {
     /// BGs = 8 KiB, boxed so the inline struct size stays bounded
     /// for `mem::swap` / `Default` callers.
     pub(crate) previous_bg_rows: Box<[BgRowBuffer; 4]>,
+    /// [`Self::previous_bg_rows`] for the sub screen: its rows of the
+    /// line before, which its vertical mosaic replays. Like the main
+    /// screen's, never part of a savestate.
+    pub(crate) previous_sub_rows: Box<[BgRowBuffer; 4]>,
+    /// Whether [`Self::previous_sub_rows`] holds the line before's: a line
+    /// keeps its sub screen rows only while the mosaic is on and the line
+    /// builds the sub screen (colour math, hires, pseudo-hires).
+    pub(crate) sub_rows_kept: bool,
 
     /// Per-BG tilemap-row cache (see [`BgTilemapRowCache`]). Boxed
     /// next to `previous_bg_rows` so the ~2 KiB of entries stays off
@@ -726,6 +734,7 @@ impl Ppu {
             .into_boxed_slice()
             .try_into()
             .expect("previous_bg_rows alloc 4 buffers");
+        let previous_sub_rows = previous_bg_rows.clone();
         let bg_tilemap_row_cache: Box<[BgTilemapRowCache; 4]> = vec![BgTilemapRowCache::EMPTY; 4]
             .into_boxed_slice()
             .try_into()
@@ -817,6 +826,8 @@ impl Ppu {
             sprite_time_over: false,
             sprite_range_over: false,
             previous_bg_rows,
+            previous_sub_rows,
+            sub_rows_kept: false,
             bg_tilemap_row_cache,
             vram_generation: 0,
             sprite_tile_cache,
@@ -1020,6 +1031,7 @@ impl Ppu {
         for row in self.previous_bg_rows.iter_mut() {
             *row = [BgRowPixel::TRANSPARENT; 512];
         }
+        self.sub_rows_kept = false;
         for slot in self.bg_tilemap_row_cache.iter_mut() {
             *slot = BgTilemapRowCache::EMPTY;
         }
@@ -1164,6 +1176,7 @@ impl Ppu {
         for row in self.previous_bg_rows.iter_mut() {
             *row = [BgRowPixel::TRANSPARENT; 512];
         }
+        self.sub_rows_kept = false;
 
         // Tilemap-row cache: drop rows cached under the pre-reset VRAM
         // contents and rewind the generation so the first post-reset

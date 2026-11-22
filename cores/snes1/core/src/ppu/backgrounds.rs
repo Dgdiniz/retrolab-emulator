@@ -8,15 +8,15 @@
 //! through the cross-scanline row cache ([`Ppu::cached_tilemap_row`],
 //! coherence in [`crate::ppu::BgTilemapRowCache`]).
 //! [`Ppu::apply_mosaic_for_bg`] then applies the horizontal and
-//! vertical mosaic to a BG's row. The Mode 7 plane fills the same row
-//! buffers from `mode7.rs`.
+//! vertical mosaic to a BG's row, on either screen. The Mode 7 plane
+//! fills the same row buffers from `mode7.rs`.
 
 use retro_core::capture::{tile_value, PixelTrace};
 
 use super::picture::WovenRow;
 use super::render::{
     bpp_for_bg, cgram_index, direct_color_word, is_hires_mode, palette_offset_for_bg, BgRowBuffer,
-    BgRowPixel, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
+    BgRowPixel, Screen, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
 use super::tile::{
     bg_tilemap_word_index, build_tilemap_row, compute_offset_per_tile, decode_tile_2bpp_row,
@@ -397,8 +397,14 @@ impl Ppu {
     /// and 512-wide (hires) rows. The vertical replay copies the
     /// full 512-wide previous-row buffer regardless so the cold
     /// tail stays consistent if the mode flips mid-frame.
+    ///
+    /// `screen` names the row's screen: the mosaic is the background's,
+    /// the same on both, and each screen replays its own rows of the
+    /// line before (`previous_bg_rows`, `previous_sub_rows`). A sub screen
+    /// row whose line before kept none (`sub_rows_kept`) starts a block.
     pub(super) fn apply_mosaic_for_bg<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
+        screen: Screen,
         bg_id: usize,
         scanline: u16,
         row: &mut BgRowBuffer,
@@ -414,11 +420,17 @@ impl Ppu {
         } else {
             1
         };
-        let is_fresh_row = scanline.wrapping_sub(first_line).is_multiple_of(n);
+        // The sub screen starts a block too where its line before kept
+        // no rows to replay.
+        let is_fresh_row = scanline.wrapping_sub(first_line).is_multiple_of(n)
+            || (screen == Screen::Sub && !self.sub_rows_kept);
         if !is_fresh_row {
-            *row = self.previous_bg_rows[bg_id];
+            *row = match screen {
+                Screen::Main => self.previous_bg_rows[bg_id],
+                Screen::Sub => self.previous_sub_rows[bg_id],
+            };
             if T::ON {
-                trace.notes().repeat_previous(bg_id);
+                trace.notes().repeat_previous(screen, bg_id);
             }
             return;
         }
@@ -433,7 +445,7 @@ impl Ppu {
                 *slot = src;
             }
             if T::ON {
-                trace.notes().repeat_block(bg_id, x, end);
+                trace.notes().repeat_block(screen, bg_id, x, end);
             }
             x += n_us;
         }

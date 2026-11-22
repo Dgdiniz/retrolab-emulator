@@ -15,7 +15,7 @@ use retro_core::Framebuffer;
 
 use super::render::{
     bg_visible_in_mode, bgr15_to_rgb8_with_brightness, is_hires_mode, BgRowBuffer, BgRowPixel,
-    ObjRowPixel, MAX_OUTPUT_ROWS, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
+    ObjRowPixel, Screen, MAX_OUTPUT_ROWS, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
 use super::trace::{FrameTrace, PictureShape};
 use super::{record, Ppu, LAYER_COUNT, LAYER_OBJ};
@@ -55,14 +55,16 @@ impl RedrawKeeps {
 
 /// What the held frame's picture leaves in the PPU besides the
 /// framebuffer: the frame-global hires and interlace state its display
-/// size and normalisation read, and the vertical-mosaic rows. A
-/// single-layer render draws into a framebuffer of its own, so it puts
+/// size and normalisation read, and both screens' vertical-mosaic rows.
+/// A single-layer render draws into a framebuffer of its own, so it puts
 /// these back for the frame the host still shows.
 struct HeldPicture {
     frame_hires: bool,
     render_interlace: bool,
     line_hires: [bool; MAX_OUTPUT_ROWS],
     previous_bg_rows: Box<[BgRowBuffer; 4]>,
+    previous_sub_rows: Box<[BgRowBuffer; 4]>,
+    sub_rows_kept: bool,
 }
 
 impl HeldPicture {
@@ -72,6 +74,8 @@ impl HeldPicture {
             render_interlace: ppu.render_interlace,
             line_hires: ppu.line_hires,
             previous_bg_rows: ppu.previous_bg_rows.clone(),
+            previous_sub_rows: ppu.previous_sub_rows.clone(),
+            sub_rows_kept: ppu.sub_rows_kept,
         }
     }
 
@@ -80,6 +84,8 @@ impl HeldPicture {
         ppu.render_interlace = self.render_interlace;
         ppu.line_hires = self.line_hires;
         ppu.previous_bg_rows = self.previous_bg_rows;
+        ppu.previous_sub_rows = self.previous_sub_rows;
+        ppu.sub_rows_kept = self.sub_rows_kept;
     }
 }
 
@@ -353,7 +359,7 @@ impl Ppu {
         if T::ON {
             trace.notes().begin_main_row(layer);
         }
-        self.apply_mosaic_for_bg(layer, vy, &mut row, output_width, trace);
+        self.apply_mosaic_for_bg(Screen::Main, layer, vy, &mut row, output_width, trace);
         self.previous_bg_rows[layer] = row;
         if T::ON {
             trace.notes().keep_previous_row(layer);

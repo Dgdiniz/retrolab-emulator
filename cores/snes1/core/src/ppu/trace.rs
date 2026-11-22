@@ -20,7 +20,7 @@ use retro_core::capture::{drawn_by, layer, planes, tile_value, PixelSources, Pix
 use retro_core::video::PixelImage;
 
 use super::render::{
-    PixelSource, ScreenRow, MAX_OUTPUT_ROWS, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
+    PixelSource, Screen, ScreenRow, MAX_OUTPUT_ROWS, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
 use super::tile::Mode7Sample;
 use super::{Ppu, LAYER_OBJ};
@@ -313,14 +313,18 @@ fn boxed<T: Copy, const N: usize>(value: T) -> Box<[T; N]> {
 /// and the planes of the whole frame, one row per output row, 512 wide,
 /// before the picture's normalisation.
 pub(crate) struct FrameTrace {
-    /// Each background's pixels as the line fetched them, before mosaic:
-    /// the sub screen's.
+    /// Each background's pixels as the line fetched them, before mosaic.
     pub(crate) fetch: Box<OriginRows>,
     /// Each background's pixels on the main screen, after mosaic.
     pub(crate) main: Box<OriginRows>,
     /// The main screen's origins of the line before, which vertical mosaic
     /// repeats.
     previous: Box<OriginRows>,
+    /// Each background's pixels on the sub screen, after mosaic.
+    pub(crate) sub: Box<OriginRows>,
+    /// The sub screen's origins of the line before that built it, which
+    /// its vertical mosaic repeats.
+    previous_sub: Box<OriginRows>,
     /// The sprite layer's pixels, by column.
     pub(crate) obj: Box<[ObjOrigin; NORMAL_SCANLINE_WIDTH]>,
     /// What colour math did to each column of the line.
@@ -356,6 +360,8 @@ impl FrameTrace {
             fetch: boxed([BgOrigin::default(); MAX_SCANLINE_WIDTH]),
             main: boxed([BgOrigin::default(); MAX_SCANLINE_WIDTH]),
             previous: boxed([BgOrigin::default(); MAX_SCANLINE_WIDTH]),
+            sub: boxed([BgOrigin::default(); MAX_SCANLINE_WIDTH]),
+            previous_sub: boxed([BgOrigin::default(); MAX_SCANLINE_WIDTH]),
             obj: boxed(ObjOrigin::default()),
             math: boxed(MathOutcome::NONE),
             layer: if plane(planes::LAYER) {
@@ -453,21 +459,41 @@ impl FrameTrace {
         *self.previous = *self.main;
     }
 
-    /// The main screen of background `bg` repeats the line before's,
-    /// every pixel of it a repeat.
-    pub(crate) fn repeat_previous(&mut self, bg: usize) {
-        for (origin, previous) in self.main[bg].iter_mut().zip(self.previous[bg].iter()) {
+    /// The sub screen starts from the fetched origins too, which its
+    /// mosaic then rearranges.
+    pub(crate) fn begin_sub_screen(&mut self) {
+        *self.sub = *self.fetch;
+    }
+
+    /// The sub screen's rows of this line are what its vertical mosaic
+    /// repeats on the next.
+    pub(crate) fn keep_previous_sub(&mut self) {
+        *self.previous_sub = *self.sub;
+    }
+
+    /// Background `bg` on `screen` repeats the line before's, every pixel
+    /// of it a repeat.
+    pub(crate) fn repeat_previous(&mut self, screen: Screen, bg: usize) {
+        let (rows, previous) = match screen {
+            Screen::Main => (&mut self.main, &self.previous),
+            Screen::Sub => (&mut self.sub, &self.previous_sub),
+        };
+        for (origin, previous) in rows[bg].iter_mut().zip(previous[bg].iter()) {
             *origin = *previous;
             origin.flags |= pixel_layer::MOSAIC_REPEAT;
         }
     }
 
-    /// The pixels `start + 1..end` of background `bg` on the main screen
-    /// repeat the one at `start`.
-    pub(crate) fn repeat_block(&mut self, bg: usize, start: usize, end: usize) {
-        let mut first = self.main[bg][start];
+    /// The pixels `start + 1..end` of background `bg` on `screen` repeat
+    /// the one at `start`.
+    pub(crate) fn repeat_block(&mut self, screen: Screen, bg: usize, start: usize, end: usize) {
+        let rows = match screen {
+            Screen::Main => &mut self.main,
+            Screen::Sub => &mut self.sub,
+        };
+        let mut first = rows[bg][start];
         first.flags |= pixel_layer::MOSAIC_REPEAT;
-        for origin in &mut self.main[bg][start + 1..end] {
+        for origin in &mut rows[bg][start + 1..end] {
             *origin = first;
         }
     }
@@ -538,7 +564,7 @@ impl FrameTrace {
     /// The `layer` (its source and the pixel's own bits), `colour`, `tile`
     /// and `cell` of a composited pixel from `source` at column `x` of its
     /// composite (a hires line's 512, its sprite at `x >> 1`), of the main
-    /// screen (`on_main`, its backgrounds mosaicked) or the sub.
+    /// screen (`on_main`) or the sub, each with its backgrounds mosaicked.
     fn pixel_values(
         &self,
         source: PixelSource,
@@ -552,7 +578,7 @@ impl FrameTrace {
                 let origin = if on_main {
                     self.main[usize::from(id)][x]
                 } else {
-                    self.fetch[usize::from(id)][x]
+                    self.sub[usize::from(id)][x]
                 };
                 (
                     source_code(source) | origin.flags,
