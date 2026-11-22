@@ -11,7 +11,7 @@ use retro_core::EmulatorCore;
 
 use crate::console::Console;
 use crate::image::{write_frame_png, write_rgba_png};
-use crate::input::InputArgs;
+use crate::input::{InputArgs, RunEnd};
 use crate::progress;
 use crate::report::write_chips;
 use crate::rom::{load, write_banner, RomArgs};
@@ -71,6 +71,14 @@ pub fn run<C: Console>(args: ScreenshotArgs<C::BootArgs, C::ScreenshotArgs>) -> 
         });
     }
 
+    // The layers come from the screenshot's frame, held at its capture
+    // boundary: its picture is the one the whole frame leaves, and its
+    // video memory has not taken the next frame's uploads yet.
+    let end = if args.render_layers {
+        RunEnd::CaptureBoundary
+    } else {
+        RunEnd::WholeFrame
+    };
     let bar = progress::bar(args.progress, frames, "frames");
     for frame in 0..frames {
         let last = frame + 1 == frames;
@@ -78,14 +86,7 @@ pub fn run<C: Console>(args: ScreenshotArgs<C::BootArgs, C::ScreenshotArgs>) -> 
             C::before_last_frame(&mut emu, &args.console)?;
         }
         input.before_frame(&mut emu, frame);
-        // The layers come from the screenshot's frame, held at its capture
-        // boundary: its picture is the one the whole frame leaves, and its
-        // video memory has not taken the next frame's uploads yet.
-        if last && args.render_layers {
-            emu.run_to_capture_boundary();
-        } else {
-            emu.run_frame();
-        }
+        end.run_frame(&mut emu, frame, frames);
         if let Some(bar) = &bar {
             bar.inc(1);
         }

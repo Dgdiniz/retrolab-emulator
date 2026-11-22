@@ -2,14 +2,18 @@
 //! (registers + decoded settings, where the window plane is drawn, DMA
 //! state, CRAM/VSRAM, VRAM usage statistics, timing, FIFO). Optionally also
 //! writes a screenshot and/or the raw VRAM blob for external hex inspection.
+//! The last frame stops at its capture boundary, as `screenshot
+//! --render-layers` holds it: the report and the exports read the video
+//! memory and the registers the picture was drawn from, before the game's
+//! uploads in that frame's vertical blank.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Args;
 use retro_cli::rom::{load, RomArgs};
-use retro_cli::InputArgs;
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_cli::{InputArgs, RunEnd};
+use retro_core::{DebuggerCore, ExecutionMode};
 use sg1_core::vdp::window::WindowArea;
 use sg1_core::vdp::TRANSPARENT_RGB;
 use sg1_core::GenesisEmulator;
@@ -20,7 +24,9 @@ use crate::console::{Genesis, GenesisBoot};
 pub struct DumpVdpArgs<B: clap::Args> {
     #[command(flatten)]
     pub rom: RomArgs<B>,
-    /// Number of frames to run before dumping, e.g. `1`.
+    /// Number of frames to run before dumping, e.g. `1`. The last stops at
+    /// its capture boundary, its picture drawn and its vertical blank not
+    /// begun: the dump reads what the picture was drawn from.
     #[arg(short, long)]
     pub frames: Option<u64>,
     #[command(flatten)]
@@ -61,10 +67,7 @@ pub fn run(args: DumpVdpArgs<GenesisBoot>) -> Result<()> {
 
     emu.debugger().set_execution_mode(ExecutionMode::Running);
     println!("Running {frames} frames...");
-    for frame in 0..frames {
-        input.before_frame(&mut emu, frame);
-        emu.run_frame();
-    }
+    input.run_frames(&mut emu, frames, RunEnd::CaptureBoundary);
 
     let report = build_vdp_report(&emu);
     if let Some(ref path) = args.output {

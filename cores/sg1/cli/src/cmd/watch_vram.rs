@@ -1,8 +1,10 @@
 //! `watch-vram`: log VDP writes that land in a VRAM address window while
 //! a ROM runs. The core prints each matching write (the watch is armed
 //! via `Vdp::set_watch_vram`); this command just parses the range, arms
-//! it, and advances the requested frames. Useful for finding which code
-//! path scribbles a nametable / sprite-table region.
+//! it, and advances the requested frames, the last to its capture boundary
+//! as `screenshot --render-layers` holds it, so the log ends with the
+//! picture's frame and not with the uploads of its vertical blank. Useful
+//! for finding which code path scribbles a nametable / sprite-table region.
 
 use std::path::PathBuf;
 
@@ -10,7 +12,8 @@ use anyhow::Result;
 use clap::Args;
 use retro_cli::parse::parse_hex_range;
 use retro_cli::rom::{load, RomArgs};
-use retro_core::{DebuggerCore, EmulatorCore, ExecutionMode};
+use retro_cli::{InputPlan, RunEnd};
+use retro_core::{DebuggerCore, ExecutionMode};
 
 use crate::console::{Genesis, GenesisBoot};
 
@@ -22,7 +25,9 @@ pub struct WatchVramArgs<B: clap::Args> {
     /// address (16-bit hex, e.g. `C000-CFFF`).
     #[arg(short, long)]
     pub range: String,
-    /// Number of frames to run, e.g. `60`.
+    /// Number of frames to run, e.g. `60`. The last stops at its capture
+    /// boundary, its picture drawn and its vertical blank not begun: the
+    /// writes the game makes there are not run, nor logged.
     #[arg(short, long)]
     pub frames: Option<u64>,
     /// Render a PNG after running.
@@ -44,10 +49,8 @@ pub fn run(args: WatchVramArgs<GenesisBoot>) -> Result<()> {
 
     emu.debugger().set_execution_mode(ExecutionMode::Running);
     println!("Running {frames} frames...");
-    for _ in 0..frames {
-        emu.run_frame();
-    }
-    println!("Done! Executed {frames} frames");
+    InputPlan::default().run_frames(&mut emu, frames, RunEnd::CaptureBoundary);
+    println!("Done! Executed {frames} frames, the last to its capture boundary");
 
     if let Some(ref path) = args.screenshot {
         super::save_screenshot(&emu, path)?;

@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
+use retro_core::capture::CaptureCore;
 use retro_core::golden::GoldenConsole;
 use retro_core::input_schedule::{self, PressSchedule};
 use retro_core::{EmulatorCore, InputState};
@@ -39,6 +40,38 @@ impl InputArgs {
     }
 }
 
+/// How a run of frames ends: its last frame run whole, or held at its
+/// capture boundary ([`CaptureCore::run_to_capture_boundary`]), its picture
+/// drawn and its vertical blank not begun. What a command reads after a run
+/// held there (the picture, the video memory, the palette, the video chip's
+/// registers) is what the frame shown was drawn from, before the uploads
+/// the game makes in its vertical blank for the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The last frame runs whole.
+    WholeFrame,
+    /// The last frame stops at its capture boundary.
+    CaptureBoundary,
+}
+
+impl RunEnd {
+    /// Whether frame `frame` of a run of `frames` (the first is 0) stops at
+    /// its capture boundary: the last one, when the run ends there.
+    pub fn holds(self, frame: u64, frames: u64) -> bool {
+        self == RunEnd::CaptureBoundary && frame + 1 == frames
+    }
+
+    /// Run frame `frame` of a run of `frames`: whole, or to its capture
+    /// boundary when [`Self::holds`] says so.
+    pub fn run_frame<E: CaptureCore>(self, emu: &mut E, frame: u64, frames: u64) {
+        if self.holds(frame, frames) {
+            emu.run_to_capture_boundary();
+        } else {
+            emu.run_frame();
+        }
+    }
+}
+
 /// Scripted input, applied before each frame of a run.
 #[derive(Clone, Debug, Default)]
 pub struct InputPlan {
@@ -57,6 +90,15 @@ impl InputPlan {
         }
         if let Some(buttons) = self.buttons_at(frame) {
             emu.set_input(0, InputState { buttons });
+        }
+    }
+
+    /// Run `frames` frames of `emu`, each with this input applied before it
+    /// ([`Self::before_frame`]), the last one ending as `end` says.
+    pub fn run_frames<E: CaptureCore>(&self, emu: &mut E, frames: u64, end: RunEnd) {
+        for frame in 0..frames {
+            self.before_frame(emu, frame);
+            end.run_frame(emu, frame, frames);
         }
     }
 
@@ -147,6 +189,15 @@ mod tests {
             .collect();
         assert_eq!(frames, vec![Some(1), Some(1), Some(0), Some(0), Some(1)]);
         assert_eq!(plan(None, None, None).buttons_at(3), None);
+    }
+
+    #[test]
+    fn a_run_held_at_its_capture_boundary_holds_its_last_frame_alone() {
+        let held = RunEnd::CaptureBoundary;
+        assert!(!held.holds(0, 3) && !held.holds(1, 3));
+        assert!(held.holds(2, 3), "the last frame");
+        assert!(held.holds(0, 1), "a run of one frame");
+        assert!(!RunEnd::WholeFrame.holds(2, 3));
     }
 
     #[test]

@@ -1,5 +1,9 @@
 //! `ppu-dump`: run a ROM and summarise PPU state, with optional raw
-//! memory dumps and viewer PNG exports.
+//! memory dumps and viewer PNG exports. The last frame stops at its capture
+//! boundary, as `screenshot --render-layers` holds it: the summary, the
+//! dumps and the exports read the video memory and the registers the
+//! picture was drawn from, before the game's uploads in that frame's
+//! vertical blank.
 //!
 //! The default text summary answers the first rendering-diagnostic
 //! questions: is the screen force-blanked, what BG mode is live, which
@@ -15,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use retro_cli::parse::parse_hex_u32;
 use retro_cli::rom::{load, RomArgs};
-use retro_cli::InputArgs;
+use retro_cli::{InputArgs, RunEnd};
 use retro_core::EmulatorCore;
 use snes1_core::{IoAccess, SnesEmulator};
 
@@ -26,6 +30,9 @@ pub struct PpuDumpArgs<B: clap::Args> {
     #[command(flatten)]
     pub rom: RomArgs<B>,
     /// Run this many frames before dumping, e.g. `300` (5 s at 60 fps).
+    /// The last stops at its capture boundary, its picture drawn and its
+    /// vertical blank not begun: the dump reads what the picture was drawn
+    /// from.
     #[arg(long)]
     pub frames: Option<u64>,
     /// Dump raw VRAM (64 KiB, little-endian words) to this file.
@@ -117,10 +124,7 @@ pub fn run(args: PpuDumpArgs<SnesBoot>) -> Result<()> {
         emu.enable_addr_watch(addr, args.watch_addr_cap);
     }
 
-    for frame in 0..frames {
-        input.before_frame(&mut emu, frame);
-        emu.run_frame();
-    }
+    input.run_frames(&mut emu, frames, RunEnd::CaptureBoundary);
 
     // -- Immutable reads: raw state, counts, optional dumps/exports --
     let bgmode = emu.ppu().bgmode();
@@ -172,7 +176,10 @@ pub fn run(args: PpuDumpArgs<SnesBoot>) -> Result<()> {
     };
 
     let mut out = super::open_output(args.output.as_ref())?;
-    writeln!(out, "PPU state after {frames} frame(s):")?;
+    writeln!(
+        out,
+        "PPU state after {frames} frame(s), the last at its capture boundary:"
+    )?;
     writeln!(out, "  BG mode:           {bgmode}")?;
     writeln!(out, "  Forced blank:      {blank}")?;
     writeln!(out, "  Master brightness: {brightness}/15")?;

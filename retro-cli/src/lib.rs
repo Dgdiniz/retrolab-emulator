@@ -47,5 +47,5 @@ pub mod trace;
 
 pub use cli::{command, run, Cli};
 pub use console::{CliCpu, Console, ProfileLine};
-pub use input::{InputArgs, InputPlan};
+pub use input::{InputArgs, InputPlan, RunEnd};
 pub use rom::RomArgs;
