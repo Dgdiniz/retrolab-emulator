@@ -193,9 +193,9 @@ impl SnesEmulator {
                 self.bus
                     .system_regs_mut()
                     .tick(stolen.min(u32::MAX as u64) as u32);
-                // A palette colour or a tile the line's HDMA wrote: the
-                // break waits for the rest of the batch.
-                hooks.raised(self, Self::drain_ppu_debug_events);
+                // A register, a palette colour or a tile the line's HDMA
+                // wrote: the break waits for the rest of the batch.
+                hooks.raised(self, Self::drain_bus_debug_events);
             }
             EventKind::VBlankStart => {
                 // A frame held at the capture boundary finished its

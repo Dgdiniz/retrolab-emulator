@@ -521,6 +521,25 @@ fn overscan_turned_on_in_the_vertical_blank_draws_no_line_over_the_finished_pict
 }
 
 #[test]
+fn an_hdma_write_to_a_register_stops_on_its_write_event() {
+    let mut emu = hdma_scene_at_boundary();
+    emu.set_execution_mode(ExecutionMode::Running);
+    // The program writes BG1HOFS ($210D) nowhere; HDMA writes it each line.
+    emu.debugger().add_breakpoint(Breakpoint {
+        address: 0,
+        bp_type: BreakpointType::Event {
+            code: snes_events::PPU_REG_WRITE,
+            param: 0x0D,
+        },
+        cpu_id: None,
+        condition: None,
+    });
+    emu.run_frame();
+    emu.run_frame();
+    assert_eq!(emu.debugger().get_execution_mode(), ExecutionMode::Paused);
+}
+
+#[test]
 fn the_pixel_sources_of_a_raster_effect_describe_its_picture() {
     let mut emu = hdma_scene_at_boundary();
     let state = emu.state_hash();

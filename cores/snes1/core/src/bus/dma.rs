@@ -331,6 +331,9 @@ impl SnesBus {
             (true, false) => ch.table_pointer(),
         };
         let mut moved = 0u32;
+        // A byte written into a B-bus register is seen as the processor's
+        // store to it is: the debugger's records and the traces.
+        let observed = matches!(direction, Direction::AToB) && self.records_accesses();
         for k in 0..length {
             let port = ch.b_bus_port.wrapping_add(bbus_offset(mode, k));
             let abus = if ch.indirect() {
@@ -347,6 +350,9 @@ impl SnesBus {
                 self.name_transfer_byte(origin, direction, abus, port);
             }
             let value = self.move_byte::<NOTE>(direction, abus, port);
+            if observed && dma_transfer_valid(port, abus) {
+                self.record_access(true, b_bus_address(port), value);
+            }
             if NOTE {
                 moved |= u32::from(value) << (8 * k);
             }

@@ -85,7 +85,7 @@ use std::sync::Arc;
 use retro_core::capture::{CaptureRecording, WriteOrigin};
 use retro_core::cartridge::{Cartridge, SlotShape, SourcePlace};
 use retro_core::cpu::Addressable;
-use retro_core::debug::{Access, AccessLog, RaisedEvents};
+use retro_core::debug::{AccessLog, RaisedEvents};
 
 use crate::apu::Apu;
 use crate::cartridge::{BusSpeed, MapPlan, MapTarget, SnesCartridge, CX4_CHIP_ID};
@@ -95,7 +95,7 @@ use crate::ppu::{Ppu, PpuAccessCtx};
 use crate::system_regs::{SystemRegWriteFx, SystemRegs};
 
 use b_bus::BBus;
-use debug::{classify_b_bus_write, is_watched_io, IoTraceBuf};
+use debug::IoTraceBuf;
 pub use debug::{BusDebugEvent, IoAccess};
 use wmdata::WmdataState;
 
@@ -376,7 +376,7 @@ fn is_noted_port(addr24: u32) -> bool {
 
 /// Whether a CPU address reaches a PPU register: `$2100-$213F` of the
 /// system-area B-bus window (banks `$00-$3F` / `$80-$BF`), the range
-/// [`classify_b_bus_write`] reports as PPU register writes.
+/// `classify_b_bus_write` reports as PPU register writes.
 pub(crate) fn is_ppu_register_address(addr: u32) -> bool {
     let bank = (addr >> 16) & 0xFF;
     (bank <= 0x3F || (0x80..=0xBF).contains(&bank)) && (0x2100..=0x213F).contains(&(addr & 0xFFFF))
@@ -1792,18 +1792,8 @@ impl Addressable for SnesBus {
         self.instr_master_cycles += self.cycles_for(addr) as u64;
         self.instr_accesses += 1;
         let value = self.read_full(addr);
-        if self.debug_armed {
-            self.accesses.push(Access {
-                address: addr,
-                write: false,
-                value,
-            });
-        }
-        if self.io_trace.is_some() && is_watched_io(addr) {
-            self.record_io_access(false, addr, value);
-        }
-        if self.addr_watch.is_some() {
-            self.record_addr_watch(false, addr, value);
+        if self.records_accesses() {
+            self.record_access(false, addr, value);
         }
         value
     }
@@ -1812,21 +1802,8 @@ impl Addressable for SnesBus {
     fn write(&mut self, addr: u32, value: u8) {
         self.instr_master_cycles += self.cycles_for(addr) as u64;
         self.instr_accesses += 1;
-        if self.debug_armed {
-            self.accesses.push(Access {
-                address: addr,
-                write: true,
-                value,
-            });
-            if let Some(ev) = classify_b_bus_write(addr) {
-                self.debug_events.raise(ev);
-            }
-        }
-        if self.io_trace.is_some() && is_watched_io(addr) {
-            self.record_io_access(true, addr, value);
-        }
-        if self.addr_watch.is_some() {
-            self.record_addr_watch(true, addr, value);
+        if self.records_accesses() {
+            self.record_access(true, addr, value);
         }
         self.write_full(addr, value);
     }

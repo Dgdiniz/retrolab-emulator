@@ -42,7 +42,7 @@ pub struct IoAccess {
 /// H-DMA triggers MDMAEN/HDMAEN (`$420B-$420C`) so a VRAM-bound transfer
 /// that paces an animation is visible.
 #[inline]
-pub(super) fn is_watched_io(addr: u32) -> bool {
+fn is_watched_io(addr: u32) -> bool {
     let bank = (addr >> 16) & 0xFF;
     if bank > 0x3F && !(0x80..=0xBF).contains(&bank) {
         return false;
@@ -92,7 +92,7 @@ pub enum BusDebugEvent {
 /// the page table routes to [`PageHandler::BBus`]. WRAM banks `$7E/$7F`
 /// (where `$2100` is plain RAM) are excluded.
 #[inline]
-pub(super) fn classify_b_bus_write(addr: u32) -> Option<BusDebugEvent> {
+fn classify_b_bus_write(addr: u32) -> Option<BusDebugEvent> {
     let bank = (addr >> 16) & 0xFF;
     let in_system_area = bank <= 0x3F || (0x80..=0xBF).contains(&bank);
     if !in_system_area {
@@ -275,11 +275,48 @@ impl SnesBus {
         accesses
     }
 
+    /// What the debugger and the traces see of an access to `addr` that
+    /// moved `value`, a read or a `write`: the processor's, or a line
+    /// transfer's write into a B-bus register. While armed, the access log
+    /// takes it and a write raises its PPU-register or APU-port event; the
+    /// I/O trace and the address watch take it while they are on. Out of
+    /// line: the access paths call it only when [`Self::records_accesses`].
+    #[cold]
+    #[inline(never)]
+    pub(super) fn record_access(&mut self, write: bool, addr: u32, value: u8) {
+        if self.debug_armed {
+            self.accesses.push(Access {
+                address: addr,
+                write,
+                value,
+            });
+            if write {
+                if let Some(ev) = classify_b_bus_write(addr) {
+                    self.debug_events.raise(ev);
+                }
+            }
+        }
+        if self.io_trace.is_some() && is_watched_io(addr) {
+            self.record_io_access(write, addr, value);
+        }
+        if self.addr_watch.is_some() {
+            self.record_addr_watch(write, addr, value);
+        }
+    }
+
+    /// Whether an access is recorded ([`Self::record_access`]): the
+    /// debugger's records are armed, or the I/O trace or the address watch
+    /// is on.
+    #[inline]
+    pub(super) fn records_accesses(&self) -> bool {
+        self.debug_armed || self.io_trace.is_some() || self.addr_watch.is_some()
+    }
+
     /// Append one access to the ring buffer, evicting the oldest entry
     /// once `cap` is reached. Only called from the CPU read/write path
     /// when capture is enabled and the address is watched.
     #[inline]
-    pub(super) fn record_io_access(&mut self, is_write: bool, addr: u32, value: u8) {
+    fn record_io_access(&mut self, is_write: bool, addr: u32, value: u8) {
         let (pc, v, h) = (self.trace_pc, self.cached_v_scanline, self.cached_h_dot);
         if let Some(buf) = self.io_trace.as_mut() {
             if buf.entries.len() == buf.cap {
@@ -300,7 +337,7 @@ impl SnesBus {
     /// resolves to the watched WRAM offset. Only called from the CPU
     /// read/write path when the watch is enabled.
     #[inline]
-    pub(super) fn record_addr_watch(&mut self, is_write: bool, addr: u32, value: u8) {
+    fn record_addr_watch(&mut self, is_write: bool, addr: u32, value: u8) {
         let (pc, v, h) = (self.trace_pc, self.cached_v_scanline, self.cached_h_dot);
         if let Some((off, buf)) = self.addr_watch.as_mut() {
             if wram_offset(addr) != Some(*off) {

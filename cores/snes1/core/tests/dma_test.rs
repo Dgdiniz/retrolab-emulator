@@ -414,6 +414,53 @@ fn hdma_repeat_flag_transfers_every_line() {
 }
 
 #[test]
+fn hdma_s_register_writes_reach_the_access_log_the_write_events_and_the_io_trace() {
+    use snes1_core::bus::BusDebugEvent;
+    let mut bus = SnesBus::new();
+    // Channel 0, unit 0, to INIDISP ($2100); channel 1, unit 2 (the
+    // register written twice), to BG1HOFS ($210D).
+    poke_wram(&mut bus, 0x8000, &[0x83, 0x0F, 0x0E, 0x0D, 0x00]);
+    poke_wram(&mut bus, 0x8100, &[0x81, 0x34, 0x12, 0x00]);
+    program_channel(&mut bus, 0, 0x00, 0x00, 0x8000, 0x7E, 0);
+    program_channel(&mut bus, 1, 0x02, 0x0D, 0x8100, 0x7E, 0);
+    set_hdmaen(&mut bus, 0x03);
+    bus.set_debug_armed(true);
+    bus.enable_io_trace(64);
+    bus.clear_debug_events();
+    bus.hdma_init_frame();
+    bus.hdma_run_line();
+
+    let writes: Vec<(u32, u8)> = bus
+        .accesses()
+        .iter()
+        .map(|access| (access.address, access.value))
+        .collect();
+    assert_eq!(writes, [(0x2100, 0x0F), (0x210D, 0x34), (0x210D, 0x12)]);
+    assert!(bus.accesses().iter().all(|access| access.write));
+    let mut events = Vec::new();
+    bus.raised_debug_events().drain(|event| events.push(event));
+    assert_eq!(
+        events,
+        [
+            BusDebugEvent::PpuRegWrite { reg: 0x00 },
+            BusDebugEvent::PpuRegWrite { reg: 0x0D },
+        ]
+    );
+    let traced: Vec<(u32, u8)> = bus
+        .take_io_trace()
+        .iter()
+        .filter(|access| access.is_write)
+        .map(|access| (access.addr, access.value))
+        .collect();
+    assert_eq!(traced, [(0x2100, 0x0F)], "INIDISP is a watched register");
+
+    // Disarmed, a line's transfer records nothing.
+    bus.set_debug_armed(false);
+    bus.hdma_run_line();
+    assert!(bus.accesses().is_empty());
+}
+
+#[test]
 fn hdma_terminate_on_zero() {
     let mut bus = SnesBus::new();
     // An immediate 0x00 line-count terminates the channel at init.
