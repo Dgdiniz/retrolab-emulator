@@ -9,7 +9,9 @@
 //! 448, and an overscan frame cropped to the NTSC window unless the host
 //! shows overscan. [`Ppu::active_display_size`] reports the size the
 //! host crops to. The field flips once a frame, at VBlank; STAT78
-//! reports it, and OBJ interlace reads it to choose a sprite's rows.
+//! reports it, and OBJ interlace reads it to choose a sprite's rows. A
+//! woven frame draws each of its rows for a line and a field of its own
+//! ([`WovenRow`], where this core's field meets [`PictureGrid::row`]'s).
 
 use retro_core::{Framebuffer, PictureGrid};
 
@@ -219,8 +221,9 @@ impl Ppu {
     /// The field state is observable via [`Self::field`] and surfaces
     /// on `$213F` (STAT78) bit 7. Mode 5/6 hires interlace renders
     /// both fields woven into one 512x448 framebuffer per frame (see
-    /// [`Self::render_scanline`]); OBJ interlace ($2133 bit 1) still
-    /// consults this field for sprite row selection.
+    /// [`Self::render_scanline`]). A frame that is not woven draws OBJ
+    /// interlace's ($2133 bit 1) sprite rows for this field; a woven one
+    /// draws each row for the field the row shows ([`WovenRow`]).
     pub(crate) fn toggle_field(&mut self) {
         self.field = !self.field;
     }
@@ -242,6 +245,51 @@ impl Ppu {
     /// duplicate produced by [`Self::finalize_frame`].
     pub fn frame_interlaced(&self) -> bool {
         self.frame_hires && self.render_interlace
+    }
+}
+
+/// What one row of a woven picture shows: the line drawn on it and the
+/// interlace field it is drawn for.
+///
+/// This is the one place this core's field meets [`PictureGrid::row`]'s,
+/// and they are the same: a woven line's first row, the grid's field 0,
+/// shows the line's even field (STAT78 bit 7 clear, `false`), and its
+/// second row, field 1, the odd field (`true`), as bsnes and ares weave
+/// them. A row's backgrounds and sprites are drawn for that line and
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WovenRow {
+    /// The line, numbered as the scanline is (1 the first drawn).
+    pub(super) line: u16,
+    /// The interlace field, as STAT78 bit 7 reads it: `true` the odd one.
+    pub(super) field: bool,
+}
+
+impl WovenRow {
+    /// The row of scanline `scanline`'s two that the grid calls field
+    /// `grid_field` (0 the first, 1 the second).
+    pub(super) fn of(scanline: u16, grid_field: u8) -> Self {
+        Self {
+            line: scanline,
+            field: grid_field != 0,
+        }
+    }
+
+    /// The background line the row fetches: on a hires line the doubled
+    /// frame's `(line << 1) | field`, as bsnes and ares fetch it; a
+    /// pseudo-hires line's backgrounds keep their 256 dots and their lines.
+    pub(super) fn background_line(self, hires: bool) -> u16 {
+        if hires {
+            (self.line << 1) | u16::from(self.field)
+        } else {
+            self.line
+        }
+    }
+
+    /// The background line a woven frame's first row fetches: 2 on a hires
+    /// line, 1 on a pseudo-hires one.
+    pub(super) fn first_background_line(hires: bool) -> u16 {
+        Self::of(1, 0).background_line(hires)
     }
 }
 
@@ -391,6 +439,41 @@ mod tests {
         // Overscan hires with the toggle on: full 512x480.
         ppu.set_show_overscan(true);
         assert_eq!(ppu.active_display_size(), (512, 480));
+    }
+
+    #[test]
+    fn a_woven_line_s_first_row_is_its_even_field_and_its_second_its_odd() {
+        // Scanline 5's rows are the doubled frame's lines 10 and 11:
+        // (5 << 1) | 0 and (5 << 1) | 1, on the rows the grid gives them.
+        let grid = PictureGrid {
+            columns_per_dot: 2,
+            rows_per_line: 2,
+            woven: true,
+        };
+        for scanline in 1..240u16 {
+            for grid_field in 0..2u8 {
+                let row = WovenRow::of(scanline, grid_field);
+                assert_eq!(
+                    row,
+                    WovenRow {
+                        line: scanline,
+                        field: grid_field == 1
+                    }
+                );
+                assert_eq!(
+                    row.background_line(true),
+                    scanline * 2 + u16::from(grid_field)
+                );
+                assert_eq!(row.background_line(false), scanline);
+                // The picture's row k shows the doubled frame's line k + 2.
+                assert_eq!(
+                    grid.row(u32::from(scanline - 1), grid_field),
+                    u32::from(row.background_line(true)) - 2
+                );
+            }
+        }
+        assert_eq!(WovenRow::first_background_line(true), 2);
+        assert_eq!(WovenRow::first_background_line(false), 1);
     }
 
     #[test]

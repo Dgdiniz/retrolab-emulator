@@ -13,9 +13,10 @@
 
 use retro_core::capture::{tile_value, PixelTrace};
 
+use super::picture::WovenRow;
 use super::render::{
-    bpp_for_bg, cgram_index, direct_color_word, palette_offset_for_bg, BgRowBuffer, BgRowPixel,
-    MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
+    bpp_for_bg, cgram_index, direct_color_word, is_hires_mode, palette_offset_for_bg, BgRowBuffer,
+    BgRowPixel, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
 use super::tile::{
     bg_tilemap_word_index, build_tilemap_row, compute_offset_per_tile, decode_tile_2bpp_row,
@@ -383,7 +384,10 @@ impl Ppu {
     /// `scanline % N == 0` formulation would mis-classify line 1
     /// (the first visible line) as "replay" and pull the empty
     /// previous-row buffer through, which manifests as black BGs
-    /// for the first mosaic block of the frame.
+    /// for the first mosaic block of the frame. The lines count from the
+    /// first background line the frame draws: line 1, or in a woven hires
+    /// frame, whose rows fetch the doubled frame's lines, line 2, so the
+    /// blocks start at the frame's first row either way.
     ///
     /// The size N is `(($2106 >> 4) & 0xF)
     /// + 1`, stored already-adjusted in [`Ppu::mosaic_size`] (range
@@ -405,7 +409,12 @@ impl Ppu {
             return;
         }
         let n = self.mosaic_size as u16;
-        let is_fresh_row = scanline.wrapping_sub(1).is_multiple_of(n);
+        let first_line = if self.render_interlace {
+            WovenRow::first_background_line(is_hires_mode(self.bgmode))
+        } else {
+            1
+        };
+        let is_fresh_row = scanline.wrapping_sub(first_line).is_multiple_of(n);
         if !is_fresh_row {
             *row = self.previous_bg_rows[bg_id];
             if T::ON {

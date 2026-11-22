@@ -640,9 +640,10 @@ fn a_hires_line_shows_the_sub_screen_on_its_even_columns_and_interlace_weaves_tw
     // Even columns: the sub screen's BG2; odd: the main screen's BG1.
     assert_eq!(layer(0, 0) & 0x0F, 2 | pixel_layer::SUB_SCREEN_SHOWN);
     assert_eq!(layer(1, 0) & 0x0F, 1);
-    // The two rows of line 1 read BG lines 1 and 2.
+    // The two rows of line 1 read BG lines 2 and 3, its two fields:
+    // (1 << 1) | 0 and (1 << 1) | 1.
     let row_read = |x, y| (at(&sources.tile, &sources, x, y) >> 26) & 7;
-    assert_eq!((row_read(1, 0), row_read(1, 1)), (1, 2));
+    assert_eq!((row_read(1, 0), row_read(1, 1)), (2, 3));
     // Each 16-pixel slot is two characters, side by side.
     let character_read = |x, y| (at(&sources.tile, &sources, x, y) >> 15) & 0x7FF;
     assert_eq!((character_read(1, 0), character_read(9, 0)), (2, 3));
@@ -765,6 +766,40 @@ fn a_pseudo_hires_line_of_an_interlaced_frame_gives_both_of_its_rows() {
         let line_row = row / 2;
         assert_eq!(red(1, row), expand((line_row % 8 + 1) * 3), "row {row}");
     }
+    read_sources(&mut bus, &frame);
+}
+
+#[test]
+fn a_woven_frame_draws_each_row_s_sprite_row_for_the_field_it_shows() {
+    // Mode 5 with interlace and OBJ interlace: an 8x8 sprite whose row `r`
+    // is colour `r + 1` covers four lines, each field showing every other
+    // row. Each row of the woven frame is drawn for its own field, the
+    // sprites as the backgrounds are, so the sprite's eight rows fall on
+    // eight rows in order, from the first row of its first line, the row
+    // of that line's even field.
+    let mut bus = scene();
+    reg(&mut bus, 0x05, 0x05);
+    reg(&mut bus, 0x01, 0x00); // 8x8 sprites, characters at word 0
+    vram(&mut bus, 0x0010, &character(4, |row, _| row as u8 + 1));
+    for index in 0..9u8 {
+        colour(&mut bus, 128 + index, u16::from(index) * 3);
+    }
+    let mut table = parked_sprites();
+    place_sprite(&mut table, 0, 40, 10, 1, 0x30, false);
+    sprite_table(&mut bus, &table);
+    reg(&mut bus, 0x2C, 0x10); // the sprites on the main screen
+    reg(&mut bus, 0x33, 0x03); // interlace and OBJ interlace
+    reg(&mut bus, 0x00, 0x0F);
+    let frame = draw_frame(&mut bus, |_, _| {});
+    assert_eq!((frame.width, frame.height), (512, 448));
+    // The main screen is on the odd columns: column 81 is dot 40.
+    let red = |y: u32| frame.picture[((y * frame.width + 81) * 4) as usize];
+    let expand = |c: u32| ((c << 3) | (c >> 2)) as u8;
+    assert_eq!(red(19), 0, "the row above the sprite");
+    for row in 0..8u32 {
+        assert_eq!(red(20 + row), expand((row + 1) * 3), "sprite row {row}");
+    }
+    assert_eq!(red(28), 0, "the row below the sprite");
     read_sources(&mut bus, &frame);
 }
 

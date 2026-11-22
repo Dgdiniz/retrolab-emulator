@@ -274,11 +274,13 @@ impl Ppu {
     /// fetch, the same mosaic replay (kept in `previous_bg_rows` for the
     /// pass), the same 256-dot sprite row widened to a hires line, and a
     /// pseudo-hires line's dots each two columns wide.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_isolated_line<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         layer: usize,
         vy: u16,
         obj_line: u16,
+        field: bool,
         fb_row: u32,
         fb: &mut Framebuffer,
         trace: &mut T,
@@ -320,7 +322,7 @@ impl Ppu {
 
         if layer == LAYER_OBJ {
             let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-            self.render_obj_row(obj_line, &mut obj_row, trace);
+            self.render_obj_row(obj_line, field, &mut obj_row, trace);
             for x in 0..visible_w {
                 let column = if hires || pseudo { x >> 1 } else { x };
                 let pixel = obj_row[column];

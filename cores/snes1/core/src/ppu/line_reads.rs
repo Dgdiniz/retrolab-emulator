@@ -13,6 +13,7 @@
 use retro_core::capture::{line_flags, LineSprites, SpriteFate};
 use retro_core::video::SpriteOrderEntry;
 
+use super::picture::WovenRow;
 use super::record::{self, LineState, ReplayedMemory};
 use super::sprite::{self, line_budget};
 use super::tile::offset_per_tile;
@@ -70,8 +71,8 @@ pub struct OffsetPerTileTable {
     /// registers and the memory as they stand.
     pub from_line_states: bool,
     /// The line of each row, in the order drawn. A line of an interlaced
-    /// hires frame gives two rows, its two background lines; a
-    /// pseudo-hires line of such a frame gives two rows as well.
+    /// hires or pseudo-hires frame gives two rows, its fields', each with
+    /// the background line it fetched.
     pub lines: Vec<u16>,
     /// Tile columns a row: 33 for a 256-dot line, 65 when a row is Mode 6,
     /// whose line is 512 dots.
@@ -374,12 +375,11 @@ impl Ppu {
             let hires = state.bgmode == 6;
             let line_width: u16 = if hires { 512 } else { 256 };
             // The background lines the line fetched: two in an interlaced
-            // hires frame, which weaves them into two rows; a pseudo-hires
-            // line of such a frame draws both of its rows from its own line.
-            let (rows, count) = if hires && interlace {
-                ([*line * 2 - 1, *line * 2], 2)
-            } else if state.pseudo_hires && interlace {
-                ([*line, *line], 2)
+            // hires or pseudo-hires frame, which weaves its two fields into
+            // two rows.
+            let (rows, count) = if (hires || state.pseudo_hires) && interlace {
+                let row = |grid_field| WovenRow::of(*line, grid_field).background_line(hires);
+                ([row(0), row(1)], 2)
             } else {
                 ([*line, 0], 1)
             };

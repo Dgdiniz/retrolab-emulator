@@ -508,10 +508,13 @@ impl Ppu {
     /// top row at output row N (the one-line OBJ pipeline latency is
     /// already absorbed by the vcounter being 1-indexed, see the
     /// Mode 7 note in [`Self::render_mode7_rows`] for the same offset
-    /// reasoning).
+    /// reasoning). `field` is the interlace field whose rows OBJ
+    /// interlace draws: the frame's, or in a woven frame the one the row
+    /// shows.
     pub(super) fn render_obj_row<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         scanline: u16,
+        field: bool,
         obj_row: &mut ObjRowBuffer,
         trace: &mut T,
     ) {
@@ -519,7 +522,6 @@ impl Ppu {
 
         let line = scanline.wrapping_sub(1);
         let obj_interlace = self.obj_interlace;
-        let field = self.field;
         let base_size = self.obj_base_size;
 
         // Pass 1: range eval.
@@ -1154,7 +1156,7 @@ pub(super) mod tests {
 
             let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
             let mut trace = FrameTrace::new(0, None);
-            ppu.render_obj_row(scanline, &mut obj, &mut trace);
+            ppu.render_obj_row(scanline, false, &mut obj, &mut trace);
 
             let budget = sprite::line_budget(
                 &ppu.oam,
@@ -1205,7 +1207,7 @@ pub(super) mod tests {
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
         // Scanline 1 -> line 0 -> sprite row 0.
-        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        ppu.render_obj_row(1, false, &mut obj, &mut NoTrace::<FrameTrace>::new());
 
         for (x, px) in obj.iter().enumerate().take(8) {
             assert!(px.opaque, "col {x} opaque");
@@ -1224,7 +1226,7 @@ pub(super) mod tests {
         ppu.cgram[128 + 5 * 16 + 1] = 0x7ABC;
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        ppu.render_obj_row(1, false, &mut obj, &mut NoTrace::<FrameTrace>::new());
         assert!(obj[0].opaque);
         assert_eq!(obj[0].color, 0x7ABC);
         assert_eq!(obj[0].prio, 3);
@@ -1239,7 +1241,7 @@ pub(super) mod tests {
         ppu.cgram[129] = 0x1234;
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        ppu.render_obj_row(1, false, &mut obj, &mut NoTrace::<FrameTrace>::new());
         assert!(obj[7].opaque, "hflip moves the leftmost pixel to column 7");
         assert_eq!(obj[7].color, 0x1234);
         assert!(!obj[0].opaque);
@@ -1264,7 +1266,7 @@ pub(super) mod tests {
         ppu.cgram[128 + 16 + 1] = 0x5555; // palette 1 index 1 (slot 1)
 
         let mut obj = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
-        ppu.render_obj_row(1, &mut obj, &mut NoTrace::<FrameTrace>::new());
+        ppu.render_obj_row(1, false, &mut obj, &mut NoTrace::<FrameTrace>::new());
 
         let order = ppu.resolved_sprite_render_order();
         let top = order.last().expect("non-empty order");

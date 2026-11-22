@@ -58,6 +58,7 @@ use retro_core::video::ColourLevels;
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
+use crate::ppu::picture::WovenRow;
 use crate::ppu::trace::{pixel_layer, source_code, FrameTrace, MathOutcome, RowColumns};
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::{window_layer, Ppu, LAYER_OBJ};
@@ -266,33 +267,39 @@ impl Ppu {
         self.frame_hires |= wide;
 
         // Mode 5/6 interlace weaves both fields into a single complete
-        // frame. `vy` is the BG vertical source (the value
-        // `render_bg_row` adds the per-BG V-scroll to); with interlace
-        // it advances one BG line per output row, the weave equivalent
-        // of `py = (vcounter << 1) | field`. Sprites stay at the
-        // visible scanline (`obj_line = scanline`) and are line-doubled
-        // across the field pair. The non-interlace path keeps the
-        // plain mapping: output row N-1 <- scanline N (vy = N). The
-        // weave is gated on the latched `render_interlace`, not the live
-        // bit, so the whole frame agrees with `active_display_size`. A
-        // pseudo-hires line of an interlaced frame gives its two rows
-        // too; its backgrounds keep their 256 dots and their lines, so
-        // both rows are drawn from the line itself (vy = N).
+        // frame, as bsnes and ares weave them: each scanline gives two
+        // rows, its even field on the first and its odd field on the
+        // second, on the rows the picture's grid gives them (`WovenRow`).
+        // `vy`, the BG vertical source (the value `render_bg_row` adds
+        // the per-BG V-scroll to), is that field's line of the doubled
+        // frame, `py = (vcounter << 1) | field`, and the sprites are the
+        // line's, with that field's rows. A pseudo-hires line of an
+        // interlaced frame gives its two rows too; its backgrounds keep
+        // their 256 dots and their lines. The non-interlace path keeps
+        // the plain mapping: output row N-1 <- scanline N (vy = N), its
+        // sprites drawn for the frame's field. The weave is gated on the
+        // latched `render_interlace`, not the live bit, so the whole
+        // frame agrees with `active_display_size`.
         if wide && self.render_interlace {
-            let r0 = u32::from(scanline - 1) * 2;
-            self.mark_line_hires(r0, true);
-            self.mark_line_hires(r0 + 1, true);
-            let (first_vy, second_vy) = if hires {
-                (scanline * 2 - 1, scanline * 2)
-            } else {
-                (scanline, scanline)
-            };
-            self.render_output_line(first_vy, scanline, r0, fb, trace);
-            self.render_output_line(second_vy, scanline, r0 + 1, fb, trace);
+            let grid = self.picture_grid();
+            for grid_field in 0..2u8 {
+                let row = grid.row(u32::from(scanline - 1), grid_field);
+                let shown = WovenRow::of(scanline, grid_field);
+                self.mark_line_hires(row, true);
+                self.render_output_line(
+                    shown.background_line(hires),
+                    shown.line,
+                    shown.field,
+                    row,
+                    fb,
+                    trace,
+                );
+            }
         } else {
             let fb_row = u32::from(scanline - 1);
             self.mark_line_hires(fb_row, wide);
-            self.render_output_line(scanline, scanline, fb_row, fb, trace);
+            let field = self.field;
+            self.render_output_line(scanline, scanline, field, fb_row, fb, trace);
         }
     }
 
@@ -308,15 +315,16 @@ impl Ppu {
     /// Render one output row into the host framebuffer's RGBA8 plane.
     ///
     /// `vy` is the BG vertical coordinate, `obj_line` the visible
-    /// scanline used for sprite evaluation, and `fb_row` the
-    /// destination row. The split from [`Ppu::render_scanline`] lets
-    /// the Mode 5/6 interlace path emit two woven rows per scanline
-    /// (doubled `vy`, shared `obj_line`) while the normal path emits
-    /// one.
+    /// scanline used for sprite evaluation, `field` the interlace field
+    /// whose rows OBJ interlace draws, and `fb_row` the destination
+    /// row. The split from [`Ppu::render_scanline`] lets the interlace
+    /// path emit two woven rows per scanline, each for its own field,
+    /// while the normal path emits one.
     fn render_output_line<T: PixelTrace<Notes = FrameTrace>>(
         &mut self,
         vy: u16,
         obj_line: u16,
+        field: bool,
         fb_row: u32,
         fb: &mut Framebuffer,
         trace: &mut T,
@@ -330,7 +338,7 @@ impl Ppu {
         // A single-layer render draws its one layer instead of the
         // composite (see `render_layer`); never set during play.
         if let Some(layer) = self.isolated_layer {
-            self.render_isolated_line(layer, vy, obj_line, fb_row, fb, trace);
+            self.render_isolated_line(layer, vy, obj_line, field, fb_row, fb, trace);
             return;
         }
 
@@ -450,7 +458,7 @@ impl Ppu {
         // walk is skipped entirely when OBJ is off on both screens.
         let mut obj_row = [ObjRowPixel::TRANSPARENT; NORMAL_SCANLINE_WIDTH];
         if (self.obj_main_enable || self.obj_sub_enable) && !self.layer_debug_disabled(LAYER_OBJ) {
-            self.render_obj_row(obj_line, &mut obj_row, trace);
+            self.render_obj_row(obj_line, field, &mut obj_row, trace);
         }
 
         // Step 4: composite each enabled screen by the per-mode
