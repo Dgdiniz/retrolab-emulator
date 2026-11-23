@@ -1,16 +1,134 @@
 //! Audio: the YM2612 and the PSG mixed at a frame's end into the host's
-//! ring, the sound hooks a host calls (`SoundCore`), and the sound chips'
-//! debugger readers.
+//! ring, the sound hooks a host calls (`SoundCore`), the stems the mix
+//! takes, and the sound chips' debugger readers.
 
-use retro_core::audio::SoundCore;
+use retro_core::audio::{
+    SampleKind, SoundCore, StemChannel, StemLayout, StemRecorder, StemSet, StemSum, StemTake,
+};
 use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
 
 use super::GenesisEmulator;
+use crate::psg::PSG_STEM_VALUES;
+use crate::ym2612::YM_STEM_VALUES;
+
+/// The PSG's share of the mix, and the YM2612's: the PSG at full scale is
+/// about a third of the FM at full scale (0.34, the ratio Genesis Plus
+/// GX's default levels give); 0.25 and 0.75 give 0.333, with the most the
+/// mix can reach 1.0.
+const PSG_SHARE: f32 = 0.25;
+const FM_SHARE: f32 = 0.75;
+
+/// An FM channel's stem as it enters the master: its share of the
+/// YM2612's sum, which divides by 6, and of the mix; a PSG channel's, of
+/// the PSG's sum (divided by 4) and of the mix. Both are powers of two, so
+/// the scaling is exact.
+const FM_STEM_SCALE: f32 = FM_SHARE / 6.0;
+const PSG_STEM_SCALE: f32 = PSG_SHARE / 4.0;
+
+/// The stems, in index order: the YM2612's six channels and its DAC, which
+/// plays in place of channel 6 (whose FM stem is then silent), the PSG's
+/// three tone channels and its noise.
+const STEM_CHANNELS: [StemChannel; 11] = [
+    fm("fm1", 0),
+    fm("fm2", 1),
+    fm("fm3", 2),
+    fm("fm4", 3),
+    fm("fm5", 4),
+    fm("fm6", 5),
+    fm("dac", 5),
+    psg("psg1", 0),
+    psg("psg2", 1),
+    psg("psg3", 2),
+    psg("noise", 3),
+];
+
+const fn fm(name: &'static str, channel: u8) -> StemChannel {
+    StemChannel {
+        name,
+        chip: Some(0),
+        channel: Some(channel),
+        stereo: true,
+        in_master: true,
+    }
+}
+
+const fn psg(name: &'static str, channel: u8) -> StemChannel {
+    StemChannel {
+        name,
+        chip: Some(1),
+        channel: Some(channel),
+        stereo: false,
+        in_master: true,
+    }
+}
+
+/// The Mega Drive's stems at the mix's `rate`: the chips' channels as they
+/// enter the master, floats, and the master the mix before its limiter,
+/// which they sum to exactly.
+fn stem_layout(rate: u32) -> StemLayout {
+    StemLayout {
+        rate,
+        kind: SampleKind::F32,
+        channels: STEM_CHANNELS.to_vec(),
+        master: StemChannel {
+            name: "master",
+            chip: None,
+            channel: None,
+            stereo: true,
+            in_master: false,
+        },
+        sum: StemSum::Exact,
+    }
+}
+
+/// A recorder of the stems at `rate`, holding at most two seconds.
+pub(super) fn stem_recorder(rate: u32) -> StemRecorder<f32> {
+    StemRecorder::new(&stem_layout(rate), rate * 2)
+}
+
+/// One side of a sample of the mix, before the limiter: the master the
+/// stems sum to.
+#[inline]
+fn mix_sample(psg: f32, ym: f32) -> f32 {
+    psg * PSG_SHARE + ym * FM_SHARE
+}
+
+/// The mix's limiter: below 0.8 the signal passes through linearly, above
+/// it a smooth compression takes the place of a hard clip. Always in
+/// [-1, 1].
+#[inline]
+fn soft_limit(x: f32) -> f32 {
+    const THRESHOLD: f32 = 0.8;
+    if x.abs() <= THRESHOLD {
+        x
+    } else {
+        let sign = x.signum();
+        let excess = x.abs() - THRESHOLD;
+        let compressed = THRESHOLD + (1.0 - THRESHOLD) * (1.0 - (-excess * 3.0).exp());
+        sign * compressed.min(1.0)
+    }
+}
 
 impl SoundCore for GenesisEmulator {
     fn render_frame(&mut self) {
         run_frame_on(self, ExecutionTier::Play);
+    }
+
+    fn stem_layout(&self) -> Option<StemLayout> {
+        Some(stem_layout(self.audio_sample_rate))
+    }
+
+    fn arm_stems(&mut self, stems: StemSet) {
+        let was = self.stems.is_armed();
+        self.stems.arm(stems, !self.frame_open);
+        if self.stems.is_armed() != was {
+            self.set_stem_taps(self.stems.is_armed());
+        }
+    }
+
+    fn take_stems(&mut self) -> Option<StemTake> {
+        self.stems.take()
     }
 }
 
@@ -114,23 +232,6 @@ impl GenesisEmulator {
     /// `discard_pending_audio` does nothing here): clearing the host ring
     /// instead would throw away sound presented and still on its way.
     pub(super) fn generate_and_mix_audio(&mut self, present: bool) {
-        /// Soft limiter using tanh-like curve.
-        /// Below threshold (0.8), signal passes through linearly.
-        /// Above threshold, applies smooth compression to avoid hard clipping.
-        /// Output is always in [-1.0, 1.0].
-        #[inline]
-        fn soft_limit(x: f32) -> f32 {
-            const THRESHOLD: f32 = 0.8;
-            if x.abs() <= THRESHOLD {
-                x
-            } else {
-                let sign = x.signum();
-                let excess = x.abs() - THRESHOLD;
-                let compressed = THRESHOLD + (1.0 - THRESHOLD) * (1.0 - (-excess * 3.0).exp());
-                sign * compressed.min(1.0)
-            }
-        }
-
         if !self.audio_enabled {
             return;
         }
@@ -198,8 +299,10 @@ impl GenesisEmulator {
         // presentation. A headless frame stops here: the mix, the waveform ring,
         // and the host audio ring below are presentation-only and never enter the
         // netplay desync hash. See the fn doc for why this ordering is
-        // load-bearing for rollback determinism.
+        // load-bearing for rollback determinism. The stems follow the host:
+        // what the chips staged for them goes with the frame.
         if !present {
+            self.clear_staged_stems();
             return;
         }
 
@@ -217,12 +320,9 @@ impl GenesisEmulator {
             let ym_left = self.ym_sample_buf[i * 2];
             let ym_right = self.ym_sample_buf[i * 2 + 1];
 
-            // Mix: PSG (mono->both) + YM2612 (stereo)
-            // PSG/FM balance: the PSG at full scale is about a third of the
-            // FM at full scale (0.34, the ratio Genesis Plus GX's default
-            // levels give). 0.25/0.75 gives 0.333, with max output = 1.0.
-            let mixed_left = soft_limit(psg * 0.25 + ym_left * 0.75);
-            let mixed_right = soft_limit(psg * 0.25 + ym_right * 0.75);
+            // Mix: PSG (mono->both) + YM2612 (stereo), then the limiter.
+            let mixed_left = soft_limit(mix_sample(psg, ym_left));
+            let mixed_right = soft_limit(mix_sample(psg, ym_right));
 
             // The stereo-interleaved mixed output, staged for the ring.
             self.mix_sample_buf[i * 2] = mixed_left;
@@ -242,5 +342,81 @@ impl GenesisEmulator {
         // reports.
         self.host_audio
             .push_slice(&self.mix_sample_buf[..mix_count * 2]);
+
+        if self.stems.is_armed() {
+            self.record_stems(mix_count);
+        }
+        self.clear_staged_stems();
+    }
+
+    /// The frame's stems from what the chips staged, one sample frame for
+    /// each the mix made, as they enter the master; the master is the mix
+    /// before its limiter. A sample frame departs where the YM2612's clamp,
+    /// the limiter or a muted channel that sounds moved what the host hears
+    /// away from the stems' sum, and where a chip handed the mix a sample
+    /// it staged none for.
+    fn record_stems(&mut self, frames: usize) {
+        let (Some((ym_values, ym_departs)), Some((psg_values, psg_departs))) = (
+            self.bus.ym2612().staged_stems(),
+            self.bus.psg().staged_stems(),
+        ) else {
+            return;
+        };
+        let mut values = [0.0f32; YM_STEM_VALUES + PSG_STEM_VALUES];
+        for i in 0..frames {
+            let psg = self.psg_sample_buf[i];
+            let (ym_left, ym_right) = (self.ym_sample_buf[i * 2], self.ym_sample_buf[i * 2 + 1]);
+            let master = [mix_sample(psg, ym_left), mix_sample(psg, ym_right)];
+            let mut departs = master[0] != self.mix_sample_buf[i * 2]
+                || master[1] != self.mix_sample_buf[i * 2 + 1];
+            let (fm, rest) = values.split_at_mut(YM_STEM_VALUES);
+            match ym_values.get(i * YM_STEM_VALUES..(i + 1) * YM_STEM_VALUES) {
+                Some(staged) => {
+                    for (stem, &value) in fm.iter_mut().zip(staged) {
+                        *stem = value * FM_STEM_SCALE;
+                    }
+                    departs |= ym_departs[i];
+                }
+                None => {
+                    fm.fill(0.0);
+                    departs |= ym_left != 0.0 || ym_right != 0.0;
+                }
+            }
+            match psg_values.get(i * PSG_STEM_VALUES..(i + 1) * PSG_STEM_VALUES) {
+                Some(staged) => {
+                    for (stem, &value) in rest.iter_mut().zip(staged) {
+                        *stem = value * PSG_STEM_SCALE;
+                    }
+                    departs |= psg_departs[i];
+                }
+                None => {
+                    rest.fill(0.0);
+                    departs |= psg != 0.0;
+                }
+            }
+            self.stems.push(&values, master, departs);
+        }
+    }
+
+    /// Drop what the chips staged for the stems: the frame's samples went.
+    fn clear_staged_stems(&mut self) {
+        self.bus.ym2612_mut().clear_staged_stems();
+        self.bus.psg_mut().clear_staged_stems();
+    }
+
+    /// The chips stage each sample for the stems while they are armed.
+    pub(super) fn set_stem_taps(&mut self, on: bool) {
+        self.bus.ym2612_mut().set_stem_tap(on);
+        self.bus.psg_mut().set_stem_tap(on);
+    }
+
+    /// The end of a frame for the stems: a frame the host was not shown is
+    /// left out, and what the host armed since is armed now.
+    pub(super) fn end_stem_frame(&mut self) {
+        let was = self.stems.is_armed();
+        self.stems.frame_end(self.present);
+        if self.stems.is_armed() != was {
+            self.set_stem_taps(self.stems.is_armed());
+        }
     }
 }

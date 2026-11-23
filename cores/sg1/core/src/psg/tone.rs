@@ -163,7 +163,11 @@ impl ToneChannel {
         if self.muted {
             return 0.0;
         }
+        self.raw_output()
+    }
 
+    /// The output the channel makes, whether the debugger muted it or not.
+    pub fn raw_output(&self) -> f32 {
         // Get volume
         let volume = self.get_volume();
 

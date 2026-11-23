@@ -5,6 +5,7 @@
 //! with the echo's writes on.
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
+use retro_core::audio::{SoundCore, SoundSamples, StemLayout, StemTake};
 use retro_core::{EmulatorCore, ExecutionMode};
 use snes1_core::SnesEmulator;
 
@@ -99,3 +100,119 @@ fn snes() -> SoundCoreUnderTest<SnesEmulator> {
 }
 
 retro_core::sound_conformance_tests!(snes());
+
+// -- The S-DSP's stems ---------------------------------------------------
+
+/// The sound moment with a second voice, not routed to the echo, and the
+/// levels lowered so that no sum clamps: voice 0 at half volume, voice 1
+/// at 0x30 left and 0x50 right an octave lower, the main volume halved.
+#[rustfmt::skip]
+const SECOND_VOICE: [(u8, u8); 11] = [
+    (0x00, 0x40), (0x01, 0x40), (0x0C, 0x40), (0x1C, 0x40),
+    (0x10, 0x30), (0x11, 0x50), (0x12, 0x00), (0x13, 0x08),
+    (0x15, 0x8F), (0x16, 0xE0), (0x4C, 0x02),
+];
+
+/// A machine with its sound off (the APU's ring then waits for the test),
+/// past the sound moment and a second voice, every stem armed, and the
+/// samples made before taken out of the ring.
+fn two_voices() -> (SnesEmulator, StemLayout) {
+    let mut emu = build();
+    emu.set_audio_enabled(false);
+    for _ in 0..4 {
+        emu.run_frame();
+    }
+    sound_moment(&mut emu);
+    let apu = emu.bus_mut().apu_mut();
+    for (register, value) in SECOND_VOICE {
+        apu.spc_write(0x00F2, register);
+        apu.spc_write(0x00F3, value);
+    }
+    let layout = emu.stem_layout().expect("the SNES takes stems");
+    emu.arm_stems(layout.all());
+    let mut ring = vec![0i16; 8192];
+    emu.bus_mut().apu_mut().drain_audio(&mut ring);
+    (emu, layout)
+}
+
+/// The integers of a take's buffer.
+fn ints(samples: &SoundSamples) -> &[i16] {
+    match samples {
+        SoundSamples::I16(samples) => samples,
+        SoundSamples::F32(_) => panic!("the S-DSP's stems are 16-bit"),
+    }
+}
+
+/// A frame run and taken: the take, and what the APU's ring received.
+fn frame(emu: &mut SnesEmulator) -> (StemTake, Vec<i16>) {
+    emu.render_frame();
+    let take = emu.take_stems().expect("armed");
+    let mut ring = vec![0i16; 8192];
+    let received = emu.bus_mut().apu_mut().drain_audio(&mut ring);
+    ring.truncate(received);
+    (take, ring)
+}
+
+/// The master is the sample the S-DSP pushed to its ring, sample for
+/// sample; with two voices and the echo at levels nothing clamps, no
+/// sample departs and the voices through their volumes and the echo sum
+/// to it within one step a voice.
+#[test]
+fn the_master_is_the_dsp_s_ring_and_two_voices_and_the_echo_sum_to_it() {
+    let (mut emu, layout) = two_voices();
+    let mut heard = false;
+    for frame_number in 0..12 {
+        let (take, ring) = frame(&mut emu);
+        assert_eq!(ints(&take.master), &ring[..], "frame {frame_number}");
+        assert!(
+            take.departures.is_empty(),
+            "frame {frame_number}: {:?}",
+            take.departures
+        );
+        for sample in 0..take.frames as usize {
+            for side in 0..2 {
+                let mut sum = 0i32;
+                for (stem, index) in take.stems.iter().zip(take.armed.iter()) {
+                    let channel = &layout.channels[index];
+                    if channel.in_master {
+                        sum += i32::from(ints(stem)[sample * channel.width() + side]);
+                    }
+                }
+                let master = i32::from(ring[sample * 2 + side]);
+                assert!(
+                    (master - sum).abs() <= 8,
+                    "sample {sample}: {master} against {sum}"
+                );
+                heard |= master != 0;
+            }
+        }
+    }
+    assert!(heard, "the voices sounded");
+    let left = ints(&emu.take_stems().expect("armed").master).len();
+    assert_eq!(left, 0, "taken frame by frame");
+}
+
+/// A muted voice keeps its stems, dry and through its volumes, and its
+/// samples depart from the master, which the speakers' mix leaves it out
+/// of; the master is still the ring's sample, and the scope shows the
+/// voice.
+#[test]
+fn a_muted_voice_keeps_its_stems_and_its_samples_depart() {
+    let (mut emu, layout) = two_voices();
+    emu.audio_debugger(0)
+        .expect("the S-DSP")
+        .mute_channel(1, true);
+    let (take, ring) = frame(&mut emu);
+    assert_eq!(ints(&take.master), &ring[..]);
+    for name in ["voice1", "voice1-dry"] {
+        let stem = ints(&take.stems[layout.index_of(name).expect(name)]);
+        assert!(stem.iter().any(|&s| s != 0), "{name} plays");
+    }
+    let departed: u32 = take.departures.iter().map(|span| span.frames).sum();
+    assert!(departed > take.frames / 2, "{departed} of {}", take.frames);
+    let wave = emu
+        .audio_debugger(0)
+        .expect("the S-DSP")
+        .get_waveform(1, 64);
+    assert!(wave.iter().any(|&s| s != 0.0), "the scope shows the voice");
+}

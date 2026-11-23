@@ -895,6 +895,50 @@ fn the_render_runs_frames_with_the_sound_on() {
 }
 
 #[wasm_bindgen_test]
+fn the_stems_are_armed_by_mask_and_taken_by_whole_frames() {
+    let mut emu = plain();
+    assert_eq!(
+        shape(&emu.get_stem_layout()),
+        "{channels: [{channel: 0, chip: 0, in_master: true, name: \"main\", stereo: true}, \
+         {channel: 0, chip: 1, in_master: true, name: \"second\", stereo: false}], kind: \"F32\", \
+         master: {channel: undefined, chip: undefined, in_master: false, name: \"master\", \
+         stereo: true}, rate: 1000, sum: \"Exact\"}"
+    );
+    assert!(emu.take_stems().is_null(), "nothing armed");
+    emu.arm_stems(0b10);
+    emu.render_frames(2);
+    let take = emu.take_stems();
+    assert_eq!(number(&take, "frames"), 2.0);
+    assert_eq!(number(&take, "armed"), 2.0);
+    let stems = Array::from(&get(&take, "stems"));
+    assert_eq!(stems.length(), 1);
+    assert_eq!(
+        stems
+            .get(0)
+            .dyn_into::<js_sys::Float32Array>()
+            .unwrap()
+            .to_vec(),
+        [0.5, 0.5]
+    );
+    assert_eq!(
+        get(&take, "master")
+            .dyn_into::<js_sys::Float32Array>()
+            .unwrap()
+            .to_vec(),
+        [0.75, 0.0, 0.75, 0.0]
+    );
+    assert_eq!(
+        get(&take, "departures")
+            .dyn_into::<js_sys::Uint32Array>()
+            .unwrap()
+            .length(),
+        0
+    );
+    emu.arm_stems(0);
+    assert!(emu.take_stems().is_null(), "disarmed");
+}
+
+#[wasm_bindgen_test]
 fn the_video_memories_are_read_and_written_by_name_in_bytes() {
     let mut emu = plain();
     assert_eq!(

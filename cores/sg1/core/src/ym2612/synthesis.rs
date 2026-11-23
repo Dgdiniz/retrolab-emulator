@@ -1,11 +1,127 @@
 //! The synthesis: the output samples owed for the input clocks received,
 //! one sample through the six channels, the timers, and the chip as the
-//! system's mix pulls it.
+//! system's mix pulls it; and the stems' tap on each sample's channels.
 
-use retro_core::audio::{AudioChip, AudioChipInfo, ChannelType};
+use retro_core::audio::{AudioChip, AudioChipInfo, ChannelType, ScopeRing};
 use retro_core::cpu::Clockable;
 
 use super::{Ym2612, MAX_BORROWED_PAIRS, MAX_FRAME_SAMPLES, MAX_TIMER_ACCUMULATOR};
+
+/// The values a sample stages for the stems: FM channels 1 to 6, then the
+/// DAC, each left and right.
+pub const YM_STEM_VALUES: usize = 14;
+
+/// The stems' tap: each sample's channel outputs as `channel_outputs` holds
+/// them, muted or not, staged beside `frame_samples` (one entry a sample,
+/// trimmed and dropped with them) until the system's mix takes the frame;
+/// and each channel's last samples for its waveform.
+pub(super) struct YmStems {
+    /// [`YM_STEM_VALUES`] a sample: channel 6 in its FM slot while it plays
+    /// FM, in the DAC's while the DAC replaces it.
+    staged: Vec<f32>,
+    /// A sample: whether the chip's clamp or a muted channel that sounds
+    /// moved its sum away from the channels'.
+    departs: Vec<bool>,
+    scopes: [ScopeRing; 6],
+}
+
+impl YmStems {
+    fn new() -> Self {
+        Self {
+            staged: Vec::with_capacity(2048 * YM_STEM_VALUES / 2),
+            departs: Vec::with_capacity(2048),
+            scopes: std::array::from_fn(|_| ScopeRing::new()),
+        }
+    }
+
+    /// One sample's channels.
+    #[inline]
+    fn record(&mut self, outputs: &[(f32, f32); 6], dac: bool, muted: &[bool; 6], clamped: bool) {
+        let mut departs = clamped;
+        for (channel, &(left, right)) in outputs.iter().enumerate() {
+            let (fm_left, fm_right) = if channel == 5 && dac {
+                (0.0, 0.0)
+            } else {
+                (left, right)
+            };
+            self.staged.push(fm_left);
+            self.staged.push(fm_right);
+            departs |= muted[channel] && (left != 0.0 || right != 0.0);
+            self.scopes[channel].push((left + right) * 0.5);
+        }
+        let (dac_left, dac_right) = if dac { outputs[5] } else { (0.0, 0.0) };
+        self.staged.push(dac_left);
+        self.staged.push(dac_right);
+        self.departs.push(departs);
+    }
+
+    /// Staged samples standing for `samples` samples the chip made with no
+    /// tap (a frame restored from a savestate): silence, each a departure.
+    pub(super) fn align(&mut self, samples: usize) {
+        self.staged.clear();
+        self.staged.resize(samples * YM_STEM_VALUES, 0.0);
+        self.departs.clear();
+        self.departs.resize(samples, true);
+    }
+
+    /// Drop the oldest `samples` staged samples, as `frame_samples` drops
+    /// them.
+    fn drop_oldest(&mut self, samples: usize) {
+        let samples = samples.min(self.departs.len());
+        self.staged.drain(..samples * YM_STEM_VALUES);
+        self.departs.drain(..samples);
+    }
+
+    /// Channel `channel`'s last `samples`, oldest first.
+    pub(super) fn scope(&self, channel: usize, samples: u32) -> Vec<f32> {
+        match self.scopes.get(channel) {
+            Some(scope) => scope.read(samples),
+            None => vec![0.0; samples as usize],
+        }
+    }
+}
+
+impl Ym2612 {
+    /// Stage each sample's channels for the stems from now on (`true`), or
+    /// stop. A host setting, not saved.
+    pub fn set_stem_tap(&mut self, on: bool) {
+        match (on, self.stems.is_some()) {
+            (true, false) => {
+                let mut stems = Box::new(YmStems::new());
+                stems.align(self.frame_samples.len() / 2);
+                self.stems = Some(stems);
+            }
+            (false, true) => self.stems = None,
+            _ => {}
+        }
+    }
+
+    /// The samples staged for the stems, one per sample `frame_samples`
+    /// holds: [`YM_STEM_VALUES`] values each, and whether each departs;
+    /// `None` while the tap is off.
+    pub fn staged_stems(&self) -> Option<(&[f32], &[bool])> {
+        self.stems
+            .as_deref()
+            .map(|stems| (&stems.staged[..], &stems.departs[..]))
+    }
+
+    /// Drop the samples staged for the stems, as the mix drops the frame's
+    /// samples once it has taken them.
+    pub fn clear_staged_stems(&mut self) {
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.align(0);
+        }
+    }
+
+    /// Stage, for the samples `frame_samples` holds, samples that stand for
+    /// them: after a load replaced them.
+    pub(super) fn align_stems(&mut self) {
+        let samples = self.frame_samples.len() / 2;
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.align(samples);
+        }
+    }
+}
 
 impl Ym2612 {
     /// Render every whole output sample owed for the clocks accumulated since the
@@ -32,6 +148,9 @@ impl Ym2612 {
         if self.frame_samples.len() > MAX_FRAME_SAMPLES {
             let excess = self.frame_samples.len() - MAX_FRAME_SAMPLES;
             self.frame_samples.drain(..excess);
+            if let Some(stems) = self.stems.as_deref_mut() {
+                stems.drop_oldest(excess / 2);
+            }
         }
     }
 
@@ -86,6 +205,16 @@ impl Ym2612 {
 
         let left_sample = left_sum.clamp(-1.0, 1.0);
         let right_sample = right_sum.clamp(-1.0, 1.0);
+
+        if let Some(stems) = self.stems.as_deref_mut() {
+            let clamped = left_sample != left_sum || right_sample != right_sum;
+            stems.record(
+                &self.channel_outputs,
+                self.dac_enabled,
+                &self.mute_flags,
+                clamped,
+            );
+        }
 
         let abs_l = left_sample.abs();
         let abs_r = right_sample.abs();

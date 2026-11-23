@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 
+use crate::audio::stems::{StemLayout, StemSet, StemTake};
 use crate::EmulatorCore;
 
 /// The sound hooks a host calls on a machine, beside the capture's
@@ -15,6 +16,25 @@ pub trait SoundCore: EmulatorCore {
     /// it writes `run_frame`, so the frame loop is compiled in the core's
     /// crate and not again in a binding that calls it.
     fn render_frame(&mut self);
+
+    /// The stems the machine takes, `None` for a console that takes none.
+    fn stem_layout(&self) -> Option<StemLayout> {
+        None
+    }
+
+    /// Record `stems`, each one's samples and the master's, from the next
+    /// frame's start, or from now while the machine stands between two
+    /// frames; an empty set disarms. Arming another set drops what was
+    /// held and not taken.
+    fn arm_stems(&mut self, stems: StemSet) {
+        let _ = stems;
+    }
+
+    /// What was recorded since the last take, by whole frames; `None`
+    /// while nothing is armed or held.
+    fn take_stems(&mut self) -> Option<StemTake> {
+        None
+    }
 }
 
 /// What [`render_frames`] did.

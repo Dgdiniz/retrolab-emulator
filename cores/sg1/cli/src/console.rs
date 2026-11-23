@@ -148,6 +148,7 @@ impl Console for Genesis {
         "benchmark",
         "profile",
         "audio-dump",
+        "stems",
         "audio-info",
         "sound-trace",
         "savestate",

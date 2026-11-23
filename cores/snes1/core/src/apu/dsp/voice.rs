@@ -211,6 +211,7 @@ impl SDsp {
             interpolate(&v.ring, v.position)
         };
         self.voice_output = v.envelope.apply(sample);
+        self.stem_dry[voice] = self.voice_output;
         v.envx_out = v.envelope.envx();
 
         let ending = BlockHeader::decode(self.block_header).ends_without_loop();
@@ -282,6 +283,7 @@ impl SDsp {
         };
         let volume = i32::from(self.vreg(voice, volume) as i8);
         let amount = (self.voice_output * volume) >> 7;
+        self.stem_amounts[voice][channel] = amount;
         let echo = self.echo_mask & (1 << voice) != 0;
         self.main_sum[channel] = clamp16(self.main_sum[channel] + amount);
         if echo {

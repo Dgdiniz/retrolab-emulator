@@ -47,6 +47,7 @@ use registers::{DIR, ENDX, EON, FLG, KOFF, NON, PMON};
 use schedule::{Step, VoiceStage};
 use voice::Voice;
 
+pub(super) use echo::STEM_VALUES;
 pub(super) use registers::{VoiceDebug, DSP_REG_COUNT};
 
 /// The DAC's range.
@@ -151,6 +152,13 @@ pub(super) struct SDsp {
     echo_sum: [i32; 2],
     /// What came out of the filter.
     echo_return: [i32; 2],
+
+    // What the stems read of a sample, stored by the timetable each sample
+    // and read after it ([`SDsp::stem_frame`]); not chip state, not saved.
+    /// Each voice's output after its envelope, before its volumes.
+    stem_dry: [i32; 8],
+    /// Each voice's amounts for the two channels, through its volumes.
+    stem_amounts: [[i32; 2]; 8],
 }
 
 impl Default for SDsp {
@@ -206,6 +214,8 @@ impl SDsp {
             main_sum: [0; 2],
             echo_sum: [0; 2],
             echo_return: [0; 2],
+            stem_dry: [0; 8],
+            stem_amounts: [[0; 2]; 8],
         }
     }
 

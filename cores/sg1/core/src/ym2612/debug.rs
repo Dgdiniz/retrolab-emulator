@@ -98,8 +98,12 @@ impl AudioDebugger for Ym2612 {
             return vec![0.0; samples as usize];
         }
 
-        // TODO: per-channel waveform buffers; without them this returns silence.
-        vec![0.0; samples as usize]
+        // The stems' tap keeps each channel's last samples while the host
+        // takes stems; otherwise there are none to show.
+        match &self.stems {
+            Some(stems) => stems.scope(channel as usize, samples),
+            None => vec![0.0; samples as usize],
+        }
     }
 
     fn get_output_waveform(&self, samples: u32) -> Vec<f32> {

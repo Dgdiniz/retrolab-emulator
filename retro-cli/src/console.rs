@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::Result;
+use retro_core::audio::SoundCore;
 use retro_core::capture::CaptureCore;
 use retro_core::debug::ByteOrder;
 use retro_core::frame::DebugMachine;
@@ -19,7 +20,7 @@ use crate::trace::line::TraceLine;
 /// call it where the console does something its own way.
 pub trait Console: Sized + 'static {
     /// The machine the tool drives.
-    type Emulator: GoldenConsole + DebugMachine + CaptureCore;
+    type Emulator: GoldenConsole + DebugMachine + CaptureCore + SoundCore;
     /// The flags every command of this tool that loads a ROM takes.
     type BootArgs: clap::Args + Clone + Debug + Default;
     /// The flags only this console's `screenshot` takes.

@@ -62,6 +62,7 @@ impl Ym2612 {
         self.current_cpu_cycle = s.current_cpu_cycle;
         self.timers.from_savestate(&s.timer);
         self.frame_samples.clear();
+        self.align_stems();
     }
 
     /// What the chip holds that the layout has no field for: the busy time
@@ -82,5 +83,6 @@ impl Ym2612 {
         self.busy_counter = extension.busy;
         self.frame_samples.clear();
         self.frame_samples.extend_from_slice(&extension.samples);
+        self.align_stems();
     }
 }

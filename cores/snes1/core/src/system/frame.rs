@@ -307,6 +307,8 @@ impl SnesEmulator {
                 // samples through the resampler into the host audio ring.
                 hooks.chip_start("APU");
                 self.bus.apu_mut().catch_up_to(self.master_cycles);
+                // The stems keep the frames the host is shown.
+                self.bus.apu_mut().stems_frame_end(self.present);
                 hooks.chip_finish(0);
                 // The APU catch-up above advances all serialized audio
                 // state; only the host-ring drain (resample) is

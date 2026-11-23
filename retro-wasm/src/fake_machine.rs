@@ -455,6 +455,7 @@ pub(crate) struct FakeMachine {
     unsupported_chip: Option<&'static str>,
     show_overscan: bool,
     memory: Vec<u8>,
+    stems: retro_core::audio::StemRecorder<f32>,
     video: FakeVideo,
     sound: [FakeSound; 2],
     debugger: DebuggerState<1, ()>,
@@ -526,6 +527,7 @@ impl FakeMachine {
             unsupported_chip: None,
             show_overscan: false,
             memory: (0..=255).collect(),
+            stems: retro_core::audio::StemRecorder::new(&fake_stem_layout(), 16),
             video: FakeVideo {
                 vram: (0..32).collect(),
                 palette: [0x0102, 0x0304, 0x0506, 0x0708],
@@ -551,7 +553,10 @@ impl FakeMachine {
         self.framebuffer.data.fill(self.frames as u8);
         if self.audio_enabled {
             self.host_audio.push_slice(&[0.25, -0.25]);
+            // One sample frame: the main stem (0.25, -0.5), the second 0.5.
+            self.stems.push(&[0.25, -0.5, 0.5], [0.75, 0.0], false);
         }
+        self.stems.frame_end(true);
     }
 
     /// Mark the battery save written, as a game's write would.
@@ -560,9 +565,41 @@ impl FakeMachine {
     }
 }
 
+/// The fake's stems: a stereo one of the main chip and a mono one of the
+/// second, which the master is the sum of.
+fn fake_stem_layout() -> retro_core::audio::StemLayout {
+    use retro_core::audio::{SampleKind, StemChannel, StemLayout, StemSum};
+    let stem = |name, chip, stereo| StemChannel {
+        name,
+        chip,
+        channel: chip.map(|_| 0),
+        stereo,
+        in_master: chip.is_some(),
+    };
+    StemLayout {
+        rate: 1000,
+        kind: SampleKind::F32,
+        channels: vec![stem("main", Some(0), true), stem("second", Some(1), false)],
+        master: stem("master", None, true),
+        sum: StemSum::Exact,
+    }
+}
+
 impl retro_core::audio::SoundCore for FakeMachine {
     fn render_frame(&mut self) {
         self.frame();
+    }
+
+    fn stem_layout(&self) -> Option<retro_core::audio::StemLayout> {
+        Some(fake_stem_layout())
+    }
+
+    fn arm_stems(&mut self, stems: retro_core::audio::StemSet) {
+        self.stems.arm(stems, true);
+    }
+
+    fn take_stems(&mut self) -> Option<retro_core::audio::StemTake> {
+        self.stems.take()
     }
 }
 

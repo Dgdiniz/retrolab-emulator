@@ -13,8 +13,13 @@
 //! The first check holds the sound moment to its word: every chip makes
 //! sound after it, so that no other check passes for want of anything to
 //! hear. A mute, the rules say, is the host's mix's alone: it changes
-//! nothing the machine holds, and it lasts until the host lifts it.
+//! nothing the machine holds, and it lasts until the host lifts it. Stems
+//! only read: armed, they change nothing the machine holds or the host
+//! hears; they hold whole frames, every stem as many sample frames as the
+//! master; and they add up to the master by the layout's rule wherever the
+//! take counts no departure.
 
+use crate::audio::stems::{SampleKind, StemLayout, StemSet, StemTake};
 use crate::audio::{render_frames, SoundCore};
 use crate::types::{Breakpoint, BreakpointType, ExecutionMode};
 
@@ -78,6 +83,9 @@ macro_rules! sound_conformance_tests {
             the_render_runs_the_player_s_loop,
             a_mute_is_the_mixer_s,
             a_mute_is_the_host_s,
+            stems_change_nothing,
+            stems_cover_whole_frames,
+            stems_sum_to_the_master,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -132,6 +140,35 @@ fn host_peak<E: SoundCore>(emu: &mut E) -> f32 {
     emu.get_audio_samples()
         .iter()
         .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+}
+
+/// The machine's stems, which a core that runs the stem checks has.
+fn layout_of<E: SoundCore>(emu: &E) -> StemLayout {
+    emu.stem_layout()
+        .expect("the console takes stems: its layout is not None")
+}
+
+/// Every stem and the master of `take` hold `take.frames` sample frames.
+fn assert_whole(take: &StemTake, layout: &StemLayout, what: &str) {
+    assert_eq!(
+        take.stems.len(),
+        take.armed.len(),
+        "{what}: a buffer per armed stem"
+    );
+    for (stem, index) in take.stems.iter().zip(take.armed.iter()) {
+        let channel = &layout.channels[index];
+        assert_eq!(
+            stem.len(),
+            take.frames as usize * channel.width(),
+            "{what}: stem {} holds the take's sample frames",
+            channel.name
+        );
+    }
+    assert_eq!(
+        take.master.len(),
+        take.frames as usize * 2,
+        "{what}: the master holds the take's sample frames"
+    );
 }
 
 // -- The checks ----------------------------------------------------------
@@ -285,4 +322,125 @@ pub fn a_mute_is_the_host_s<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
     emu.run_frame();
     mute_all_but(&mut emu, None, false);
     assert_all_muted(&mut emu, false, "the host lifted them");
+}
+
+/// Stems change nothing: with every stem armed and taken after each frame,
+/// each frame's state hash, the host's samples and their count are those
+/// of a machine with no stem armed.
+pub fn stems_change_nothing<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut armed = core.playing();
+    let mut plain = core.playing();
+    let layout = layout_of(&armed);
+    armed.arm_stems(layout.all());
+    let mut taken = 0u32;
+    for frame in 1..=FRAMES {
+        armed.render_frame();
+        plain.render_frame();
+        taken += armed.take_stems().expect("stems armed").frames;
+        assert_eq!(
+            armed.state_hash(),
+            plain.state_hash(),
+            "frame {frame}: the machine with every stem armed parted from the plain one"
+        );
+        assert_eq!(
+            armed.get_audio_samples().to_vec(),
+            plain.get_audio_samples().to_vec(),
+            "frame {frame}: the host heard something else with every stem armed"
+        );
+    }
+    assert!(taken > 0, "the stems recorded the frames");
+}
+
+/// Stems cover whole frames: armed while a frame runs, they start at the
+/// next frame's start; every stem and the master hold as many sample
+/// frames; and a frame the host is not shown is left out.
+pub fn stems_cover_whole_frames<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut emu = core.playing();
+    let layout = layout_of(&emu);
+    // A frame begun and left running: the main processor stepped.
+    for _ in 0..16 {
+        emu.step_cpu(0);
+    }
+    emu.arm_stems(layout.all());
+    let take = emu.take_stems().expect("stems armed");
+    assert_eq!(
+        take.frames, 0,
+        "armed during a frame, nothing before its end"
+    );
+    emu.render_frame();
+    let take = emu.take_stems().expect("stems armed");
+    assert_eq!(take.frames, 0, "the frame running when armed is not taken");
+    emu.render_frame();
+    let take = emu.take_stems().expect("stems armed");
+    assert!(take.frames > 0, "a whole frame was taken");
+    assert_eq!(take.armed, layout.all());
+    assert_whole(&take, &layout, "a frame");
+    let one = take.frames;
+    emu.run_frame_headless();
+    emu.render_frame();
+    let take = emu.take_stems().expect("stems armed");
+    assert_whole(&take, &layout, "a headless frame, then a frame");
+    assert!(
+        take.frames <= one + one / 8 && take.frames + take.frames / 8 >= one,
+        "a headless frame is left out: {} sample frames after it, {one} for one frame",
+        take.frames
+    );
+    emu.arm_stems(StemSet::EMPTY);
+    assert_eq!(emu.take_stems(), None, "disarmed, nothing is held");
+}
+
+/// Stems sum to the master: on every sample frame the take counts no
+/// departure, the sum of the stems that are the master's parts, a mono
+/// stem added to both sides, is the master within the layout's rule; and
+/// the check has something to check.
+pub fn stems_sum_to_the_master<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut emu = core.playing();
+    let layout = layout_of(&emu);
+    emu.arm_stems(layout.all());
+    emu.render_frame();
+    let _ = emu.take_stems();
+    let tolerance = layout.sum.tolerance(layout.kind);
+    let unit = match layout.kind {
+        SampleKind::I16 => 1.0 / 32768.0,
+        SampleKind::F32 => 1.0,
+    };
+    let (mut checked, mut loudest) = (0u64, 0.0f64);
+    for frame in 1..=FRAMES {
+        emu.render_frame();
+        let take = emu.take_stems().expect("stems armed");
+        assert_whole(&take, &layout, "a frame");
+        for sample in 0..take.frames {
+            if take.departs(sample) {
+                continue;
+            }
+            for side in 0..2usize {
+                let mut sum = 0.0f64;
+                for (stem, index) in take.stems.iter().zip(take.armed.iter()) {
+                    if !layout.channels[index].in_master {
+                        continue;
+                    }
+                    let width = layout.channels[index].width();
+                    let at = sample as usize * width + side.min(width - 1);
+                    sum += stem.value(at);
+                }
+                let master = take.master.value(sample as usize * 2 + side);
+                loudest = loudest.max(master.abs() * unit);
+                assert!(
+                    (master - sum).abs() <= tolerance,
+                    "frame {frame}, sample frame {sample}, side {side}: the master is {master}, \
+                     the stems sum to {sum} ({:?})",
+                    layout.sum
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "every sample frame departed: nothing was checked"
+    );
+    assert!(
+        loudest >= f64::from(SOUND_PEAK),
+        "the master was silence (peak {loudest}): the check has nothing to bite on"
+    );
 }

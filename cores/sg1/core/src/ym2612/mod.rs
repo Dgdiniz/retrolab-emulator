@@ -29,6 +29,7 @@ pub use channel::{Channel, StereoFlags};
 pub use envelope::{EnvelopeGenerator, EnvelopeState};
 pub use lfo::Lfo;
 pub use operator::Operator;
+pub use synthesis::YM_STEM_VALUES;
 pub use tables::SINE_TABLE;
 pub use timers::Timers;
 
@@ -190,6 +191,10 @@ pub struct Ym2612 {
     /// disabled (zero overhead, no allocation). Transient diagnostic for the
     /// `sg1-cli sound-trace` cross-core timing diff, never serialized.
     sound_write_log: Option<Vec<FmWrite>>,
+
+    /// The stems' tap while the host takes stems (`synthesis::YmStems`):
+    /// each sample's channels staged beside `frame_samples`. Not saved.
+    stems: Option<Box<synthesis::YmStems>>,
 }
 
 /// A single YM2612 data-port write captured by the optional sound-write log.
@@ -255,6 +260,7 @@ impl Ym2612 {
             current_cpu_cycle: 0,
             rendering_enabled: true,
             sound_write_log: None,
+            stems: None,
         }
     }
 
@@ -365,6 +371,9 @@ impl Ym2612 {
         self.busy_counter = 0;
         self.busy_end_cycle = 0;
         self.frame_samples.clear();
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.align(0);
+        }
         self.dac_start_value = 0;
         self.ch3_mode = 0;
         self.ch3_fnum = [0; 4];

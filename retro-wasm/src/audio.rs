@@ -5,8 +5,11 @@
 //!
 //! [`audio_bindings!`]: crate::audio_bindings
 
-use retro_core::audio::{AudioChipInfo, ChannelState};
+use retro_core::audio::{AudioChipInfo, ChannelState, SoundSamples, StemTake};
 use retro_core::EmulatorCore;
+use wasm_bindgen::JsValue;
+
+use crate::js::{int16_array, plain_object, uint32_array};
 
 /// Every sound chip's description, chip 0 the console's main chip.
 pub fn chips<E: EmulatorCore>(core: &mut E) -> Vec<AudioChipInfo> {
@@ -32,6 +35,39 @@ pub fn chip_channels<E: EmulatorCore>(
     )
 }
 
+/// A buffer of samples for the host: an `Int16Array` or a `Float32Array`,
+/// as the console makes them, copied.
+pub fn samples_array(samples: &SoundSamples) -> JsValue {
+    match samples {
+        SoundSamples::I16(values) => int16_array(values),
+        SoundSamples::F32(values) => js_sys::Float32Array::from(&values[..]).into(),
+    }
+}
+
+/// A take of the stems for the host: `{ frames, armed, stems, master,
+/// departures, dropped }`, each stem and the master a buffer of the
+/// console's samples ([`samples_array`]), stereo ones interleaved, and the
+/// departures a `Uint32Array` of `[start, frames]` pairs.
+pub fn stem_take(take: &StemTake) -> JsValue {
+    let stems = js_sys::Array::new();
+    for stem in &take.stems {
+        stems.push(&samples_array(stem));
+    }
+    let departures: Vec<u32> = take
+        .departures
+        .iter()
+        .flat_map(|span| [span.start, span.frames])
+        .collect();
+    plain_object(&[
+        ("frames", JsValue::from(take.frames)),
+        ("armed", JsValue::from(take.armed.bits() as f64)),
+        ("stems", stems.into()),
+        ("master", samples_array(&take.master)),
+        ("departures", uint32_array(&departures)),
+        ("dropped", JsValue::from(take.dropped as f64)),
+    ])
+}
+
 /// Writes the host's sound methods on `$emulator`, over the `EmulatorCore`
 /// in its field `$core`: `getAudioSamples()`, `getAudioSamplesN(n)`,
 /// `getAudioAvailable()`, `getAudioRingOverflows()`, `clearAudioBuffer()`
@@ -42,7 +78,8 @@ pub fn chip_channels<E: EmulatorCore>(
 /// `muteAudioChipChannel(chip, channel, muted)`,
 /// `getAudioChipWaveform(chip, channel, samples)` and
 /// `getAudioOutputWaveform(samples)`, the mixed sound; and the sound hooks
-/// over `SoundCore`: `renderFrames(frames)`, and the associated
+/// over `SoundCore`: `renderFrames(frames)`, the stems' `getStemLayout()`,
+/// `armStems(mask)` and `takeStems()`, and the associated
 /// `encodeWav(samples, sampleRate, channels)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
@@ -226,6 +263,52 @@ macro_rules! audio_bindings {
                     &mut self.$core,
                     frames,
                 ))
+            }
+
+            /// The stems the console takes, `{ rate, kind, channels, master,
+            /// sum }` (each channel `{ name, chip, channel, stereo,
+            /// in_master }`, stem `n` the layout's channel `n`), or `null`
+            /// for a console that takes none.
+            #[wasm_bindgen(js_name = getStemLayout)]
+            pub fn get_stem_layout(&self) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::audio::SoundCore::stem_layout(&self.$core) {
+                    ::core::option::Option::Some(layout) => $crate::js::to_js(&layout),
+                    ::core::option::Option::None => {
+                        $crate::__private::wasm_bindgen::JsValue::NULL
+                    }
+                }
+            }
+
+            /// Record the stems whose bits `mask` sets, stem `n` bit `n`,
+            /// each one's samples and the master's, from the next frame's
+            /// start, or at once while the machine stands between two
+            /// frames; `0` disarms. Arming another set drops what was held
+            /// and not taken.
+            #[wasm_bindgen(js_name = armStems)]
+            pub fn arm_stems(&mut self, mask: u32) {
+                $crate::__private::retro_core::audio::SoundCore::arm_stems(
+                    &mut self.$core,
+                    $crate::__private::retro_core::audio::StemSet::from_bits(
+                        ::core::primitive::u64::from(mask),
+                    ),
+                );
+            }
+
+            /// What the stems recorded since the last take, by whole
+            /// frames: `{ frames, armed, stems, master, departures,
+            /// dropped }`, each stem and the master an `Int16Array` or a
+            /// `Float32Array` (the layout's kind), stereo ones
+            /// interleaved, and the departures a `Uint32Array` of
+            /// `[start, frames]` pairs; `null` while nothing is armed or
+            /// held.
+            #[wasm_bindgen(js_name = takeStems)]
+            pub fn take_stems(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::audio::SoundCore::take_stems(&mut self.$core) {
+                    ::core::option::Option::Some(take) => $crate::audio::stem_take(&take),
+                    ::core::option::Option::None => {
+                        $crate::__private::wasm_bindgen::JsValue::NULL
+                    }
+                }
             }
 
             /// Interleaved samples in [-1, 1] as a WAV file's bytes: 16-bit

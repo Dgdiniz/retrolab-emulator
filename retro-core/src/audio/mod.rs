@@ -16,6 +16,7 @@ pub mod rate_converter;
 pub mod resample;
 pub mod ring_buffer;
 pub mod sound_core;
+pub mod stems;
 pub mod wav;
 
 pub use buffer::ChipSampleBuffer;
@@ -26,7 +27,11 @@ pub use rate_converter::{IntegerRateConverter, RateConverterState};
 pub use resample::LinearResampler;
 pub use ring_buffer::AudioRingBuffer;
 pub use sound_core::{render_frames, RenderReport, SoundCore};
-pub use wav::encode_wav;
+pub use stems::{
+    SampleKind, SampleSpan, ScopeRing, SoundSamples, StemChannel, StemLayout, StemRecorder,
+    StemSet, StemSum, StemTake,
+};
+pub use wav::{encode_wav, encode_wav_samples};
 
 /// Audio channel state (expanded for comprehensive debugging).
 #[derive(Debug, Clone, Serialize, Deserialize)]

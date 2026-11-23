@@ -117,6 +117,11 @@ pub struct GenesisEmulator {
     /// Mixed waveform ring buffer for visualization (mono, last N samples)
     mixed_waveform_buffer: std::collections::VecDeque<f32>,
 
+    /// The stems the host armed and what they recorded: the chips' taps
+    /// staged, taken at the mix of each frame the host is shown. A host
+    /// setting, not saved.
+    stems: retro_core::audio::StemRecorder<f32>,
+
     /// Previous step's total CPU cycles (including any VDP wait states).
     /// Used to tick the VDP FIFO drain at the start of the next step.
     last_step_cycles: u32,
@@ -288,6 +293,7 @@ impl GenesisEmulator {
             ym_sample_buf: vec![0.0; 2048],
             mix_sample_buf: vec![0.0; 2048],
             mixed_waveform_buffer: std::collections::VecDeque::with_capacity(2048),
+            stems: audio::stem_recorder(44100),
 
             // Previous step's total cycles for FIFO drain timing
             last_step_cycles: 0,
@@ -428,6 +434,8 @@ impl GenesisEmulator {
             .set_rendering_enabled(self.audio_enabled);
         self.bus.psg_mut().set_rendering_enabled(self.audio_enabled);
         mutes.apply(self);
+        // And stage what the host's stems take.
+        self.set_stem_taps(self.stems.is_armed());
         // The new VDP records what the host asked the old one to.
         self.bus
             .vdp_mut()

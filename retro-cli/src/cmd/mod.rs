@@ -17,6 +17,7 @@ pub mod run;
 pub mod savestate;
 pub mod screenshot;
 pub mod sram;
+pub mod stems;
 pub mod trace;
 pub mod trace_to_text;
 pub mod watch_ram;

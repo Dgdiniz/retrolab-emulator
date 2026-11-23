@@ -975,10 +975,13 @@ impl EmulatorCore for SnesEmulator {
         // tearing the emulator down), replace the bus wholesale with
         // a fresh instance so every page resets to `OpenBus` before
         // the new cart claims its slots.
-        // The new bus's APU keeps the channels the host muted.
+        // The new bus's APU keeps the channels the host muted, and the
+        // stems the host takes.
         let mutes = ChannelMutes::of(self);
+        let stems = self.bus.apu_mut().take_stem_state();
         self.bus = SnesBus::new();
         mutes.apply(self);
+        self.bus.apu_mut().restore_stem_state(stems);
         self.bus.install_cartridge(cart);
         // The header's region: the timing profile, and the PAL bit STAT78
         // (`$213F` bit 4) reports.

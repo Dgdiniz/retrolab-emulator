@@ -132,6 +132,7 @@ impl Console for Snes {
         "ppu-dump",
         "apu-dump",
         "audio-dump",
+        "stems",
         "singlestep-65816",
         "singlestep-spc700",
         "benchmark",

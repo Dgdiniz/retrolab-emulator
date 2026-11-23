@@ -102,11 +102,15 @@ impl AudioDebugger for Apu {
         if channel >= VOICE_COUNT || n == 0 {
             return vec![0.0; n];
         }
-        // The DSP sums all eight voices into a single ring before it is
-        // captured, so a true per-voice tap isn't retained. Approximate
-        // it by scaling the mixed output by this voice's instantaneous
-        // normalized amplitude (envelope x peak volume); a muted or
-        // keyed-off voice therefore reads as silence.
+        // While the host takes the voice's dry stem, its last samples are
+        // the voice's own, before its volumes.
+        if let Some(scope) = self.voice_scope(channel as usize) {
+            return scope.read(samples);
+        }
+        // Otherwise the DSP keeps no voice's samples apart from the mix.
+        // Approximate it by scaling the mixed output by this voice's
+        // instantaneous normalized amplitude (envelope x peak volume); a
+        // muted or keyed-off voice therefore reads as silence.
         let vd = self.state.dsp.voice_debug(channel as usize);
         if vd.muted {
             return vec![0.0; n];

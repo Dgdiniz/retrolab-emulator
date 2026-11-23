@@ -11,13 +11,17 @@
 //!   writes taken after every frame as a host takes them;
 //! - **host-steps**: a frame at a time in host steps of the main CPU, as a
 //!   debugger steps, each with its history and the CPU states written; at
-//!   most as many frames as fit in 15 seconds.
+//!   most as many frames as fit in 15 seconds;
+//! - **fast-sound**: the play tier with the sound on and every sound hook
+//!   armed (every stem), what they record taken after every frame as a
+//!   sound tool takes it.
 //!
 //! Each row's block, then a summary of the rows against the fast one.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use retro_core::audio::{SoundCore, StemSet};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::debug::MAIN_CPU;
 use retro_core::frame::run_frame_on;
@@ -49,6 +53,9 @@ pub enum Mode {
     FastRecording,
     /// Host steps of the main CPU, as a debugger steps.
     HostSteps,
+    /// Fast path with the sound on and every sound hook armed (every
+    /// stem), what they record taken every frame, as a sound tool takes it.
+    FastSound,
 }
 
 #[derive(clap::Args, Debug)]
@@ -212,6 +219,28 @@ pub fn run<C: Console>(args: BenchmarkArgs<C::BootArgs>) -> Result<()> {
         });
     }
 
+    if wants(Mode::FastSound) {
+        let arm = |emu: &mut C::Emulator| {
+            emu.set_audio_enabled(true);
+            if let Some(layout) = emu.stem_layout() {
+                emu.arm_stems(layout.all());
+            }
+        };
+        let frame = |emu: &mut C::Emulator| {
+            run_frame_on(emu, ExecutionTier::Play);
+            std::hint::black_box(emu.take_stems());
+            let _ = emu.get_audio_samples();
+        };
+        rows.push(measure(
+            &mut emu,
+            "fast+sound",
+            "Play + sound hooks",
+            frames,
+            arm,
+            frame,
+        ));
+    }
+
     for row in &rows {
         print_block(row, host_steps_asked.filter(|_| row.label == "host-steps"));
     }
@@ -221,7 +250,7 @@ pub fn run<C: Console>(args: BenchmarkArgs<C::BootArgs>) -> Result<()> {
 
 /// A row: the machine reset and cleared, `arm` setting what the row
 /// measures, then `frame` called `frames` times and timed.
-fn measure<E: EmulatorCore + CaptureCore>(
+fn measure<E: EmulatorCore + CaptureCore + SoundCore>(
     emu: &mut E,
     label: &'static str,
     summary: &'static str,
@@ -248,8 +277,9 @@ fn measure<E: EmulatorCore + CaptureCore>(
 /// Reset the machine and clear what an earlier row armed (the recorders,
 /// the breakpoints, the traces), the debugger running, so each row picks
 /// its tier from a clean slate.
-fn make_clean<E: EmulatorCore + CaptureCore>(emu: &mut E) {
+fn make_clean<E: EmulatorCore + CaptureCore + SoundCore>(emu: &mut E) {
     emu.set_capture_recording(CaptureRecording::default());
+    emu.arm_stems(StemSet::EMPTY);
     emu.reset();
     let cpus = emu.system_info().cpus.len();
     let debugger = emu.debugger();

@@ -2,13 +2,14 @@
 //! and write it as a 16-bit PCM stereo WAV, with its loudness: the peak,
 //! the RMS and the clipped samples, and a warning when it is silent, so a
 //! sound driver that loaded but never played shows without opening the
-//! file.
+//! file. `--native` writes the console's own output instead, at its own
+//! rate and in its own samples: the master its stems record.
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use retro_core::audio::encode_wav;
+use retro_core::audio::{encode_wav, encode_wav_samples, SoundCore, StemSet};
 use retro_core::EmulatorCore;
 
 use crate::audio::AudioStats;
@@ -36,6 +37,9 @@ pub struct AudioDumpArgs<B: clap::Args> {
     /// refused, since the samples are not resampled.
     #[arg(long)]
     pub sample_rate: Option<u32>,
+    /// Write the console's own output at its own rate.
+    #[arg(long, conflicts_with = "sample_rate")]
+    pub native: bool,
     /// Show a progress bar (on stderr).
     #[arg(long)]
     pub progress: bool,
@@ -50,6 +54,9 @@ pub fn run<C: Console>(args: AudioDumpArgs<C::BootArgs>) -> Result<()> {
     let input = args.input.plan::<C::Emulator>()?;
 
     let (_, mut emu) = load::<C>(&args.rom)?;
+    if args.native {
+        return run_native::<C>(args, &mut emu, input, frames);
+    }
     let sample_rate = emu.get_audio_info().sample_rate;
     if let Some(asked) = args.sample_rate {
         if asked != sample_rate {
@@ -76,7 +83,39 @@ pub fn run<C: Console>(args: AudioDumpArgs<C::BootArgs>) -> Result<()> {
     }
     progress::finish(bar);
 
-    let stats = AudioStats::analyze(&samples);
+    report(&samples, sample_rate, frames);
+    let wav = encode_wav(&samples, sample_rate, CHANNELS);
+    write(&args.output, &wav)
+}
+
+/// `--native`: the master of the console's stems, which records it, every
+/// frame taken.
+fn run_native<C: Console>(
+    args: AudioDumpArgs<C::BootArgs>,
+    emu: &mut C::Emulator,
+    input: crate::input::InputPlan,
+    frames: u64,
+) -> Result<()> {
+    let Some(layout) = emu.stem_layout() else {
+        anyhow::bail!("{} takes no stems: it has no output of its own", C::TOOL);
+    };
+    write_banner(emu, &mut std::io::stdout())?;
+    // The stems' recorder keeps the master beside any stem; one is enough.
+    let take = crate::cmd::stems::record(
+        emu,
+        StemSet::EMPTY.with(0),
+        frames,
+        |emu, frame| input.before_frame(emu, frame),
+        args.progress,
+    )?;
+    report(&take.master.to_f32(), layout.rate, frames);
+    let wav = encode_wav_samples(&take.master, layout.rate, CHANNELS);
+    write(&args.output, &wav)
+}
+
+/// The sound's length and loudness, and a warning when it is silent.
+fn report(samples: &[f32], sample_rate: u32, frames: u64) {
+    let stats = AudioStats::analyze(samples);
     let sample_frames = samples.len() / usize::from(CHANNELS);
     println!(
         "Captured {sample_frames} stereo sample frames ({:.2}s @ {sample_rate} Hz)",
@@ -100,13 +139,15 @@ pub fn run<C: Console>(args: AudioDumpArgs<C::BootArgs>) -> Result<()> {
             stats.peak
         );
     }
+}
 
-    let wav = encode_wav(&samples, sample_rate, CHANNELS);
-    let mut out = open_output(Some(&args.output))?;
-    out.write_all(&wav)
-        .with_context(|| format!("failed to write WAV: {}", args.output.display()))?;
+/// Write the WAV's bytes to `path`, and say so.
+fn write(path: &std::path::Path, wav: &[u8]) -> Result<()> {
+    let mut out = open_output(Some(path))?;
+    out.write_all(wav)
+        .with_context(|| format!("failed to write WAV: {}", path.display()))?;
     out.flush()
-        .with_context(|| format!("failed to write WAV: {}", args.output.display()))?;
-    println!("Wrote {} bytes to {}", wav.len(), args.output.display());
+        .with_context(|| format!("failed to write WAV: {}", path.display()))?;
+    println!("Wrote {} bytes to {}", wav.len(), path.display());
     Ok(())
 }

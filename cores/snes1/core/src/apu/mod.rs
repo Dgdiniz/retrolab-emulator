@@ -49,7 +49,10 @@ mod dsp;
 mod ipl;
 mod timers;
 
-use retro_core::audio::{AudioRingBuffer, IntegerRateConverter};
+use retro_core::audio::{
+    AudioRingBuffer, IntegerRateConverter, SampleKind, ScopeRing, StemChannel, StemLayout,
+    StemRecorder, StemSet, StemSum, StemTake,
+};
 use retro_core::cpu::Addressable;
 use spc700::Spc700;
 
@@ -80,6 +83,87 @@ const AUDIO_RING_CAPACITY: usize = 8192;
 /// real region clock (NTSC vs PAL) is bound in [`Apu::reset`], which
 /// every boot path runs before the APU is stepped.
 const DEFAULT_MASTER_CLOCK_HZ: u64 = 21_477_270;
+
+/// The stems, in index order: each voice through its volumes and the main
+/// volume, each voice's output before its volumes (which the master holds
+/// through the first eight), and the echo through the echo volume.
+const STEM_CHANNELS: [StemChannel; 17] = [
+    voice("voice0", 0, true),
+    voice("voice1", 1, true),
+    voice("voice2", 2, true),
+    voice("voice3", 3, true),
+    voice("voice4", 4, true),
+    voice("voice5", 5, true),
+    voice("voice6", 6, true),
+    voice("voice7", 7, true),
+    voice("voice0-dry", 0, false),
+    voice("voice1-dry", 1, false),
+    voice("voice2-dry", 2, false),
+    voice("voice3-dry", 3, false),
+    voice("voice4-dry", 4, false),
+    voice("voice5-dry", 5, false),
+    voice("voice6-dry", 6, false),
+    voice("voice7-dry", 7, false),
+    StemChannel {
+        name: "echo",
+        chip: Some(0),
+        channel: None,
+        stereo: true,
+        in_master: true,
+    },
+];
+
+/// The first dry stem: voice `n`'s is `DRY_STEMS + n`.
+const DRY_STEMS: usize = 8;
+
+/// A voice's stem: through its volumes (stereo, one of the master's
+/// parts), or before them (mono, dry).
+const fn voice(name: &'static str, channel: u8, stereo: bool) -> StemChannel {
+    StemChannel {
+        name,
+        chip: Some(0),
+        channel: Some(channel),
+        stereo,
+        in_master: stereo,
+    }
+}
+
+/// The stems the host armed on the S-DSP and what they recorded: each
+/// sample's voices and echo beside the sample the DSP output, and each
+/// voice's last dry samples for its waveform. A host setting, not saved.
+pub(crate) struct ApuStems {
+    recorder: StemRecorder<i16>,
+    /// Voice 0's left amount and dry output for the next sample.
+    carry: [i32; 2],
+    /// Whether `carry` follows the DSP: a load or a reset puts the DSP
+    /// somewhere the carry did not come from, and the sample after it
+    /// departs.
+    carried: bool,
+    scopes: [ScopeRing; 8],
+}
+
+impl ApuStems {
+    fn new() -> Self {
+        Self {
+            recorder: StemRecorder::new(&Apu::stem_layout(), DSP_SAMPLE_RATE_HZ as u32 * 2),
+            carry: [0; 2],
+            carried: false,
+            scopes: std::array::from_fn(|_| ScopeRing::new()),
+        }
+    }
+
+    /// One sample, `master` the one the DSP output.
+    #[inline]
+    pub(in crate::apu) fn record(&mut self, dsp: &dsp::SDsp, master: (i16, i16)) {
+        let mut values = [0i16; dsp::STEM_VALUES];
+        let mut departs = dsp.stem_frame(&mut self.carry, master, &mut values);
+        departs |= !std::mem::replace(&mut self.carried, true);
+        for (scope, &dry) in self.scopes.iter_mut().zip(&values[16..24]) {
+            scope.push(f32::from(dry) / 32768.0);
+        }
+        self.recorder.push(&values, [master.0, master.1], departs);
+    }
+}
 
 /// The Audio Processing Unit.
 ///
@@ -112,6 +196,8 @@ pub struct Apu {
     /// reachable from inside `catch_up_to`, which runs deep in a mailbox
     /// access).
     spc_trace_buf: Vec<TraceEntryBinarySpc700>,
+    /// The stems, once the host armed any.
+    stems: Option<Box<ApuStems>>,
 }
 
 impl Apu {
@@ -130,6 +216,7 @@ impl Apu {
             audio_ring: AudioRingBuffer::with_capacity(AUDIO_RING_CAPACITY),
             spc_trace_enabled: false,
             spc_trace_buf: Vec::new(),
+            stems: None,
         };
         apu.boot_spc();
         apu
@@ -147,6 +234,7 @@ impl Apu {
         self.dsp_samples_emitted = 0;
         self.audio_ring.clear();
         self.boot_spc();
+        self.stems_lose_track();
     }
 
     /// Fetch the SPC700 reset vector (from the IPL ROM, mapped in by
@@ -213,8 +301,9 @@ impl Apu {
             // to the window's drift-free target so the total never changes.
             let due = (self.apu_cycles / SPC_CYCLES_PER_DSP_SAMPLE).min(dsp_target);
             if due > self.dsp_samples_emitted {
+                let stems = self.stems.as_deref_mut().filter(|s| s.recorder.is_armed());
                 self.state
-                    .run_dsp(due - self.dsp_samples_emitted, &mut self.audio_ring);
+                    .run_dsp(due - self.dsp_samples_emitted, &mut self.audio_ring, stems);
                 self.dsp_samples_emitted = due;
             }
         }
@@ -226,8 +315,12 @@ impl Apu {
         // this top-up keeps the cumulative count exact and the cadence
         // drift-free over any run length.
         if dsp_target > self.dsp_samples_emitted {
-            self.state
-                .run_dsp(dsp_target - self.dsp_samples_emitted, &mut self.audio_ring);
+            let stems = self.stems.as_deref_mut().filter(|s| s.recorder.is_armed());
+            self.state.run_dsp(
+                dsp_target - self.dsp_samples_emitted,
+                &mut self.audio_ring,
+                stems,
+            );
             self.dsp_samples_emitted = dsp_target;
         }
         self.dsp_clock.advance(master_cycles, dsp_target);
@@ -470,6 +563,84 @@ impl Apu {
         self.apu_cycles = s.apu_cycles;
         self.dsp_samples_emitted = s.dsp_samples_emitted;
         self.audio_ring.clear();
+        self.stems_lose_track();
+    }
+
+    /// The S-DSP's stems: at its 32 kHz rate, 16-bit samples, each voice's
+    /// rounded on its own where the output rounds their sum once (one step
+    /// a voice).
+    pub fn stem_layout() -> StemLayout {
+        StemLayout {
+            rate: DSP_SAMPLE_RATE_HZ as u32,
+            kind: SampleKind::I16,
+            channels: STEM_CHANNELS.to_vec(),
+            master: StemChannel {
+                name: "master",
+                chip: None,
+                channel: None,
+                stereo: true,
+                in_master: false,
+            },
+            sum: StemSum::WithinLsb(8),
+        }
+    }
+
+    /// Record `stems` from the next frame's end, or from now when
+    /// `between_frames` ([`retro_core::audio::SoundCore::arm_stems`]).
+    pub fn arm_stems(&mut self, stems: StemSet, between_frames: bool) {
+        let state = self.stems.get_or_insert_with(|| Box::new(ApuStems::new()));
+        let was = state.recorder.is_armed();
+        state.recorder.arm(stems, between_frames);
+        if state.recorder.is_armed() && !was {
+            state.carry = self.state.dsp.stem_carry();
+            state.carried = true;
+        }
+    }
+
+    /// The end of a frame for the stems: a frame the host was not shown is
+    /// taken back out, and what the host armed since is armed.
+    pub fn stems_frame_end(&mut self, presented: bool) {
+        if let Some(state) = self.stems.as_deref_mut() {
+            let was = state.recorder.is_armed();
+            state.recorder.frame_end(presented);
+            if state.recorder.is_armed() && !was {
+                state.carry = self.state.dsp.stem_carry();
+                state.carried = true;
+            }
+        }
+    }
+
+    /// What the stems recorded since the last take, by whole frames.
+    pub fn take_stems(&mut self) -> Option<StemTake> {
+        self.stems.as_deref_mut()?.recorder.take()
+    }
+
+    /// The stems, to carry over to the APU a load builds.
+    pub(crate) fn take_stem_state(&mut self) -> Option<Box<ApuStems>> {
+        self.stems.take()
+    }
+
+    /// The stems carried over from the APU this one replaces.
+    pub(crate) fn restore_stem_state(&mut self, stems: Option<Box<ApuStems>>) {
+        self.stems = stems;
+        self.stems_lose_track();
+    }
+
+    /// Voice `voice`'s last dry samples while the host takes its dry stem.
+    pub(crate) fn voice_scope(&self, voice: usize) -> Option<&ScopeRing> {
+        let state = self.stems.as_deref()?;
+        state
+            .recorder
+            .armed()
+            .contains(DRY_STEMS + voice)
+            .then(|| &state.scopes[voice])
+    }
+
+    /// The DSP is somewhere the stems' carry did not follow it.
+    fn stems_lose_track(&mut self) {
+        if let Some(state) = self.stems.as_deref_mut() {
+            state.carried = false;
+        }
     }
 }
 

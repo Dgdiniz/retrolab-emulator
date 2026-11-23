@@ -71,6 +71,17 @@ fn fed_back(regs: &[u8; DSP_REG_COUNT], echo_sum: i32, echo_return: i32) -> i32 
     clamp16(echo_sum + fed) & !1
 }
 
+/// The values a sample gives the stems, in their order: each voice's two
+/// amounts through the main volume, each voice's dry output, and the
+/// echo's two terms through the echo volume.
+pub(in crate::apu) const STEM_VALUES: usize = 26;
+
+/// A value cut to a 16-bit sample, at the ends of its range.
+#[inline]
+fn saturated(value: i32) -> i16 {
+    value.clamp(-0x8000, 0x7fff) as i16
+}
+
 /// The 16-bit word of ARAM at `at`, little-endian, wrapping at 64 KiB.
 #[inline]
 fn aram_word(aram: &[u8], at: usize) -> i16 {
@@ -325,6 +336,61 @@ impl SDsp {
     /// Clock 30: the right half written back.
     pub(super) fn echo_write_right(&mut self, aram: &mut [u8]) {
         self.write_back(1, aram);
+    }
+
+    /// Voice 0's left amount and dry output as the timetable left them:
+    /// the next sample's, since voice 0's pass straddles the boundary.
+    pub(in crate::apu) fn stem_carry(&self) -> [i32; 2] {
+        [self.stem_amounts[0][0], self.stem_dry[0]]
+    }
+
+    /// The stems of the sample just made, into `values` in their order
+    /// ([`STEM_VALUES`]): each voice's amounts through the main volume, as
+    /// the output applies it to their sum, each voice's dry output, and the
+    /// echo's terms through the echo volume. Voice 0's left amount and dry
+    /// output were made at the end of the sample before, which `carry`
+    /// holds; it gets this sample's last ones, the next sample's. `master`
+    /// is the sample the chip output. Returns whether something moved it
+    /// away from the stems' sum: a sum that clamped as a voice was added, a
+    /// volume's cut to 16 bits, the output's clamp, FLG's mute, or the
+    /// speakers' mix leaving a muted voice out.
+    pub(in crate::apu) fn stem_frame(
+        &self,
+        carry: &mut [i32; 2],
+        master: (i16, i16),
+        values: &mut [i16; STEM_VALUES],
+    ) -> bool {
+        let mut amounts = self.stem_amounts;
+        let mut dry = self.stem_dry;
+        let next = [amounts[0][0], dry[0]];
+        [amounts[0][0], dry[0]] = *carry;
+        *carry = next;
+
+        let mut departs = false;
+        let mut chip = [0i32; 2];
+        for channel in 0..2 {
+            let main_volume = i32::from(self.regs[[MVOLL, MVOLR][channel]] as i8);
+            let echo_volume = i32::from(self.regs[[EVOLL, EVOLR][channel]] as i8);
+            let mut sum = 0;
+            for (voice, amount) in amounts.iter().enumerate() {
+                let added = sum + amount[channel];
+                sum = clamp16(added);
+                departs |= sum != added;
+                let wet = (amount[channel] * main_volume) >> 7;
+                values[voice * 2 + channel] = saturated(wet);
+                departs |= i32::from(saturated(wet)) != wet;
+            }
+            let main = (sum * main_volume) >> 7;
+            let echo = (self.echo_return[channel] * echo_volume) >> 7;
+            let (main_cut, echo_cut) = (i32::from(main as i16), i32::from(echo as i16));
+            chip[channel] = clamp16(main_cut + echo_cut);
+            departs |= main_cut != main || echo_cut != echo || chip[channel] != main_cut + echo_cut;
+            values[24 + channel] = echo_cut as i16;
+        }
+        for (voice, &output) in dry.iter().enumerate() {
+            values[16 + voice] = saturated(output);
+        }
+        departs || [i32::from(master.0), i32::from(master.1)] != chip
     }
 }
 

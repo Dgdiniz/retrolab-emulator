@@ -247,6 +247,7 @@ impl GenesisEmulator {
         hooks.chip_finish(0);
         hooks.chip_start("audio mix");
         self.generate_and_mix_audio(self.present);
+        self.end_stem_frame();
         hooks.chip_finish(0);
         if self.present {
             hooks.chip_start("framebuffer");

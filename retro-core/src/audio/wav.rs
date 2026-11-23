@@ -1,7 +1,12 @@
 //! The WAV writer: interleaved samples as a RIFF WAVE file.
 
+use crate::audio::stems::SoundSamples;
+
 /// A WAV's samples are 16-bit PCM.
 const BITS_PER_SAMPLE: u16 = 16;
+
+/// The format tag of 32-bit float samples (`WAVE_FORMAT_IEEE_FLOAT`).
+const FORMAT_FLOAT: u16 = 3;
 
 /// Interleaved `f32` samples (nominally `-1.0..=1.0`) as a 16-bit PCM WAV:
 /// the 44-byte canonical header, then the samples, each clamped to
@@ -36,6 +41,60 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     out
 }
 
+/// Interleaved samples of a console's own kind as a WAV, neither
+/// converted: 16-bit integers as 16-bit PCM (the canonical 44-byte header,
+/// each sample as it is), 32-bit floats as 32-bit float samples (a format
+/// chunk of 18 bytes and the `fact` chunk a non-PCM file carries).
+pub fn encode_wav_samples(samples: &SoundSamples, sample_rate: u32, channels: u16) -> Vec<u8> {
+    match samples {
+        SoundSamples::I16(values) => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let block_align = channels * 2;
+            let mut out = Vec::with_capacity(44 + data.len());
+            out.extend_from_slice(b"RIFF");
+            out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            out.extend_from_slice(b"WAVE");
+            out.extend_from_slice(b"fmt ");
+            out.extend_from_slice(&16u32.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&channels.to_le_bytes());
+            out.extend_from_slice(&sample_rate.to_le_bytes());
+            out.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            out.extend_from_slice(&block_align.to_le_bytes());
+            out.extend_from_slice(&16u16.to_le_bytes());
+            out.extend_from_slice(b"data");
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&data);
+            out
+        }
+        SoundSamples::F32(values) => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let block_align = channels * 4;
+            let frames = values.len() as u32 / u32::from(channels.max(1));
+            let mut out = Vec::with_capacity(58 + data.len());
+            out.extend_from_slice(b"RIFF");
+            out.extend_from_slice(&(50 + data.len() as u32).to_le_bytes());
+            out.extend_from_slice(b"WAVE");
+            out.extend_from_slice(b"fmt ");
+            out.extend_from_slice(&18u32.to_le_bytes());
+            out.extend_from_slice(&FORMAT_FLOAT.to_le_bytes());
+            out.extend_from_slice(&channels.to_le_bytes());
+            out.extend_from_slice(&sample_rate.to_le_bytes());
+            out.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            out.extend_from_slice(&block_align.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(b"fact");
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&frames.to_le_bytes());
+            out.extend_from_slice(b"data");
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&data);
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +126,42 @@ mod tests {
         assert_eq!(data_size, 8);
         assert_eq!(u32_at(&wav, 4), 36 + data_size);
         assert_eq!(wav.len(), 44 + data_size as usize);
+    }
+
+    #[test]
+    fn integer_samples_are_written_as_they_are() {
+        let wav = encode_wav_samples(&SoundSamples::I16(vec![-32768, 1, 32767, -2]), 32_000, 2);
+        assert_eq!(wav.len(), 44 + 8);
+        assert_eq!(u16_at(&wav, 20), 1, "PCM");
+        assert_eq!(u32_at(&wav, 28), 32_000 * 4, "byte rate");
+        assert_eq!(u16_at(&wav, 34), 16);
+        assert_eq!(u32_at(&wav, 40), 8);
+        assert_eq!(&wav[44..], &[0x00, 0x80, 1, 0, 0xFF, 0x7F, 0xFE, 0xFF]);
+        assert_eq!(
+            encode_wav_samples(&SoundSamples::I16(vec![1, -1]), 44_100, 2)[..44],
+            encode_wav(&[0.0, 0.0], 44_100, 2)[..44],
+            "the same header as the PCM writer's"
+        );
+    }
+
+    #[test]
+    fn float_samples_are_written_as_floats_with_their_fact_chunk() {
+        let wav = encode_wav_samples(&SoundSamples::F32(vec![0.5, -1.25, 2.0]), 44_100, 1);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32_at(&wav, 4) as usize, wav.len() - 8);
+        assert_eq!(u32_at(&wav, 16), 18, "the format chunk's size");
+        assert_eq!(u16_at(&wav, 20), 3, "IEEE float");
+        assert_eq!(u16_at(&wav, 22), 1);
+        assert_eq!(u32_at(&wav, 28), 44_100 * 4);
+        assert_eq!(u16_at(&wav, 32), 4);
+        assert_eq!(u16_at(&wav, 34), 32);
+        assert_eq!(u16_at(&wav, 36), 0, "no extension");
+        assert_eq!(&wav[38..42], b"fact");
+        assert_eq!(u32_at(&wav, 46), 3, "sample frames");
+        assert_eq!(&wav[50..54], b"data");
+        assert_eq!(u32_at(&wav, 54), 12);
+        let at = |i: usize| f32::from_le_bytes(wav[58 + 4 * i..62 + 4 * i].try_into().unwrap());
+        assert_eq!([at(0), at(1), at(2)], [0.5, -1.25, 2.0], "nothing clamped");
     }
 
     #[test]

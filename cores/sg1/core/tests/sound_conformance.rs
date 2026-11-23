@@ -4,6 +4,7 @@
 //! channel and a tone on the PSG's second.
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
+use retro_core::audio::{SoundCore, SoundSamples, StemLayout, StemTake};
 use retro_core::{EmulatorCore, ExecutionMode};
 use sg1_core::GenesisEmulator;
 
@@ -80,3 +81,96 @@ fn mega_drive() -> SoundCoreUnderTest<GenesisEmulator> {
 }
 
 retro_core::sound_conformance_tests!(mega_drive());
+
+// -- The Mega Drive's stems ----------------------------------------------
+
+/// A machine past the sound moment with every stem armed.
+fn armed() -> (GenesisEmulator, StemLayout) {
+    let mut emu = build();
+    for _ in 0..4 {
+        emu.run_frame();
+    }
+    sound_moment(&mut emu);
+    let layout = emu.stem_layout().expect("the Mega Drive takes stems");
+    emu.arm_stems(layout.all());
+    (emu, layout)
+}
+
+/// Stem `name` of a take of every stem.
+fn stem<'a>(take: &'a StemTake, layout: &StemLayout, name: &str) -> &'a [f32] {
+    match &take.stems[layout.index_of(name).expect(name)] {
+        SoundSamples::F32(samples) => samples,
+        SoundSamples::I16(_) => panic!("the Mega Drive's stems are floats"),
+    }
+}
+
+/// The master is the mix the host hears before the limiter: below the
+/// limiter's threshold, the host's very samples, and none departs.
+#[test]
+fn the_master_is_the_host_s_sound_below_the_limiter() {
+    let (mut emu, _) = armed();
+    let _ = emu.get_audio_samples();
+    emu.render_frame();
+    let take = emu.take_stems().expect("armed");
+    assert_eq!(
+        take.master,
+        SoundSamples::F32(emu.get_audio_samples().to_vec())
+    );
+    assert!(take.departures.is_empty(), "{:?}", take.departures);
+    assert!(
+        take.frames > 700,
+        "a frame's sample frames: {}",
+        take.frames
+    );
+}
+
+/// A muted channel's stem is its sound still, and its samples depart from
+/// the master, which leaves it out; the scope shows the channel too.
+#[test]
+fn a_muted_channel_keeps_its_stem_and_its_samples_depart() {
+    let (mut emu, layout) = armed();
+    emu.audio_debugger(0)
+        .expect("the YM2612")
+        .mute_channel(0, true);
+    emu.render_frame();
+    let take = emu.take_stems().expect("armed");
+    assert!(stem(&take, &layout, "fm1").iter().any(|&s| s != 0.0));
+    let departed: u32 = take.departures.iter().map(|span| span.frames).sum();
+    assert!(departed > take.frames / 2, "{departed} of {}", take.frames);
+    let psg2 = stem(&take, &layout, "psg2");
+    let SoundSamples::F32(master) = &take.master else {
+        panic!("floats")
+    };
+    for (frame, &tone) in psg2.iter().enumerate() {
+        assert_eq!(
+            master[frame * 2],
+            tone,
+            "the master is the PSG's tone alone"
+        );
+    }
+    let wave = emu
+        .audio_debugger(0)
+        .expect("the YM2612")
+        .get_waveform(0, 64);
+    assert!(
+        wave.iter().any(|&s| s != 0.0),
+        "the scope shows the channel"
+    );
+}
+
+/// While the DAC plays in channel 6's place the `dac` stem holds it, as
+/// it enters the master, and channel 6's FM stem is silent.
+#[test]
+fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
+    let (mut emu, layout) = armed();
+    let ym = emu.ym2612_mut();
+    for (port, register, value) in [(2, 0xB6, 0xC0), (0, 0x2B, 0x80), (0, 0x2A, 0xF0)] {
+        ym.write_port(port, register);
+        ym.write_port(port + 1, value);
+    }
+    emu.render_frame();
+    let take = emu.take_stems().expect("armed");
+    let level = ((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
+    assert!(stem(&take, &layout, "dac").iter().all(|&s| s == level));
+    assert!(stem(&take, &layout, "fm6").iter().all(|&s| s == 0.0));
+}

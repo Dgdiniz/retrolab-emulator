@@ -1,15 +1,34 @@
 //! Audio: the S-DSP's samples resampled at a frame's end into the host's
 //! ring, and the sound hooks a host calls (`SoundCore`).
 
-use retro_core::audio::SoundCore;
+use retro_core::audio::{SoundCore, StemLayout, StemSet, StemTake};
 use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
 
 use super::SnesEmulator;
+use crate::apu::Apu;
 
+/// The stems are the S-DSP's, taken where its output is made, at its own
+/// 32 kHz; the master is the sample it pushes, before the host's resampling.
 impl SoundCore for SnesEmulator {
     fn render_frame(&mut self) {
         run_frame_on(self, ExecutionTier::Play);
+    }
+
+    fn stem_layout(&self) -> Option<StemLayout> {
+        Some(Apu::stem_layout())
+    }
+
+    /// Armed between two frames, or at a frame's start before anything of
+    /// it ran (the frame a reset arms), the stems start at once.
+    fn arm_stems(&mut self, stems: StemSet) {
+        let between_frames =
+            !self.frame_in_progress() || self.master_cycles == self.frame_base_cycle;
+        self.bus.apu_mut().arm_stems(stems, between_frames);
+    }
+
+    fn take_stems(&mut self) -> Option<StemTake> {
+        self.bus.apu_mut().take_stems()
     }
 }
 

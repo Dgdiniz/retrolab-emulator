@@ -23,6 +23,7 @@ use crate::cmd::run::RunArgs;
 use crate::cmd::savestate::SavestateArgs;
 use crate::cmd::screenshot::ScreenshotArgs;
 use crate::cmd::sram::SramArgs;
+use crate::cmd::stems::StemsArgs;
 use crate::cmd::trace::TraceArgs;
 use crate::cmd::trace_to_text::TraceToTextArgs;
 use crate::cmd::watch_ram::WatchRamArgs;
@@ -85,6 +86,8 @@ pub enum SharedCommand<B: clap::Args, S: clap::Args> {
     Profile(ProfileArgs<B>),
     /// Run a ROM with audio capture and save the output as a WAV.
     AudioDump(AudioDumpArgs<B>),
+    /// Run a ROM and save each sound channel's stem and the master as WAVs.
+    Stems(StemsArgs<B>),
     /// Save or load an emulator savestate.
     Savestate(SavestateArgs<B>),
     /// Dump or seed a game's battery-backed SRAM.
@@ -353,6 +356,28 @@ pub fn command<C: Console>() -> clap::Command {
             .mut_arg("sample_rate", |a| {
                 a.default_value(facts.sample_rate.to_string())
             })
+            .mut_arg("native", |a| {
+                a.help(format!(
+                    "Write the console's own output instead: the master of its stems, at {} Hz, \
+                     {}, before anything the host does to it",
+                    facts.stem_rate, facts.stem_samples
+                ))
+            })
+        })
+        .mut_subcommand("stems", |s| {
+            s.about(format!(
+                "Run a ROM and save each stem of the {} output and the master as WAVs at {} Hz, \
+                 with stems.json",
+                C::SOUND_CHIPS,
+                facts.stem_rate
+            ))
+            .mut_arg("only", |a| {
+                a.help(format!(
+                    "The stems to write, comma-separated ({}); every stem by default. The \
+                     master is always written",
+                    facts.stems.join(", ")
+                ))
+            })
         })
         .mut_subcommand("benchmark", |s| {
             s.mut_arg("mode", |a| a.value_parser(benchmark_modes(main.label)))
@@ -421,12 +446,26 @@ pub fn command<C: Console>() -> clap::Command {
 struct MachineFacts {
     sample_rate: u32,
     layers: Vec<String>,
+    /// The stems' names, rate and samples.
+    stems: Vec<&'static str>,
+    stem_rate: u32,
+    stem_samples: &'static str,
 }
 
 impl MachineFacts {
     fn of<C: Console>() -> Self {
         let mut emu = C::Emulator::new_for_golden();
         let sample_rate = emu.get_audio_info().sample_rate;
+        let layout = retro_core::audio::SoundCore::stem_layout(&emu);
+        let stems = layout
+            .iter()
+            .flat_map(|l| l.channels.iter().map(|stem| stem.name))
+            .collect();
+        let stem_rate = layout.as_ref().map_or(sample_rate, |l| l.rate);
+        let stem_samples = match layout.map(|l| l.kind) {
+            Some(retro_core::audio::SampleKind::I16) => "16-bit samples",
+            _ => "32-bit float samples",
+        };
         let debugger = emu.video_debugger();
         let layers = (0..debugger.get_layer_count())
             .map(|id| {
@@ -438,6 +477,9 @@ impl MachineFacts {
         Self {
             sample_rate,
             layers,
+            stems,
+            stem_rate,
+            stem_samples,
         }
     }
 }
@@ -706,6 +748,7 @@ fn run_shared<C: Console>(command: SharedCommand<C::BootArgs, C::ScreenshotArgs>
         SharedCommand::Benchmark(args) => crate::cmd::benchmark::run::<C>(args),
         SharedCommand::Profile(args) => crate::cmd::profile::run::<C>(args),
         SharedCommand::AudioDump(args) => crate::cmd::audio_dump::run::<C>(args),
+        SharedCommand::Stems(args) => crate::cmd::stems::run::<C>(args),
         SharedCommand::Savestate(args) => crate::cmd::savestate::run::<C>(args),
         SharedCommand::Sram(args) => crate::cmd::sram::run::<C>(args),
         SharedCommand::Golden(args) => crate::cmd::golden::run::<C>(args),

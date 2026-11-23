@@ -35,6 +35,7 @@ use retro_core::cpu::Addressable;
 use super::dsp::SDsp;
 use super::ipl::{IPL_BASE, IPL_ROM};
 use super::timers::{ApuTimer, DIVISOR_64KHZ, DIVISOR_8KHZ};
+use super::ApuStems;
 
 /// Size of the APU's audio RAM (64 KiB).
 pub const ARAM_SIZE: usize = 0x10000;
@@ -131,16 +132,25 @@ impl ApuState {
         }
     }
 
-    /// Generate `samples` stereo 32 kHz samples and push them to `ring`.
+    /// Generate `samples` stereo 32 kHz samples and push them to `ring`,
+    /// and to `stems` while the host takes stems.
     ///
     /// The DSP reads its BRR data and sample directory straight from
     /// ARAM, so `dsp` and `aram` are borrowed disjointly here (two
     /// fields of the same state). `aram` is taken mutably because the
     /// echo unit writes its ring back into it.
-    pub(super) fn run_dsp(&mut self, samples: u64, ring: &mut AudioRingBuffer<i16>) {
+    pub(super) fn run_dsp(
+        &mut self,
+        samples: u64,
+        ring: &mut AudioRingBuffer<i16>,
+        mut stems: Option<&mut ApuStems>,
+    ) {
         for _ in 0..samples {
             let (l, r) = self.dsp.run_sample(&mut self.aram[..]);
             ring.push_slice(&[l, r]);
+            if let Some(stems) = stems.as_deref_mut() {
+                stems.record(&self.dsp, (l, r));
+            }
         }
     }
 

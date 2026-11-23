@@ -95,7 +95,18 @@ pub struct Psg {
     /// disabled (zero overhead). Transient diagnostic for `sg1-cli
     /// sound-trace`; never serialized.
     sound_write_log: Option<Vec<PsgWrite>>,
+
+    /// The stems' tap while the host takes stems: each sample's four
+    /// channel outputs, muted or not, staged beside `frame_samples`
+    /// ([`PSG_STEM_VALUES`] a sample) until the system's mix takes the
+    /// frame, with whether a muted channel that sounds moved the sample.
+    /// Not saved.
+    stems: Option<Box<(Vec<f32>, Vec<bool>)>>,
 }
+
+/// The values a sample stages for the stems: tone channels 1 to 3, then
+/// the noise channel.
+pub const PSG_STEM_VALUES: usize = 4;
 
 /// A single SN76489 byte write captured by the optional sound-write log.
 ///
@@ -145,6 +156,7 @@ impl Psg {
             waveform_decimation: 0,
             rendering_enabled: true,
             sound_write_log: None,
+            stems: None,
         }
     }
 
@@ -231,6 +243,24 @@ impl Psg {
             }
 
             self.frame_samples.push(self.get_mixed_output());
+            if let Some(stems) = self.stems.as_deref_mut() {
+                let outputs = [
+                    self.tone_channels[0].raw_output(),
+                    self.tone_channels[1].raw_output(),
+                    self.tone_channels[2].raw_output(),
+                    self.noise_channel.raw_output(),
+                ];
+                let muted = [
+                    self.tone_channels[0].muted,
+                    self.tone_channels[1].muted,
+                    self.tone_channels[2].muted,
+                    self.noise_channel.muted,
+                ];
+                stems.0.extend_from_slice(&outputs);
+                stems
+                    .1
+                    .push(outputs.iter().zip(muted).any(|(&out, m)| m && out != 0.0));
+            }
 
             if self.waveform_decimation.is_multiple_of(16) {
                 self.store_waveform_sample();
@@ -242,6 +272,54 @@ impl Psg {
         if self.frame_samples.len() > MAX_PSG_FRAME_SAMPLES {
             let excess = self.frame_samples.len() - MAX_PSG_FRAME_SAMPLES;
             self.frame_samples.drain(..excess);
+            if let Some(stems) = self.stems.as_deref_mut() {
+                stems.0.drain(..excess * PSG_STEM_VALUES);
+                stems.1.drain(..excess);
+            }
+        }
+    }
+
+    /// Stage each sample's channels for the stems from now on (`true`), or
+    /// stop. A host setting, not saved.
+    pub fn set_stem_tap(&mut self, on: bool) {
+        match (on, self.stems.is_some()) {
+            (true, false) => {
+                self.stems = Some(Box::default());
+                self.align_stems();
+            }
+            (false, true) => self.stems = None,
+            _ => {}
+        }
+    }
+
+    /// The samples staged for the stems, one per sample `frame_samples`
+    /// holds: [`PSG_STEM_VALUES`] values each, and whether each departs;
+    /// `None` while the tap is off.
+    pub fn staged_stems(&self) -> Option<(&[f32], &[bool])> {
+        self.stems
+            .as_deref()
+            .map(|(values, departs)| (&values[..], &departs[..]))
+    }
+
+    /// Drop the samples staged for the stems, as the mix drops the frame's
+    /// samples once it has taken them.
+    pub fn clear_staged_stems(&mut self) {
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.0.clear();
+            stems.1.clear();
+        }
+    }
+
+    /// Stage, for the samples `frame_samples` holds, samples that stand for
+    /// them (silence, each a departure): after a load replaced them, or
+    /// when the tap starts.
+    fn align_stems(&mut self) {
+        let samples = self.frame_samples.len();
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.0.clear();
+            stems.0.resize(samples * PSG_STEM_VALUES, 0.0);
+            stems.1.clear();
+            stems.1.resize(samples, true);
         }
     }
 
@@ -263,6 +341,7 @@ impl Psg {
         self.latched_channel = 0;
         self.latched_type = LatchType::Tone;
         self.frame_samples.clear();
+        self.align_stems();
         self.waveform_decimation = 0;
 
         // Clear waveform buffers
@@ -460,6 +539,7 @@ impl AudioChip for Psg {
         self.latched_channel = 0;
         self.latched_type = LatchType::Tone;
         self.frame_samples.clear();
+        self.align_stems();
         self.waveform_decimation = 0;
 
         // Clear waveform buffers
@@ -611,6 +691,7 @@ impl Psg {
         self.clock_accumulator = state.clock_accumulator;
         self.internal_clock_accumulator = state.internal_clock_accumulator;
         self.frame_samples.clear();
+        self.align_stems();
     }
 
     /// What the chip holds that the layout has no field for: the samples
@@ -627,6 +708,7 @@ impl Psg {
     pub fn restore_extension(&mut self, extension: PsgExtension) {
         self.frame_samples.clear();
         self.frame_samples.extend_from_slice(&extension.samples);
+        self.align_stems();
     }
 }
 
