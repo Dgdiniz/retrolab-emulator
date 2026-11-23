@@ -61,7 +61,10 @@ use crate::debugger::TraceEntryBinarySpc700;
 use bus::{ApuBus, ApuState, DspLog};
 
 pub use bus::ARAM_SIZE;
-pub use dsp::{decode_sample, directory, BrrEnd, BrrSample, DirectoryEntry};
+pub use dsp::{
+    decode_sample, directory, loop_passes, BrrEnd, BrrSample, DirectoryEntry, LoopPasses,
+    LOOP_VALUES_CAP,
+};
 
 /// SPC700 master clock in Hz (~1.024 MHz).
 const SPC_CLOCK_HZ: u64 = 1_024_000;

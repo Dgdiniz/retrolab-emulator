@@ -47,7 +47,10 @@ use registers::{DIR, ENDX, EON, FLG, KOFF, NON, PMON};
 use schedule::{Step, VoiceStage};
 use voice::{KeyLog, Voice};
 
-pub use brr::{decode_sample, directory, BrrEnd, BrrSample, DirectoryEntry};
+pub use brr::{
+    decode_sample, directory, loop_passes, BrrEnd, BrrSample, DirectoryEntry, LoopPasses,
+    LOOP_VALUES_CAP,
+};
 pub(super) use echo::STEM_VALUES;
 pub(super) use registers::{VoiceDebug, DSP_REG_COUNT};
 
