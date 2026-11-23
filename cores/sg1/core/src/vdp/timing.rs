@@ -72,7 +72,9 @@ pub struct VdpTiming {
     /// Total cycles executed this frame
     pub frame_cycles: u32,
 
-    /// Total frames rendered
+    /// Frames counted by [`Self::next_scanline`], which the frame loop
+    /// does not call, so it stays 0; the savestate keeps the field. The
+    /// frame being drawn is the VDP's own number, set as each frame starts.
     pub frame_count: u64,
 
     /// Whether we're in VBLANK

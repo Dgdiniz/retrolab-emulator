@@ -839,7 +839,7 @@ impl Vdp {
 
         eprintln!(
             "=== DEBUG PIXEL ({}, {}) frame={} ===",
-            xu16, line, self.timing.frame_count
+            xu16, line, self.frame_being_drawn
         );
 
         eprintln!("  --- VDP Registers ---");

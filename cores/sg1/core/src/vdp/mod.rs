@@ -777,16 +777,23 @@ impl Vdp {
 
     #[cold]
     fn log_vram_watch(&self, addr: u16, value: u16, source: &str) {
+        eprintln!("{}", self.vram_watch_line(addr, value, source));
+    }
+
+    /// The line the VRAM watch prints for a write: the frame being drawn
+    /// (the frames finished, plus one), the line, the address, the word and
+    /// the word read as a nametable entry.
+    fn vram_watch_line(&self, addr: u16, value: u16, source: &str) -> String {
         let tile = value & 0x07FF;
         let palette = (value >> 13) & 0x03;
         let priority = (value >> 15) & 0x01;
         let hflip = (value >> 11) & 0x01;
         let vflip = (value >> 12) & 0x01;
-        eprintln!(
+        format!(
             "[VRAM-WATCH] frame={} scan={} addr=0x{:04X} val=0x{:04X} tile={} pal={} pri={} hf={} vf={} src={}",
-            self.timing.frame_count, self.timing.scanline, addr, value,
+            self.frame_being_drawn, self.timing.scanline, addr, value,
             tile, palette, priority, hflip, vflip, source,
-        );
+        )
     }
 
     /// Execute one scanline of VDP rendering.

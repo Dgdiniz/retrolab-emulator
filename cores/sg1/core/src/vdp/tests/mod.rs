@@ -13,6 +13,18 @@ mod render;
 mod sprite_table;
 
 #[test]
+fn the_vram_watch_names_the_frame_being_drawn() {
+    let mut vdp = Vdp::new();
+    vdp.set_frame_being_drawn(42);
+    vdp.timing.scanline = 7;
+    let line = vdp.vram_watch_line(0xC000, 0x8123, "data-port");
+    assert_eq!(
+        line,
+        "[VRAM-WATCH] frame=42 scan=7 addr=0xC000 val=0x8123 tile=291 pal=0 pri=1 hf=0 vf=0 src=data-port"
+    );
+}
+
+#[test]
 fn test_vdp_creation() {
     let vdp = Vdp::new();
     assert_eq!(vdp.vram.len(), 0x10000);
