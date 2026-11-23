@@ -131,6 +131,7 @@ impl Console for Snes {
         "disasm",
         "ppu-dump",
         "apu-dump",
+        "spc-dump",
         "audio-dump",
         "stems",
         "singlestep-65816",

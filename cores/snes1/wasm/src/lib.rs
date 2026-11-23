@@ -24,6 +24,7 @@
 use retro_core::video::VideoMemoryId;
 use retro_core::*;
 use retro_wasm::js::{plain_object, set_property, to_js, uint16_array, uint8_array};
+use snes1_core::sound::Id666;
 use snes1_core::{CoprocessorMode, SnesEmulator, SnesSnapshotConsole};
 use wasm_bindgen::prelude::*;
 
@@ -284,6 +285,45 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = getAram)]
     pub fn get_aram(&self) -> Vec<u8> {
         self.snes.bus().apu().aram().to_vec()
+    }
+}
+
+/// The ID666 tag a host gives (`{ title, game, dumper, comment, date,
+/// seconds, fade_ms, artist }`, each optional), or none for `undefined`.
+fn spc_tag(tag: JsValue) -> Result<Id666, JsValue> {
+    match tag.is_undefined() || tag.is_null() {
+        true => Ok(Id666::default()),
+        false => retro_wasm::audio::from_js(tag),
+    }
+}
+
+/// The SPC, the APU's state as an SPC player runs it.
+#[wasm_bindgen]
+impl RetroEmulator {
+    /// The APU as an SPC file (version 0.30) a player plays: its bytes,
+    /// tagged with `tag` (`{ title, game, dumper, comment, date, seconds,
+    /// fade_ms, artist }`, each optional; `undefined` for no tag). Between
+    /// two frames it is the APU at the frame's end.
+    #[wasm_bindgen(js_name = exportSpc)]
+    pub fn export_spc(&self, tag: JsValue) -> Result<Vec<u8>, JsValue> {
+        Ok(self.snes.export_spc(&spc_tag(tag)?))
+    }
+
+    /// Keep the APU as it stands after the first SPC700 instruction that
+    /// keys a voice on, from now on; what was kept and not taken is
+    /// dropped.
+    #[wasm_bindgen(js_name = armSpcAtKeyOn)]
+    pub fn arm_spc_at_key_on(&mut self) {
+        self.snes.arm_spc_at_key_on();
+    }
+
+    /// The SPC file of the APU the key-on kept, tagged as `exportSpc`'s,
+    /// once; `undefined` while the key-on has not come or nothing was
+    /// armed.
+    #[wasm_bindgen(js_name = takeKeyOnSpc)]
+    pub fn take_key_on_spc(&mut self, tag: JsValue) -> Result<Option<Vec<u8>>, JsValue> {
+        let tag = spc_tag(tag)?;
+        Ok(self.snes.take_key_on_spc(&tag))
     }
 }
 

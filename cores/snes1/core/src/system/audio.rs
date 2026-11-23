@@ -9,6 +9,7 @@ use retro_core::ExecutionTier;
 
 use super::SnesEmulator;
 use crate::apu::Apu;
+use crate::sound::{build_spc, Id666};
 
 /// The stems are the S-DSP's, taken where its output is made, at its own
 /// 32 kHz; the master is the sample it pushes, before the host's resampling.
@@ -51,6 +52,27 @@ impl SoundCore for SnesEmulator {
 }
 
 impl SnesEmulator {
+    /// The APU as an SPC file a player runs, tagged with `tag`: as it
+    /// stands, which between two frames is the frame's end (within a frame
+    /// the APU runs behind the CPU until it next catches up).
+    pub fn export_spc(&self, tag: &Id666) -> Vec<u8> {
+        build_spc(&self.bus.apu().to_savestate(), tag)
+    }
+
+    /// Keep the APU as it stands after the first SPC700 instruction that
+    /// keys a voice on, from now on ([`Apu::arm_key_on_latch`]); a load
+    /// keeps it waiting.
+    pub fn arm_spc_at_key_on(&mut self) {
+        self.bus.apu_mut().arm_key_on_latch();
+    }
+
+    /// The SPC file of what the key-on latch kept, tagged with `tag`, once;
+    /// `None` while it waits or was never armed.
+    pub fn take_key_on_spc(&mut self, tag: &Id666) -> Option<Vec<u8>> {
+        let state = self.bus.apu_mut().take_key_on_state()?;
+        Some(build_spc(&state, tag))
+    }
+
     /// Pull every queued 32 kHz `i16` sample out of the APU, resample it
     /// to the 44.1 kHz host rate, and push the `f32` result into the host
     /// audio ring. Called once per frame after the APU catch-up.

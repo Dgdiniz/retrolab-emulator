@@ -129,6 +129,12 @@ impl SDsp {
         self.regs[usize::from(self.addr & 0x7f)]
     }
 
+    /// Whether writing `value` to the data port keys a voice on: KON
+    /// selected, a voice's bit set.
+    pub(in crate::apu) fn writes_key_on(&self, value: u8) -> bool {
+        usize::from(self.addr) == KON && value != 0
+    }
+
     /// The data port, `$F3`, written.
     pub(in crate::apu) fn write_data(&mut self, value: u8) {
         if self.addr & 0x80 != 0 {

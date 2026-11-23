@@ -20,6 +20,7 @@ pub mod irq;
 pub mod ppu;
 pub mod savestate;
 pub mod scheduler;
+pub mod sound;
 pub mod system;
 pub mod system_regs;
 pub mod trace_format;

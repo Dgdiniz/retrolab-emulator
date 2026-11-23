@@ -62,6 +62,35 @@ fn the_cartridge_hash_is_the_sha256_of_the_file_loaded_its_copier_header_include
 }
 
 #[wasm_bindgen_test]
+fn the_spc_is_the_apu_s_and_its_tag_the_host_s() {
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&synth_lorom("SPC GAME")).unwrap();
+    emu.run_frame();
+    let plain = emu.export_spc(JsValue::UNDEFINED).unwrap();
+    assert_eq!(plain.len(), 0x10200);
+    assert_eq!(&plain[..33], b"SNES-SPC700 Sound File Data v0.30");
+    assert_eq!(plain[0x23], 27, "no tag");
+    let tag = js_sys::Object::new();
+    js_sys::Reflect::set(&tag, &"title".into(), &"Song".into()).unwrap();
+    let tagged = emu.export_spc(tag.into()).unwrap();
+    assert_eq!(plain[0x23], 27);
+    assert_eq!((tagged[0x23], &tagged[0x2E..0x33]), (26, &b"Song\0"[..]));
+    assert!(emu.export_spc(JsValue::from(3)).is_err(), "not a tag");
+    assert_eq!(
+        emu.take_key_on_spc(JsValue::UNDEFINED).unwrap(),
+        None,
+        "never armed"
+    );
+    emu.arm_spc_at_key_on();
+    emu.run_frame();
+    assert_eq!(
+        emu.take_key_on_spc(JsValue::UNDEFINED).unwrap(),
+        None,
+        "the program keys no voice"
+    );
+}
+
+#[wasm_bindgen_test]
 fn test_breakpoint_add_list() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     let id = emu.add_breakpoint(0x008000, "execute".to_string(), None);

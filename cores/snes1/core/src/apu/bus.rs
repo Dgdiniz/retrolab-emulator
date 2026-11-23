@@ -78,6 +78,12 @@ pub(super) struct ApuState {
     pub(super) dsp_write_events: Vec<u8>,
     /// The sound log while the host logs. A host setting, not saved.
     pub(super) sound_log: Option<Box<DspLog>>,
+    /// The key-on latch waits for a key-on write
+    /// ([`crate::apu::Apu::arm_key_on_latch`]). A host setting, not saved.
+    pub(super) key_on_armed: bool,
+    /// While it waits, a write of KON with a voice's bit set came during
+    /// the SPC700's instruction.
+    pub(super) key_on_written: bool,
 }
 
 /// The sound log of the S-DSP: each register write the DSP takes, and each
@@ -134,6 +140,8 @@ impl ApuState {
             dsp_event_armed: false,
             dsp_write_events: Vec::new(),
             sound_log: None,
+            key_on_armed: false,
+            key_on_written: false,
         }
     }
 
@@ -293,6 +301,9 @@ impl Addressable for ApuBus<'_> {
                             },
                         }]);
                     }
+                }
+                if self.state.key_on_armed && self.state.dsp.writes_key_on(value) {
+                    self.state.key_on_written = true;
                 }
                 self.state.dsp.write_data(value);
             }

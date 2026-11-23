@@ -199,6 +199,15 @@ pub struct Apu {
     spc_trace_buf: Vec<TraceEntryBinarySpc700>,
     /// The stems, once the host armed any.
     stems: Option<Box<ApuStems>>,
+    /// What the key-on latch kept, until the host takes it.
+    key_on_state: Option<Box<crate::savestate::ApuSaveState>>,
+}
+
+/// The key-on latch, to carry over to the APU a load builds: whether it
+/// waits, and what it kept.
+pub(crate) struct KeyOnLatch {
+    armed: bool,
+    kept: Option<Box<crate::savestate::ApuSaveState>>,
 }
 
 impl Apu {
@@ -218,6 +227,7 @@ impl Apu {
             spc_trace_enabled: false,
             spc_trace_buf: Vec::new(),
             stems: None,
+            key_on_state: None,
         };
         apu.boot_spc();
         apu
@@ -294,6 +304,9 @@ impl Apu {
             self.state.timer0.tick(cycles);
             self.state.timer1.tick(cycles);
             self.state.timer2.tick(cycles);
+            if self.state.key_on_written {
+                self.keep_key_on_state();
+            }
 
             // Emit the samples due as of the SPC cycle just reached, so the
             // DSP register writes the instruction just made (a voice
@@ -714,6 +727,49 @@ impl Apu {
         }
     }
 
+    /// From now on, keep the APU's state as it stands after the first
+    /// SPC700 instruction that writes KON with a voice's bit set, the
+    /// instruction's cycles counted on the timers, before the samples they
+    /// are due; the latch then waits no more. What it kept before is
+    /// dropped.
+    pub fn arm_key_on_latch(&mut self) {
+        self.state.key_on_armed = true;
+        self.state.key_on_written = false;
+        self.key_on_state = None;
+    }
+
+    /// Whether the key-on latch waits for a key-on.
+    pub fn key_on_latch_armed(&self) -> bool {
+        self.state.key_on_armed
+    }
+
+    /// The state the key-on latch kept, once; `None` while it waits or was
+    /// never armed.
+    pub fn take_key_on_state(&mut self) -> Option<crate::savestate::ApuSaveState> {
+        self.key_on_state.take().map(|state| *state)
+    }
+
+    /// The key-on came: keep the state, and wait no more.
+    fn keep_key_on_state(&mut self) {
+        self.state.key_on_written = false;
+        self.state.key_on_armed = false;
+        self.key_on_state = Some(Box::new(self.to_savestate()));
+    }
+
+    /// The key-on latch, to carry over to the APU a load builds.
+    pub(crate) fn take_key_on_latch(&mut self) -> KeyOnLatch {
+        KeyOnLatch {
+            armed: std::mem::take(&mut self.state.key_on_armed),
+            kept: self.key_on_state.take(),
+        }
+    }
+
+    /// The key-on latch carried over from the APU this one replaces.
+    pub(crate) fn restore_key_on_latch(&mut self, latch: KeyOnLatch) {
+        self.state.key_on_armed = latch.armed;
+        self.key_on_state = latch.kept;
+    }
+
     /// The DSP is somewhere the stems' carry did not follow it.
     fn stems_lose_track(&mut self) {
         if let Some(state) = self.stems.as_deref_mut() {
@@ -807,6 +863,33 @@ mod tests {
     /// key on: every note in a busy frame would be silently dropped. We
     /// assert voice 0's ENVX climbs above 0, proving it keyed on and ran
     /// its envelope within the window.
+    /// The key-on latch keeps the APU as the instruction that writes KON
+    /// leaves it: the program counter past that instruction, KON written;
+    /// it keeps nothing before, and nothing more after.
+    #[test]
+    fn the_key_on_latch_keeps_the_state_after_the_instruction() {
+        #[rustfmt::skip]
+        let program: [u8; 14] = [
+            0x8F, 0x4C, 0xF2, // mov $f2,#$4c   DSPADDR = KON
+            0x8F, 0x00, 0xF3, // mov $f3,#$00   KON = 0: no voice, no key-on
+            0x8F, 0x05, 0xF3, // mov $f3,#$05   KON = voices 0 and 2
+            0x8F, 0x01, 0xF3, // mov $f3,#$01   KON = voice 0
+            0x2F, 0xFE,       // bra -2
+        ];
+        let mut apu = Apu::new();
+        apu.state.aram[0x0200..0x0200 + program.len()].copy_from_slice(&program);
+        apu.spc700.pc = 0x0200;
+        assert!(apu.take_key_on_state().is_none(), "never armed");
+        apu.arm_key_on_latch();
+        assert!(apu.key_on_latch_armed());
+        apu.catch_up_to(400 * DEFAULT_MASTER_CLOCK_HZ / SPC_CLOCK_HZ);
+        assert!(!apu.key_on_latch_armed(), "the latch waits no more");
+        let kept = apu.take_key_on_state().expect("the key-on was kept");
+        assert_eq!(kept.spc700.pc, 0x0209, "after the instruction");
+        assert_eq!(kept.dsp.regs[0x4C], 0x05);
+        assert!(apu.take_key_on_state().is_none(), "taken once");
+    }
+
     #[test]
     fn key_on_pulse_within_one_window_is_not_coalesced() {
         // Tiny SPC700 routine at $0200. All DSP access goes through the
