@@ -62,12 +62,13 @@ fn test_ym2612_lfo_state() {
 
     let lfo_state = genesis.get_ym2612_lfo_state();
 
-    // The JSON must have the fields enabled and frequency
-    assert!(lfo_state.get("enabled").is_some());
-    assert!(lfo_state.get("frequency").is_some());
+    // The JSON has the fields enabled and frequency.
+    let json = serde_json::to_value(lfo_state).unwrap();
+    assert!(json.get("enabled").is_some());
+    assert!(json.get("frequency").is_some());
 
     // The LFO starts disabled
-    assert!(!lfo_state.get("enabled").unwrap().as_bool().unwrap());
+    assert!(!lfo_state.enabled);
 }
 
 #[test]
@@ -76,11 +77,12 @@ fn test_ym2612_dac_state() {
 
     let dac_state = genesis.get_ym2612_dac_state();
 
-    // The JSON must have the field enabled
-    assert!(dac_state.get("enabled").is_some());
+    // The JSON has the field enabled, and no other.
+    let json = serde_json::to_value(dac_state).unwrap();
+    assert_eq!(json, serde_json::json!({ "enabled": false }));
 
     // The DAC starts disabled
-    assert!(!dac_state.get("enabled").unwrap().as_bool().unwrap());
+    assert!(!dac_state.enabled);
 }
 
 #[test]
@@ -90,12 +92,14 @@ fn test_ym2612_timer_a_state() {
     let timer_state = genesis.get_ym2612_timer_a_state();
 
     // JSON has fields `running` (not `enabled`), `period`, `overflowed`.
-    assert!(timer_state.get("running").is_some());
-    assert!(timer_state.get("period").is_some());
-    assert!(timer_state.get("overflowed").is_some());
+    let json = serde_json::to_value(timer_state).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "running": false, "period": 0, "overflowed": false })
+    );
 
     // Initially the timer is stopped.
-    assert!(!timer_state.get("running").unwrap().as_bool().unwrap());
+    assert!(!timer_state.running);
 }
 
 #[test]
@@ -105,12 +109,14 @@ fn test_ym2612_timer_b_state() {
     let timer_state = genesis.get_ym2612_timer_b_state();
 
     // Same shape as Timer A.
-    assert!(timer_state.get("running").is_some());
-    assert!(timer_state.get("period").is_some());
-    assert!(timer_state.get("overflowed").is_some());
+    let json = serde_json::to_value(timer_state).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "running": false, "period": 0, "overflowed": false })
+    );
 
     // Initially the timer is stopped.
-    assert!(!timer_state.get("running").unwrap().as_bool().unwrap());
+    assert!(!timer_state.running);
 }
 
 #[test]

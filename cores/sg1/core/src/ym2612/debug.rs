@@ -49,6 +49,29 @@ pub struct FmOperator {
     pub ssg_eg: u8,
 }
 
+/// The LFO as the debugger reads it: whether it runs, and its frequency
+/// setting (0-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LfoStatus {
+    pub enabled: bool,
+    pub frequency: u8,
+}
+
+/// The DAC as the debugger reads it: whether it plays in channel 6's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DacStatus {
+    pub enabled: bool,
+}
+
+/// A timer as the debugger reads it: whether it runs, its period (timer A's
+/// ten bits, timer B's eight), and whether its overflow flag is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TimerStatus {
+    pub running: bool,
+    pub period: u16,
+    pub overflowed: bool,
+}
+
 impl FmOperator {
     fn of(operator: &Operator) -> Self {
         let envelope = operator.envelope();
@@ -174,6 +197,39 @@ impl Ym2612 {
                     channel: channel as u8,
                 },
             );
+        }
+    }
+
+    /// The LFO as the debugger reads it.
+    pub fn lfo_status(&self) -> LfoStatus {
+        LfoStatus {
+            enabled: self.lfo.is_enabled(),
+            frequency: self.lfo.get_frequency(),
+        }
+    }
+
+    /// The DAC as the debugger reads it.
+    pub fn dac_status(&self) -> DacStatus {
+        DacStatus {
+            enabled: self.dac_enabled,
+        }
+    }
+
+    /// Timer A as the debugger reads it.
+    pub fn timer_a_status(&self) -> TimerStatus {
+        TimerStatus {
+            running: self.timers.is_timer_a_running(),
+            period: self.timers.get_timer_a_period(),
+            overflowed: self.timers.get_status() & 0x01 != 0,
+        }
+    }
+
+    /// Timer B as the debugger reads it.
+    pub fn timer_b_status(&self) -> TimerStatus {
+        TimerStatus {
+            running: self.timers.is_timer_b_running(),
+            period: u16::from(self.timers.get_timer_b_period()),
+            overflowed: self.timers.get_status() & 0x02 != 0,
         }
     }
 

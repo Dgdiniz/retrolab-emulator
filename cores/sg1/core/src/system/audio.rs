@@ -12,7 +12,7 @@ use retro_core::ExecutionTier;
 use super::GenesisEmulator;
 use crate::psg::PSG_STEM_VALUES;
 use crate::timing::GenesisTiming;
-use crate::ym2612::YM_STEM_VALUES;
+use crate::ym2612::{DacStatus, LfoStatus, TimerStatus, YM_STEM_VALUES};
 
 /// The PSG's share of the mix, and the YM2612's: the PSG at full scale is
 /// about a third of the FM at full scale (0.34, the ratio Genesis Plus
@@ -326,41 +326,24 @@ impl GenesisEmulator {
         self.ym2612_mut().mute_channel(channel, muted);
     }
 
-    /// Get YM2612 LFO state.
-    pub fn get_ym2612_lfo_state(&self) -> serde_json::Value {
-        let lfo = self.ym2612().lfo();
-        serde_json::json!({
-            "enabled": lfo.is_enabled(),
-            "frequency": lfo.get_frequency(),
-        })
+    /// The YM2612's LFO: `{ enabled, frequency }`.
+    pub fn get_ym2612_lfo_state(&self) -> LfoStatus {
+        self.ym2612().lfo_status()
     }
 
-    /// Get YM2612 DAC state.
-    pub fn get_ym2612_dac_state(&self) -> serde_json::Value {
-        let ym = self.ym2612();
-        serde_json::json!({
-            "enabled": ym.is_dac_enabled(),
-        })
+    /// The YM2612's DAC: `{ enabled }`.
+    pub fn get_ym2612_dac_state(&self) -> DacStatus {
+        self.ym2612().dac_status()
     }
 
-    /// Get YM2612 Timer A state.
-    pub fn get_ym2612_timer_a_state(&self) -> serde_json::Value {
-        let timers = self.ym2612().timers();
-        serde_json::json!({
-            "running": timers.is_timer_a_running(),
-            "period": timers.get_timer_a_period(),
-            "overflowed": (timers.get_status() & 0x01) != 0,
-        })
+    /// The YM2612's timer A: `{ running, period, overflowed }`.
+    pub fn get_ym2612_timer_a_state(&self) -> TimerStatus {
+        self.ym2612().timer_a_status()
     }
 
-    /// Get YM2612 Timer B state.
-    pub fn get_ym2612_timer_b_state(&self) -> serde_json::Value {
-        let timers = self.ym2612().timers();
-        serde_json::json!({
-            "running": timers.is_timer_b_running(),
-            "period": timers.get_timer_b_period(),
-            "overflowed": (timers.get_status() & 0x02) != 0,
-        })
+    /// The YM2612's timer B: `{ running, period, overflowed }`.
+    pub fn get_ym2612_timer_b_state(&self) -> TimerStatus {
+        self.ym2612().timer_b_status()
     }
 
     /// The last `samples` of the mixed PSG and YM2612 output, mono, oldest

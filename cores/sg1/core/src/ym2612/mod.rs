@@ -26,7 +26,7 @@ pub mod timers;
 // Re-exports
 pub use algorithms::Algorithm;
 pub use channel::{Channel, StereoFlags};
-pub use debug::{FmOperator, FmPatch};
+pub use debug::{DacStatus, FmOperator, FmPatch, LfoStatus, TimerStatus};
 pub use envelope::{EnvelopeGenerator, EnvelopeState};
 pub use lfo::Lfo;
 pub use operator::Operator;
