@@ -43,9 +43,10 @@ pub trait SoundCore: EmulatorCore {
         Vec::new()
     }
 
-    /// Start a sound log holding `contents`, its first entries the chips'
-    /// registers as they stand, at time 0; what an earlier log left is
-    /// dropped. Contents of nothing stop the log.
+    /// Start a sound log holding `contents`, its first entries, at time 0,
+    /// the chips as they stand: their registers in a log of the writes, a
+    /// key-on for each channel sounding in a log of the keys. What an
+    /// earlier log left is dropped. Contents of nothing stop the log.
     fn start_sound_log(&mut self, contents: SoundLogContents) {
         let _ = contents;
     }

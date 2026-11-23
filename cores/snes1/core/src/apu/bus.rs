@@ -29,7 +29,9 @@
 //! | `$0100-$FFBF`  | ARAM                                         |
 //! | `$FFC0-$FFFF`  | IPL ROM if CONTROL bit 7 set, else ARAM      |
 
-use retro_core::audio::{AudioRingBuffer, SoundEvent, SoundLogEntry, SoundLogger};
+use retro_core::audio::{
+    AudioRingBuffer, SoundEvent, SoundLogContents, SoundLogEntry, SoundLogger,
+};
 use retro_core::cpu::Addressable;
 
 use super::dsp::SDsp;
@@ -78,10 +80,10 @@ pub(super) struct ApuState {
     pub(super) sound_log: Option<Box<DspLog>>,
 }
 
-/// The sound log of the S-DSP: each register write the DSP takes, stamped
-/// with the samples the DSP made since the log began. The log keeps its own
-/// count, so the APU's own, which a reset starts again, cannot take its
-/// time back.
+/// The sound log of the S-DSP: each register write the DSP takes, and each
+/// voice's keys, stamped with the samples the DSP made since the log began
+/// (a key at the sample its output joins). The log keeps its own count, so
+/// the APU's own, which a reset starts again, cannot take its time back.
 #[derive(Debug, Default)]
 pub(crate) struct DspLog {
     pub(super) logger: SoundLogger,
@@ -90,21 +92,29 @@ pub(crate) struct DspLog {
 }
 
 impl DspLog {
-    /// The DSP's registers as entries at the log's time.
-    pub(super) fn image(&self, dsp: &SDsp) -> Vec<SoundLogEntry> {
+    /// The DSP as entries at the log's time, what the log holds of it: the
+    /// registers, with the writes; a key-on for each voice sounding, with
+    /// the keys.
+    pub(super) fn image(&self, dsp: &SDsp, contents: SoundLogContents) -> Vec<SoundLogEntry> {
         let time = self.samples;
-        dsp.regs()
-            .iter()
-            .enumerate()
-            .map(|(register, &value)| SoundLogEntry {
-                time,
-                chip: 0,
-                event: SoundEvent::Write {
+        let entry = |event| SoundLogEntry {
+            time,
+            chip: 0,
+            event,
+        };
+        let mut image = Vec::new();
+        if contents.writes {
+            image.extend(dsp.regs().iter().enumerate().map(|(register, &value)| {
+                entry(SoundEvent::Write {
                     register: register as u16,
                     value,
-                },
-            })
-            .collect()
+                })
+            }));
+        }
+        if contents.keys {
+            image.extend(dsp.key_image().into_iter().map(entry));
+        }
+        image
     }
 }
 
@@ -166,7 +176,8 @@ impl ApuState {
     }
 
     /// Generate `samples` stereo 32 kHz samples and push them to `ring`,
-    /// and to `stems` while the host takes stems.
+    /// to `stems` while the host takes stems, and the voices' keys to the
+    /// sound log while it takes them.
     ///
     /// The DSP reads its BRR data and sample directory straight from
     /// ARAM, so `dsp` and `aram` are borrowed disjointly here (two
@@ -178,11 +189,24 @@ impl ApuState {
         ring: &mut AudioRingBuffer<i16>,
         mut stems: Option<&mut ApuStems>,
     ) {
-        for _ in 0..samples {
+        let keys = self.dsp.keys_logged();
+        for sample in 0..samples {
             let (l, r) = self.dsp.run_sample(&mut self.aram[..]);
             ring.push_slice(&[l, r]);
             if let Some(stems) = stems.as_deref_mut() {
                 stems.record(&self.dsp, (l, r));
+            }
+            if keys {
+                if let Some(log) = self.sound_log.as_deref_mut() {
+                    let time = log.samples + sample;
+                    for (later, event) in self.dsp.drain_key_events() {
+                        log.logger.extend([SoundLogEntry {
+                            time: time + u64::from(later),
+                            chip: 0,
+                            event,
+                        }]);
+                    }
+                }
             }
         }
         if let Some(log) = self.sound_log.as_deref_mut() {
@@ -259,7 +283,7 @@ impl Addressable for ApuBus<'_> {
                 // with bit 7 set reads the register file and writes none.
                 let register = self.state.dsp.addr();
                 if let Some(log) = self.state.sound_log.as_deref_mut() {
-                    if register & 0x80 == 0 {
+                    if register & 0x80 == 0 && log.logger.logs_writes() {
                         log.logger.extend([SoundLogEntry {
                             time: log.samples,
                             chip: 0,

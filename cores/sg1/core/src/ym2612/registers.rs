@@ -4,9 +4,10 @@
 
 use super::{StereoFlags, Ym2612};
 
-/// The operators whose key-on bits 4 to 7 of register 0x28 are, in this
-/// core's order: slots 1, 2, 3 and 4 are operators 0, 2, 1 and 3.
-const KEY_BIT_OPERATORS: [usize; 4] = [0, 2, 1, 3];
+/// The operators the chip's slots 1 to 4 are, in this core's order
+/// (register-slot order): slots 1, 2, 3 and 4 are operators 0, 2, 1 and 3.
+/// Key-on bits 4 to 7 of register 0x28 name the slots in this order.
+pub(super) const SLOT_OPERATORS: [usize; 4] = [0, 2, 1, 3];
 
 /// Channel 3's own frequency registers (0xA8 to 0xAA, and 0xAC to 0xAE for
 /// the block and high bits) and the operator each sets, in this core's
@@ -74,15 +75,20 @@ impl Ym2612 {
                         ch_low
                     };
                     if channel_idx < 6 {
+                        let keyed_before =
+                            self.logs_keys().then(|| self.keyed_operators(channel_idx));
                         // Key-on bits 4-7 name the chip's slots 1-4, and
                         // slots 2 and 3 are operators 3 and 2 in our order.
                         let op_bits = (value >> 4) & 0x0F;
-                        for (i, &op_idx) in KEY_BIT_OPERATORS.iter().enumerate() {
+                        for (i, &op_idx) in SLOT_OPERATORS.iter().enumerate() {
                             if (op_bits & (1 << i)) != 0 {
                                 self.channels[channel_idx].operator_mut(op_idx).key_on();
                             } else {
                                 self.channels[channel_idx].operator_mut(op_idx).key_off();
                             }
+                        }
+                        if let Some(before) = keyed_before {
+                            self.log_key_change(self.input_clocks, channel_idx, before);
                         }
                     }
                 }
@@ -175,13 +181,9 @@ impl Ym2612 {
                 put(part, 0x90 + register, envelope.get_ssg_eg());
             }
         }
-        for (channel, state) in self.channels.iter().enumerate() {
+        for channel in 0..self.channels.len() {
             let (part, low) = places(channel);
-            let (number, block) = if channel == 2 && self.ch3_mode & 0x40 != 0 {
-                (self.ch3_fnum[3], self.ch3_block[3])
-            } else {
-                (state.operator(0).freq_number, state.operator(0).block)
-            };
+            let (number, block) = self.channel_frequency(channel);
             put(part, 0xA4 + low, block << 3 | (number >> 8) as u8 & 0x07);
             put(part, 0xA0 + low, number as u8);
         }
@@ -205,7 +207,7 @@ impl Ym2612 {
             );
         }
         for (channel, state) in self.channels.iter().enumerate() {
-            let keyed = KEY_BIT_OPERATORS
+            let keyed = SLOT_OPERATORS
                 .iter()
                 .enumerate()
                 .filter(|(_, &operator)| state.operator(operator).is_key_on())
@@ -214,6 +216,18 @@ impl Ym2612 {
             put(0, 0x28, keyed | (part as u8) << 2 | low);
         }
         image
+    }
+
+    /// The F-number and block channel `channel`'s frequency registers (0xA0
+    /// and 0xA4 and theirs) hold: in channel 3's special mode, its fourth
+    /// slot's, which those registers set there.
+    pub(super) fn channel_frequency(&self, channel: usize) -> (u16, u8) {
+        if channel == 2 && self.ch3_mode & 0x40 != 0 {
+            (self.ch3_fnum[3], self.ch3_block[3])
+        } else {
+            let operator = self.channels[channel].operator(0);
+            (operator.freq_number, operator.block)
+        }
     }
 
     /// Get channel index from register address and part

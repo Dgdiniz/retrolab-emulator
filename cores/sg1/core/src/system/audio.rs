@@ -88,10 +88,10 @@ fn stem_layout(rate: u32) -> StemLayout {
 /// on the 68000's clock, the PSG on the Z80's.
 const CHIP_DIVIDERS: [u64; 2] = [7, 15];
 
-/// The sound log while a host logs. Each chip logs its writes on its own
-/// input clock; each frame's end gathers them onto the master clock, the
-/// YM2612's before the PSG's at the same time, then the frame's end. A
-/// host setting, not saved.
+/// The sound log while a host logs. Each chip logs its writes (and the
+/// YM2612 its channels' keys) on its own input clock; each frame's end
+/// gathers them onto the master clock, the YM2612's before the PSG's at the
+/// same time, then the frame's end. A host setting, not saved.
 #[derive(Debug, Default)]
 pub(super) struct SoundLogState {
     logger: SoundLogger,
@@ -165,24 +165,25 @@ impl SoundCore for GenesisEmulator {
         ]
     }
 
-    /// The log's clock is the master clock. The chips log no keys: a log
-    /// asked for them holds the writes.
+    /// The log's clock is the master clock. The YM2612 keys its channels;
+    /// the PSG's tones have no keys, so a log of the keys names the
+    /// YM2612's alone.
     fn start_sound_log(&mut self, contents: SoundLogContents) {
         if !contents.any() {
             self.stop_sound_log();
             return;
         }
-        self.set_chip_logs(true);
+        self.set_chip_logs(contents);
         self.sound_log.bases = self.chip_clocks();
         self.sound_log.offset = 0;
         self.sound_log.paused = false;
-        let image = self.sound_log_image(0);
+        let image = self.sound_log_image(0, contents);
         self.sound_log.logger.start(contents, image);
     }
 
     fn stop_sound_log(&mut self) {
         self.gather_sound_log();
-        self.set_chip_logs(false);
+        self.set_chip_logs(SoundLogContents::default());
         self.sound_log.logger.stop();
     }
 
@@ -206,25 +207,33 @@ impl GenesisEmulator {
         log.offset + clock.saturating_sub(log.bases[chip]) * CHIP_DIVIDERS[chip]
     }
 
-    /// The chips' registers as entries at `time`: the YM2612's, then the
-    /// PSG's.
-    fn sound_log_image(&self, time: u64) -> Vec<SoundLogEntry> {
-        let entry = |chip, register, value| SoundLogEntry {
-            time,
-            chip,
-            event: SoundEvent::Write { register, value },
-        };
-        let ym = self.bus.ym2612().register_image();
-        let psg = self.bus.psg().register_image();
-        ym.into_iter()
-            .map(|(register, value)| entry(0, register, value))
-            .chain(psg.into_iter().map(|value| entry(1, 0, value)))
-            .collect()
+    /// The chips as entries at `time`, what `contents` holds of them: with
+    /// the writes, the YM2612's registers, then the PSG's; with the keys, a
+    /// key-on for each YM2612 channel keyed.
+    fn sound_log_image(&self, time: u64, contents: SoundLogContents) -> Vec<SoundLogEntry> {
+        let entry = |chip, event| SoundLogEntry { time, chip, event };
+        let write = |chip, register, value| entry(chip, SoundEvent::Write { register, value });
+        let mut image = Vec::new();
+        if contents.writes {
+            let ym = self.bus.ym2612().register_image();
+            let psg = self.bus.psg().register_image();
+            image.extend(
+                ym.into_iter()
+                    .map(|(register, value)| write(0, register, value))
+                    .chain(psg.into_iter().map(|value| write(1, 0, value))),
+            );
+        }
+        if contents.keys {
+            let keys = self.bus.ym2612().key_image();
+            image.extend(keys.into_iter().map(|event| entry(0, event)));
+        }
+        image
     }
 
-    fn set_chip_logs(&mut self, on: bool) {
-        self.bus.ym2612_mut().set_sound_log(on);
-        self.bus.psg_mut().set_sound_log(on);
+    /// Each chip logs what `contents` asks of it: the PSG its writes.
+    fn set_chip_logs(&mut self, contents: SoundLogContents) {
+        self.bus.ym2612_mut().set_sound_log(contents);
+        self.bus.psg_mut().set_sound_log(contents.writes);
     }
 
     /// What the chips logged since the last gathering, onto the log's
@@ -290,12 +299,13 @@ impl GenesisEmulator {
             return;
         }
         self.sound_log.paused = false;
-        self.set_chip_logs(true);
+        let contents = self.sound_log.logger.contents();
+        self.set_chip_logs(contents);
         let time = self.sound_log.logger.latest();
         self.sound_log.offset = time;
         self.sound_log.bases = self.chip_clocks();
         self.sound_log.logger.interrupt();
-        let image = self.sound_log_image(time);
+        let image = self.sound_log_image(time, contents);
         self.sound_log.logger.extend(image);
     }
 }

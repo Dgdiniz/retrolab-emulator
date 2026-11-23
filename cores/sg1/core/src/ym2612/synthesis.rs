@@ -233,6 +233,7 @@ impl Ym2612 {
     /// Run timers for the given number of input clock cycles.
     /// Timers tick at the internal FM rate (every 144 input clocks).
     fn clock_timers(&mut self, cycles: u32) {
+        let start = self.timer_accumulator;
         self.timer_accumulator += cycles as f32;
         if self.timer_accumulator > MAX_TIMER_ACCUMULATOR {
             self.timer_accumulator = MAX_TIMER_ACCUMULATOR;
@@ -244,19 +245,38 @@ impl Ym2612 {
 
             self.csm_key_state <<= 1;
             if self.csm_key_state & 0x02 != 0 {
+                let keyed_before = self.logs_keys().then(|| self.keyed_operators(2));
                 self.channels[2].key_off_all();
                 self.csm_key_state &= !0x02;
+                if let Some(before) = keyed_before {
+                    let clock = self.tick_clock(cycles, start, timer_ticks);
+                    self.log_key_change(clock, 2, before);
+                }
             }
 
             let timer_a_overflow = self.timers.clock_timer_a();
             if timer_a_overflow && self.timers.is_csm_mode() {
+                let keyed_before = self.logs_keys().then(|| self.keyed_operators(2));
                 self.channels[2].key_on_all();
                 self.csm_key_state |= 0x01;
+                if let Some(before) = keyed_before {
+                    let clock = self.tick_clock(cycles, start, timer_ticks);
+                    self.log_key_change(clock, 2, before);
+                }
             }
         }
         if timer_ticks > 0 {
             self.timers.clock_timer_b(timer_ticks);
         }
+    }
+
+    /// The input clock of tick `tick` (from 1) of a `clock(cycles)` call
+    /// that found `start` clocks in the timers' accumulator: each tick comes
+    /// 144 clocks after the one before, the first once the accumulator
+    /// reaches 144.
+    fn tick_clock(&self, cycles: u32, start: f32, tick: i32) -> u64 {
+        let into_call = (144.0 * tick as f32 - start) as u64;
+        self.input_clocks - u64::from(cycles) + into_call
     }
 }
 

@@ -639,18 +639,20 @@ impl Apu {
             .then(|| &state.scopes[voice])
     }
 
-    /// Start a sound log holding `contents`, its first entries the DSP's
-    /// 128 registers, at time 0 ([`retro_core::audio::SoundCore::start_sound_log`]).
-    /// The DSP logs no keys: a log asked for them holds the writes.
+    /// Start a sound log holding `contents`, its first entries at time 0
+    /// the DSP's 128 registers (with the writes) and a key-on for each
+    /// voice sounding (with the keys)
+    /// ([`retro_core::audio::SoundCore::start_sound_log`]).
     pub fn start_sound_log(&mut self, contents: SoundLogContents) {
         if !contents.any() {
             self.stop_sound_log();
             return;
         }
         let mut log = Box::<DspLog>::default();
-        let image = log.image(&self.state.dsp);
+        let image = log.image(&self.state.dsp, contents);
         log.logger.start(contents, image);
         self.state.sound_log = Some(log);
+        self.state.dsp.set_keys_logged(contents.keys);
     }
 
     /// Stop the log; what it logged waits for the next take.
@@ -658,6 +660,7 @@ impl Apu {
         if let Some(log) = self.state.sound_log.as_deref_mut() {
             log.logger.stop();
         }
+        self.state.dsp.set_keys_logged(false);
     }
 
     /// What the log took down since the last take, on the DSP's 32 kHz
@@ -693,16 +696,19 @@ impl Apu {
     /// The log carried over from the APU this one replaces; the reset a
     /// load ends with marks it interrupted.
     pub(crate) fn restore_sound_log_state(&mut self, log: Option<Box<DspLog>>) {
+        let keys = log.as_deref().is_some_and(|log| log.logger.logs_keys());
         self.state.sound_log = log;
+        self.state.dsp.set_keys_logged(keys);
     }
 
     /// A reset, a load or a savestate's load came: the next take says so,
-    /// and the log goes on with the DSP's registers as they stand.
+    /// and the log goes on with the DSP as it stands, what the log holds of
+    /// it.
     fn sound_log_interrupted(&mut self) {
         if let Some(log) = self.state.sound_log.as_deref_mut() {
             if log.logger.is_on() {
                 log.logger.interrupt();
-                let image = log.image(&self.state.dsp);
+                let image = log.image(&self.state.dsp, log.logger.contents());
                 log.logger.extend(image);
             }
         }

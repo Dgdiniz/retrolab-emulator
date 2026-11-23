@@ -4,11 +4,13 @@
 //! A host starts the log with [`crate::audio::SoundCore::start_sound_log`]
 //! and takes what was logged with
 //! [`crate::audio::SoundCore::take_sound_log`]. The first entries of the
-//! first take are the chips' registers as they stood when the log began
-//! (the image), all at time 0; the times never go back; a frame's end is an
-//! entry of its own. A load, a reset or a power cycle between two takes
-//! marks the later one interrupted, and the log goes on with the chips'
-//! registers again at the time it stood at.
+//! first take are the chips as they stood when the log began (the image),
+//! all at time 0: their registers, in a log of the writes, and a key-on for
+//! each channel then sounding, in a log of the keys. The times never go
+//! back; a frame's end is an entry of its own, in every log. A load, a reset
+//! or a power cycle between two takes marks the later one interrupted (every
+//! note held before it ends there), and the log goes on with the chips'
+//! image again at the time it stood at.
 //!
 //! The record form ([`SoundLog::records`]) packs each entry in
 //! [`RECORD_BYTES`] bytes, little-endian, for a host that moves logs
@@ -27,6 +29,24 @@ pub enum SoundEvent {
     Reset,
     /// The end of one of the machine's frames.
     FrameEnd,
+    /// A channel keyed on: a note starts. `instrument` names what it plays
+    /// (the sample's number on a chip that plays samples, a hash of the
+    /// channel's patch on an FM chip), `pitch` is the chip's own value for
+    /// the note, and `level` the chip's own measure of its loudness (on a
+    /// chip that plays samples the larger of the voice's two volumes, louder
+    /// as it grows; on an FM chip the attenuation of the channel's loudest
+    /// carrier, softer as it grows).
+    KeyOn {
+        channel: u8,
+        instrument: u64,
+        pitch: u32,
+        level: u16,
+    },
+    /// A channel keyed off, or cut by its chip: its note ends.
+    KeyOff { channel: u8 },
+    /// A channel's sample reached an end with no loop, and the voice fell
+    /// silent there.
+    SampleEnd { channel: u8 },
 }
 
 /// One entry of a [`SoundLog`]: when, which chip, what.
@@ -51,13 +71,14 @@ pub enum SoundChipKind {
     SDsp,
 }
 
-/// What a log holds.
+/// What a log holds; every log holds the frames' ends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundLogContents {
-    /// The chips' register writes (and their resets and the frames' ends).
+    /// The chips' register writes, and their resets.
     pub writes: bool,
-    /// Each channel's key-on and key-off, which the chips work out of
-    /// their writes.
+    /// Each channel's key-on and key-off, and a sample's end, as the chips
+    /// work them out of their writes: an entry where a channel's keyed
+    /// state changes, none for a write that leaves it as it was.
     pub keys: bool,
 }
 
@@ -89,13 +110,18 @@ pub const RECORD_BYTES: usize = 24;
 const KIND_WRITE: u8 = 0;
 const KIND_RESET: u8 = 1;
 const KIND_FRAME_END: u8 = 2;
+const KIND_KEY_ON: u8 = 3;
+const KIND_KEY_OFF: u8 = 4;
+const KIND_SAMPLE_END: u8 = 5;
 
 impl SoundLog {
     /// The entries in the record form, [`RECORD_BYTES`] each: bytes 0-7 the
     /// time; byte 8 the kind in its low four bits (0 a write, 1 a reset, 2
-    /// a frame's end) and the chip in its high four; for a write, byte 9
-    /// the value and bytes 10-11 the register. The bytes a kind does not
-    /// use are zero.
+    /// a frame's end, 3 a key-on, 4 a key-off, 5 a sample's end) and the
+    /// chip in its high four. A write: byte 9 the value, bytes 10-11 the
+    /// register. A key-on: byte 9 the channel, bytes 10-11 the level, 12-15
+    /// the pitch, 16-23 the instrument. A key-off and a sample's end: byte 9
+    /// the channel. The bytes a kind does not use are zero.
     pub fn records(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.entries.len() * RECORD_BYTES);
         for entry in &self.entries {
@@ -109,6 +135,26 @@ impl SoundLog {
                 }
                 SoundEvent::Reset => KIND_RESET,
                 SoundEvent::FrameEnd => KIND_FRAME_END,
+                SoundEvent::KeyOn {
+                    channel,
+                    instrument,
+                    pitch,
+                    level,
+                } => {
+                    record[9] = channel;
+                    record[10..12].copy_from_slice(&level.to_le_bytes());
+                    record[12..16].copy_from_slice(&pitch.to_le_bytes());
+                    record[16..24].copy_from_slice(&instrument.to_le_bytes());
+                    KIND_KEY_ON
+                }
+                SoundEvent::KeyOff { channel } => {
+                    record[9] = channel;
+                    KIND_KEY_OFF
+                }
+                SoundEvent::SampleEnd { channel } => {
+                    record[9] = channel;
+                    KIND_SAMPLE_END
+                }
             };
             record[8] = kind | entry.chip << 4;
             out.extend_from_slice(&record);
@@ -138,6 +184,14 @@ impl SoundLog {
                     },
                     KIND_RESET => SoundEvent::Reset,
                     KIND_FRAME_END => SoundEvent::FrameEnd,
+                    KIND_KEY_ON => SoundEvent::KeyOn {
+                        channel: record[9],
+                        level: u16::from_le_bytes([record[10], record[11]]),
+                        pitch: u32::from_le_bytes(record[12..16].try_into().expect("4 bytes")),
+                        instrument: u64::from_le_bytes(record[16..24].try_into().expect("8 bytes")),
+                    },
+                    KIND_KEY_OFF => SoundEvent::KeyOff { channel: record[9] },
+                    KIND_SAMPLE_END => SoundEvent::SampleEnd { channel: record[9] },
                     kind => return Err(format!("record {index}: no kind {kind}")),
                 };
                 Ok(SoundLogEntry {
@@ -191,6 +245,16 @@ impl SoundLogger {
     /// Whether a log is running.
     pub fn is_on(&self) -> bool {
         self.contents.any()
+    }
+
+    /// Whether the log takes the chips' writes down.
+    pub fn logs_writes(&self) -> bool {
+        self.contents.writes
+    }
+
+    /// Whether the log takes the channels' keys down.
+    pub fn logs_keys(&self) -> bool {
+        self.contents.keys
     }
 
     /// Start a log holding `contents`, its first entries `image`, at time
@@ -271,18 +335,53 @@ mod tests {
                     chip: 0,
                     event: SoundEvent::FrameEnd,
                 },
+                SoundLogEntry {
+                    time: 11,
+                    chip: 1,
+                    event: SoundEvent::KeyOn {
+                        channel: 5,
+                        instrument: 0x1122_3344_5566_7788,
+                        pitch: 0x0A0B_0C0D,
+                        level: 0x0E0F,
+                    },
+                },
+                SoundLogEntry {
+                    time: 12,
+                    chip: 0,
+                    event: SoundEvent::KeyOff { channel: 7 },
+                },
+                SoundLogEntry {
+                    time: 13,
+                    chip: 0,
+                    event: SoundEvent::SampleEnd { channel: 2 },
+                },
             ],
             image_len: 0,
             interrupted: false,
         };
         let records = log.records();
-        assert_eq!(records.len(), 3 * RECORD_BYTES);
+        assert_eq!(records.len(), 6 * RECORD_BYTES);
         assert_eq!(
             &records[..RECORD_BYTES],
             &[8, 7, 6, 5, 4, 3, 2, 1, 0x10, 0xCD, 0x2B, 0x1A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(records[RECORD_BYTES + 8], 1);
         assert_eq!(records[2 * RECORD_BYTES + 8], 2);
+        assert_eq!(
+            &records[3 * RECORD_BYTES..4 * RECORD_BYTES],
+            &[
+                11, 0, 0, 0, 0, 0, 0, 0, 0x13, 5, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x88, 0x77,
+                0x66, 0x55, 0x44, 0x33, 0x22, 0x11
+            ]
+        );
+        assert_eq!(
+            &records[4 * RECORD_BYTES + 8..4 * RECORD_BYTES + 10],
+            &[4, 7]
+        );
+        assert_eq!(
+            &records[5 * RECORD_BYTES + 8..5 * RECORD_BYTES + 10],
+            &[5, 2]
+        );
         assert_eq!(SoundLog::entries_of(&records).unwrap(), log.entries);
         assert!(SoundLog::entries_of(&records[1..]).is_err());
         let mut bad = records.clone();

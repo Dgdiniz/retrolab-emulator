@@ -189,6 +189,46 @@ fn get_ym2612_timer_b_state_is_a_plain_object() {
     );
 }
 
+#[wasm_bindgen_test]
+fn get_fm_patch_is_a_plain_object_its_operators_four() {
+    let emu = with_plain_cartridge();
+    let patch = emu.get_fm_patch(5);
+    assert_plain_object(
+        &patch,
+        &[
+            "algorithm",
+            "feedback",
+            "left",
+            "right",
+            "ams",
+            "pms",
+            "operators",
+        ],
+        "getFmPatch",
+    );
+    let operators = js_sys::Reflect::get(&patch, &JsValue::from_str("operators")).unwrap();
+    let operators: js_sys::Array = operators.dyn_into().unwrap();
+    assert_eq!(operators.length(), 4);
+    assert_plain_object(
+        &operators.get(3),
+        &[
+            "detune",
+            "multiple",
+            "total_level",
+            "rate_scaling",
+            "attack_rate",
+            "am",
+            "decay_rate",
+            "sustain_rate",
+            "sustain_level",
+            "release_rate",
+            "ssg_eg",
+        ],
+        "getFmPatch's operator",
+    );
+    assert!(emu.get_fm_patch(6).is_undefined());
+}
+
 /// Place `words` at `address` of `rom`, high byte first.
 fn place(rom: &mut [u8], address: usize, words: &[u16]) {
     for (i, word) in words.iter().enumerate() {

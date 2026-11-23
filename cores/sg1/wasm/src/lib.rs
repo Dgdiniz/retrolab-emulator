@@ -157,6 +157,20 @@ impl RetroEmulator {
     pub fn get_ym2612_timer_b_state(&self) -> JsValue {
         to_js(&self.genesis.get_ym2612_timer_b_state())
     }
+
+    /// The patch of the YM2612's channel `channel` (0-5): `{ algorithm,
+    /// feedback, left, right, ams, pms, operators }`, the four operators in
+    /// register-slot order (S1, S3, S2, S4), each `{ detune, multiple,
+    /// total_level, rate_scaling, attack_rate, am, decay_rate,
+    /// sustain_rate, sustain_level, release_rate, ssg_eg }`; `undefined`
+    /// past the sixth.
+    #[wasm_bindgen(js_name = getFmPatch)]
+    pub fn get_fm_patch(&self, channel: u32) -> JsValue {
+        match self.genesis.ym2612().patch(channel as usize) {
+            Some(patch) => to_js(&patch),
+            None => JsValue::UNDEFINED,
+        }
+    }
 }
 
 /// The Mega Drive's sound files from a sound log a host took

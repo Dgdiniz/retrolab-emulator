@@ -344,9 +344,10 @@ macro_rules! audio_bindings {
             }
 
             /// Start a sound log of the chips' register writes (`writes`)
-            /// and their channels' keys (`keys`), its first entries the
-            /// chips' registers as they stand, at time 0; what an earlier
-            /// log left is dropped. Neither stops the log.
+            /// and their channels' keys (`keys`), its first entries, at
+            /// time 0, the chips as they stand (their registers with
+            /// `writes`, a key-on for each channel sounding with `keys`);
+            /// what an earlier log left is dropped. Neither stops the log.
             #[wasm_bindgen(js_name = startSoundLog)]
             pub fn start_sound_log(&mut self, writes: bool, keys: bool) {
                 $crate::__private::retro_core::audio::SoundCore::start_sound_log(

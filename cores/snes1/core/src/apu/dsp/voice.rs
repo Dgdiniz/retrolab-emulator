@@ -21,10 +21,12 @@
 //! key-on, pitch modulation and the ENDX/ENVX/OUTX write-back; checked
 //! against bsnes-plus.
 
+use retro_core::audio::SoundEvent;
+
 use super::brr::{decode_four, BlockHeader, SampleRing};
 use super::envelope::{Envelope, Stage};
 use super::gaussian::interpolate;
-use super::registers::{VoiceReg, ENDX, FLG, FLG_RESET};
+use super::registers::{VoiceReg, DSP_REG_COUNT, ENDX, FLG, FLG_RESET};
 use super::{clamp16, SDsp};
 
 /// A pitch bent by the previous voice's output.
@@ -37,6 +39,82 @@ fn modulated(pitch: i32, previous_output: i32) -> i32 {
 #[inline]
 fn noise_sample(lfsr: u16) -> i32 {
     i32::from((lfsr << 1) as i16)
+}
+
+/// What a sample's events do to a voice, in the order the chip takes them:
+/// a cut (a soft reset or an end block without loop), a key-off, a key-on.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VoiceKeys {
+    pub soft_reset: bool,
+    pub ending: bool,
+    pub key_off: bool,
+    pub key_on: bool,
+}
+
+impl VoiceKeys {
+    fn any(self) -> bool {
+        self.soft_reset || self.ending || self.key_off || self.key_on
+    }
+}
+
+/// The keys the sound log takes down: where a sample's events change a
+/// voice's keyed state, a key-on, a key-off or a sample's end, each with
+/// the samples after the current one it belongs to (voice 0's pass reaches
+/// its keys at the end of the sample before the one its output joins). Not
+/// chip state, not saved.
+#[derive(Debug, Clone, Default)]
+pub(super) struct KeyLog {
+    pub on: bool,
+    pub events: Vec<(u8, SoundEvent)>,
+}
+
+impl KeyLog {
+    /// Note what `keys` do to voice `voice`, whose envelope stands as
+    /// `envelope` before them: a cut silences a sounding voice (a sample's
+    /// end when its sample ended), a key-off releases one not already
+    /// releasing, and a key-on starts a note.
+    fn note(
+        &mut self,
+        regs: &[u8; DSP_REG_COUNT],
+        voice: usize,
+        envelope: &Envelope,
+        keys: VoiceKeys,
+    ) {
+        let channel = voice as u8;
+        let later = u8::from(voice == 0);
+        let mut releasing = envelope.stage == Stage::Release;
+        let sounding = !releasing || envelope.level != 0;
+        if keys.soft_reset || keys.ending {
+            if sounding {
+                let event = match keys.ending {
+                    true => SoundEvent::SampleEnd { channel },
+                    false => SoundEvent::KeyOff { channel },
+                };
+                self.events.push((later, event));
+            }
+            releasing = true;
+        }
+        if keys.key_off && !keys.key_on && !releasing {
+            self.events.push((later, SoundEvent::KeyOff { channel }));
+        }
+        if keys.key_on {
+            self.events.push((later, key_on_event(regs, voice)));
+        }
+    }
+}
+
+/// Voice `voice`'s note as a key-on names it, from the registers: its
+/// source number, its 14-bit pitch, and the larger of its two volumes'
+/// sizes.
+pub(super) fn key_on_event(regs: &[u8; DSP_REG_COUNT], voice: usize) -> SoundEvent {
+    let reg = |r: VoiceReg| regs[voice * 0x10 + r as usize];
+    let volume = |r: VoiceReg| (reg(r) as i8).unsigned_abs();
+    SoundEvent::KeyOn {
+        channel: voice as u8,
+        instrument: u64::from(reg(VoiceReg::Srcn)),
+        pitch: u32::from(reg(VoiceReg::PitchL)) | u32::from(reg(VoiceReg::PitchH) & 0x3f) << 8,
+        level: u16::from(volume(VoiceReg::VolL).max(volume(VoiceReg::VolR))),
+    }
 }
 
 /// One voice.
@@ -214,12 +292,16 @@ impl SDsp {
         self.stem_dry[voice] = self.voice_output;
         v.envx_out = v.envelope.envx();
 
-        let ending = BlockHeader::decode(self.block_header).ends_without_loop();
-        v.key_events(
-            soft_reset || ending,
-            self.key_sample && self.key_off_mask & bit != 0,
-            self.key_sample && self.key_on_mask & bit != 0,
-        );
+        let keys = VoiceKeys {
+            soft_reset,
+            ending: BlockHeader::decode(self.block_header).ends_without_loop(),
+            key_off: self.key_sample && self.key_off_mask & bit != 0,
+            key_on: self.key_sample && self.key_on_mask & bit != 0,
+        };
+        if self.key_log.on && keys.any() {
+            self.key_log.note(&self.regs, voice, &v.envelope, keys);
+        }
+        v.key_events(keys.soft_reset || keys.ending, keys.key_off, keys.key_on);
         if v.key_on_countdown == 0 {
             v.envelope
                 .step(self.envelope_control, adsr2, gain, self.rate_counter);

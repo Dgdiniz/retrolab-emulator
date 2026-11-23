@@ -19,7 +19,8 @@
 //! master; and they add up to the master by the layout's rule wherever the
 //! take counts no departure. So does the sound log, which starts with the
 //! chips' registers at time 0, never goes back in time, holds a frame's end
-//! for every frame, and says when a load came between two takes.
+//! for every frame, says when a load came between two takes, and, holding
+//! the keys alone, holds the notes and no write.
 
 use crate::audio::sound_log::{SoundEvent, SoundLog, SoundLogContents};
 use crate::audio::stems::{SampleKind, StemLayout, StemSet, StemTake};
@@ -92,6 +93,7 @@ macro_rules! sound_conformance_tests {
             the_log_changes_nothing,
             the_log_starts_with_the_image_and_never_goes_back,
             a_load_interrupts_the_log,
+            the_log_takes_the_keys_down,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -483,8 +485,15 @@ pub fn the_log_changes_nothing<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
     assert!(entries > 0, "the log took the frames down");
 }
 
+/// What a log holds in the checks of the keys: the keys alone.
+const KEYS: SoundLogContents = SoundLogContents {
+    writes: false,
+    keys: true,
+};
+
 /// The log starts with the chips' registers, every one at time 0, before
-/// anything else; the writes after them are the sound moment's, at their
+/// anything else (then a key-on for each channel sounding, none before the
+/// sound moment); the writes after them are the sound moment's, at their
 /// time; the times never go back; and every frame ends with an entry.
 pub fn the_log_starts_with_the_image_and_never_goes_back<E: SoundCore>(
     core: &SoundCoreUnderTest<E>,
@@ -511,8 +520,11 @@ pub fn the_log_starts_with_the_image_and_never_goes_back<E: SoundCore>(
     for entry in &first.entries[..first.image_len] {
         assert_eq!(entry.time, 0, "the registers stand at time 0");
         assert!(
-            matches!(entry.event, SoundEvent::Write { .. }),
-            "the registers are writes"
+            matches!(
+                entry.event,
+                SoundEvent::Write { .. } | SoundEvent::KeyOn { .. }
+            ),
+            "the image is the registers and the sounding channels' key-ons"
         );
         assert!(
             usize::from(entry.chip) < chips.len(),
@@ -582,4 +594,55 @@ pub fn a_load_interrupts_the_log<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
     emu.render_frame();
     let next = emu.take_sound_log().expect("a log runs");
     assert!(!next.interrupted, "the take after says nothing came");
+}
+
+/// A log of the keys holds no write and no reset. Started before the sound
+/// moment, its image is empty (nothing sounds yet) and the moment's notes
+/// come after it as key-ons, at no earlier time; started while the notes
+/// sound, its image is their key-ons, every one at time 0.
+pub fn the_log_takes_the_keys_down<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let no_writes = |log: &SoundLog, when: &str| {
+        assert!(
+            !log.entries
+                .iter()
+                .any(|entry| matches!(entry.event, SoundEvent::Write { .. } | SoundEvent::Reset)),
+            "{when}: a log of the keys took a write down"
+        );
+    };
+    let mut emu = (core.build)();
+    for _ in 0..WARM_UP {
+        emu.run_frame();
+    }
+    emu.start_sound_log(KEYS);
+    (core.sound_moment)(&mut emu);
+    let mut key_ons = 0;
+    let mut latest = 0;
+    for frame in 0..FRAMES {
+        emu.render_frame();
+        let log = emu.take_sound_log().expect("a log runs");
+        no_writes(&log, "before the sound moment");
+        if frame == 0 {
+            assert_eq!(log.image_len, 0, "nothing sounded when the log began");
+        }
+        for entry in &log.entries {
+            assert!(entry.time >= latest, "the time went back");
+            latest = entry.time;
+            key_ons += usize::from(matches!(entry.event, SoundEvent::KeyOn { .. }));
+        }
+    }
+    assert!(key_ons > 0, "the sound moment's notes are logged");
+
+    let mut emu = core.playing();
+    emu.render_frame();
+    emu.start_sound_log(KEYS);
+    emu.render_frame();
+    let log = emu.take_sound_log().expect("a log runs");
+    no_writes(&log, "while the notes sound");
+    assert!(log.image_len > 0, "the notes sounding make the image");
+    for entry in &log.entries[..log.image_len] {
+        assert!(
+            matches!(entry.event, SoundEvent::KeyOn { .. }) && entry.time == 0,
+            "the image is key-ons at time 0"
+        );
+    }
 }

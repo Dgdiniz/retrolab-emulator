@@ -45,7 +45,7 @@ use echo::HISTORY_LEN;
 use envelope::{count_down, rate_fires, Stage};
 use registers::{DIR, ENDX, EON, FLG, KOFF, NON, PMON};
 use schedule::{Step, VoiceStage};
-use voice::Voice;
+use voice::{KeyLog, Voice};
 
 pub(super) use echo::STEM_VALUES;
 pub(super) use registers::{VoiceDebug, DSP_REG_COUNT};
@@ -159,6 +159,10 @@ pub(super) struct SDsp {
     stem_dry: [i32; 8],
     /// Each voice's amounts for the two channels, through its volumes.
     stem_amounts: [[i32; 2]; 8],
+
+    /// The keys the sound log takes down while it takes keys; not chip
+    /// state, not saved.
+    key_log: KeyLog,
 }
 
 impl Default for SDsp {
@@ -216,16 +220,49 @@ impl SDsp {
             echo_return: [0; 2],
             stem_dry: [0; 8],
             stem_amounts: [[0; 2]; 8],
+            key_log: KeyLog::default(),
         }
     }
 
-    /// Back to power-on; the debugger's mutes stay, and the speakers' mix
-    /// starts again from the chip at power-on.
+    /// Back to power-on; the debugger's mutes stay, so does whether the
+    /// sound log takes the keys down, and the speakers' mix starts again
+    /// from the chip at power-on.
     pub(super) fn reset(&mut self) {
         let voice_mute = self.voice_mute;
+        let keys_logged = self.key_log.on;
         *self = Self::new();
         self.voice_mute = voice_mute;
+        self.key_log.on = keys_logged;
         self.follow_mutes();
+    }
+
+    /// Note the voices' keys for the sound log from now on (`true`), or
+    /// stop and drop what waits.
+    pub(in crate::apu) fn set_keys_logged(&mut self, on: bool) {
+        self.key_log.on = on;
+        self.key_log.events.clear();
+    }
+
+    /// Whether the voices' keys are noted for the sound log.
+    pub(in crate::apu) fn keys_logged(&self) -> bool {
+        self.key_log.on
+    }
+
+    /// The keys noted since the last call, each with the samples after the
+    /// one just made it belongs to (0 or 1).
+    pub(in crate::apu) fn drain_key_events(
+        &mut self,
+    ) -> std::vec::Drain<'_, (u8, retro_core::audio::SoundEvent)> {
+        self.key_log.events.drain(..)
+    }
+
+    /// A key-on for each voice sounding now (keyed and not releasing): the
+    /// notes a log of the keys starts with.
+    pub(in crate::apu) fn key_image(&self) -> Vec<retro_core::audio::SoundEvent> {
+        (0..self.voices.len())
+            .filter(|&voice| self.voices[voice].envelope.stage != Stage::Release)
+            .map(|voice| voice::key_on_event(&self.regs, voice))
+            .collect()
     }
 
     /// Start the speakers' mix from the chip as it stands when the first
@@ -598,6 +635,97 @@ mod tests {
         );
         muted.set_voice_mute(0, false);
         assert!(muted.speakers.is_none(), "it ends with the last mute");
+    }
+
+    /// Run `dsp` `samples` samples, the keys it notes each at the sample
+    /// whose output it joins, counted from `from`.
+    fn noted_keys(
+        dsp: &mut SDsp,
+        aram: &mut [u8],
+        from: u64,
+        samples: u64,
+    ) -> Vec<(u64, retro_core::audio::SoundEvent)> {
+        let mut noted = Vec::new();
+        for sample in from..from + samples {
+            dsp.run_sample(aram);
+            noted.extend(
+                dsp.drain_key_events()
+                    .map(|(later, event)| (sample + u64::from(later), event)),
+            );
+        }
+        noted
+    }
+
+    /// The keys the sound log takes down: one KON's key-ons at the sample
+    /// both voices join the output (voice 0 reaching its key at the end of
+    /// the sample before voice 1), a sample's end where the voice reaches
+    /// an end block without loop, one key-off however long KOFF holds it,
+    /// and nothing while the keys are not logged.
+    #[test]
+    fn the_keys_are_noted_where_they_change_a_voice() {
+        use retro_core::audio::SoundEvent;
+        let mut dsp = SDsp::new();
+        let mut aram = vec![0u8; 0x10000];
+        // Source 0 loops on one block at $0300; source 1 is two blocks at
+        // $0400, the second an end without loop.
+        aram[0x0200..0x0208].copy_from_slice(&[0x00, 0x03, 0x00, 0x03, 0x00, 0x04, 0x00, 0x04]);
+        aram[0x0300] = 0xc3;
+        aram[0x0301..0x0309].fill(0x77);
+        aram[0x0400] = 0xc0;
+        aram[0x0401..0x0409].fill(0x77);
+        aram[0x0409] = 0xc1;
+        for voice in 0..2 {
+            for (reg, value) in [
+                (VoiceReg::VolL, 0x40),
+                (VoiceReg::VolR, 0x90),
+                (VoiceReg::PitchH, 0x10),
+                (VoiceReg::Srcn, voice as u8),
+                (VoiceReg::Adsr1, 0x8f),
+                (VoiceReg::Adsr2, 0xe0),
+            ] {
+                dsp.set_vreg(voice, reg, value);
+            }
+        }
+        dsp.regs[DIR] = 0x02;
+        dsp.regs[FLG] = 0;
+        dsp.set_addr(KON as u8);
+        dsp.write_data(0b11);
+        let unlogged = noted_keys(&mut dsp.clone(), &mut aram.clone(), 0, 64);
+        assert!(unlogged.is_empty(), "nothing is noted while off");
+
+        dsp.set_keys_logged(true);
+        let mut noted = Vec::new();
+        let mut key_sample = None;
+        for sample in 0..64 {
+            noted.extend(noted_keys(&mut dsp, &mut aram, sample, 1));
+            if key_sample.is_none() && dsp.voices[1].key_on_countdown == 5 {
+                key_sample = Some(sample);
+                assert_eq!(dsp.voices[0].key_on_countdown, 4, "voice 0 a sample ahead");
+            }
+        }
+        let at = key_sample.expect("the voices keyed on");
+        let key_on = |voice: u8| SoundEvent::KeyOn {
+            channel: voice,
+            instrument: u64::from(voice),
+            pitch: 0x1000,
+            level: 0x70,
+        };
+        assert_eq!(
+            &noted[..2],
+            &[(at, key_on(0)), (at, key_on(1))],
+            "{noted:?}"
+        );
+        let ends: Vec<_> = noted[2..].iter().collect();
+        assert_eq!(ends.len(), 1, "{noted:?}");
+        assert!(ends[0].0 > at);
+        assert_eq!(ends[0].1, SoundEvent::SampleEnd { channel: 1 });
+
+        dsp.set_addr(KOFF as u8);
+        dsp.write_data(0b01);
+        let released = noted_keys(&mut dsp, &mut aram, 64, 64);
+        assert_eq!(released.len(), 1, "{released:?}");
+        assert_eq!(released[0].1, SoundEvent::KeyOff { channel: 0 });
+        assert!(dsp.key_image().is_empty(), "nothing sounds");
     }
 
     #[test]

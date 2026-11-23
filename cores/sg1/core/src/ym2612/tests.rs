@@ -4,7 +4,17 @@ use retro_core::audio::{AudioChip, AudioDebugger, ChannelType};
 use retro_core::cpu::Clockable;
 
 use super::*;
-use retro_core::audio::SoundEvent;
+use retro_core::audio::{SoundEvent, SoundLogContents};
+
+/// A log of the writes alone, of the keys alone.
+const WRITES: SoundLogContents = SoundLogContents {
+    writes: true,
+    keys: false,
+};
+const KEYS: SoundLogContents = SoundLogContents {
+    writes: false,
+    keys: true,
+};
 
 #[test]
 fn test_ym2612_creation() {
@@ -779,7 +789,7 @@ fn the_register_image_written_into_a_fresh_chip_gives_it_back() {
 #[test]
 fn an_ic_reset_logs_a_reset_and_the_registers_it_leaves() {
     let mut ym = written_chip();
-    ym.set_sound_log(true);
+    ym.set_sound_log(WRITES);
     ym.clock(1000);
     ym.write_port(0, 0x22);
     ym.write_port(1, 0x00);
@@ -806,7 +816,7 @@ fn an_ic_reset_logs_a_reset_and_the_registers_it_leaves() {
         .collect();
     assert_eq!(left, ym.register_image());
     assert!(ym.take_sound_log().is_empty(), "taken");
-    ym.set_sound_log(false);
+    ym.set_sound_log(SoundLogContents::default());
     ym.write_port(0, 0x22);
     ym.write_port(1, 0x08);
     assert!(ym.take_sound_log().is_empty(), "off");
@@ -821,4 +831,194 @@ fn the_write_log_stamps_the_input_clocks_received() {
     ym.write_port(1, 0x08);
     assert_eq!(ym.take_write_log()[0].clock, 321);
     assert_eq!(ym.input_clocks(), 321);
+}
+
+/// Write `value` to register `register` of part `part`, as a program does.
+fn write(ym: &mut Ym2612, part: u8, register: u8, value: u8) {
+    ym.write_port(part * 2, register);
+    ym.write_port(part * 2 + 1, value);
+}
+
+#[test]
+fn a_patch_reads_back_every_register_written() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    // Channel 5 (part 1, low bits 1), every operator register a value of
+    // its own: the register's offset within its group names the slot.
+    for (offset, slot) in [(0u8, 0usize), (4, 1), (8, 2), (12, 3)] {
+        let n = slot as u8;
+        write(&mut ym, 1, 0x31 + offset, (n + 1) << 4 | (n + 2)); // DT, MUL
+        write(&mut ym, 1, 0x41 + offset, 10 + n); // TL
+        write(&mut ym, 1, 0x51 + offset, n << 6 | (20 + n)); // KS, AR
+        write(&mut ym, 1, 0x61 + offset, (0x80 * (n & 1)) | (5 + n)); // AM, D1R
+        write(&mut ym, 1, 0x71 + offset, 7 + n); // D2R
+        write(&mut ym, 1, 0x81 + offset, (n + 3) << 4 | (n + 9)); // SL, RR
+        write(&mut ym, 1, 0x91 + offset, 0x08 | n); // SSG-EG
+    }
+    write(&mut ym, 1, 0xB1, 0x3D); // feedback 7, algorithm 5
+    write(&mut ym, 1, 0xB5, 0x80 | 0x20 | 0x06); // left only, AMS 2, PMS 6
+    let patch = ym.patch(4).expect("channel 5");
+    assert_eq!(
+        (
+            patch.algorithm,
+            patch.feedback,
+            patch.left,
+            patch.right,
+            patch.ams,
+            patch.pms
+        ),
+        (5, 7, true, false, 2, 6)
+    );
+    for (slot, operator) in patch.operators.iter().enumerate() {
+        let n = slot as u8;
+        assert_eq!(
+            *operator,
+            FmOperator {
+                detune: n + 1,
+                multiple: n + 2,
+                total_level: 10 + n,
+                rate_scaling: n,
+                attack_rate: 20 + n,
+                am: n & 1 == 1,
+                decay_rate: 5 + n,
+                sustain_rate: 7 + n,
+                sustain_level: n + 3,
+                release_rate: n + 9,
+                ssg_eg: 0x08 | n,
+            },
+            "the operator at register offset {}",
+            slot * 4
+        );
+    }
+    assert!(ym.patch(6).is_none());
+}
+
+#[test]
+fn the_carriers_of_each_algorithm_are_the_ones_the_channel_sums() {
+    // In this core's order: 0 the first modulator, 1 the second, 2 the
+    // first carrier, 3 the second (the channel's routing names them so).
+    let expected: [&[usize]; 8] = [
+        &[3],
+        &[3],
+        &[3],
+        &[3],
+        &[2, 3],
+        &[1, 2, 3],
+        &[1, 2, 3],
+        &[0, 1, 2, 3],
+    ];
+    for (algorithm, carriers) in expected.iter().enumerate() {
+        let mut ym = Ym2612::new(7_670_453, 44_100);
+        write(&mut ym, 0, 0xB0, algorithm as u8);
+        // Each operator a total level of its own; the carriers' least is
+        // the level.
+        for (slot, level) in [40u8, 30, 20, 10].into_iter().enumerate() {
+            write(&mut ym, 0, 0x40 + slot as u8 * 4, level);
+        }
+        let levels = [40u8, 30, 20, 10];
+        let least = carriers.iter().map(|&i| levels[i]).min().unwrap();
+        let state = ym.get_channel_state(0).unwrap();
+        assert_eq!(state.attenuation, least, "algorithm {algorithm}");
+        assert_eq!(state.volume, 1.0 - least as f32 / 127.0);
+    }
+}
+
+#[test]
+fn a_key_write_logs_the_keys_it_changes() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    write(&mut ym, 0, 0xB1, 0x04); // channel 2: algorithm 4
+    write(&mut ym, 0, 0x49, 0x18); // its first carrier's total level
+    write(&mut ym, 0, 0x4D, 0x20); // its second carrier's
+    write(&mut ym, 0, 0xA5, 0x22);
+    write(&mut ym, 0, 0xA1, 0x69);
+    ym.set_sound_log(KEYS);
+    ym.clock(500);
+    write(&mut ym, 0, 0x28, 0xF1); // channel 2 on
+    write(&mut ym, 0, 0x28, 0xF1); // on again: nothing changes
+    write(&mut ym, 0, 0x28, 0x13); // channel value 3 names none
+    ym.clock(100);
+    write(&mut ym, 0, 0x28, 0x01); // off
+    write(&mut ym, 0, 0x28, 0x01); // off again
+    let log = ym.take_sound_log();
+    assert_eq!(
+        log,
+        vec![
+            (
+                500,
+                SoundEvent::KeyOn {
+                    channel: 1,
+                    instrument: ym.instrument(1),
+                    pitch: 0x269 | 4 << 11,
+                    level: 0x18,
+                }
+            ),
+            (600, SoundEvent::KeyOff { channel: 1 }),
+        ]
+    );
+    // A log of the writes takes the key register's writes, not the keys;
+    // one of both takes the write, then the key it changes.
+    ym.set_sound_log(SoundLogContents {
+        writes: true,
+        keys: true,
+    });
+    write(&mut ym, 0, 0x28, 0x11);
+    let log = ym.take_sound_log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(
+        log[0].1,
+        SoundEvent::Write {
+            register: 0x28,
+            value: 0x11
+        }
+    );
+    assert!(matches!(log[1].1, SoundEvent::KeyOn { channel: 1, .. }));
+}
+
+#[test]
+fn the_instrument_is_the_patch_less_its_loudness_and_stereo() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    write(&mut ym, 0, 0xB0, 0x04);
+    let plain = ym.instrument(0);
+    write(&mut ym, 0, 0x48, 0x30); // a carrier's total level
+    write(&mut ym, 0, 0xB4, 0x40); // right only
+    assert_eq!(ym.instrument(0), plain, "loudness and stereo");
+    write(&mut ym, 0, 0x40, 0x30); // a modulator's total level
+    assert_ne!(ym.instrument(0), plain, "a modulator's level is timbre");
+}
+
+#[test]
+fn csm_keys_channel_3_on_and_off_on_the_timer() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    write(&mut ym, 0, 0x24, 0xFF); // timer A: 1024 - 1023 = 1 tick
+    write(&mut ym, 0, 0x25, 0x03);
+    write(&mut ym, 0, 0x27, 0x85); // CSM, load and enable timer A
+    ym.set_sound_log(KEYS);
+    ym.clock(100);
+    ym.clock(200);
+    // Each tick overflows the timer: the first keys channel 3 on, the next
+    // keys it off (the key-on a tick before) and on again.
+    let log = ym.take_sound_log();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert!(matches!(
+        log[0],
+        (144, SoundEvent::KeyOn { channel: 2, .. })
+    ));
+    assert_eq!(log[1], (288, SoundEvent::KeyOff { channel: 2 }));
+    assert!(matches!(
+        log[2],
+        (288, SoundEvent::KeyOn { channel: 2, .. })
+    ));
+}
+
+#[test]
+fn an_ic_reset_ends_the_notes_sounding() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    write(&mut ym, 1, 0x28, 0xF6); // channel 6 on
+    ym.set_sound_log(KEYS);
+    ym.clock(10);
+    ym.ic_reset();
+    assert_eq!(
+        ym.take_sound_log(),
+        vec![(10, SoundEvent::KeyOff { channel: 5 })]
+    );
+    assert!(ym.key_image().is_empty(), "nothing sounds after it");
 }
