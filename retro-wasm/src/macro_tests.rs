@@ -900,6 +900,108 @@ fn the_render_runs_frames_with_the_sound_on() {
     );
 }
 
+/// The bytes of a typed array, as a host streaming a WAV to disk writes
+/// them after the header: a view of its buffer.
+fn buffer_bytes(buffer: &js_sys::ArrayBuffer, offset: u32, length: u32) -> Vec<u8> {
+    Uint8Array::new_with_byte_offset_and_length(buffer, offset, length).to_vec()
+}
+
+#[wasm_bindgen_test]
+fn the_wav_writers_write_samples_of_their_kind_and_the_header_alone() {
+    let pcm = js_sys::Int16Array::from(&[1i16, -2, 32767, -32768, 0, 5][..]);
+    let floats = js_sys::Float32Array::from(&[0.5f32, -1.25, 2.0, 0.0, -0.0, 1.0e-3][..]);
+    let cases = [
+        (
+            JsValue::from(pcm.clone()),
+            "I16",
+            retro_core::audio::SoundSamples::I16(pcm.to_vec()),
+            buffer_bytes(&pcm.buffer(), pcm.byte_offset(), pcm.byte_length()),
+        ),
+        (
+            JsValue::from(floats.clone()),
+            "F32",
+            retro_core::audio::SoundSamples::F32(floats.to_vec()),
+            buffer_bytes(&floats.buffer(), floats.byte_offset(), floats.byte_length()),
+        ),
+    ];
+    for (samples, kind, own, bytes) in cases {
+        let wav =
+            PlainEmulator::encode_wav_samples(samples.clone(), 44_100, 2, None, None).unwrap();
+        assert_eq!(
+            wav,
+            retro_core::audio::encode_wav_samples(&own, 44_100, 2),
+            "{kind}"
+        );
+        // A file streamed to disk: the header, then the array's own bytes.
+        let mut streamed = PlainEmulator::wav_header(kind, 44_100, 2, 3).unwrap();
+        streamed.extend(bytes);
+        assert_eq!(streamed, wav, "{kind}");
+        // With a loop: the same file, then its `smpl` chunk.
+        assert_eq!(
+            PlainEmulator::encode_wav_samples(samples, 44_100, 2, Some(1), Some(2)).unwrap(),
+            retro_core::audio::wav_with_loop(wav, 44_100, 1, 2),
+            "{kind}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn the_wav_writers_refuse_what_no_wav_holds() {
+    let refusal = |result: Result<Vec<u8>, JsValue>| result.unwrap_err().as_string().unwrap();
+    // Three 16-bit samples, as `channels` channels, with a loop.
+    let three = |channels: u16, first: Option<u32>, last: Option<u32>| {
+        let samples = js_sys::Int16Array::from(&[1i16, 2, 3][..]);
+        PlainEmulator::encode_wav_samples(samples.into(), 32_000, channels, first, last)
+    };
+    let plain_array = Array::of2(&JsValue::from(1), &JsValue::from(2));
+    assert_eq!(
+        refusal(PlainEmulator::encode_wav_samples(
+            plain_array.into(),
+            32_000,
+            1,
+            None,
+            None
+        )),
+        "the samples are not an Int16Array or a Float32Array"
+    );
+    assert_eq!(
+        refusal(three(2, None, None)),
+        "3 samples are not whole frames of 2 channels"
+    );
+    assert_eq!(
+        refusal(three(0, None, None)),
+        "a WAV has at least one channel"
+    );
+    assert_eq!(
+        refusal(three(1, Some(0), None)),
+        "a loop needs its first and its last frame"
+    );
+    assert_eq!(
+        refusal(three(1, Some(1), Some(3))),
+        "the loop from frame 1 to frame 3 does not run forward inside the 3 frames"
+    );
+    assert!(
+        three(1, Some(2), Some(1)).is_err(),
+        "a loop that ends before it starts"
+    );
+    assert!(three(1, Some(0), Some(2)).is_ok());
+    assert_eq!(
+        refusal(PlainEmulator::wav_header("i16", 32_000, 1, 1)),
+        "\"i16\" is not a sample kind: \"I16\" or \"F32\""
+    );
+    assert_eq!(
+        refusal(PlainEmulator::wav_header("I16", 32_000, 0, 1)),
+        "a WAV has at least one channel"
+    );
+    assert_eq!(
+        refusal(PlainEmulator::wav_header("F32", 44_100, 2, u32::MAX)),
+        "a WAV's header cannot hold 4294967295 frames of 2 channels of F32 samples at 44100 Hz"
+    );
+    // A refusal leaves the module answering.
+    let header = PlainEmulator::wav_header("F32", 44_100, 2, 0).unwrap();
+    assert_eq!(header.len(), 58);
+}
+
 #[wasm_bindgen_test]
 fn the_stems_are_armed_by_mask_and_taken_by_whole_frames() {
     let mut emu = plain();

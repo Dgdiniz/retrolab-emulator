@@ -197,6 +197,14 @@ impl SoundSamples {
         self.len() == 0
     }
 
+    /// The kind of the samples held.
+    pub fn kind(&self) -> SampleKind {
+        match self {
+            SoundSamples::I16(_) => SampleKind::I16,
+            SoundSamples::F32(_) => SampleKind::F32,
+        }
+    }
+
     /// Sample `index` in its own unit: a 16-bit step, or the float.
     pub fn value(&self, index: usize) -> f64 {
         match self {

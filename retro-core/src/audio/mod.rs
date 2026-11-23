@@ -38,7 +38,7 @@ pub use stems::{
     StemSet, StemSum, StemTake,
 };
 pub use vgm::{encode_vgm, DacForm, Gd3Tag, VgmError, VgmOptions};
-pub use wav::{encode_wav, encode_wav_samples, wav_with_loop};
+pub use wav::{encode_wav, encode_wav_samples, wav_header, wav_with_loop};
 
 /// Audio channel state (expanded for comprehensive debugging).
 #[derive(Debug, Clone, Serialize, Deserialize)]

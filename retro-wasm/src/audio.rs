@@ -6,10 +6,11 @@
 //! [`audio_bindings!`]: crate::audio_bindings
 
 use retro_core::audio::{
-    AudioChipInfo, ChannelState, SoundChipKind, SoundLog, SoundSamples, StemTake,
+    encode_wav_samples, wav_with_loop, AudioChipInfo, ChannelState, SampleKind, SoundChipKind,
+    SoundLog, SoundSamples, StemTake,
 };
 use retro_core::EmulatorCore;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::js::{int16_array, plain_object, to_js, uint32_array, uint8_array};
 
@@ -99,6 +100,107 @@ pub fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsVa
     serde_wasm_bindgen::from_value(value).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// The samples a host hands a WAV writer, copied: an `Int16Array` as 16-bit
+/// integers, a `Float32Array` as 32-bit floats, the two kinds a take of the
+/// stems gives; an error for any other value.
+pub fn samples_of(value: &JsValue) -> Result<SoundSamples, JsValue> {
+    if let Some(array) = value.dyn_ref::<js_sys::Int16Array>() {
+        Ok(SoundSamples::I16(array.to_vec()))
+    } else if let Some(array) = value.dyn_ref::<js_sys::Float32Array>() {
+        Ok(SoundSamples::F32(array.to_vec()))
+    } else {
+        Err(JsValue::from_str(
+            "the samples are not an Int16Array or a Float32Array",
+        ))
+    }
+}
+
+/// The sample kind a host names as `getStemLayout` names it, `"I16"` or
+/// `"F32"`; an error for any other name.
+pub fn sample_kind(name: &str) -> Result<SampleKind, JsValue> {
+    match name {
+        "I16" => Ok(SampleKind::I16),
+        "F32" => Ok(SampleKind::F32),
+        _ => Err(JsValue::from_str(&format!(
+            "{name:?} is not a sample kind: \"I16\" or \"F32\""
+        ))),
+    }
+}
+
+/// The header of a WAV of `frames` sample frames of `channels` samples of
+/// `kind` at `sample_rate` ([`retro_core::audio::wav_header`]), or an error
+/// naming why a WAV's header cannot hold such a file.
+fn header_of(
+    kind: SampleKind,
+    sample_rate: u32,
+    channels: u16,
+    frames: u32,
+) -> Result<Vec<u8>, JsValue> {
+    if channels == 0 {
+        return Err(JsValue::from_str("a WAV has at least one channel"));
+    }
+    retro_core::audio::wav_header(kind, sample_rate, channels, frames).ok_or_else(|| {
+        JsValue::from_str(&format!(
+            "a WAV's header cannot hold {frames} frames of {channels} channels of {kind:?} \
+             samples at {sample_rate} Hz"
+        ))
+    })
+}
+
+/// What `wavHeader` answers: the header of a WAV of `frames` sample frames
+/// of `channels` samples of the kind named `kind` at `sample_rate`, or an
+/// error naming why there is none.
+pub fn wav_header(
+    kind: &str,
+    sample_rate: u32,
+    channels: u16,
+    frames: u32,
+) -> Result<Vec<u8>, JsValue> {
+    header_of(sample_kind(kind)?, sample_rate, channels, frames)
+}
+
+/// What `encodeWavSamples` answers: the samples a host hands
+/// ([`samples_of`]) as a WAV of their kind
+/// ([`retro_core::audio::encode_wav_samples`]), with a loop from sample
+/// frame `loop_start` to `loop_end` in a `smpl` chunk
+/// ([`retro_core::audio::wav_with_loop`]) when both are given; or an error
+/// naming what is wrong: samples of another type, samples that are not
+/// whole frames of `channels`, a loop with one end or not running forward
+/// inside the frames, or a file whose sizes a WAV's header cannot hold.
+pub fn wav_of(
+    samples: &JsValue,
+    sample_rate: u32,
+    channels: u16,
+    loop_start: Option<u32>,
+    loop_end: Option<u32>,
+) -> Result<Vec<u8>, JsValue> {
+    let samples = samples_of(samples)?;
+    let whole = usize::from(channels.max(1));
+    if samples.len() % whole != 0 {
+        return Err(JsValue::from_str(&format!(
+            "{} samples are not whole frames of {channels} channels",
+            samples.len()
+        )));
+    }
+    let frames = u32::try_from(samples.len() / whole)
+        .map_err(|_| JsValue::from_str("a WAV's header cannot hold so many frames"))?;
+    header_of(samples.kind(), sample_rate, channels, frames)?;
+    let wav = encode_wav_samples(&samples, sample_rate, channels);
+    match (loop_start, loop_end) {
+        (None, None) => Ok(wav),
+        (Some(start), Some(end)) if start <= end && end < frames => {
+            Ok(wav_with_loop(wav, sample_rate, start, end))
+        }
+        (Some(start), Some(end)) => Err(JsValue::from_str(&format!(
+            "the loop from frame {start} to frame {end} does not run forward inside the {frames} \
+             frames"
+        ))),
+        _ => Err(JsValue::from_str(
+            "a loop needs its first and its last frame",
+        )),
+    }
+}
+
 /// Writes the host's sound methods on `$emulator`, over the `EmulatorCore`
 /// in its field `$core`: `getAudioSamples()`, `getAudioSamplesN(n)`,
 /// `getAudioAvailable()`, `getAudioRingOverflows()`, `clearAudioBuffer()`
@@ -111,8 +213,10 @@ pub fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsVa
 /// `getAudioOutputWaveform(samples)`, the mixed sound; and the sound hooks
 /// over `SoundCore`: `renderFrames(frames)`, the stems' `getStemLayout()`,
 /// `armStems(mask)` and `takeStems()`, the log's `startSoundLog(writes,
-/// keys)`, `stopSoundLog()` and `takeSoundLog()`, and the associated
-/// `encodeWav(samples, sampleRate, channels)`.
+/// keys)`, `stopSoundLog()` and `takeSoundLog()`, and the associated WAV
+/// writers `encodeWav(samples, sampleRate, channels)`,
+/// `encodeWavSamples(samples, sampleRate, channels, loopStart, loopEnd)`
+/// and `wavHeader(kind, sampleRate, channels, frames)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -392,6 +496,51 @@ macro_rules! audio_bindings {
                 channels: u16,
             ) -> ::std::vec::Vec<u8> {
                 $crate::__private::retro_core::audio::encode_wav(samples, sample_rate, channels)
+            }
+
+            /// Interleaved samples as a WAV file's bytes, of the kind they
+            /// come in, neither converted: an `Int16Array` as 16-bit PCM, a
+            /// `Float32Array` as 32-bit floats, as `takeStems` gives each
+            /// console's; with a loop in a `smpl` chunk after the samples
+            /// when `loopStart` and `loopEnd` are given, the first and the
+            /// last sample frame it plays, for ever. An error for samples of
+            /// another type, samples that are not whole frames of
+            /// `channels`, a loop with one end or not running forward inside
+            /// the frames, or a file whose sizes a WAV's header cannot hold.
+            #[wasm_bindgen(js_name = encodeWavSamples)]
+            pub fn encode_wav_samples(
+                samples: $crate::__private::wasm_bindgen::JsValue,
+                sample_rate: u32,
+                channels: u16,
+                loop_start: ::core::option::Option<u32>,
+                loop_end: ::core::option::Option<u32>,
+            ) -> ::core::result::Result<
+                ::std::vec::Vec<u8>,
+                $crate::__private::wasm_bindgen::JsValue,
+            > {
+                $crate::audio::wav_of(&samples, sample_rate, channels, loop_start, loop_end)
+            }
+
+            /// The header alone of a WAV of `frames` sample frames of
+            /// `channels` interleaved samples of `kind`, `"I16"` or `"F32"`
+            /// as `getStemLayout` names it, at `sampleRate`: the bytes
+            /// `encodeWavSamples` writes before such samples. A file
+            /// streamed to disk is this header, then the samples' bytes,
+            /// little-endian; one written before its frames are counted
+            /// starts with the header of none, written again over it once
+            /// they are. An error for another kind, no channel, or a file
+            /// whose sizes a WAV's header cannot hold.
+            #[wasm_bindgen(js_name = wavHeader)]
+            pub fn wav_header(
+                kind: &str,
+                sample_rate: u32,
+                channels: u16,
+                frames: u32,
+            ) -> ::core::result::Result<
+                ::std::vec::Vec<u8>,
+                $crate::__private::wasm_bindgen::JsValue,
+            > {
+                $crate::audio::wav_header(kind, sample_rate, channels, frames)
             }
         }
     };
