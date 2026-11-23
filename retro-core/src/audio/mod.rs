@@ -11,6 +11,7 @@ pub mod buffer;
 pub mod conformance;
 pub mod host_ring;
 pub mod limiter;
+pub mod mutes;
 pub mod rate_converter;
 pub mod resample;
 pub mod ring_buffer;
@@ -20,6 +21,7 @@ pub mod wav;
 pub use buffer::ChipSampleBuffer;
 pub use host_ring::HostAudioRing;
 pub use limiter::{soft_clip, soft_clip_buffer};
+pub use mutes::ChannelMutes;
 pub use rate_converter::{IntegerRateConverter, RateConverterState};
 pub use resample::LinearResampler;
 pub use ring_buffer::AudioRingBuffer;
@@ -364,7 +366,11 @@ pub trait AudioDebugger {
     /// Get state of a specific channel.
     fn get_channel_state(&self, channel: u32) -> Option<ChannelState>;
 
-    /// Mute or unmute a channel.
+    /// Mute or unmute a channel: a setting of the host's mix, which leaves
+    /// a muted channel out of what the speakers hear while the chip runs
+    /// it as before, so a mute changes nothing the machine holds. It lasts
+    /// across the reset button, a power cycle and a ROM load
+    /// ([`ChannelMutes`]), until the host lifts it.
     fn mute_channel(&mut self, channel: u32, muted: bool);
 
     /// Get waveform data for visualization.

@@ -59,29 +59,25 @@ impl Ym2612 {
         let mut left_sum = 0.0f32;
         let mut right_sum = 0.0f32;
 
+        // Every channel runs whatever its mute: a mute is the mix's, which
+        // leaves the channel's output out of the sum.
         for i in 0..6 {
-            if self.mute_flags[i] {
-                self.channel_outputs[i] = (0.0, 0.0);
-                continue;
-            }
-
-            if i == 5 && self.dac_enabled {
+            let output = if i == 5 && self.dac_enabled {
                 let dac_scaled = (self.dac_value as i32) << 6;
                 let dac_f32 = dac_scaled as f32 / 8192.0;
                 let stereo = self.channels[5].get_stereo();
                 let left_dac = if stereo.left { dac_f32 } else { 0.0 };
                 let right_dac = if stereo.right { dac_f32 } else { 0.0 };
-                self.channel_outputs[i] = (left_dac, right_dac);
-                left_sum += left_dac;
-                right_sum += right_dac;
+                (left_dac, right_dac)
             } else {
                 let (left, right) =
                     self.channels[i].clock_with_lfo_eg(pm_step, am_value, advance_eg);
-                let left_f32 = left as f32 / 8192.0;
-                let right_f32 = right as f32 / 8192.0;
-                self.channel_outputs[i] = (left_f32, right_f32);
-                left_sum += left_f32;
-                right_sum += right_f32;
+                (left as f32 / 8192.0, right as f32 / 8192.0)
+            };
+            self.channel_outputs[i] = output;
+            if !self.mute_flags[i] {
+                left_sum += output.0;
+                right_sum += output.1;
             }
         }
 

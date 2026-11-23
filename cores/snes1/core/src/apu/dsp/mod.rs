@@ -77,8 +77,12 @@ pub(super) struct SDsp {
     addr: u8,
     voices: [Voice; 8],
     /// Voices muted from the debugger: not chip state, not saved. A muted
-    /// voice runs as before and adds nothing to the mix.
+    /// voice runs and mixes as before; the speakers' mix leaves it out.
     voice_mute: [bool; 8],
+    /// What the speakers hear while a voice is muted
+    /// ([`echo::SpeakersMix`]); `None` while none is. Not chip state, not
+    /// saved.
+    speakers: Option<Box<echo::SpeakersMix>>,
 
     // The key latches. KON and KOFF are honoured on every other sample.
     /// This sample honours them.
@@ -169,6 +173,7 @@ impl SDsp {
             addr: 0,
             voices: [Voice::SILENT; 8],
             voice_mute: [false; 8],
+            speakers: None,
             key_sample: true,
             key_on_mask: 0,
             key_on_pending: 0,
@@ -204,11 +209,25 @@ impl SDsp {
         }
     }
 
-    /// Back to power-on; the debugger's mutes stay.
+    /// Back to power-on; the debugger's mutes stay, and the speakers' mix
+    /// starts again from the chip at power-on.
     pub(super) fn reset(&mut self) {
         let voice_mute = self.voice_mute;
         *self = Self::new();
         self.voice_mute = voice_mute;
+        self.follow_mutes();
+    }
+
+    /// Start the speakers' mix from the chip as it stands when the first
+    /// mute begins, and end it with the last.
+    pub(super) fn follow_mutes(&mut self) {
+        let muted = self.voice_mute.contains(&true);
+        if muted && self.speakers.is_none() {
+            let speakers = echo::SpeakersMix::from_chip(self);
+            self.speakers = Some(Box::new(speakers));
+        } else if !muted {
+            self.speakers = None;
+        }
     }
 
     /// One step of the timetable. `run_sample` (in `schedule`) calls
@@ -403,6 +422,9 @@ impl SDsp {
         self.main_sum = s.main_sum;
         self.echo_sum = s.echo_sum;
         self.echo_return = s.echo_return;
+        // The speakers' mix starts again from the chip as it was saved.
+        self.speakers = None;
+        self.follow_mutes();
     }
 }
 
@@ -490,6 +512,82 @@ mod tests {
         assert_eq!(dsp.noise_lfsr, 0x4000);
         assert_eq!(dsp.regs()[0x40], 0);
         assert!(dsp.voice_muted(3));
+    }
+
+    /// A voice muted from the debugger is the speakers' alone: routed to
+    /// the echo, it still reaches the chip's sums and the echo ring in
+    /// ARAM, which stay those of the chip with nothing muted, while the
+    /// speakers hear none of it, in the voices or in the echo.
+    #[test]
+    fn a_muted_voice_changes_nothing_the_chip_holds() {
+        let playing = || {
+            let mut dsp = SDsp::new();
+            let mut aram = vec![0u8; 0x10000];
+            aram[0x0200..0x0204].copy_from_slice(&[0x00, 0x03, 0x00, 0x03]);
+            aram[0x0300] = 0xc3; // shift 12, filter 0, loop, the end
+            aram[0x0301..0x0305].fill(0x77);
+            aram[0x0305..0x0309].fill(0x99);
+            for (reg, value) in [
+                (VoiceReg::VolL, 0x7f),
+                (VoiceReg::VolR, 0x7f),
+                (VoiceReg::PitchH, 0x10),
+                (VoiceReg::Adsr1, 0x8f),
+                (VoiceReg::Adsr2, 0xe0),
+            ] {
+                dsp.set_vreg(0, reg, value);
+            }
+            for (reg, value) in [
+                (DIR, 0x02),
+                (EON, 0x01),
+                (registers::ESA, 0x80),
+                (registers::EDL, 0x01),
+                (registers::EFB, 0x40),
+                (registers::EVOLL, 0x40),
+                (registers::EVOLR, 0x40),
+                (registers::FIR, 0x7f),
+                (registers::MVOLL, 0x7f),
+                (registers::MVOLR, 0x7f),
+                (FLG, 0),
+            ] {
+                dsp.regs[reg] = value;
+            }
+            dsp.set_addr(KON as u8);
+            dsp.write_data(1);
+            (dsp, aram)
+        };
+        let (mut heard, mut heard_aram) = playing();
+        let (mut muted, mut muted_aram) = playing();
+        muted.set_voice_mute(0, true);
+        let mut loudest = 0;
+        for _ in 0..4000 {
+            let (left, _) = heard.run_sample(&mut heard_aram);
+            loudest = loudest.max(left.unsigned_abs());
+            assert_eq!(
+                muted.run_sample(&mut muted_aram),
+                (0, 0),
+                "the speakers hear nothing"
+            );
+        }
+        assert!(loudest > 1000, "the voice sounds when it is not muted");
+        assert!(
+            heard_aram != vec![0u8; 0x10000] && muted_aram == heard_aram,
+            "the echo ring"
+        );
+        assert_eq!(
+            format!("{:?}", muted.to_savestate()),
+            format!("{:?}", heard.to_savestate())
+        );
+        assert!(
+            heard.speakers.is_none(),
+            "with no mute the speakers' mix never starts"
+        );
+        let speakers = muted.speakers.as_ref().expect("the speakers' mix runs");
+        assert!(
+            speakers.words_unlike_the_chip() > 0,
+            "the speakers' echo is their own"
+        );
+        muted.set_voice_mute(0, false);
+        assert!(muted.speakers.is_none(), "it ends with the last mute");
     }
 
     #[test]

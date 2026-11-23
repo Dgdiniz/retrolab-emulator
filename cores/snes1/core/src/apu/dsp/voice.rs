@@ -272,12 +272,9 @@ impl SDsp {
 
     /// Add the voice's output, through its volume for `channel`, to the
     /// main sum and, when the voice is routed to the echo, to the echo
-    /// sum. A voice muted from the debugger still plays (its registers
-    /// keep reading back right) but adds nothing.
+    /// sum. A voice muted from the debugger is mixed as any other: the
+    /// speakers' mix, while it runs, leaves it out.
     fn mix(&mut self, voice: usize, channel: usize) {
-        if self.voice_muted(voice) {
-            return;
-        }
         let volume = if channel == 0 {
             VoiceReg::VolL
         } else {
@@ -285,9 +282,15 @@ impl SDsp {
         };
         let volume = i32::from(self.vreg(voice, volume) as i8);
         let amount = (self.voice_output * volume) >> 7;
+        let echo = self.echo_mask & (1 << voice) != 0;
         self.main_sum[channel] = clamp16(self.main_sum[channel] + amount);
-        if self.echo_mask & (1 << voice) != 0 {
+        if echo {
             self.echo_sum[channel] = clamp16(self.echo_sum[channel] + amount);
+        }
+        if let Some(speakers) = self.speakers.as_deref_mut() {
+            if !self.voice_mute[voice] {
+                speakers.mix(channel, amount, echo);
+            }
         }
     }
 }
@@ -314,16 +317,29 @@ mod tests {
     }
 
     #[test]
-    fn a_muted_voice_adds_nothing_until_unmuted() {
+    fn a_muted_voice_reaches_the_chip_s_sums_and_not_the_speakers() {
         let mut dsp = SDsp::new();
         dsp.voice_output = 1000;
         dsp.set_vreg(0, VoiceReg::VolL, 127);
+        dsp.set_vreg(1, VoiceReg::VolL, 127);
+        let amount = (1000 * 127) >> 7;
         dsp.set_voice_mute(0, true);
         dsp.mix(0, 0);
-        assert_eq!(dsp.main_sum[0], 0);
+        assert_eq!(dsp.main_sum[0], amount, "the chip mixes the muted voice");
+        let speakers = |dsp: &SDsp| dsp.speakers.as_ref().unwrap().main_sum()[0];
+        assert_eq!(speakers(&dsp), 0, "the speakers leave it out");
+        dsp.mix(1, 0);
+        assert_eq!(dsp.main_sum[0], 2 * amount);
+        assert_eq!(
+            speakers(&dsp),
+            amount,
+            "and hear the voice that is not muted"
+        );
         dsp.set_voice_mute(0, false);
-        dsp.mix(0, 0);
-        assert_eq!(dsp.main_sum[0], (1000 * 127) >> 7);
+        assert!(
+            dsp.speakers.is_none(),
+            "the speakers' mix ends with the mute"
+        );
     }
 
     #[test]

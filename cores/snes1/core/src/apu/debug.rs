@@ -6,9 +6,8 @@
 //! visualises lives in the APU's host audio ring. `Apu` owns both, so
 //! it is the natural home for the trait.
 //!
-//! Per the SG1 precedent, `DebuggerCore::audio_debugger()` returns
-//! `None` (the debugger struct doesn't own the APU); the host reaches
-//! this view through `SnesEmulator::audio_debugger()` instead.
+//! A host reaches it as sound chip 0 of the console,
+//! `EmulatorCore::audio_debugger(0)`.
 
 use retro_core::audio::{
     AudioChipInfo, AudioDebugger, ChannelState, ChannelType, EnvelopePhase, EnvelopeState,

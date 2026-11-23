@@ -39,7 +39,7 @@ pub use descriptors::destination_region_str;
 
 use std::collections::VecDeque;
 
-use retro_core::audio::{HostAudioRing, LinearResampler};
+use retro_core::audio::{ChannelMutes, HostAudioRing, LinearResampler};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
@@ -975,7 +975,10 @@ impl EmulatorCore for SnesEmulator {
         // tearing the emulator down), replace the bus wholesale with
         // a fresh instance so every page resets to `OpenBus` before
         // the new cart claims its slots.
+        // The new bus's APU keeps the channels the host muted.
+        let mutes = ChannelMutes::of(self);
         self.bus = SnesBus::new();
+        mutes.apply(self);
         self.bus.install_cartridge(cart);
         // The header's region: the timing profile, and the PAL bit STAT78
         // (`$213F` bit 4) reports.

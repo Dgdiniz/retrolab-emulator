@@ -292,7 +292,7 @@ fn test_reset_via_trait() {
 
     let state = ym.get_channel_state(0).unwrap();
     assert!(!state.enabled); // Key off
-    assert!(!state.muted); // Unmuted
+    assert!(state.muted); // The mute is the host's: a reset keeps it
 
     let level = ym.get_output_level();
     assert_eq!(level, 0.0); // No output

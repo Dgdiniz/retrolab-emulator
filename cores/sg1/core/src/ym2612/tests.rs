@@ -1,6 +1,6 @@
 //! The chip's unit tests.
 
-use retro_core::audio::{AudioChip, ChannelType};
+use retro_core::audio::{AudioChip, AudioDebugger, ChannelType};
 use retro_core::cpu::Clockable;
 
 use super::*;
@@ -316,6 +316,50 @@ fn test_csm_mode() {
     ym.write_register(0, 0x27, 0x00);
 
     assert!(!ym.timers().is_csm_mode());
+}
+
+// A channel the debugger mutes runs as an unmuted one: its operators'
+// phases and envelopes move alike, so the chip holds the same state, and
+// only the mix leaves the channel out.
+#[test]
+fn a_muted_channel_runs_as_an_unmuted_one() {
+    let note = |ym: &mut Ym2612| {
+        ym.set_rendering_enabled(true);
+        for (register, value) in [
+            (0x40, 0x00),
+            (0x50, 0x1F),
+            (0xB0, 0x07),
+            (0xB4, 0xC0),
+            (0xA4, 0x22),
+            (0xA0, 0x69),
+            (0x28, 0xF0),
+        ] {
+            ym.write_port(0, register);
+            ym.write_port(1, value);
+        }
+    };
+    let mut heard = Ym2612::new(7_670_454, 44100);
+    let mut muted = Ym2612::new(7_670_454, 44100);
+    note(&mut heard);
+    note(&mut muted);
+    muted.mute_channel(0, true);
+    let (mut out_heard, mut out_muted) = (vec![0.0; 1470], vec![0.0; 1470]);
+    let mut peak = 0.0f32;
+    for _ in 0..4 {
+        heard.clock(clocks_for_samples(735));
+        muted.clock(clocks_for_samples(735));
+        heard.generate_samples(&mut out_heard, 44100);
+        muted.generate_samples(&mut out_muted, 44100);
+        peak = out_heard.iter().fold(peak, |p, s| p.max(s.abs()));
+        assert!(out_muted.iter().all(|&s| s == 0.0), "the mix leaves it out");
+    }
+    assert!(peak > 0.01, "the channel sounds when it is not muted");
+    assert_eq!(
+        format!("{:?}", muted.to_savestate()),
+        format!("{:?}", heard.to_savestate()),
+        "the muted channel's phases and envelopes moved as the unmuted one's"
+    );
+    assert!(muted.get_channel_state(0).unwrap().muted);
 }
 
 // ===== Sub-frame timestamp catch-up rendering =====

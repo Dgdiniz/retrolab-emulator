@@ -37,11 +37,11 @@ const DSP: [(u8, u8); 30] = [
     (0x6C, 0x00), (0x4C, 0x01),
 ];
 
-fn rom() -> Vec<u8> {
+fn program(title: &[u8; 21]) -> Vec<u8> {
     let mut chip = vec![0u8; 0x10_0000];
     chip[..2].copy_from_slice(&[0x80, 0xFE]); // BRA LOOP
     let h = 0x7FB0;
-    chip[h + 0x10..h + 0x10 + 21].copy_from_slice(b"SOUND CONFORMANCE    ");
+    chip[h + 0x10..h + 0x10 + 21].copy_from_slice(title);
     chip[h + 0x25] = 0x20; // LoROM
     chip[h + 0x26] = 0x00; // ROM only
     chip[h + 0x27] = 0x0A; // 1 MiB
@@ -52,6 +52,14 @@ fn rom() -> Vec<u8> {
     chip[h + 0x2E..h + 0x30].copy_from_slice(&checksum.to_le_bytes());
     chip[0x7FFC..0x7FFE].copy_from_slice(&0x8000u16.to_le_bytes());
     chip
+}
+
+fn rom() -> Vec<u8> {
+    program(b"SOUND CONFORMANCE    ")
+}
+
+fn other_rom() -> Vec<u8> {
+    program(b"SOUND CONFORMANCE B  ")
 }
 
 fn build() -> SnesEmulator {
@@ -85,6 +93,8 @@ fn snes() -> SoundCoreUnderTest<SnesEmulator> {
         build,
         sound_moment,
         every_frame: LOOP,
+        rom: rom(),
+        other_rom: other_rom(),
     }
 }
 

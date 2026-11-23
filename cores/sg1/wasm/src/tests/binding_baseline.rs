@@ -533,11 +533,11 @@ getAudioChipChannels(0).length => 6
 getAudioOutputWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
 getAudioChipChannels(1)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 0, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: true, noise_params: undefined, pan: 0, period: 8128, volume: 1}
 getAudioChipWaveform(1, 0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getAudioChipChannels(0)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: true, noise_params: undefined, pan: 0, period: 0, volume: 1}
+getAudioChipChannels(0)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.9423828125, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: true, noise_params: undefined, pan: 0, period: 0, volume: 1}
 getAudioOutputWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioChipChannels(1)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: -1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
 getAudioChipWaveform(1, 0, 32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getAudioChipChannels(0)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: 0, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
+getAudioChipChannels(0)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.9423828125, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
 getAudioOutputWaveform(32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 "#,
     );

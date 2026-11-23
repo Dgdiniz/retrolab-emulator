@@ -12,7 +12,8 @@
 //!
 //! The first check holds the sound moment to its word: every chip makes
 //! sound after it, so that no other check passes for want of anything to
-//! hear.
+//! hear. A mute, the rules say, is the host's mix's alone: it changes
+//! nothing the machine holds, and it lasts until the host lifts it.
 
 use crate::audio::{render_frames, SoundCore};
 use crate::types::{Breakpoint, BreakpointType, ExecutionMode};
@@ -39,6 +40,10 @@ pub struct SoundCoreUnderTest<E> {
     pub sound_moment: fn(&mut E),
     /// An address the main processor (CPU 0) executes in every frame.
     pub every_frame: u32,
+    /// The program's ROM, for a check that loads it again.
+    pub rom: Vec<u8>,
+    /// Another program, which a check loads in place of the first.
+    pub other_rom: Vec<u8>,
 }
 
 impl<E: SoundCore> SoundCoreUnderTest<E> {
@@ -71,6 +76,8 @@ macro_rules! sound_conformance_tests {
         $crate::sound_conformance_tests!(@each $core;
             every_chip_plays_after_the_sound_moment,
             the_render_runs_the_player_s_loop,
+            a_mute_is_the_mixer_s,
+            a_mute_is_the_host_s,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -96,6 +103,26 @@ fn mute_all_but<E: SoundCore>(emu: &mut E, keep: Option<usize>, muted: bool) {
             .unwrap_or_else(|| panic!("sound chip {chip} answers its count"));
         for channel in 0..debugger.get_channel_count() {
             debugger.mute_channel(channel, muted);
+        }
+    }
+}
+
+/// Whether every channel of every sound chip is muted (`true`) or none is
+/// (`false`), naming the first that is not as `what` leaves it.
+fn assert_all_muted<E: SoundCore>(emu: &mut E, muted: bool, what: &str) {
+    for chip in 0..emu.audio_chip_count() {
+        let debugger = emu
+            .audio_debugger(chip)
+            .unwrap_or_else(|| panic!("sound chip {chip} answers its count"));
+        for channel in 0..debugger.get_channel_count() {
+            let state = debugger
+                .get_channel_state(channel)
+                .unwrap_or_else(|| panic!("chip {chip} channel {channel} reports its state"));
+            assert_eq!(
+                state.muted, muted,
+                "chip {chip} channel {channel}: muted {} after {what}",
+                state.muted
+            );
         }
     }
 }
@@ -191,4 +218,71 @@ pub fn the_render_runs_the_player_s_loop<E: SoundCore>(core: &SoundCoreUnderTest
         "the render says it turned the sound on"
     );
     assert!(silent.is_audio_enabled(), "the sound stays on");
+}
+
+/// A mute is the mixer's: with every channel of every chip muted before
+/// the sound moment, each frame's state hash is the hash of a machine
+/// with nothing muted, which makes sound while the muted one makes none.
+pub fn a_mute_is_the_mixer_s<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut heard = (core.build)();
+    let mut muted = (core.build)();
+    mute_all_but(&mut muted, None, true);
+    for _ in 0..WARM_UP {
+        heard.run_frame();
+        muted.run_frame();
+    }
+    (core.sound_moment)(&mut heard);
+    (core.sound_moment)(&mut muted);
+    let (mut heard_peak, mut muted_peak) = (0.0f32, 0.0f32);
+    for frame in 1..=FRAMES {
+        heard.render_frame();
+        muted.render_frame();
+        heard_peak = heard_peak.max(host_peak(&mut heard));
+        muted_peak = muted_peak.max(host_peak(&mut muted));
+        if heard.state_hash() != muted.state_hash() {
+            let parts: Vec<&str> = heard
+                .state_hash_parts()
+                .iter()
+                .zip(muted.state_hash_parts().iter())
+                .filter(|(a, b)| a.1 != b.1)
+                .map(|(a, _)| a.0)
+                .collect();
+            panic!(
+                "frame {frame} after the sound moment: the muted machine's state parted from the \
+                 machine with nothing muted, in {}",
+                parts.join(", ")
+            );
+        }
+    }
+    assert!(
+        heard_peak >= SOUND_PEAK,
+        "the machine with nothing muted made no sound (peak {heard_peak})"
+    );
+    assert!(
+        muted_peak < SOUND_PEAK,
+        "the machine with every channel muted made sound (peak {muted_peak})"
+    );
+}
+
+/// A mute is the host's: it lasts across the reset button, a power cycle
+/// and the load of another ROM or of the same one again, on every channel
+/// of every chip, until the host lifts it.
+pub fn a_mute_is_the_host_s<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut emu = (core.build)();
+    emu.run_frame();
+    mute_all_but(&mut emu, None, true);
+    emu.reset();
+    assert_all_muted(&mut emu, true, "the reset button");
+    emu.power_cycle();
+    assert_all_muted(&mut emu, true, "a power cycle");
+    emu.load_rom(&core.other_rom)
+        .expect("the other program loads");
+    assert_all_muted(&mut emu, true, "a load of another ROM");
+    emu.load_rom(&core.rom).expect("the program loads");
+    assert_all_muted(&mut emu, true, "a load of the program again");
+    emu.load_rom(&core.rom).expect("the program loads");
+    assert_all_muted(&mut emu, true, "a load of the same ROM");
+    emu.run_frame();
+    mute_all_but(&mut emu, None, false);
+    assert_all_muted(&mut emu, false, "the host lifted them");
 }

@@ -184,9 +184,11 @@ impl SDsp {
     pub(in crate::apu) fn set_voice_mute(&mut self, voice: usize, muted: bool) {
         if voice < 8 {
             self.voice_mute[voice] = muted;
+            self.follow_mutes();
         }
     }
 
+    #[cfg(test)]
     pub(in crate::apu) fn voice_muted(&self, voice: usize) -> bool {
         voice < 8 && self.voice_mute[voice]
     }

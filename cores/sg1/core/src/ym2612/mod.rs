@@ -121,7 +121,8 @@ pub struct Ym2612 {
     address_latch_part1: u8,
 
     // ===== Debugging Support =====
-    /// Mute flags for each channel
+    /// The channels the debugger muted: each still runs, and the mix
+    /// leaves its output out. A host setting, not saved; a reset keeps it.
     mute_flags: [bool; 6],
 
     /// Output level for visualization
@@ -133,7 +134,7 @@ pub struct Ym2612 {
     /// Max waveform buffer size
     max_waveform_samples: usize,
 
-    /// Last output samples (left, right) for each channel
+    /// Last output samples (left, right) for each channel, muted or not
     channel_outputs: [(f32, f32); 6],
 
     // ===== Incremental Rendering (timestamp catch-up) =====
@@ -342,7 +343,7 @@ impl Ym2612 {
         self.channels.get_mut(index)
     }
 
-    /// Reset the chip to initial state
+    /// Reset the chip to initial state; the debugger's mutes stay.
     pub fn reset(&mut self) {
         for channel in &mut self.channels {
             channel.reset();
@@ -356,7 +357,6 @@ impl Ym2612 {
         self.timer_accumulator = 0.0;
         self.address_latch_part0 = 0;
         self.address_latch_part1 = 0;
-        self.mute_flags = [false; 6];
         self.output_level = 0.0;
         self.waveform_buffer.clear();
         self.channel_outputs = [(0.0, 0.0); 6];

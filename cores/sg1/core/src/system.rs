@@ -28,6 +28,7 @@ use crate::timing::{GenesisTiming, VideoRegion};
 use crate::z80::Z80;
 use descriptors::{genesis_button_layout, genesis_cpus};
 use frame::LineRun;
+use retro_core::audio::ChannelMutes;
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
 use retro_core::debug::{trace_to_text, AccessLog};
@@ -398,6 +399,8 @@ impl GenesisEmulator {
     /// Callers must run [`EmulatorCore::reset`] afterwards to boot the CPUs
     /// off the (now freshly mapped) vector table.
     fn rebuild_volatile_hardware(&mut self) {
+        // The channels the host muted, which the new chips keep.
+        let mutes = ChannelMutes::of(self);
         let cartridge = self.bus.take_cartridge();
 
         let mut bus = AddressBus::with_region(self.region);
@@ -424,6 +427,7 @@ impl GenesisEmulator {
             .ym2612_mut()
             .set_rendering_enabled(self.audio_enabled);
         self.bus.psg_mut().set_rendering_enabled(self.audio_enabled);
+        mutes.apply(self);
         // The new VDP records what the host asked the old one to.
         self.bus
             .vdp_mut()

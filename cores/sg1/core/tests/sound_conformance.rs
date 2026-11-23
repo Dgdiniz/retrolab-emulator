@@ -33,12 +33,20 @@ const FM_NOTE: [(u8, u8); 30] = [
 /// attenuation.
 const PSG_TONE: [u8; 3] = [0xAE, 0x0F, 0xB0];
 
-fn rom() -> Vec<u8> {
+fn program(title: &str) -> Vec<u8> {
     MiniCartridgeBuilder::new()
         .with_size(0x80000)
-        .with_title("SOUND CONFORMANCE")
+        .with_title(title)
         .with_instructions(LOOP as usize, &[0x6000, 0xFFFE]) // BRA.w LOOP
         .build()
+}
+
+fn rom() -> Vec<u8> {
+    program("SOUND CONFORMANCE")
+}
+
+fn other_rom() -> Vec<u8> {
+    program("SOUND CONFORMANCE B")
 }
 
 fn build() -> GenesisEmulator {
@@ -66,6 +74,8 @@ fn mega_drive() -> SoundCoreUnderTest<GenesisEmulator> {
         build,
         sound_moment,
         every_frame: LOOP,
+        rom: rom(),
+        other_rom: other_rom(),
     }
 }
 
