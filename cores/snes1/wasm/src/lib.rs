@@ -330,6 +330,25 @@ impl RetroEmulator {
         ])
     }
 
+    /// The files of sample `source` (0-255) of the directory the S-DSP's
+    /// registers name, read from ARAM as it stands, keyed on at `pitches`
+    /// by `voices` (each once, in the order they came): `{ brr,
+    /// brr_looped, wav, info }`, `brr` its blocks as they sit in ARAM,
+    /// `brr_looped` the same after the 2-byte loop header AddmusicK and
+    /// BRRtools read, `wav` its values as a 32 kHz WAV with its loop in a
+    /// `smpl` chunk (each a `Uint8Array`), and `info` the text of its JSON
+    /// description; the bytes `brr-dump` writes of the sample.
+    #[wasm_bindgen(js_name = encodeBrrSample)]
+    pub fn encode_brr_sample(&self, source: u8, pitches: Vec<u32>, voices: Vec<u8>) -> JsValue {
+        let files = self.snes.sample_files(source, pitches, voices);
+        plain_object(&[
+            ("brr", uint8_array(&files.brr)),
+            ("brr_looped", uint8_array(&files.brr_looped)),
+            ("wav", uint8_array(&files.wav)),
+            ("info", JsValue::from_str(&files.info.to_json())),
+        ])
+    }
+
     /// The APU as an SPC file (version 0.30) a player plays: its bytes,
     /// tagged with `tag` (`{ title, game, dumper, comment, date, seconds,
     /// fade_ms, artist }`, each optional; `undefined` for no tag). Between

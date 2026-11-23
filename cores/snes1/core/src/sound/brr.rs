@@ -7,7 +7,7 @@
 use retro_core::audio::{encode_wav_samples, wav_with_loop, SoundSamples};
 use serde::Serialize;
 
-use crate::apu::{BrrEnd, BrrSample, DirectoryEntry};
+use crate::apu::{decode_sample, BrrEnd, BrrSample, DirectoryEntry};
 
 /// The S-DSP's sample rate.
 const DSP_RATE: u32 = 32_000;
@@ -92,10 +92,45 @@ impl SampleInfo {
     }
 }
 
+/// A sample's files: its blocks as a `.brr`, raw and after the loop
+/// header; its values as a WAV with its loop; and what `sample.json` says
+/// of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleFiles {
+    /// The blocks as they sit in ARAM ([`brr_blocks`]).
+    pub brr: Vec<u8>,
+    /// The blocks after the loop header ([`brr_with_loop_header`]).
+    pub brr_looped: Vec<u8>,
+    /// The values as a WAV at 32 kHz with its loop ([`sample_wav`]).
+    pub wav: Vec<u8>,
+    /// What `sample.json` says of it ([`SampleInfo::to_json`] writes it).
+    pub info: SampleInfo,
+}
+
+impl SampleFiles {
+    /// The files of the sample `entry` of the directory at `directory`
+    /// names in the 64 KiB `aram`, decoded as a voice decodes it, keyed on
+    /// at `pitches` by `voices`.
+    pub fn of(
+        aram: &[u8],
+        directory: u16,
+        entry: &DirectoryEntry,
+        pitches: Vec<u32>,
+        voices: Vec<u8>,
+    ) -> Self {
+        let sample = decode_sample(aram, entry.start, entry.loop_start);
+        Self {
+            brr: brr_blocks(aram, entry.start, &sample),
+            brr_looped: brr_with_loop_header(aram, entry.start, &sample),
+            wav: sample_wav(&sample),
+            info: SampleInfo::of(directory, entry, &sample, pitches, voices),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apu::decode_sample;
 
     fn aram() -> Vec<u8> {
         let mut aram = vec![0u8; 0x10000];
@@ -122,6 +157,33 @@ mod tests {
         let headed = brr_with_loop_header(&aram, 0xFFF7, &sample);
         assert_eq!(&headed[..2], &[9, 0], "the loop block 9 bytes in");
         assert_eq!(&headed[2..], &blocks[..]);
+    }
+
+    #[test]
+    fn the_files_are_the_writers_of_the_sample_the_entry_names() {
+        let aram = aram();
+        let entry = DirectoryEntry {
+            source: 7,
+            start: 0xFFF7,
+            loop_start: 0x0000,
+            voices: 0b1001,
+        };
+        let files = SampleFiles::of(&aram, 0x0400, &entry, vec![0x1000, 0x0800], vec![0, 3]);
+        let sample = decode_sample(&aram, 0xFFF7, 0x0000);
+        assert_eq!(files.brr, brr_blocks(&aram, 0xFFF7, &sample));
+        assert_eq!(
+            files.brr_looped,
+            brr_with_loop_header(&aram, 0xFFF7, &sample)
+        );
+        assert_eq!(files.wav, sample_wav(&sample));
+        assert_eq!(
+            files.info,
+            SampleInfo::of(0x0400, &entry, &sample, vec![0x1000, 0x0800], vec![0, 3])
+        );
+        assert_eq!(
+            (files.info.source, files.info.directory, files.info.blocks),
+            (7, 0x0400, 2)
+        );
     }
 
     #[test]

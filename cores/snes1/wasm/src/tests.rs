@@ -122,6 +122,70 @@ fn the_sample_directory_and_a_decode_read_aram() {
     );
 }
 
+/// Source 1 of a directory at `$0200` as the sample of three blocks at
+/// `$0300` whose end block loops back to the second, the S-DSP pointed at
+/// the directory.
+fn put_a_sample_in_aram(emu: &mut RetroEmulator) {
+    let apu = emu.snes.bus_mut().apu_mut();
+    for (i, &byte) in [0x00, 0x03, 0x09, 0x03].iter().enumerate() {
+        apu.spc_write(0x0204 + i as u16, byte);
+    }
+    let blocks: [(u8, [u8; 8]); 3] = [
+        (0xC0, [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]),
+        (0x44, [0x7F, 0x80, 0x01, 0xFF, 0x70, 0x0F, 0x88, 0x77]),
+        (0x8F, [0x11, 0x22, 0x33, 0x44, 0xCC, 0xDD, 0xEE, 0x99]),
+    ];
+    for (n, (header, data)) in blocks.iter().enumerate() {
+        let at = 0x0300 + 9 * n as u16;
+        apu.spc_write(at, *header);
+        for (i, &byte) in data.iter().enumerate() {
+            apu.spc_write(at + 1 + i as u16, byte);
+        }
+    }
+    apu.spc_write(0x00F2, 0x5D);
+    apu.spc_write(0x00F3, 0x02);
+}
+
+#[wasm_bindgen_test]
+fn a_sample_s_files_are_the_core_s_for_the_directory_the_dsp_names() {
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&synth_lorom("BRR FILES")).unwrap();
+    put_a_sample_in_aram(&mut emu);
+    let files = emu.encode_brr_sample(1, vec![0x1000, 0x0800], vec![0, 3]);
+    let keys: Vec<String> = js_sys::Object::keys(files.unchecked_ref())
+        .iter()
+        .map(|key| key.as_string().unwrap())
+        .collect();
+    assert_eq!(keys, ["brr", "brr_looped", "wav", "info"]);
+    let bytes = |key: &str| {
+        property(&files, key)
+            .dyn_into::<js_sys::Uint8Array>()
+            .unwrap()
+            .to_vec()
+    };
+    let own = emu.snes.sample_files(1, vec![0x1000, 0x0800], vec![0, 3]);
+    assert_eq!(bytes("brr"), own.brr);
+    assert_eq!(bytes("brr_looped"), own.brr_looped);
+    assert_eq!(bytes("wav"), own.wav);
+    assert_eq!(
+        property(&files, "info").as_string(),
+        Some(own.info.to_json())
+    );
+    // The sample the directory names, read from ARAM.
+    assert_eq!(own.brr.len(), 27);
+    assert_eq!(&own.brr_looped[..2], &[9, 0], "the loop block 9 bytes in");
+    let info = &own.info;
+    assert_eq!(
+        (info.source, info.directory, info.start, info.loop_start),
+        (1, 0x0200, 0x0300, 0x0309)
+    );
+    assert_eq!((info.blocks, info.loop_sample), (3, Some(16)));
+    assert_eq!(
+        (&info.pitches[..], &info.voices[..]),
+        (&[0x1000, 0x0800][..], &[0, 3][..])
+    );
+}
+
 #[wasm_bindgen_test]
 fn test_breakpoint_add_list() {
     let mut emu = RetroEmulator::new("snes").unwrap();

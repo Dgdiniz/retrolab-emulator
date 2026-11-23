@@ -9,7 +9,7 @@ use retro_core::ExecutionTier;
 
 use super::SnesEmulator;
 use crate::apu::{decode_sample, Apu, BrrSample, DirectoryEntry};
-use crate::sound::{build_spc, Id666};
+use crate::sound::{build_spc, Id666, SampleFiles};
 
 /// The stems are the S-DSP's, taken where its output is made, at its own
 /// 32 kHz; the master is the sample it pushes, before the host's resampling.
@@ -82,6 +82,16 @@ impl SnesEmulator {
     /// `loop_start` its loop address ([`decode_sample`]).
     pub fn decode_brr(&self, start: u16, loop_start: u16) -> BrrSample {
         decode_sample(self.bus.apu().aram(), start, loop_start)
+    }
+
+    /// The files of sample `source` of the directory the S-DSP's registers
+    /// name, read from ARAM as it stands ([`SampleFiles::of`]), keyed on at
+    /// `pitches` by `voices`.
+    pub fn sample_files(&self, source: u8, pitches: Vec<u32>, voices: Vec<u8>) -> SampleFiles {
+        let apu = self.bus.apu();
+        let entry = apu.sample_directory()[usize::from(source)];
+        let directory = u16::from(apu.sample_directory_page()) << 8;
+        SampleFiles::of(apu.aram(), directory, &entry, pitches, voices)
     }
 
     /// Pull every queued 32 kHz `i16` sample out of the APU, resample it
