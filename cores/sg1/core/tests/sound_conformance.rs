@@ -5,7 +5,7 @@
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
 use retro_core::audio::{
-    SoundCore, SoundEvent, SoundLogContents, SoundSamples, StemLayout, StemTake,
+    SoundCore, SoundEvent, SoundLogContents, SoundLogEntry, SoundSamples, StemLayout, StemTake,
 };
 use retro_core::{EmulatorCore, ExecutionMode};
 use sg1_core::GenesisEmulator;
@@ -37,10 +37,15 @@ const FM_NOTE: [(u8, u8); 30] = [
 const PSG_TONE: [u8; 3] = [0xAE, 0x0F, 0xB0];
 
 fn program(title: &str) -> Vec<u8> {
+    program_of(title, &[0x6000, 0xFFFE]) // BRA.w LOOP
+}
+
+/// A program that runs `code` from `LOOP`.
+fn program_of(title: &str, code: &[u16]) -> Vec<u8> {
     MiniCartridgeBuilder::new()
         .with_size(0x80000)
         .with_title(title)
-        .with_instructions(LOOP as usize, &[0x6000, 0xFFFE]) // BRA.w LOOP
+        .with_instructions(LOOP as usize, code)
         .build()
 }
 
@@ -257,4 +262,129 @@ fn a_z80_s_writes_are_logged_in_their_order_on_the_chip_s_clock() {
     let (first, second) = (log.entries[first].time, log.entries[second].time);
     assert!(0 < first && first < second, "stamped {first} then {second}");
     assert!(second <= log.entries[end].time);
+}
+
+/// A Z80 program that turns the DAC on and then, forever, writes a value
+/// to the DAC and right after it the PSG's first channel's attenuation,
+/// each pair 318 Z80 cycles after the one before (about 187 pairs a
+/// frame).
+#[rustfmt::skip]
+const DAC_AND_PSG: [u8; 36] = [
+    0x3E, 0x2B, 0x32, 0x00, 0x40, // ld a,$2B ; ld ($4000),a
+    0x3E, 0x80, 0x32, 0x01, 0x40, // ld a,$80 ; ld ($4001),a   the DAC on
+    0x3E, 0x2A, 0x32, 0x00, 0x40, // ld a,$2A ; ld ($4000),a   its data
+    0x06, 0x00,                   // ld b,0
+    0x78,                         // loop: ld a,b
+    0x32, 0x01, 0x40,             // ld ($4001),a              the DAC
+    0xE6, 0x0F, 0xF6, 0x90,       // and $0F ; or $90
+    0x32, 0x11, 0x7F,             // ld ($7F11),a              the PSG
+    0x04,                         // inc b
+    0x0E, 0x10,                   // ld c,16
+    0x0D, 0x20, 0xFD,             // delay: dec c ; jr nz,delay
+    0x18, 0xED,                   // jr loop
+];
+
+/// A Z80 writing the DAC and the PSG through every frame, under a 68000
+/// that runs long instructions (each line's last runs far past the line's
+/// end, more than the PSG's share of the line pays for), logged for
+/// `frames` frames after a first: each take with the master clocks the
+/// machine had run at its frame's end.
+fn dac_and_psg_logged(frames: u32) -> Vec<(Vec<SoundLogEntry>, u64)> {
+    // loop: move.w #$FFFF,d1 ; mulu d1,d1 ; bra.s loop
+    let rom = program_of("SOUND LOG CLOCK", &[0x323C, 0xFFFF, 0xC2C1, 0x60F8]);
+    let mut emu = GenesisEmulator::new();
+    emu.load_rom(&rom).expect("the program loads");
+    emu.set_audio_enabled(true);
+    emu.set_execution_mode(ExecutionMode::Running);
+    emu.run_frame();
+    emu.write_memory_debug(0xA1_1100, &[0x01]);
+    emu.write_memory_debug(0xA0_0000, &DAC_AND_PSG);
+    emu.write_memory_debug(0xA1_1200, &[0x01]);
+    emu.write_memory_debug(0xA1_1100, &[0x00]);
+    emu.render_frame();
+    emu.start_sound_log(WRITES);
+    let mut takes = Vec::new();
+    for _ in 0..frames {
+        emu.render_frame();
+        let log = emu.take_sound_log().expect("a log runs");
+        takes.push((log.entries[log.image_len..].to_vec(), emu.master_cycles()));
+    }
+    takes
+}
+
+/// One line of the Mega Drive, in master clocks.
+const LINE: u64 = 3420;
+
+/// Each chip's writes sit on the master clock, in their frame: every
+/// frame's end comes the master clocks the frame ran after the one before;
+/// the DAC's writes of a frame are spread across it in their order, none
+/// raised to the frame's start (one may stand there: a write in the frame's
+/// first Z80 instruction); and each PSG write lies close to the DAC write
+/// the Z80 made just before it, though the 68000's long instructions give
+/// the PSG a few percent more clocks than its share. Close is two lines:
+/// inside a line the YM2612 may run up to a line ahead, and the PSG's
+/// extra clocks do not fall evenly over the frame.
+#[test]
+fn each_chip_s_writes_sit_on_the_master_clock_in_their_frame() {
+    let takes = dac_and_psg_logged(30);
+    let (mut dac, mut psg) = (Vec::new(), Vec::new());
+    let mut last_end: Option<(u64, u64)> = None;
+    for (frame, (entries, master)) in takes.iter().enumerate() {
+        let end = entries.last().expect("the frame's end");
+        assert_eq!(end.event, SoundEvent::FrameEnd, "frame {frame} ends");
+        let writes: Vec<u64> = entries
+            .iter()
+            .filter(|entry| matches!(entry.event, SoundEvent::Write { register: 0x2A, .. }))
+            .map(|entry| entry.time)
+            .collect();
+        if let Some((start, last_master)) = last_end {
+            assert_eq!(
+                end.time - start,
+                master - last_master,
+                "frame {frame}: its end is the master clocks it ran after the one before"
+            );
+            assert!(
+                writes.len() > 150,
+                "frame {frame}: {} DAC writes",
+                writes.len()
+            );
+            let spacing = (end.time - start) / writes.len() as u64;
+            let gaps: Vec<u64> = std::iter::once(start)
+                .chain(writes.iter().copied())
+                .chain(std::iter::once(end.time))
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|pair| {
+                    assert!(pair[0] <= pair[1], "frame {frame}: a write out of order");
+                    pair[1] - pair[0]
+                })
+                .collect();
+            let at_start = writes.iter().filter(|&&time| time == start).count();
+            assert!(
+                at_start <= 1,
+                "frame {frame}: {at_start} DAC writes at its start"
+            );
+            let widest = gaps.iter().max().expect("gaps");
+            assert!(
+                *widest <= 2 * spacing,
+                "frame {frame}: a gap of {widest} master clocks between the DAC's writes, \
+                 which come {spacing} apart"
+            );
+        }
+        last_end = Some((end.time, *master));
+        for entry in entries {
+            match entry.event {
+                SoundEvent::Write { register: 0x2A, .. } => dac.push(entry.time),
+                SoundEvent::Write { .. } if entry.chip == 1 => psg.push(entry.time),
+                _ => {}
+            }
+        }
+    }
+    assert!(dac.len() > 4000 && psg.len() >= dac.len());
+    for (pair, (&dac, &psg)) in dac.iter().zip(&psg).enumerate() {
+        assert!(
+            dac.abs_diff(psg) <= 2 * LINE,
+            "pair {pair}: the DAC write at {dac}, the PSG write after it at {psg}"
+        );
+    }
 }

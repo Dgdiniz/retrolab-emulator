@@ -19,8 +19,9 @@
 //! master; and they add up to the master by the layout's rule wherever the
 //! take counts no departure. So does the sound log, which starts with the
 //! chips' registers at time 0, never goes back in time, holds a frame's end
-//! for every frame, says when a load came between two takes, and, holding
-//! the keys alone, holds the notes and no write.
+//! for every frame, keeps the machine's time from frame to frame, says when
+//! a load came between two takes, and, holding the keys alone, holds the
+//! notes and no write.
 
 use crate::audio::sound_log::{SoundEvent, SoundLog, SoundLogContents};
 use crate::audio::stems::{SampleKind, StemLayout, StemSet, StemTake};
@@ -92,6 +93,7 @@ macro_rules! sound_conformance_tests {
             stems_sum_to_the_master,
             the_log_changes_nothing,
             the_log_starts_with_the_image_and_never_goes_back,
+            the_log_keeps_the_machine_s_time,
             a_load_interrupts_the_log,
             the_log_takes_the_keys_down,
         );
@@ -561,6 +563,44 @@ pub fn the_log_starts_with_the_image_and_never_goes_back<E: SoundCore>(
         None,
         "stopped and taken, nothing waits"
     );
+}
+
+/// The log keeps the machine's time: each frame's end comes as many of the
+/// log's ticks after the one before as the frame ran master clocks, to
+/// within one tick, however long the log runs. A frame's end at a sound
+/// chip's own count would part from the machine's time wherever that chip
+/// is clocked a little more or less than its share.
+pub fn the_log_keeps_the_machine_s_time<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut emu = core.playing();
+    let master_hz = i128::from(emu.master_clock_hz());
+    emu.start_sound_log(EVERYTHING);
+    let mut last: Option<(u64, u64)> = None;
+    for frame in 0..FRAMES {
+        emu.render_frame();
+        let master = emu.master_cycles();
+        let log = emu.take_sound_log().expect("a log runs");
+        let end = log
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.event == SoundEvent::FrameEnd)
+            .expect("the frame's end")
+            .time;
+        if let Some((last_end, last_master)) = last {
+            // Both in the log's ticks times the master clock's rate.
+            let ticks = i128::from(end - last_end) * master_hz;
+            let ran = i128::from(master - last_master) * i128::from(log.clock_hz);
+            assert!(
+                (ticks - ran).abs() < master_hz,
+                "frame {frame}: its end came {} ticks after the one before, \
+                 where the machine ran {} master clocks ({:.1} ticks)",
+                end - last_end,
+                master - last_master,
+                ran as f64 / master_hz as f64
+            );
+        }
+        last = Some((end, master));
+    }
 }
 
 /// A load between two takes marks the later one interrupted, and the log
