@@ -72,15 +72,34 @@ impl Lfo {
     }
 
     /// Set LFO enable and frequency (register 0x22)
+    ///
+    /// A write that turns the LFO on from off starts it from its first step.
+    /// A write that leaves it on lets it go on from where it is, as Genesis
+    /// Plus GX and ymfm run it: a new rate counts on from the samples
+    /// counted so far, and one whose count they already reach steps at the
+    /// chip's next sample and counts again from there.
     pub fn set_control(&mut self, value: u8) {
+        let was_enabled = self.enabled;
         self.enabled = (value & 0x08) != 0;
         self.frequency = value & 0x07;
 
-        // Reset phase when LFO is enabled
-        if self.enabled {
+        if self.enabled && !was_enabled {
             self.phase = 0;
             self.counter = 0;
+        } else if self.enabled {
+            let divider = self.divider();
+            if self.counter >= divider {
+                // The count reaches the divider at the next of the chip's
+                // samples: one step there.
+                self.counter = divider - (CHIP_SAMPLE - self.counter % CHIP_SAMPLE);
+            }
         }
+    }
+
+    /// The chip's samples a step lasts at the current rate, in
+    /// [`CHIP_SAMPLE`]ths.
+    fn divider(&self) -> u32 {
+        self.frequency_dividers[self.frequency as usize] * CHIP_SAMPLE
     }
 
     /// Get LFO enabled status
@@ -110,7 +129,7 @@ impl Lfo {
         }
 
         self.counter = self.counter.saturating_add(chip_samples);
-        let divider = self.frequency_dividers[self.frequency as usize] * CHIP_SAMPLE;
+        let divider = self.divider();
 
         while self.counter >= divider {
             self.counter -= divider;
@@ -400,6 +419,68 @@ mod tests {
             })
             .collect();
         assert_eq!(steps, [0, 0, 0, 1, 1, 1, 2, 2, 2, 3]);
+    }
+
+    #[test]
+    fn a_write_that_leaves_the_lfo_on_does_not_restart_it() {
+        let mut lfo = Lfo::new();
+        lfo.set_control(0x08); // On, rate 0: 108 samples a step
+        for _ in 0..(108 * 3 + 50) {
+            lfo.clock(CHIP_SAMPLE);
+        }
+        assert_eq!(lfo.get_phase(), 3);
+
+        // The same value again: the LFO goes on, and its count with it
+        lfo.set_control(0x08);
+        assert_eq!(lfo.get_phase(), 3);
+        for _ in 0..57 {
+            lfo.clock(CHIP_SAMPLE);
+        }
+        assert_eq!(lfo.get_phase(), 3);
+        lfo.clock(CHIP_SAMPLE);
+        assert_eq!(lfo.get_phase(), 4);
+    }
+
+    #[test]
+    fn turning_the_lfo_on_from_off_starts_it_from_its_first_step() {
+        let mut lfo = Lfo::new();
+        lfo.set_control(0x08);
+        for _ in 0..(108 * 3 + 50) {
+            lfo.clock(CHIP_SAMPLE);
+        }
+        lfo.set_control(0x00); // Off
+        assert_eq!(lfo.get_pm_step(), 0);
+        lfo.set_control(0x08); // On again
+        assert_eq!(lfo.get_phase(), 0);
+        for _ in 0..107 {
+            lfo.clock(CHIP_SAMPLE);
+        }
+        assert_eq!(lfo.get_phase(), 0);
+        lfo.clock(CHIP_SAMPLE);
+        assert_eq!(lfo.get_phase(), 1);
+    }
+
+    #[test]
+    fn a_rate_whose_count_is_already_reached_steps_once_at_the_next_sample() {
+        let mut lfo = Lfo::new();
+        lfo.set_control(0x08); // On, rate 0: 108 samples a step
+        for _ in 0..201 {
+            lfo.clock(CHIP_SAMPLE / 2);
+        }
+        assert_eq!(lfo.get_phase(), 0); // 100.5 samples counted
+
+        // Rate 7 steps every 5 samples: one step at the next sample, half a
+        // sample on, then one every 5 from there.
+        lfo.set_control(0x0F);
+        assert_eq!(lfo.get_phase(), 0);
+        lfo.clock(CHIP_SAMPLE / 2);
+        assert_eq!(lfo.get_phase(), 1);
+        for _ in 0..9 {
+            lfo.clock(CHIP_SAMPLE / 2);
+        }
+        assert_eq!(lfo.get_phase(), 1);
+        lfo.clock(CHIP_SAMPLE / 2);
+        assert_eq!(lfo.get_phase(), 2);
     }
 
     #[test]
