@@ -77,9 +77,9 @@ fn test_ym2612_dac_state() {
 
     let dac_state = genesis.get_ym2612_dac_state();
 
-    // The JSON has the field enabled, and no other.
+    // The JSON has the fields enabled and value (the sample), and no other.
     let json = serde_json::to_value(dac_state).unwrap();
-    assert_eq!(json, serde_json::json!({ "enabled": false }));
+    assert_eq!(json, serde_json::json!({ "enabled": false, "value": 0 }));
 
     // The DAC starts disabled
     assert!(!dac_state.enabled);

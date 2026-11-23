@@ -12,6 +12,26 @@
 const YM2612_CHIP = 0;
 const PSG_CHIP = 1;
 
+/**
+ * The YM2612's LFO, DAC and timers as the Channels tab shows them, from
+ * what the emulator's readers give: `getYm2612LfoState()` is
+ * `{ enabled, frequency }` (the rate setting, 0-7),
+ * `getYm2612DacState()` is `{ enabled, value }` (the sample the DAC
+ * holds, -128 to 127), and each of `getYm2612TimerAState()` and
+ * `getYm2612TimerBState()` is `{ running, period, overflowed }`.
+ * Returns the three lines' HTML: `{ lfo, dac, timers }`.
+ */
+export function ym2612StatusHtml(lfo, dac, timerA, timerB) {
+    const flag = (on) => (on ? '✅' : '❌');
+    const timer = (state) =>
+        `${flag(state.running)} (${state.period})${state.overflowed ? ', overflowed' : ''}`;
+    return {
+        lfo: `<strong>LFO:</strong> Enabled: ${flag(lfo.enabled)}, Freq: ${lfo.frequency}`,
+        dac: `<strong>DAC:</strong> Enabled: ${flag(dac.enabled)}, Value: ${dac.value}`,
+        timers: `<strong>Timers:</strong> A: ${timer(timerA)}, B: ${timer(timerB)}`,
+    };
+}
+
 export class AudioDebuggerMultiChip {
     constructor(emulator, containerId) {
         this.emulator = emulator;
@@ -371,35 +391,17 @@ export class AudioDebuggerMultiChip {
             const timerAState = this.emulator.getYm2612TimerAState();
             const timerBState = this.emulator.getYm2612TimerBState();
 
-            // Update LFO
+            if (!lfoState || !dacState || !timerAState || !timerBState) return;
+            const html = ym2612StatusHtml(lfoState, dacState, timerAState, timerBState);
+
             const lfoDiv = this.container.querySelector('#ym2612-lfo');
-            if (lfoDiv && lfoState) {
-                lfoDiv.innerHTML = `
-                    <strong>LFO:</strong>
-                    Enabled: ${lfoState.enabled ? '✅' : '❌'},
-                    Freq: ${lfoState.frequency || 'N/A'}
-                `;
-            }
+            if (lfoDiv) lfoDiv.innerHTML = html.lfo;
 
-            // Update DAC
             const dacDiv = this.container.querySelector('#ym2612-dac');
-            if (dacDiv && dacState) {
-                dacDiv.innerHTML = `
-                    <strong>DAC:</strong>
-                    Enabled: ${dacState.enabled ? '✅' : '❌'},
-                    Value: ${dacState.value || 0}
-                `;
-            }
+            if (dacDiv) dacDiv.innerHTML = html.dac;
 
-            // Update Timers
             const timersDiv = this.container.querySelector('#ym2612-timers');
-            if (timersDiv && timerAState && timerBState) {
-                timersDiv.innerHTML = `
-                    <strong>Timers:</strong>
-                    A: ${timerAState.enabled ? '✅' : '❌'} (${timerAState.value || 0}),
-                    B: ${timerBState.enabled ? '✅' : '❌'} (${timerBState.value || 0})
-                `;
-            }
+            if (timersDiv) timersDiv.innerHTML = html.timers;
         } catch (err) {
             console.error('Error updating YM2612 extended info:', err);
         }

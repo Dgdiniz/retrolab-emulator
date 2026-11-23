@@ -68,6 +68,16 @@ fn test_dac_registers() {
 
     ym.write_register(0, 0x2A, 0x00);
     assert_eq!(ym.get_dac_value(), -128); // 0 - 128 = -128
+
+    // The debugger's reader gives the same sample
+    ym.write_register(0, 0x2A, 0x90);
+    assert_eq!(
+        ym.dac_status(),
+        DacStatus {
+            enabled: true,
+            value: 16
+        }
+    );
 }
 
 #[test]

@@ -57,10 +57,12 @@ pub struct LfoStatus {
     pub frequency: u8,
 }
 
-/// The DAC as the debugger reads it: whether it plays in channel 6's place.
+/// The DAC as the debugger reads it: whether it plays in channel 6's place,
+/// and the sample it holds: register $2A's byte less 128, -128 to 127.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DacStatus {
     pub enabled: bool,
+    pub value: i16,
 }
 
 /// A timer as the debugger reads it: whether it runs, its period (timer A's
@@ -212,6 +214,7 @@ impl Ym2612 {
     pub fn dac_status(&self) -> DacStatus {
         DacStatus {
             enabled: self.dac_enabled,
+            value: self.dac_value,
         }
     }
 

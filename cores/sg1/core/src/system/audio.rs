@@ -331,7 +331,7 @@ impl GenesisEmulator {
         self.ym2612().lfo_status()
     }
 
-    /// The YM2612's DAC: `{ enabled }`.
+    /// The YM2612's DAC: `{ enabled, value }`.
     pub fn get_ym2612_dac_state(&self) -> DacStatus {
         self.ym2612().dac_status()
     }

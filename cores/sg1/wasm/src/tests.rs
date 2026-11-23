@@ -164,7 +164,7 @@ fn get_ym2612_dac_state_is_a_plain_object() {
     let emu = with_plain_cartridge();
     assert_plain_object(
         &emu.get_ym2612_dac_state(),
-        &["enabled"],
+        &["enabled", "value"],
         "getYm2612DacState",
     );
 }
