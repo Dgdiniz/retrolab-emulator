@@ -17,6 +17,9 @@ frame-conformance = []
 # The machine's conformance suite (`emulator::conformance`), which each
 # core's tests run against its own emulator.
 emulator-conformance = []
+# The sound conformance suite (`audio::conformance`), which each core's
+# tests run against its own emulator.
+sound-conformance = []
 # The runner of CPU test vectors (`testing::singlestep`), which the CPU
 # crates' and the cores' tests run with their own CPU under test.
 singlestep = ["dep:flate2"]

@@ -244,6 +244,7 @@ impl NoiseChannel {
                 mode: self.mode,
                 lfsr_state: self.lfsr,
             }),
+            sample: None,
         }
     }
 }

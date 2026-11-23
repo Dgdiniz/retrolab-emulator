@@ -8,9 +8,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use retro_core::audio::encode_wav;
 use retro_core::EmulatorCore;
 
-use crate::audio::{encode_wav, AudioStats};
+use crate::audio::AudioStats;
 use crate::console::Console;
 use crate::input::InputArgs;
 use crate::output::open_output;

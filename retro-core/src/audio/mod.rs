@@ -7,11 +7,15 @@ use crate::cpu::Clockable;
 use serde::{Deserialize, Serialize};
 
 pub mod buffer;
+#[cfg(feature = "sound-conformance")]
+pub mod conformance;
 pub mod host_ring;
 pub mod limiter;
 pub mod rate_converter;
 pub mod resample;
 pub mod ring_buffer;
+pub mod sound_core;
+pub mod wav;
 
 pub use buffer::ChipSampleBuffer;
 pub use host_ring::HostAudioRing;
@@ -19,6 +23,8 @@ pub use limiter::{soft_clip, soft_clip_buffer};
 pub use rate_converter::{IntegerRateConverter, RateConverterState};
 pub use resample::LinearResampler;
 pub use ring_buffer::AudioRingBuffer;
+pub use sound_core::{render_frames, RenderReport, SoundCore};
+pub use wav::encode_wav;
 
 /// Audio channel state (expanded for comprehensive debugging).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +54,20 @@ pub struct ChannelState {
 
     // Noise-specific (optional)
     pub noise_params: Option<NoiseParams>,
+
+    /// The sample the channel plays and where it reads it, on a chip that
+    /// plays samples from its memory; `None` elsewhere, and then absent
+    /// from the JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<SamplePlayback>,
+}
+
+/// The sample a channel plays: its number in the chip's directory of
+/// samples, and the address of memory it reads now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplePlayback {
+    pub source: u16,
+    pub address: u32,
 }
 
 /// Type of audio channel.

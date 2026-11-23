@@ -101,6 +101,7 @@ impl AudioDebugger for DummyAudioChip {
             envelope: None,
             current_output: 0.5,
             noise_params: None,
+            sample: None,
         })
     }
 
@@ -365,6 +366,7 @@ mod tests {
             envelope: None,
             current_output: 0.5,
             noise_params: None,
+            sample: None,
         };
 
         // Serialize to JSON
@@ -401,6 +403,7 @@ mod tests {
             envelope: None,
             current_output: 0.0,
             noise_params: Some(noise),
+            sample: None,
         };
 
         assert!(state.noise_params.is_some());

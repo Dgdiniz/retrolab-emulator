@@ -250,7 +250,7 @@ fn record<C: Console>(
     }
     if wav {
         let rate = emu.get_audio_info().sample_rate;
-        let bytes = crate::audio::encode_wav(&samples, rate, 2);
+        let bytes = retro_core::audio::encode_wav(&samples, rate, 2);
         fs::write(out.join("audio.wav"), bytes)
             .with_context(|| format!("failed to write {}", out.join("audio.wav").display()))?;
     }

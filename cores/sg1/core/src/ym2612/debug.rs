@@ -83,6 +83,7 @@ impl AudioDebugger for Ym2612 {
             envelope,
             current_output,
             noise_params: None,
+            sample: None,
         })
     }
 

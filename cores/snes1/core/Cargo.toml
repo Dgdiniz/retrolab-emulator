@@ -54,7 +54,7 @@ js-sys = "0.3"
 # `tests/capture_conformance_test.rs`, `tests/emulator_conformance_test.rs`
 # and `tests/frame_conformance_test.rs` run; the core's own build leaves them
 # out.
-retro-core = { path = "../../../retro-core", features = ["capture-conformance", "emulator-conformance", "frame-conformance"] }
+retro-core = { path = "../../../retro-core", features = ["capture-conformance", "emulator-conformance", "frame-conformance", "sound-conformance"] }
 serde_json = { workspace = true }
 criterion = "0.5"
 

@@ -1,7 +1,18 @@
 //! Audio: the YM2612 and the PSG mixed at a frame's end into the host's
-//! ring, and the sound chips' debugger readers.
+//! ring, the sound hooks a host calls (`SoundCore`), and the sound chips'
+//! debugger readers.
+
+use retro_core::audio::SoundCore;
+use retro_core::frame::run_frame_on;
+use retro_core::ExecutionTier;
 
 use super::GenesisEmulator;
+
+impl SoundCore for GenesisEmulator {
+    fn render_frame(&mut self) {
+        run_frame_on(self, ExecutionTier::Play);
+    }
+}
 
 impl GenesisEmulator {
     /// Get YM2612 channel state for debugging.

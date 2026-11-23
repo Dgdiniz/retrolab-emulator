@@ -241,6 +241,7 @@ impl AudioDebugger for FakeSound {
             envelope: None,
             current_output: 0.0,
             noise_params: None,
+            sample: None,
         })
     }
     fn mute_channel(&mut self, channel: u32, muted: bool) {
@@ -556,6 +557,12 @@ impl FakeMachine {
     /// Mark the battery save written, as a game's write would.
     pub(crate) fn write_save(&mut self) {
         self.sram_dirty = true;
+    }
+}
+
+impl retro_core::audio::SoundCore for FakeMachine {
+    fn render_frame(&mut self) {
+        self.frame();
     }
 }
 

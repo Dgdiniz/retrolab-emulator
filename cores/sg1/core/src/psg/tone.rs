@@ -205,6 +205,7 @@ impl ToneChannel {
             envelope: None,
             current_output: self.get_output(),
             noise_params: None,
+            sample: None,
         }
     }
 }

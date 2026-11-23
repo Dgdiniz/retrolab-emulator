@@ -41,7 +41,9 @@ pub fn chip_channels<E: EmulatorCore>(
 /// `getAudioChips()`, `getAudioChipChannels(chip)`,
 /// `muteAudioChipChannel(chip, channel, muted)`,
 /// `getAudioChipWaveform(chip, channel, samples)` and
-/// `getAudioOutputWaveform(samples)`, the mixed sound.
+/// `getAudioOutputWaveform(samples)`, the mixed sound; and the sound hooks
+/// over `SoundCore`: `renderFrames(frames)`, and the associated
+/// `encodeWav(samples, sampleRate, channels)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -212,6 +214,29 @@ macro_rules! audio_bindings {
             #[wasm_bindgen(js_name = getAudioOutputWaveform)]
             pub fn get_audio_output_waveform(&self, samples: u32) -> ::std::vec::Vec<f32> {
                 $crate::__private::retro_core::EmulatorCore::output_waveform(&self.$core, samples)
+            }
+
+            /// Run `frames` frames of the loop a player's host runs, whatever
+            /// the debugger has armed, with the sound on (turned on first if
+            /// it is off, and left on): `{ frames, sound_turned_on }`. The
+            /// samples go to the host's ring as a frame call's do.
+            #[wasm_bindgen(js_name = renderFrames)]
+            pub fn render_frames(&mut self, frames: u32) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::js::to_js(&$crate::__private::retro_core::audio::render_frames(
+                    &mut self.$core,
+                    frames,
+                ))
+            }
+
+            /// Interleaved samples in [-1, 1] as a WAV file's bytes: 16-bit
+            /// PCM, the 44-byte canonical header, each sample clamped.
+            #[wasm_bindgen(js_name = encodeWav)]
+            pub fn encode_wav(
+                samples: &[f32],
+                sample_rate: u32,
+                channels: u16,
+            ) -> ::std::vec::Vec<u8> {
+                $crate::__private::retro_core::audio::encode_wav(samples, sample_rate, channels)
             }
         }
     };

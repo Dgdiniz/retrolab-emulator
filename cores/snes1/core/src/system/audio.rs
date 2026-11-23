@@ -1,7 +1,17 @@
 //! Audio: the S-DSP's samples resampled at a frame's end into the host's
-//! ring.
+//! ring, and the sound hooks a host calls (`SoundCore`).
+
+use retro_core::audio::SoundCore;
+use retro_core::frame::run_frame_on;
+use retro_core::ExecutionTier;
 
 use super::SnesEmulator;
+
+impl SoundCore for SnesEmulator {
+    fn render_frame(&mut self) {
+        run_frame_on(self, ExecutionTier::Play);
+    }
+}
 
 impl SnesEmulator {
     /// Pull every queued 32 kHz `i16` sample out of the APU, resample it

@@ -88,6 +88,7 @@ impl AudioDebugger for Apu {
             // PSG-style per-channel taps `NoiseParams` models, so this
             // stays `None` even for noise-enabled voices.
             noise_params: None,
+            sample: None,
         })
     }
 

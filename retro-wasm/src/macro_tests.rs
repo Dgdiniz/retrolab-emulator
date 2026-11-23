@@ -871,6 +871,30 @@ fn the_sound_chips_are_read_by_their_index() {
 }
 
 #[wasm_bindgen_test]
+fn the_render_runs_frames_with_the_sound_on() {
+    let mut emu = plain();
+    assert!(!emu.is_audio_enabled());
+    assert_eq!(
+        shape(&emu.render_frames(3)),
+        "{frames: 3, sound_turned_on: true}"
+    );
+    assert!(emu.is_audio_enabled(), "the sound stays on");
+    assert_eq!(emu.get_frame_number(), 3);
+    assert_eq!(
+        emu.get_audio_samples(),
+        [0.25, -0.25, 0.25, -0.25, 0.25, -0.25]
+    );
+    assert_eq!(
+        shape(&emu.render_frames(1)),
+        "{frames: 1, sound_turned_on: false}"
+    );
+    assert_eq!(
+        PlainEmulator::encode_wav(&[1.0, -1.0], 32_000, 1),
+        retro_core::audio::encode_wav(&[1.0, -1.0], 32_000, 1)
+    );
+}
+
+#[wasm_bindgen_test]
 fn the_video_memories_are_read_and_written_by_name_in_bytes() {
     let mut emu = plain();
     assert_eq!(
