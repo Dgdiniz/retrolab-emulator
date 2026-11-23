@@ -337,6 +337,21 @@ pub trait EmulatorCore {
     /// before one.
     fn last_rom(&self) -> &[u8];
 
+    /// The cartridge's ROM image: the file [`Self::last_rom`] less what a
+    /// loader takes off its front (a copier header, the 512 bytes some SNES
+    /// files begin with), as the cartridge maps it before any padding; its
+    /// SHA-256 is the cartridge's `rom_hash`, which is the file's
+    /// ([`Self::get_cartridge_hash`]) when nothing was taken off. A file
+    /// stored interleaved is handed as it was loaded: no core here puts one
+    /// back in order. `None` with no cartridge. The image is the file's
+    /// last `rom_size` bytes ([`CartridgeInfo::rom_size`]), so a core whose
+    /// loader changes the bytes it keeps writes its own.
+    fn rom_image(&self) -> Option<&[u8]> {
+        let size = self.cartridge_info()?.rom_size;
+        let file = self.last_rom();
+        file.get(file.len().checked_sub(size)?..)
+    }
+
     /// The SHA-256 of that file, in lowercase hex; `None` before a load.
     fn get_cartridge_hash(&self) -> Option<String>;
 

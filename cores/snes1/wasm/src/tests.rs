@@ -52,12 +52,22 @@ fn lorom_running(title: &str, program: &[u8], data: &[(u16, &[u8])]) -> Vec<u8> 
 fn the_cartridge_hash_is_the_sha256_of_the_file_loaded_its_copier_header_included() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     assert_eq!(emu.get_cartridge_hash(), None, "no load yet");
+    assert!(emu.get_rom_bytes().is_empty(), "no load yet");
     let mut file = vec![0u8; 512];
     file.extend(synth_lorom("HASHED GAME"));
     emu.load_rom(&file).unwrap();
     assert_eq!(
         emu.get_cartridge_hash(),
         Some(retro_core::cartridge::rom_sha256(&file))
+    );
+    // The ROM's bytes are the image: the copier header taken off, the
+    // image's hash the cartridge's.
+    let image = emu.get_rom_bytes();
+    assert_eq!(image, synth_lorom("HASHED GAME"));
+    let info = emu.get_cartridge_info().unwrap();
+    assert_eq!(
+        property(&info, "rom_hash").as_string(),
+        Some(retro_core::cartridge::rom_sha256(&image))
     );
 }
 

@@ -97,6 +97,7 @@ macro_rules! emulator_conformance_tests {
             a_savestate_opens_only_on_its_core_and_build,
             the_button_layout_names_the_pads_bits,
             audio_debuggers_answer_their_count,
+            the_rom_image_is_the_cartridge_s,
         );
     };
     (@each $machine:expr; $($check:ident),+ $(,)?) => {
@@ -863,6 +864,18 @@ pub fn the_button_layout_names_the_pads_bits<E: GoldenConsole>(m: &MachineUnderT
             button.name
         );
     }
+}
+
+/// The ROM image is the cartridge's: as long as it says, its SHA-256 the
+/// cartridge's hash, the same after a power cycle.
+pub fn the_rom_image_is_the_cartridge_s<E: EmulatorCore>(m: &MachineUnderTest<E>) {
+    let mut emu = (m.build)();
+    let info = emu.cartridge_info().expect("a cartridge").clone();
+    let image = emu.rom_image().expect("an image").to_vec();
+    assert_eq!(image.len(), info.rom_size);
+    assert_eq!(crate::cartridge::rom_sha256(&image), info.rom_hash);
+    emu.power_cycle();
+    assert_eq!(emu.rom_image(), Some(&image[..]), "after a power cycle");
 }
 
 /// The sound chips the debugger opens are there below their count and not

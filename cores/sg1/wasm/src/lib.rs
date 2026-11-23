@@ -54,22 +54,6 @@ impl RetroEmulator {
         }
     }
 
-    // ===== Debugger Methods =====
-
-    /// Read the full ROM binary from the cartridge (for "Save ROM" feature).
-    #[wasm_bindgen(js_name = getRomBytes)]
-    pub fn get_rom_bytes(&mut self) -> Vec<u8> {
-        let size = self
-            .genesis
-            .get_rom_info()
-            .map(|info| info.size)
-            .unwrap_or(0);
-        if size == 0 {
-            return Vec::new();
-        }
-        self.genesis.read_memory_debug(0, size as u32)
-    }
-
     // ===== Multi-CPU Debug Methods =====
 
     /// Check if Z80 is held in reset (controlled by 68K writes to 0xA11200).

@@ -557,6 +557,7 @@ fn the_debuggers_memory_and_disassembly_answer_the_core() {
 fn the_cartridge_readers_answer_before_and_after_a_load() {
     let mut emu = plain();
     assert_eq!(emu.get_cartridge_hash(), None);
+    assert!(emu.get_rom_bytes().is_empty(), "no cartridge, no image");
     assert_eq!(
         emu.get_cartridge_info().unwrap_err().as_string().as_deref(),
         Some("No cartridge loaded")
@@ -574,6 +575,11 @@ fn the_cartridge_readers_answer_before_and_after_a_load() {
         Some(4.0)
     );
     assert_eq!(emu.get_cartridge_title().as_deref(), Some("FAKE"));
+    assert_eq!(
+        emu.get_rom_bytes(),
+        vec![1, 2, 3, 4],
+        "the cartridge's image"
+    );
     assert!(!emu.is_cartridge_sram_dirty());
     emu.core.write_save();
     assert!(emu.is_cartridge_sram_dirty());

@@ -122,6 +122,8 @@ macro_rules! __mapper_label {
 ///   `loadRom` received, in lowercase hex, `undefined` before one;
 /// - `getCartridgeInfo()`, `getCartridgeTitle()`, `isCartridgeSramDirty()`
 ///   and `clearCartridgeSramDirty()`;
+/// - `getRomBytes()`: the cartridge's ROM image
+///   (`EmulatorCore::rom_image`), empty with no cartridge;
 /// - `getMapperState()`, `getChipState()`, `getChipStates()`,
 ///   `getMemoryMap()` and `getCartridgeManifest()`
 ///   ([`cartridge_manifest_object`]);
@@ -169,6 +171,18 @@ macro_rules! cartridge_bindings {
                         $crate::__private::wasm_bindgen::JsValue::from_str("No cartridge loaded"),
                     ),
                 }
+            }
+
+            /// The cartridge's ROM image, as the cartridge maps it: the
+            /// file `loadRom` received less a copier header in front of it
+            /// (the 512 bytes some SNES files begin with), its SHA-256 the
+            /// `rom_hash` of `getCartridgeInfo`; a file stored interleaved
+            /// as it was loaded. Empty with no cartridge.
+            #[wasm_bindgen(js_name = getRomBytes)]
+            pub fn get_rom_bytes(&self) -> ::std::vec::Vec<u8> {
+                $crate::__private::retro_core::EmulatorCore::rom_image(&self.$core)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
             }
 
             /// The cartridge's title; `undefined` with no cartridge.
