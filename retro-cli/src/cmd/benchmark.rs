@@ -13,15 +13,15 @@
 //!   debugger steps, each with its history and the CPU states written; at
 //!   most as many frames as fit in 15 seconds;
 //! - **fast-sound**: the play tier with the sound on and every sound hook
-//!   armed (every stem), what they record taken after every frame as a
-//!   sound tool takes it.
+//!   armed (every stem, the sound log of writes and keys), what they
+//!   record taken after every frame as a sound tool takes it.
 //!
 //! Each row's block, then a summary of the rows against the fast one.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use retro_core::audio::{SoundCore, StemSet};
+use retro_core::audio::{SoundCore, SoundLogContents, StemSet};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::debug::MAIN_CPU;
 use retro_core::frame::run_frame_on;
@@ -54,7 +54,8 @@ pub enum Mode {
     /// Host steps of the main CPU, as a debugger steps.
     HostSteps,
     /// Fast path with the sound on and every sound hook armed (every
-    /// stem), what they record taken every frame, as a sound tool takes it.
+    /// stem, the sound log), what they record taken every frame, as a
+    /// sound tool takes it.
     FastSound,
 }
 
@@ -225,10 +226,15 @@ pub fn run<C: Console>(args: BenchmarkArgs<C::BootArgs>) -> Result<()> {
             if let Some(layout) = emu.stem_layout() {
                 emu.arm_stems(layout.all());
             }
+            emu.start_sound_log(SoundLogContents {
+                writes: true,
+                keys: true,
+            });
         };
         let frame = |emu: &mut C::Emulator| {
             run_frame_on(emu, ExecutionTier::Play);
             std::hint::black_box(emu.take_stems());
+            std::hint::black_box(emu.take_sound_log());
             let _ = emu.get_audio_samples();
         };
         rows.push(measure(
@@ -280,6 +286,8 @@ fn measure<E: EmulatorCore + CaptureCore + SoundCore>(
 fn make_clean<E: EmulatorCore + CaptureCore + SoundCore>(emu: &mut E) {
     emu.set_capture_recording(CaptureRecording::default());
     emu.arm_stems(StemSet::EMPTY);
+    emu.stop_sound_log();
+    let _ = emu.take_sound_log();
     emu.reset();
     let cpus = emu.system_info().cpus.len();
     let debugger = emu.debugger();

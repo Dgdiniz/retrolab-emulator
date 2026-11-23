@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 
+use crate::audio::sound_log::{SoundChipKind, SoundLog, SoundLogContents};
 use crate::audio::stems::{StemLayout, StemSet, StemTake};
 use crate::EmulatorCore;
 
@@ -33,6 +34,28 @@ pub trait SoundCore: EmulatorCore {
     /// What was recorded since the last take, by whole frames; `None`
     /// while nothing is armed or held.
     fn take_stems(&mut self) -> Option<StemTake> {
+        None
+    }
+
+    /// The sound chips a sound log names, an entry's chip their index:
+    /// none on a console that logs none.
+    fn sound_log_chips(&self) -> Vec<SoundChipKind> {
+        Vec::new()
+    }
+
+    /// Start a sound log holding `contents`, its first entries the chips'
+    /// registers as they stand, at time 0; what an earlier log left is
+    /// dropped. Contents of nothing stop the log.
+    fn start_sound_log(&mut self, contents: SoundLogContents) {
+        let _ = contents;
+    }
+
+    /// Stop the log; what it logged waits for the next take.
+    fn stop_sound_log(&mut self) {}
+
+    /// What the log took down since the last take, by whole frames; `None`
+    /// while no log runs and nothing waits.
+    fn take_sound_log(&mut self) -> Option<SoundLog> {
         None
     }
 }

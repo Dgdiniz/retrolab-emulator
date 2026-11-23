@@ -939,6 +939,33 @@ fn the_stems_are_armed_by_mask_and_taken_by_whole_frames() {
 }
 
 #[wasm_bindgen_test]
+fn the_sound_log_is_taken_as_records_and_its_chips() {
+    let mut emu = plain();
+    assert!(emu.take_sound_log().is_null(), "no log runs");
+    emu.start_sound_log(true, false);
+    emu.render_frames(2);
+    let log = emu.take_sound_log();
+    assert_eq!(number(&log, "clockHz"), 1000.0);
+    assert_eq!(number(&log, "imageLen"), 1.0);
+    assert_eq!(get(&log, "interrupted").as_bool(), Some(false));
+    assert_eq!(shape(&get(&log, "chips")), "[{Sn76489: {clock_hz: 1000}}]");
+    let records = get(&log, "records")
+        .dyn_into::<Uint8Array>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(records.len(), 3 * 24, "the image and two frames' ends");
+    assert_eq!(
+        &records[8..10],
+        &[0x00, 0x9F],
+        "a write of the first chip, its value"
+    );
+    assert_eq!(records[24 + 8], 2, "a frame's end");
+    assert_eq!(records[24], 10, "at its time");
+    emu.stop_sound_log();
+    assert!(emu.take_sound_log().is_null(), "stopped and taken");
+}
+
+#[wasm_bindgen_test]
 fn the_video_memories_are_read_and_written_by_name_in_bytes() {
     let mut emu = plain();
     assert_eq!(

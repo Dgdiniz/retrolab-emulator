@@ -5,11 +5,13 @@
 //!
 //! [`audio_bindings!`]: crate::audio_bindings
 
-use retro_core::audio::{AudioChipInfo, ChannelState, SoundSamples, StemTake};
+use retro_core::audio::{
+    AudioChipInfo, ChannelState, SoundChipKind, SoundLog, SoundSamples, StemTake,
+};
 use retro_core::EmulatorCore;
 use wasm_bindgen::JsValue;
 
-use crate::js::{int16_array, plain_object, uint32_array};
+use crate::js::{int16_array, plain_object, to_js, uint32_array, uint8_array};
 
 /// Every sound chip's description, chip 0 the console's main chip.
 pub fn chips<E: EmulatorCore>(core: &mut E) -> Vec<AudioChipInfo> {
@@ -68,6 +70,35 @@ pub fn stem_take(take: &StemTake) -> JsValue {
     ])
 }
 
+/// A take of the sound log for the host: `{ clockHz, imageLen, interrupted,
+/// chips, records }`, `chips` the chips its entries name and `records` its
+/// entries in the record form, a `Uint8Array` of 24 bytes an entry.
+pub fn sound_log(log: &SoundLog, chips: &[SoundChipKind]) -> JsValue {
+    plain_object(&[
+        ("clockHz", JsValue::from(log.clock_hz as f64)),
+        ("imageLen", JsValue::from(log.image_len as f64)),
+        ("interrupted", JsValue::from(log.interrupted)),
+        ("chips", to_js(chips)),
+        ("records", uint8_array(&log.records())),
+    ])
+}
+
+/// The log a host hands back: its entries in the record form, on a clock of
+/// `clock_hz`, as `takeSoundLog` gave them.
+pub fn sound_log_of(records: &[u8], clock_hz: f64) -> Result<SoundLog, JsValue> {
+    Ok(SoundLog {
+        clock_hz: clock_hz as u64,
+        entries: SoundLog::entries_of(records).map_err(|e| JsValue::from_str(&e))?,
+        image_len: 0,
+        interrupted: false,
+    })
+}
+
+/// A value of the host's as `T`, or an error naming what was wrong.
+pub fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
+    serde_wasm_bindgen::from_value(value).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Writes the host's sound methods on `$emulator`, over the `EmulatorCore`
 /// in its field `$core`: `getAudioSamples()`, `getAudioSamplesN(n)`,
 /// `getAudioAvailable()`, `getAudioRingOverflows()`, `clearAudioBuffer()`
@@ -79,7 +110,8 @@ pub fn stem_take(take: &StemTake) -> JsValue {
 /// `getAudioChipWaveform(chip, channel, samples)` and
 /// `getAudioOutputWaveform(samples)`, the mixed sound; and the sound hooks
 /// over `SoundCore`: `renderFrames(frames)`, the stems' `getStemLayout()`,
-/// `armStems(mask)` and `takeStems()`, and the associated
+/// `armStems(mask)` and `takeStems()`, the log's `startSoundLog(writes,
+/// keys)`, `stopSoundLog()` and `takeSoundLog()`, and the associated
 /// `encodeWav(samples, sampleRate, channels)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
@@ -305,6 +337,45 @@ macro_rules! audio_bindings {
             pub fn take_stems(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
                 match $crate::__private::retro_core::audio::SoundCore::take_stems(&mut self.$core) {
                     ::core::option::Option::Some(take) => $crate::audio::stem_take(&take),
+                    ::core::option::Option::None => {
+                        $crate::__private::wasm_bindgen::JsValue::NULL
+                    }
+                }
+            }
+
+            /// Start a sound log of the chips' register writes (`writes`)
+            /// and their channels' keys (`keys`), its first entries the
+            /// chips' registers as they stand, at time 0; what an earlier
+            /// log left is dropped. Neither stops the log.
+            #[wasm_bindgen(js_name = startSoundLog)]
+            pub fn start_sound_log(&mut self, writes: bool, keys: bool) {
+                $crate::__private::retro_core::audio::SoundCore::start_sound_log(
+                    &mut self.$core,
+                    $crate::__private::retro_core::audio::SoundLogContents { writes, keys },
+                );
+            }
+
+            /// Stop the sound log; what it logged waits for the next take.
+            #[wasm_bindgen(js_name = stopSoundLog)]
+            pub fn stop_sound_log(&mut self) {
+                $crate::__private::retro_core::audio::SoundCore::stop_sound_log(&mut self.$core);
+            }
+
+            /// What the sound log took down since the last take, by whole
+            /// frames: `{ clockHz, imageLen, interrupted, chips, records }`,
+            /// `records` a `Uint8Array` of 24 bytes an entry; `null` while no
+            /// log runs and nothing waits.
+            #[wasm_bindgen(js_name = takeSoundLog)]
+            pub fn take_sound_log(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::audio::SoundCore::take_sound_log(
+                    &mut self.$core,
+                ) {
+                    ::core::option::Option::Some(log) => $crate::audio::sound_log(
+                        &log,
+                        &$crate::__private::retro_core::audio::SoundCore::sound_log_chips(
+                            &self.$core,
+                        ),
+                    ),
                     ::core::option::Option::None => {
                         $crate::__private::wasm_bindgen::JsValue::NULL
                     }

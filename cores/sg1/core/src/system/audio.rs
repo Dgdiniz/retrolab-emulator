@@ -3,13 +3,15 @@
 //! takes, and the sound chips' debugger readers.
 
 use retro_core::audio::{
-    SampleKind, SoundCore, StemChannel, StemLayout, StemRecorder, StemSet, StemSum, StemTake,
+    merge_by_time, SampleKind, SoundChipKind, SoundCore, SoundEvent, SoundLog, SoundLogContents,
+    SoundLogEntry, SoundLogger, StemChannel, StemLayout, StemRecorder, StemSet, StemSum, StemTake,
 };
 use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
 
 use super::GenesisEmulator;
 use crate::psg::PSG_STEM_VALUES;
+use crate::timing::GenesisTiming;
 use crate::ym2612::YM_STEM_VALUES;
 
 /// The PSG's share of the mix, and the YM2612's: the PSG at full scale is
@@ -82,6 +84,27 @@ fn stem_layout(rate: u32) -> StemLayout {
     }
 }
 
+/// The master clocks one input clock of each chip takes: the YM2612 runs
+/// on the 68000's clock, the PSG on the Z80's.
+const CHIP_DIVIDERS: [u64; 2] = [7, 15];
+
+/// The sound log while a host logs. Each chip logs its writes on its own
+/// input clock; each frame's end gathers them onto the master clock, the
+/// YM2612's before the PSG's at the same time, then the frame's end. A
+/// host setting, not saved.
+#[derive(Debug, Default)]
+pub(super) struct SoundLogState {
+    logger: SoundLogger,
+    /// Each chip's input clocks (the YM2612's, the PSG's) when the log's
+    /// time stood at `offset`.
+    bases: [u64; 2],
+    /// The log's time at the bases, in master clocks.
+    offset: u64,
+    /// A reset, a load, a power cycle or a savestate's load is under way:
+    /// the log goes on once it ends.
+    paused: bool,
+}
+
 /// A recorder of the stems at `rate`, holding at most two seconds.
 pub(super) fn stem_recorder(rate: u32) -> StemRecorder<f32> {
     StemRecorder::new(&stem_layout(rate), rate * 2)
@@ -129,6 +152,151 @@ impl SoundCore for GenesisEmulator {
 
     fn take_stems(&mut self) -> Option<StemTake> {
         self.stems.take()
+    }
+
+    fn sound_log_chips(&self) -> Vec<SoundChipKind> {
+        vec![
+            SoundChipKind::Ym2612 {
+                clock_hz: self.bus.ym2612().clock_freq(),
+            },
+            SoundChipKind::Sn76489 {
+                clock_hz: self.bus.psg().clock_freq(),
+            },
+        ]
+    }
+
+    /// The log's clock is the master clock. The chips log no keys: a log
+    /// asked for them holds the writes.
+    fn start_sound_log(&mut self, contents: SoundLogContents) {
+        if !contents.any() {
+            self.stop_sound_log();
+            return;
+        }
+        self.set_chip_logs(true);
+        self.sound_log.bases = self.chip_clocks();
+        self.sound_log.offset = 0;
+        self.sound_log.paused = false;
+        let image = self.sound_log_image(0);
+        self.sound_log.logger.start(contents, image);
+    }
+
+    fn stop_sound_log(&mut self) {
+        self.gather_sound_log();
+        self.set_chip_logs(false);
+        self.sound_log.logger.stop();
+    }
+
+    fn take_sound_log(&mut self) -> Option<SoundLog> {
+        self.sound_log.logger.take(self.region.master_clock())
+    }
+}
+
+impl GenesisEmulator {
+    /// Each chip's input clocks received: the YM2612's, the PSG's.
+    fn chip_clocks(&self) -> [u64; 2] {
+        [
+            self.bus.ym2612().input_clocks(),
+            self.bus.psg().input_clocks(),
+        ]
+    }
+
+    /// The log's time of chip `chip`'s input clock count `clock`.
+    fn log_time(&self, chip: usize, clock: u64) -> u64 {
+        let log = &self.sound_log;
+        log.offset + clock.saturating_sub(log.bases[chip]) * CHIP_DIVIDERS[chip]
+    }
+
+    /// The chips' registers as entries at `time`: the YM2612's, then the
+    /// PSG's.
+    fn sound_log_image(&self, time: u64) -> Vec<SoundLogEntry> {
+        let entry = |chip, register, value| SoundLogEntry {
+            time,
+            chip,
+            event: SoundEvent::Write { register, value },
+        };
+        let ym = self.bus.ym2612().register_image();
+        let psg = self.bus.psg().register_image();
+        ym.into_iter()
+            .map(|(register, value)| entry(0, register, value))
+            .chain(psg.into_iter().map(|value| entry(1, 0, value)))
+            .collect()
+    }
+
+    fn set_chip_logs(&mut self, on: bool) {
+        self.bus.ym2612_mut().set_sound_log(on);
+        self.bus.psg_mut().set_sound_log(on);
+    }
+
+    /// What the chips logged since the last gathering, onto the log's
+    /// clock, by time. The two chips' clocks do not always stand together:
+    /// inside a line the YM2612's runs ahead of the PSG's (a Z80 burst
+    /// clocks it by the burst's instructions, and the 68000 by its own),
+    /// and they meet at the line's end, to a 68000 cycle. An entry that
+    /// would come before the last one logged is logged at its time.
+    fn gather_sound_log(&mut self) {
+        if !self.sound_log.logger.is_on() {
+            return;
+        }
+        let latest = self.sound_log.logger.latest();
+        let mut chips: [Vec<SoundLogEntry>; 2] = [Vec::new(), Vec::new()];
+        let logged = [
+            self.bus.ym2612_mut().take_sound_log(),
+            self.bus.psg_mut().take_sound_log(),
+        ];
+        for (chip, (entries, logged)) in chips.iter_mut().zip(logged).enumerate() {
+            entries.extend(logged.into_iter().map(|(clock, event)| SoundLogEntry {
+                time: self.log_time(chip, clock).max(latest),
+                chip: chip as u8,
+                event,
+            }));
+        }
+        let merged = merge_by_time(&chips[0], &chips[1]);
+        self.sound_log.logger.extend(merged);
+    }
+
+    /// The end of a frame for the log: what the chips logged, then the
+    /// frame's end, at the later of the two chips' clocks.
+    pub(super) fn end_sound_log_frame(&mut self) {
+        if !self.sound_log.logger.is_on() {
+            return;
+        }
+        self.gather_sound_log();
+        let [ym, psg] = self.chip_clocks();
+        let time = self
+            .log_time(0, ym)
+            .max(self.log_time(1, psg))
+            .max(self.sound_log.logger.latest());
+        self.sound_log.logger.extend([SoundLogEntry {
+            time,
+            chip: 0,
+            event: SoundEvent::FrameEnd,
+        }]);
+    }
+
+    /// A reset, a load, a power cycle or a savestate's load begins: what
+    /// the chips logged goes onto the log before their state goes.
+    pub(super) fn pause_sound_log(&mut self) {
+        if self.sound_log.logger.is_on() && !self.sound_log.paused {
+            self.gather_sound_log();
+            self.sound_log.paused = true;
+        }
+    }
+
+    /// It ended: the log goes on from the latest time it logged, the next
+    /// take marked interrupted, with the chips' registers as they stand
+    /// now (chips built again log too).
+    pub(super) fn resume_sound_log(&mut self) {
+        if !self.sound_log.paused {
+            return;
+        }
+        self.sound_log.paused = false;
+        self.set_chip_logs(true);
+        let time = self.sound_log.logger.latest();
+        self.sound_log.offset = time;
+        self.sound_log.bases = self.chip_clocks();
+        self.sound_log.logger.interrupt();
+        let image = self.sound_log_image(time);
+        self.sound_log.logger.extend(image);
     }
 }
 

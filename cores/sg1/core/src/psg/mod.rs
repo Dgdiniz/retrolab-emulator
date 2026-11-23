@@ -14,7 +14,9 @@ pub mod tone;
 use noise::NoiseChannel;
 use tone::ToneChannel;
 
-use retro_core::audio::{AudioChip, AudioChipInfo, AudioDebugger, ChannelState, ChannelType};
+use retro_core::audio::{
+    AudioChip, AudioChipInfo, AudioDebugger, ChannelState, ChannelType, SoundEvent,
+};
 use retro_core::cpu::Clockable;
 
 /// Upper bound on buffered, undrained mono samples. If the host stops consuming
@@ -102,6 +104,15 @@ pub struct Psg {
     /// frame, with whether a muted channel that sounds moved the sample.
     /// Not saved.
     stems: Option<Box<(Vec<f32>, Vec<bool>)>>,
+
+    /// The input clocks the chip has received since it was built: the
+    /// clock the sound log and the write log stamp a byte with. Never
+    /// saved, and the same whether the chip renders or not.
+    input_clocks: u64,
+
+    /// The sound log while the host logs: each byte written, stamped with
+    /// `input_clocks`. Not saved.
+    sound_log: Option<Vec<(u64, SoundEvent)>>,
 }
 
 /// The values a sample stages for the stems: tone channels 1 to 3, then
@@ -115,10 +126,13 @@ pub const PSG_STEM_VALUES: usize = 4;
 /// already rendered when the byte arrived. `data` is the raw command byte;
 /// the SN76489 latch/data encoding (channel, tone/volume, data nibble) lives
 /// in the byte itself, so the log stays a faithful record of the wire bytes.
+/// `clock` is the chip's input clocks received when the byte arrived,
+/// counted from when it was built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PsgWrite {
     pub sample_pos: u32,
     pub data: u8,
+    pub clock: u64,
 }
 
 impl Psg {
@@ -157,6 +171,8 @@ impl Psg {
             rendering_enabled: true,
             sound_write_log: None,
             stems: None,
+            input_clocks: 0,
+            sound_log: None,
         }
     }
 
@@ -199,13 +215,80 @@ impl Psg {
         }
     }
 
-    /// Record one PSG byte at its current in-frame sample position. No-op
-    /// unless capture is enabled.
+    /// Record one PSG byte at its current in-frame sample position, and in
+    /// the sound log. No-op unless a log is on.
     fn log_psg_write(&mut self, data: u8) {
         let sample_pos = self.frame_samples.len() as u32;
+        let clock = self.input_clocks;
         if let Some(log) = self.sound_write_log.as_mut() {
-            log.push(PsgWrite { sample_pos, data });
+            log.push(PsgWrite {
+                sample_pos,
+                data,
+                clock,
+            });
         }
+        if let Some(log) = self.sound_log.as_mut() {
+            log.push((
+                clock,
+                SoundEvent::Write {
+                    register: 0,
+                    value: data,
+                },
+            ));
+        }
+    }
+
+    /// Log each byte written on the chip's input clock (`true`), dropping
+    /// what was logged before; or stop. A host setting, not saved.
+    pub fn set_sound_log(&mut self, on: bool) {
+        self.sound_log = on.then(Vec::new);
+    }
+
+    /// What the sound log holds since the last take: each byte with the
+    /// input clocks received when it came ([`Self::input_clocks`]).
+    pub fn take_sound_log(&mut self) -> Vec<(u64, SoundEvent)> {
+        self.sound_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// The input clocks received since the chip was built.
+    pub fn input_clocks(&self) -> u64 {
+        self.input_clocks
+    }
+
+    /// The bytes that write the chip's state back: each tone channel's
+    /// period and attenuation, the noise channel's control and attenuation,
+    /// then the register the chip has latched, latched again with the value
+    /// it holds, so a data byte after the bytes lands where it would have.
+    /// A noise channel's control written restarts its shift register.
+    pub fn register_image(&self) -> Vec<u8> {
+        let mut image = Vec::with_capacity(12);
+        for (channel, tone) in self.tone_channels.iter().enumerate() {
+            let channel = (channel as u8) << 5;
+            let period = tone.get_frequency();
+            image.push(0x80 | channel | (period & 0x0F) as u8);
+            image.push((period >> 4) as u8 & 0x3F);
+            image.push(0x90 | channel | tone.get_attenuation());
+        }
+        image.push(0xE0 | self.noise_channel.get_control());
+        image.push(0xF0 | self.noise_channel.get_attenuation());
+        let latched = self.latched_channel;
+        let (kind, value) = match (latched, self.latched_type) {
+            (3, LatchType::Tone) => (0x00, self.noise_channel.get_control()),
+            (3, LatchType::Volume) => (0x10, self.noise_channel.get_attenuation()),
+            (channel, LatchType::Tone) => {
+                let period = self.tone_channels[usize::from(channel)].get_frequency();
+                (0x00, (period & 0x0F) as u8)
+            }
+            (channel, LatchType::Volume) => (
+                0x10,
+                self.tone_channels[usize::from(channel)].get_attenuation(),
+            ),
+        };
+        image.push(0x80 | latched << 5 | kind | value);
+        image
     }
 
     /// Enable or disable audio rendering. When disabled (host audio off),
@@ -614,6 +697,7 @@ impl Clockable for Psg {
         // Accumulate cycles for sample generation
         // DON'T clock channels here - catch_up() does, before each register
         // write and from generate_samples()
+        self.input_clocks += u64::from(cycles);
         self.clock_accumulator += cycles as f32;
         cycles
     }
@@ -1029,6 +1113,50 @@ mod tests {
         );
 
         assert!(psg.take_write_log().is_empty());
+    }
+
+    #[test]
+    fn the_register_image_written_into_a_fresh_chip_gives_it_back() {
+        let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
+        for byte in [
+            0x8E, 0x0F, 0x93, 0xA5, 0x21, 0xBA, 0xC1, 0x3F, 0xD0, 0xE5, 0xF2, 0xA7,
+        ] {
+            psg.write(byte);
+        }
+        let image = psg.register_image();
+        let mut fresh = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
+        for &byte in &image {
+            fresh.write(byte);
+        }
+        assert_eq!(fresh.register_image(), image);
+        assert_eq!(
+            image.last(),
+            Some(&0xA7),
+            "the latch: channel 1's tone, as written last"
+        );
+        // A data byte after the image lands where it would have.
+        psg.write(0x12);
+        fresh.write(0x12);
+        assert_eq!(fresh.register_image(), psg.register_image());
+    }
+
+    #[test]
+    fn the_sound_log_stamps_each_byte_with_the_input_clocks() {
+        let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
+        psg.set_sound_log(true);
+        psg.clock(77);
+        psg.write(0x9F);
+        assert_eq!(
+            psg.take_sound_log(),
+            [(
+                77,
+                SoundEvent::Write {
+                    register: 0,
+                    value: 0x9F
+                }
+            )]
+        );
+        assert_eq!(psg.input_clocks(), 77);
     }
 
     #[test]

@@ -151,6 +151,8 @@ impl Console for Genesis {
         "stems",
         "audio-info",
         "sound-trace",
+        "vgm-log",
+        "gym-log",
         "savestate",
         "sram",
         "golden",

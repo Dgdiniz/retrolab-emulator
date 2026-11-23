@@ -159,6 +159,50 @@ impl RetroEmulator {
     }
 }
 
+/// The Mega Drive's sound files from a sound log a host took
+/// (`takeSoundLog`).
+#[wasm_bindgen]
+impl RetroEmulator {
+    /// A VGM 1.71 file of the log whose `records` (on a clock of `clockHz`)
+    /// and `chips` `takeSoundLog` gave, written with `options` (`{ tag: {
+    /// track, game, system, author, date, ripper, notes }, dac: "Raw" or
+    /// "Bank", loop_entry, frame_rate }`, each field optional, `undefined`
+    /// for none): its bytes, or an error naming why it cannot be written.
+    #[wasm_bindgen(js_name = encodeVgm)]
+    pub fn encode_vgm(
+        records: &[u8],
+        clock_hz: f64,
+        chips: JsValue,
+        options: JsValue,
+    ) -> Result<Vec<u8>, JsValue> {
+        let log = retro_wasm::audio::sound_log_of(records, clock_hz)?;
+        let chips: Vec<retro_core::audio::SoundChipKind> = retro_wasm::audio::from_js(chips)?;
+        let options = match options.is_undefined() || options.is_null() {
+            true => retro_core::audio::VgmOptions::default(),
+            false => retro_wasm::audio::from_js(options)?,
+        };
+        retro_core::audio::encode_vgm(&log, &chips, &options)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// A GYM file of the log whose `records` and `chips` `takeSoundLog`
+    /// gave, with a GYMX header when `header` is given (`{ song, game,
+    /// publisher, emulator, dumper, comment, loop_frame }`, each optional):
+    /// its bytes, or an error naming why it cannot be written.
+    #[wasm_bindgen(js_name = encodeGym)]
+    pub fn encode_gym(records: &[u8], chips: JsValue, header: JsValue) -> Result<Vec<u8>, JsValue> {
+        let log = retro_wasm::audio::sound_log_of(records, 0.0)?;
+        let chips: Vec<retro_core::audio::SoundChipKind> = retro_wasm::audio::from_js(chips)?;
+        let header: Option<sg1_core::sound::GymHeader> =
+            match header.is_undefined() || header.is_null() {
+                true => None,
+                false => Some(retro_wasm::audio::from_js(header)?),
+            };
+        sg1_core::sound::encode_gym(&log, &chips, header.as_ref())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+}
+
 /// Writes the Mega Drive's part of a frame snapshot: `vsram`, a
 /// `Uint16Array` of the vertical scroll RAM's 64 words, as `getVsram` gives
 /// them.

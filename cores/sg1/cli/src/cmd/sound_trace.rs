@@ -163,6 +163,7 @@ mod tests {
             part: 0,
             register: 0x28,
             value: 0xF0,
+            clock: 0,
         };
         assert_eq!(format_fm(&w), "FM0 28=F0");
         let w2 = FmWrite {
@@ -170,6 +171,7 @@ mod tests {
             part: 1,
             register: 0xB6,
             value: 0x07,
+            clock: 0,
         };
         assert_eq!(format_fm(&w2), "FM1 B6=07");
     }
@@ -180,7 +182,8 @@ mod tests {
         assert_eq!(
             format_psg(&PsgWrite {
                 sample_pos: 0,
-                data: 0x9F
+                data: 0x9F,
+                clock: 0,
             }),
             "PSG ch0 vol=F (raw=9F)"
         );
@@ -188,7 +191,8 @@ mod tests {
         assert_eq!(
             format_psg(&PsgWrite {
                 sample_pos: 0,
-                data: 0x80
+                data: 0x80,
+                clock: 0,
             }),
             "PSG ch0 freq.lo=0 (raw=80)"
         );
@@ -196,7 +200,8 @@ mod tests {
         assert_eq!(
             format_psg(&PsgWrite {
                 sample_pos: 0,
-                data: 0xE5
+                data: 0xE5,
+                clock: 0,
             }),
             "PSG noise ctl=5 (raw=E5)"
         );
@@ -204,7 +209,8 @@ mod tests {
         assert_eq!(
             format_psg(&PsgWrite {
                 sample_pos: 0,
-                data: 0xFF
+                data: 0xFF,
+                clock: 0,
             }),
             "PSG noise vol=F (raw=FF)"
         );
@@ -212,7 +218,8 @@ mod tests {
         assert_eq!(
             format_psg(&PsgWrite {
                 sample_pos: 0,
-                data: 0x3F
+                data: 0x3F,
+                clock: 0,
             }),
             "PSG freq.hi=3F (raw=3F)"
         );
@@ -225,10 +232,12 @@ mod tests {
             part: 0,
             register: 0x28,
             value: 0xF0,
+            clock: 0,
         }];
         let psg = vec![PsgWrite {
             sample_pos: 50,
             data: 0x90,
+            clock: 0,
         }];
         let lines = merge_frame_lines(7, &fm, &psg);
         assert_eq!(
@@ -247,10 +256,12 @@ mod tests {
             part: 0,
             register: 0x22,
             value: 0x08,
+            clock: 0,
         }];
         let psg = vec![PsgWrite {
             sample_pos: 10,
             data: 0x80,
+            clock: 0,
         }];
         let lines = merge_frame_lines(0, &fm, &psg);
         assert_eq!(lines[0], "F0:10 FM0 22=08");
@@ -267,12 +278,14 @@ mod tests {
                 part: 0,
                 register: 0x28,
                 value: 0xF0,
+                clock: 0,
             },
             FmWrite {
                 sample_pos: 5,
                 part: 0,
                 register: 0x28,
                 value: 0x00,
+                clock: 0,
             },
         ];
         let lines = merge_frame_lines(0, &fm, &[]);

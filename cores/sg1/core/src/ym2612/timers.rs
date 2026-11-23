@@ -216,6 +216,11 @@ impl Timers {
         self.tb_period
     }
 
+    /// The last byte written to register 0x27.
+    pub fn control(&self) -> u8 {
+        self.mode
+    }
+
     /// Check if Timer A is running (bit 0 of mode)
     pub fn is_timer_a_running(&self) -> bool {
         self.mode & RUN_A != 0

@@ -29,7 +29,7 @@
 //! | `$0100-$FFBF`  | ARAM                                         |
 //! | `$FFC0-$FFFF`  | IPL ROM if CONTROL bit 7 set, else ARAM      |
 
-use retro_core::audio::AudioRingBuffer;
+use retro_core::audio::{AudioRingBuffer, SoundEvent, SoundLogEntry, SoundLogger};
 use retro_core::cpu::Addressable;
 
 use super::dsp::SDsp;
@@ -74,6 +74,38 @@ pub(super) struct ApuState {
     /// DSP register indices written since the last drain (newest last).
     /// Always empty unless [`Self::dsp_event_armed`] is set.
     pub(super) dsp_write_events: Vec<u8>,
+    /// The sound log while the host logs. A host setting, not saved.
+    pub(super) sound_log: Option<Box<DspLog>>,
+}
+
+/// The sound log of the S-DSP: each register write the DSP takes, stamped
+/// with the samples the DSP made since the log began. The log keeps its own
+/// count, so the APU's own, which a reset starts again, cannot take its
+/// time back.
+#[derive(Debug, Default)]
+pub(crate) struct DspLog {
+    pub(super) logger: SoundLogger,
+    /// Samples made since the log began.
+    pub(super) samples: u64,
+}
+
+impl DspLog {
+    /// The DSP's registers as entries at the log's time.
+    pub(super) fn image(&self, dsp: &SDsp) -> Vec<SoundLogEntry> {
+        let time = self.samples;
+        dsp.regs()
+            .iter()
+            .enumerate()
+            .map(|(register, &value)| SoundLogEntry {
+                time,
+                chip: 0,
+                event: SoundEvent::Write {
+                    register: register as u16,
+                    value,
+                },
+            })
+            .collect()
+    }
 }
 
 impl ApuState {
@@ -91,6 +123,7 @@ impl ApuState {
             control: CONTROL_IPL_ENABLE,
             dsp_event_armed: false,
             dsp_write_events: Vec::new(),
+            sound_log: None,
         }
     }
 
@@ -151,6 +184,9 @@ impl ApuState {
             if let Some(stems) = stems.as_deref_mut() {
                 stems.record(&self.dsp, (l, r));
             }
+        }
+        if let Some(log) = self.sound_log.as_deref_mut() {
+            log.samples += samples;
         }
     }
 
@@ -218,6 +254,21 @@ impl Addressable for ApuBus<'_> {
                     self.state
                         .dsp_write_events
                         .push(self.state.dsp.addr() & 0x7F);
+                }
+                // The sound log takes the writes the DSP takes: an address
+                // with bit 7 set reads the register file and writes none.
+                let register = self.state.dsp.addr();
+                if let Some(log) = self.state.sound_log.as_deref_mut() {
+                    if register & 0x80 == 0 {
+                        log.logger.extend([SoundLogEntry {
+                            time: log.samples,
+                            chip: 0,
+                            event: SoundEvent::Write {
+                                register: u16::from(register),
+                                value,
+                            },
+                        }]);
+                    }
                 }
                 self.state.dsp.write_data(value);
             }

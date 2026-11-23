@@ -456,6 +456,7 @@ pub(crate) struct FakeMachine {
     show_overscan: bool,
     memory: Vec<u8>,
     stems: retro_core::audio::StemRecorder<f32>,
+    sound_log: retro_core::audio::SoundLogger,
     video: FakeVideo,
     sound: [FakeSound; 2],
     debugger: DebuggerState<1, ()>,
@@ -528,6 +529,7 @@ impl FakeMachine {
             show_overscan: false,
             memory: (0..=255).collect(),
             stems: retro_core::audio::StemRecorder::new(&fake_stem_layout(), 16),
+            sound_log: Default::default(),
             video: FakeVideo {
                 vram: (0..32).collect(),
                 palette: [0x0102, 0x0304, 0x0506, 0x0708],
@@ -557,6 +559,15 @@ impl FakeMachine {
             self.stems.push(&[0.25, -0.5, 0.5], [0.75, 0.0], false);
         }
         self.stems.frame_end(true);
+        if self.sound_log.is_on() {
+            // A frame is 10 ticks of the log's clock, its end one entry.
+            let time = self.frames * 10;
+            self.sound_log.extend([retro_core::audio::SoundLogEntry {
+                time,
+                chip: 0,
+                event: retro_core::audio::SoundEvent::FrameEnd,
+            }]);
+        }
     }
 
     /// Mark the battery save written, as a game's write would.
@@ -600,6 +611,30 @@ impl retro_core::audio::SoundCore for FakeMachine {
 
     fn take_stems(&mut self) -> Option<retro_core::audio::StemTake> {
         self.stems.take()
+    }
+
+    fn sound_log_chips(&self) -> Vec<retro_core::audio::SoundChipKind> {
+        vec![retro_core::audio::SoundChipKind::Sn76489 { clock_hz: 1000 }]
+    }
+
+    fn start_sound_log(&mut self, contents: retro_core::audio::SoundLogContents) {
+        let image = vec![retro_core::audio::SoundLogEntry {
+            time: 0,
+            chip: 0,
+            event: retro_core::audio::SoundEvent::Write {
+                register: 0,
+                value: 0x9F,
+            },
+        }];
+        self.sound_log.start(contents, image);
+    }
+
+    fn stop_sound_log(&mut self) {
+        self.sound_log.stop();
+    }
+
+    fn take_sound_log(&mut self) -> Option<retro_core::audio::SoundLog> {
+        self.sound_log.take(1000)
     }
 }
 

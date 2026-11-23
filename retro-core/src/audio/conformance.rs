@@ -17,8 +17,11 @@
 //! only read: armed, they change nothing the machine holds or the host
 //! hears; they hold whole frames, every stem as many sample frames as the
 //! master; and they add up to the master by the layout's rule wherever the
-//! take counts no departure.
+//! take counts no departure. So does the sound log, which starts with the
+//! chips' registers at time 0, never goes back in time, holds a frame's end
+//! for every frame, and says when a load came between two takes.
 
+use crate::audio::sound_log::{SoundEvent, SoundLog, SoundLogContents};
 use crate::audio::stems::{SampleKind, StemLayout, StemSet, StemTake};
 use crate::audio::{render_frames, SoundCore};
 use crate::types::{Breakpoint, BreakpointType, ExecutionMode};
@@ -86,6 +89,9 @@ macro_rules! sound_conformance_tests {
             stems_change_nothing,
             stems_cover_whole_frames,
             stems_sum_to_the_master,
+            the_log_changes_nothing,
+            the_log_starts_with_the_image_and_never_goes_back,
+            a_load_interrupts_the_log,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -443,4 +449,137 @@ pub fn stems_sum_to_the_master<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
         loudest >= f64::from(SOUND_PEAK),
         "the master was silence (peak {loudest}): the check has nothing to bite on"
     );
+}
+
+/// What a log holds in the checks: everything.
+const EVERYTHING: SoundLogContents = SoundLogContents {
+    writes: true,
+    keys: true,
+};
+
+/// The log changes nothing: with every write and key logged and the log
+/// taken after each frame, each frame's state hash, the host's samples and
+/// their count are those of a machine with no log.
+pub fn the_log_changes_nothing<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut logged = core.playing();
+    let mut plain = core.playing();
+    logged.start_sound_log(EVERYTHING);
+    let mut entries = 0;
+    for frame in 1..=FRAMES {
+        logged.render_frame();
+        plain.render_frame();
+        entries += logged.take_sound_log().expect("a log runs").entries.len();
+        assert_eq!(
+            logged.state_hash(),
+            plain.state_hash(),
+            "frame {frame}: the machine with the log on parted from the plain one"
+        );
+        assert_eq!(
+            logged.get_audio_samples().to_vec(),
+            plain.get_audio_samples().to_vec(),
+            "frame {frame}: the host heard something else with the log on"
+        );
+    }
+    assert!(entries > 0, "the log took the frames down");
+}
+
+/// The log starts with the chips' registers, every one at time 0, before
+/// anything else; the writes after them are the sound moment's, at their
+/// time; the times never go back; and every frame ends with an entry.
+pub fn the_log_starts_with_the_image_and_never_goes_back<E: SoundCore>(
+    core: &SoundCoreUnderTest<E>,
+) {
+    let mut emu = (core.build)();
+    for _ in 0..WARM_UP {
+        emu.run_frame();
+    }
+    let chips = emu.sound_log_chips();
+    assert!(!chips.is_empty(), "the console logs its sound chips");
+    emu.start_sound_log(EVERYTHING);
+    (core.sound_moment)(&mut emu);
+    let mut logs: Vec<SoundLog> = Vec::new();
+    for _ in 0..FRAMES {
+        emu.render_frame();
+        logs.push(emu.take_sound_log().expect("a log runs"));
+    }
+    let first = &logs[0];
+    assert!(
+        first.image_len > 0,
+        "the log starts with the chips' registers"
+    );
+    assert!(first.clock_hz > 0);
+    for entry in &first.entries[..first.image_len] {
+        assert_eq!(entry.time, 0, "the registers stand at time 0");
+        assert!(
+            matches!(entry.event, SoundEvent::Write { .. }),
+            "the registers are writes"
+        );
+        assert!(
+            usize::from(entry.chip) < chips.len(),
+            "an entry names a chip of the list"
+        );
+    }
+    let writes_after = first.entries[first.image_len..]
+        .iter()
+        .filter(|entry| matches!(entry.event, SoundEvent::Write { .. }))
+        .count();
+    assert!(writes_after > 0, "the sound moment's writes are logged");
+    let mut latest = 0;
+    let mut frame_ends = 0;
+    for (take, log) in logs.iter().enumerate() {
+        assert!(
+            take == 0 || log.image_len == 0,
+            "only the first take starts with the image"
+        );
+        assert!(!log.interrupted, "nothing interrupted the log");
+        for entry in &log.entries {
+            assert!(
+                entry.time >= latest,
+                "take {take}: the time went back from {latest} to {}",
+                entry.time
+            );
+            latest = entry.time;
+            frame_ends += usize::from(entry.event == SoundEvent::FrameEnd);
+        }
+    }
+    assert_eq!(frame_ends, FRAMES as usize, "a frame's end for every frame");
+    emu.stop_sound_log();
+    assert_eq!(
+        emu.take_sound_log(),
+        None,
+        "stopped and taken, nothing waits"
+    );
+}
+
+/// A load between two takes marks the later one interrupted, and the log
+/// goes on, its time still moving forward, the new chips' registers first.
+pub fn a_load_interrupts_the_log<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut emu = core.playing();
+    emu.start_sound_log(EVERYTHING);
+    emu.render_frame();
+    let before = emu.take_sound_log().expect("a log runs");
+    assert!(!before.interrupted);
+    let latest = before.entries.last().expect("a frame's end").time;
+    emu.load_rom(&core.other_rom)
+        .expect("the other program loads");
+    emu.render_frame();
+    let after = emu.take_sound_log().expect("a log runs");
+    assert!(after.interrupted, "the load is said");
+    assert!(
+        after
+            .entries
+            .first()
+            .is_some_and(|entry| entry.time >= latest),
+        "the time goes on from {latest}"
+    );
+    assert!(
+        after
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.event, SoundEvent::Write { .. })),
+        "the new chips' registers are logged"
+    );
+    emu.render_frame();
+    let next = emu.take_sound_log().expect("a log runs");
+    assert!(!next.interrupted, "the take after says nothing came");
 }

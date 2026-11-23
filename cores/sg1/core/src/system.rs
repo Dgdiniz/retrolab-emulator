@@ -122,6 +122,9 @@ pub struct GenesisEmulator {
     /// setting, not saved.
     stems: retro_core::audio::StemRecorder<f32>,
 
+    /// The sound log while the host logs. A host setting, not saved.
+    sound_log: audio::SoundLogState,
+
     /// Previous step's total CPU cycles (including any VDP wait states).
     /// Used to tick the VDP FIFO drain at the start of the next step.
     last_step_cycles: u32,
@@ -294,6 +297,7 @@ impl GenesisEmulator {
             mix_sample_buf: vec![0.0; 2048],
             mixed_waveform_buffer: std::collections::VecDeque::with_capacity(2048),
             stems: audio::stem_recorder(44100),
+            sound_log: audio::SoundLogState::default(),
 
             // Previous step's total cycles for FIFO drain timing
             last_step_cycles: 0,
@@ -405,6 +409,8 @@ impl GenesisEmulator {
     /// Callers must run [`EmulatorCore::reset`] afterwards to boot the CPUs
     /// off the (now freshly mapped) vector table.
     fn rebuild_volatile_hardware(&mut self) {
+        // What the old chips logged goes onto the log before they go.
+        self.pause_sound_log();
         // The channels the host muted, which the new chips keep.
         let mutes = ChannelMutes::of(self);
         let cartridge = self.bus.take_cartridge();
@@ -641,8 +647,10 @@ impl EmulatorCore for GenesisEmulator {
         payload: crate::savestate::SystemSaveState,
         extension: crate::savestate::GenesisExtension,
     ) {
+        self.pause_sound_log();
         self.restore_payload(payload);
         self.restore_extension(extension);
+        self.resume_sound_log();
     }
 
     /// The wall clock, in seconds since 1970: the envelope's twin of the
@@ -660,6 +668,8 @@ impl EmulatorCore for GenesisEmulator {
     }
 
     fn reset(&mut self) {
+        // The sound log goes on after the reset, interrupted.
+        self.pause_sound_log();
         // The calls the call stack holds belong to the machine the reset
         // ends.
         self.debugger.console_mut().clear_instruction_boundaries();
@@ -721,6 +731,7 @@ impl EmulatorCore for GenesisEmulator {
         // right after a load) shows the reset vector instead of nothing.
         // It reads the registers only: nothing here runs or changes state.
         self.refresh_debugger_state();
+        self.resume_sound_log();
     }
 
     /// The power switch, which the reset button is not: [`Self::reset`]

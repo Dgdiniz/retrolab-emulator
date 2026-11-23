@@ -50,14 +50,15 @@ mod ipl;
 mod timers;
 
 use retro_core::audio::{
-    AudioRingBuffer, IntegerRateConverter, SampleKind, ScopeRing, StemChannel, StemLayout,
-    StemRecorder, StemSet, StemSum, StemTake,
+    AudioRingBuffer, IntegerRateConverter, SampleKind, ScopeRing, SoundEvent, SoundLog,
+    SoundLogContents, SoundLogEntry, StemChannel, StemLayout, StemRecorder, StemSet, StemSum,
+    StemTake,
 };
 use retro_core::cpu::Addressable;
 use spc700::Spc700;
 
 use crate::debugger::TraceEntryBinarySpc700;
-use bus::{ApuBus, ApuState};
+use bus::{ApuBus, ApuState, DspLog};
 
 pub use bus::ARAM_SIZE;
 
@@ -235,6 +236,7 @@ impl Apu {
         self.audio_ring.clear();
         self.boot_spc();
         self.stems_lose_track();
+        self.sound_log_interrupted();
     }
 
     /// Fetch the SPC700 reset vector (from the IPL ROM, mapped in by
@@ -564,6 +566,7 @@ impl Apu {
         self.dsp_samples_emitted = s.dsp_samples_emitted;
         self.audio_ring.clear();
         self.stems_lose_track();
+        self.sound_log_interrupted();
     }
 
     /// The S-DSP's stems: at its 32 kHz rate, 16-bit samples, each voice's
@@ -634,6 +637,75 @@ impl Apu {
             .armed()
             .contains(DRY_STEMS + voice)
             .then(|| &state.scopes[voice])
+    }
+
+    /// Start a sound log holding `contents`, its first entries the DSP's
+    /// 128 registers, at time 0 ([`retro_core::audio::SoundCore::start_sound_log`]).
+    /// The DSP logs no keys: a log asked for them holds the writes.
+    pub fn start_sound_log(&mut self, contents: SoundLogContents) {
+        if !contents.any() {
+            self.stop_sound_log();
+            return;
+        }
+        let mut log = Box::<DspLog>::default();
+        let image = log.image(&self.state.dsp);
+        log.logger.start(contents, image);
+        self.state.sound_log = Some(log);
+    }
+
+    /// Stop the log; what it logged waits for the next take.
+    pub fn stop_sound_log(&mut self) {
+        if let Some(log) = self.state.sound_log.as_deref_mut() {
+            log.logger.stop();
+        }
+    }
+
+    /// What the log took down since the last take, on the DSP's 32 kHz
+    /// sample clock.
+    pub fn take_sound_log(&mut self) -> Option<SoundLog> {
+        let log = self.state.sound_log.as_deref_mut()?;
+        let take = log.logger.take(DSP_SAMPLE_RATE_HZ);
+        if !log.logger.is_on() {
+            self.state.sound_log = None;
+        }
+        take
+    }
+
+    /// A frame's end for the log.
+    pub fn sound_log_frame_end(&mut self) {
+        if let Some(log) = self.state.sound_log.as_deref_mut() {
+            if log.logger.is_on() {
+                let time = log.samples;
+                log.logger.extend([SoundLogEntry {
+                    time,
+                    chip: 0,
+                    event: SoundEvent::FrameEnd,
+                }]);
+            }
+        }
+    }
+
+    /// The log, to carry over to the APU a load builds.
+    pub(crate) fn take_sound_log_state(&mut self) -> Option<Box<DspLog>> {
+        self.state.sound_log.take()
+    }
+
+    /// The log carried over from the APU this one replaces; the reset a
+    /// load ends with marks it interrupted.
+    pub(crate) fn restore_sound_log_state(&mut self, log: Option<Box<DspLog>>) {
+        self.state.sound_log = log;
+    }
+
+    /// A reset, a load or a savestate's load came: the next take says so,
+    /// and the log goes on with the DSP's registers as they stand.
+    fn sound_log_interrupted(&mut self) {
+        if let Some(log) = self.state.sound_log.as_deref_mut() {
+            if log.logger.is_on() {
+                log.logger.interrupt();
+                let image = log.image(&self.state.dsp);
+                log.logger.extend(image);
+            }
+        }
     }
 
     /// The DSP is somewhere the stems' carry did not follow it.

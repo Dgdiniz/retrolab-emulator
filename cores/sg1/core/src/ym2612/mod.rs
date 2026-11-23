@@ -35,6 +35,8 @@ pub use timers::Timers;
 
 use std::collections::VecDeque;
 
+use retro_core::audio::SoundEvent;
+
 /// Cap on `timer_accumulator`, in input clocks: eight timer ticks' worth.
 /// It bounds the timer work of one `clock()` call; a longer call runs eight
 /// ticks and drops the rest.
@@ -195,6 +197,16 @@ pub struct Ym2612 {
     /// The stems' tap while the host takes stems (`synthesis::YmStems`):
     /// each sample's channels staged beside `frame_samples`. Not saved.
     stems: Option<Box<synthesis::YmStems>>,
+
+    /// The input clocks the chip has received since it was built: the
+    /// clock the sound log and the write log stamp a write with. Never
+    /// saved, and the same whether the chip renders or not.
+    input_clocks: u64,
+
+    /// The sound log while the host logs: each data write, and each reset
+    /// of the /IC pin followed by the registers it leaves, stamped with
+    /// `input_clocks`. Not saved.
+    sound_log: Option<Vec<(u64, SoundEvent)>>,
 }
 
 /// A single YM2612 data-port write captured by the optional sound-write log.
@@ -206,12 +218,15 @@ pub struct Ym2612 {
 /// accurate, so it is the right quantity to diff against a reference core.
 /// `part` is the port pair (0 = part I / channels 1-3, 1 = part II /
 /// channels 4-6); `register`/`value` are the latched address and data byte.
+/// `clock` is the chip's input clocks received when the write arrived,
+/// counted from when it was built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FmWrite {
     pub sample_pos: u32,
     pub part: u8,
     pub register: u8,
     pub value: u8,
+    pub clock: u64,
 }
 
 impl Ym2612 {
@@ -261,6 +276,8 @@ impl Ym2612 {
             rendering_enabled: true,
             sound_write_log: None,
             stems: None,
+            input_clocks: 0,
+            sound_log: None,
         }
     }
 
@@ -281,20 +298,47 @@ impl Ym2612 {
     }
 
     /// Record one resolved FM data write at its current in-frame sample
-    /// position. No-op unless capture is enabled.
+    /// position, and in the sound log. No-op unless a log is on.
     fn log_fm_write(&mut self, part: u8, register: u8, value: u8) {
         // Snapshot the position before the borrow so this stays a disjoint
         // field access (the log borrows `sound_write_log`, the position reads
         // `frame_samples`).
         let sample_pos = (self.frame_samples.len() / 2) as u32;
+        let clock = self.input_clocks;
         if let Some(log) = self.sound_write_log.as_mut() {
             log.push(FmWrite {
                 sample_pos,
                 part,
                 register,
                 value,
+                clock,
             });
         }
+        if let Some(log) = self.sound_log.as_mut() {
+            let register = u16::from(part) << 8 | u16::from(register);
+            log.push((clock, SoundEvent::Write { register, value }));
+        }
+    }
+
+    /// Log each data write, and each reset of the /IC pin with the
+    /// registers it leaves, on the chip's input clock (`true`), dropping
+    /// what was logged before; or stop. A host setting, not saved.
+    pub fn set_sound_log(&mut self, on: bool) {
+        self.sound_log = on.then(Vec::new);
+    }
+
+    /// What the sound log holds since the last take: each entry with the
+    /// input clocks received when it came ([`Self::input_clocks`]).
+    pub fn take_sound_log(&mut self) -> Vec<(u64, SoundEvent)> {
+        self.sound_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// The input clocks received since the chip was built.
+    pub fn input_clocks(&self) -> u64 {
+        self.input_clocks
     }
 
     /// The input clock, in Hz.
@@ -413,6 +457,19 @@ impl Ym2612 {
         self.eg_counter = 0;
         self.busy_counter = 0;
         self.busy_end_cycle = 0;
+
+        if self.sound_log.is_some() {
+            let clock = self.input_clocks;
+            let image = self.register_image();
+            if let Some(log) = self.sound_log.as_mut() {
+                log.push((clock, SoundEvent::Reset));
+                log.extend(
+                    image
+                        .into_iter()
+                        .map(|(register, value)| (clock, SoundEvent::Write { register, value })),
+                );
+            }
+        }
     }
 
     // ===== Z80 Communication Interface =====

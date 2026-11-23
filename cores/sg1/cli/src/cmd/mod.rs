@@ -5,6 +5,7 @@
 
 pub mod audio_info;
 pub mod dump_vdp;
+pub mod sound_log;
 pub mod sound_trace;
 pub mod watch_read;
 pub mod watch_vram;
@@ -33,6 +34,10 @@ pub enum Command {
     AudioInfo(audio_info::AudioInfoArgs<GenesisBoot>),
     /// Dump YM2612 + PSG register writes with their in-frame sample offset.
     SoundTrace(sound_trace::SoundTraceArgs<GenesisBoot>),
+    /// Log the YM2612 and the PSG while running and write it as a VGM.
+    VgmLog(sound_log::VgmLogArgs<GenesisBoot>),
+    /// Log the YM2612 and the PSG while running and write it as a GYM.
+    GymLog(sound_log::GymLogArgs<GenesisBoot>),
 }
 
 /// Run one of the Mega Drive's own commands.
@@ -43,6 +48,8 @@ pub fn run(command: Command) -> Result<()> {
         Command::WatchRead(args) => watch_read::run(args),
         Command::AudioInfo(args) => audio_info::run(args),
         Command::SoundTrace(args) => sound_trace::run(args),
+        Command::VgmLog(args) => sound_log::run_vgm(args),
+        Command::GymLog(args) => sound_log::run_gym(args),
     }
 }
 

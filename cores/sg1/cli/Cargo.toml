@@ -12,7 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 sg1-core = { path = "../core" }
-retro-core = { path = "../../../retro-core" }
+# `vgz`: the gzip of a VGM, which `vgm-log --vgz` writes.
+retro-core = { path = "../../../retro-core", features = ["vgz"] }
 retro-cli = { path = "../../../retro-cli" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"

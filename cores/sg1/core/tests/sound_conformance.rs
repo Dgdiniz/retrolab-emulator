@@ -4,7 +4,9 @@
 //! channel and a tone on the PSG's second.
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
-use retro_core::audio::{SoundCore, SoundSamples, StemLayout, StemTake};
+use retro_core::audio::{
+    SoundCore, SoundEvent, SoundLogContents, SoundSamples, StemLayout, StemTake,
+};
 use retro_core::{EmulatorCore, ExecutionMode};
 use sg1_core::GenesisEmulator;
 
@@ -173,4 +175,86 @@ fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
     let level = ((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
     assert!(stem(&take, &layout, "dac").iter().all(|&s| s == level));
     assert!(stem(&take, &layout, "fm6").iter().all(|&s| s == 0.0));
+}
+
+// -- The Mega Drive's sound log -------------------------------------------
+
+const WRITES: SoundLogContents = SoundLogContents {
+    writes: true,
+    keys: false,
+};
+
+/// A machine past its warm-up, its log started, the sound moment made,
+/// `frames` frames run: the log, taken whole.
+fn logged(sound: bool, frames: u32) -> Vec<retro_core::audio::SoundLogEntry> {
+    let mut emu = build();
+    emu.set_audio_enabled(sound);
+    for _ in 0..4 {
+        emu.run_frame();
+    }
+    emu.start_sound_log(WRITES);
+    sound_moment(&mut emu);
+    let mut entries = Vec::new();
+    for _ in 0..frames {
+        emu.render_frame();
+        entries.extend(emu.take_sound_log().expect("a log runs").entries);
+    }
+    entries
+}
+
+/// The log is on the chips' input clocks, which run whether the chips
+/// make samples or not: with the sound off it logs what it logs with the
+/// sound on, at the same times.
+#[test]
+fn the_log_s_times_are_the_same_with_the_sound_off() {
+    assert_eq!(logged(false, 8), logged(true, 8));
+}
+
+/// Writes the Z80 makes in its bursts are logged in the order it made
+/// them, each stamped with the YM2612's input clock when it came (the
+/// clock the chip renders its sound on, which runs on the Z80's
+/// instructions inside a burst), the later one later, both before the end
+/// of the frame that made them.
+#[test]
+fn a_z80_s_writes_are_logged_in_their_order_on_the_chip_s_clock() {
+    #[rustfmt::skip]
+    let program: [u8; 34] = [
+        0x3E, 0x30, 0x32, 0x00, 0x40, // ld a,$30 ; ld ($4000),a
+        0x3E, 0x01, 0x32, 0x01, 0x40, // ld a,$01 ; ld ($4001),a   the first write
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ten nop
+        0x3E, 0x34, 0x32, 0x00, 0x40, // ld a,$34 ; ld ($4000),a
+        0x3E, 0x02, 0x32, 0x01, 0x40, // ld a,$02 ; ld ($4001),a   the second
+        0x18, 0xFE, // jr $
+        0x00, 0x00,
+    ];
+    let mut emu = build();
+    emu.run_frame();
+    emu.write_memory_debug(0xA1_1100, &[0x01]);
+    emu.write_memory_debug(0xA0_0000, &program);
+    emu.start_sound_log(WRITES);
+    emu.write_memory_debug(0xA1_1200, &[0x01]);
+    emu.write_memory_debug(0xA1_1100, &[0x00]);
+    emu.render_frame();
+    let log = emu.take_sound_log().expect("a log runs");
+    // The last write of each: the chip's registers at the log's start
+    // (and after the reset the Z80's release makes) come first.
+    let at = |register, value| {
+        log.entries
+            .iter()
+            .rposition(|entry| entry.event == SoundEvent::Write { register, value })
+            .unwrap_or_else(|| panic!("the program's write of {register:#X}"))
+    };
+    let (first, second) = (at(0x30, 0x01), at(0x34, 0x02));
+    let end = log
+        .entries
+        .iter()
+        .position(|entry| entry.event == SoundEvent::FrameEnd)
+        .expect("the frame's end");
+    assert!(
+        first < second && second < end,
+        "in their order, in their frame"
+    );
+    let (first, second) = (log.entries[first].time, log.entries[second].time);
+    assert!(0 < first && first < second, "stamped {first} then {second}");
+    assert!(second <= log.entries[end].time);
 }

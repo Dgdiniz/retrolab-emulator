@@ -266,6 +266,7 @@ impl Clockable for Ym2612 {
         // by `catch_up()` at each register write and flushed by `generate_samples()`,
         // so register changes land at their true sub-frame sample position.
         self.busy_counter = self.busy_counter.saturating_sub(cycles);
+        self.input_clocks += u64::from(cycles);
         self.clock_timers(cycles);
         self.clock_accumulator += cycles as f32;
         cycles

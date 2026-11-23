@@ -979,9 +979,11 @@ impl EmulatorCore for SnesEmulator {
         // stems the host takes.
         let mutes = ChannelMutes::of(self);
         let stems = self.bus.apu_mut().take_stem_state();
+        let log = self.bus.apu_mut().take_sound_log_state();
         self.bus = SnesBus::new();
         mutes.apply(self);
         self.bus.apu_mut().restore_stem_state(stems);
+        self.bus.apu_mut().restore_sound_log_state(log);
         self.bus.install_cartridge(cart);
         // The header's region: the timing profile, and the PAL bit STAT78
         // (`$213F` bit 4) reports.

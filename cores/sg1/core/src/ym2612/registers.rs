@@ -1,7 +1,17 @@
-//! The register file: what a write to each register does, and the channel
-//! and the operator a register names.
+//! The register file: what a write to each register does, the channel
+//! and the operator a register names, and the registers as the chip's
+//! state gives them back.
 
 use super::{StereoFlags, Ym2612};
+
+/// The operators whose key-on bits 4 to 7 of register 0x28 are, in this
+/// core's order: slots 1, 2, 3 and 4 are operators 0, 2, 1 and 3.
+const KEY_BIT_OPERATORS: [usize; 4] = [0, 2, 1, 3];
+
+/// Channel 3's own frequency registers (0xA8 to 0xAA, and 0xAC to 0xAE for
+/// the block and high bits) and the operator each sets, in this core's
+/// order: slots 3, 1 and 2.
+const CH3_FREQUENCY_OPERATORS: [usize; 3] = [2, 0, 1];
 
 impl Ym2612 {
     /// Write to a YM2612 register
@@ -66,9 +76,8 @@ impl Ym2612 {
                     if channel_idx < 6 {
                         // Key-on bits 4-7 name the chip's slots 1-4, and
                         // slots 2 and 3 are operators 3 and 2 in our order.
-                        const BIT_TO_OP: [usize; 4] = [0, 2, 1, 3];
                         let op_bits = (value >> 4) & 0x0F;
-                        for (i, &op_idx) in BIT_TO_OP.iter().enumerate() {
+                        for (i, &op_idx) in KEY_BIT_OPERATORS.iter().enumerate() {
                             if (op_bits & (1 << i)) != 0 {
                                 self.channels[channel_idx].operator_mut(op_idx).key_on();
                             } else {
@@ -104,6 +113,107 @@ impl Ym2612 {
                 // Unimplemented or invalid register
             }
         }
+    }
+
+    /// The registers as the chip's state gives them back, each a register
+    /// (part 1's in the high byte) and a value, in an order a chip written
+    /// with them in turn takes back the same state: the LFO, the timers'
+    /// periods, channel 3's mode with the timers' run and flag bits, the
+    /// DAC's switch and value, each channel's operators in register-slot
+    /// order (detune and multiple, total level, rate scaling and attack, AM
+    /// and decay, sustain rate, sustain level and release, SSG-EG), the
+    /// frequencies (block and high bits before the low byte), channel 3's
+    /// own frequencies, feedback and algorithm, stereo and sensitivities,
+    /// and each channel's keyed operators last. Registers cannot hold an
+    /// envelope's level: a note keyed on starts again from its attack.
+    pub fn register_image(&self) -> Vec<(u16, u8)> {
+        let mut image = Vec::with_capacity(256);
+        let mut put = |part: u16, register: u8, value: u8| {
+            image.push((part << 8 | u16::from(register), value));
+        };
+        let timer_a = self.timers.get_timer_a_period();
+        put(
+            0,
+            0x22,
+            u8::from(self.lfo.is_enabled()) << 3 | self.lfo.get_frequency(),
+        );
+        put(0, 0x24, (timer_a >> 2) as u8);
+        put(0, 0x25, (timer_a & 0x03) as u8);
+        put(0, 0x26, self.timers.get_timer_b_period());
+        put(0, 0x27, self.ch3_mode | self.timers.control() & 0x0F);
+        put(0, 0x2B, u8::from(self.dac_enabled) << 7);
+        put(0, 0x2A, (self.dac_value + 128) as u8);
+        let places = |channel: usize| ((channel / 3) as u16, (channel % 3) as u8);
+        for (channel, state) in self.channels.iter().enumerate() {
+            let (part, low) = places(channel);
+            for slot in 0..4u8 {
+                let operator = state.operator(usize::from(slot));
+                let envelope = operator.envelope();
+                let register = low + slot * 4;
+                put(
+                    part,
+                    0x30 + register,
+                    operator.detune << 4 | operator.multiple,
+                );
+                put(part, 0x40 + register, operator.total_level);
+                put(
+                    part,
+                    0x50 + register,
+                    operator.rate_scaling << 6 | envelope.attack_rate,
+                );
+                put(
+                    part,
+                    0x60 + register,
+                    u8::from(operator.am_enable) << 7 | envelope.decay_rate,
+                );
+                put(part, 0x70 + register, envelope.sustain_rate);
+                put(
+                    part,
+                    0x80 + register,
+                    envelope.sustain_level << 4 | envelope.release_rate,
+                );
+                put(part, 0x90 + register, envelope.get_ssg_eg());
+            }
+        }
+        for (channel, state) in self.channels.iter().enumerate() {
+            let (part, low) = places(channel);
+            let (number, block) = if channel == 2 && self.ch3_mode & 0x40 != 0 {
+                (self.ch3_fnum[3], self.ch3_block[3])
+            } else {
+                (state.operator(0).freq_number, state.operator(0).block)
+            };
+            put(part, 0xA4 + low, block << 3 | (number >> 8) as u8 & 0x07);
+            put(part, 0xA0 + low, number as u8);
+        }
+        for (low, &operator) in CH3_FREQUENCY_OPERATORS.iter().enumerate() {
+            let (number, block) = (self.ch3_fnum[operator], self.ch3_block[operator]);
+            put(0, 0xAC + low as u8, block << 3 | (number >> 8) as u8 & 0x07);
+            put(0, 0xA8 + low as u8, number as u8);
+        }
+        for (channel, state) in self.channels.iter().enumerate() {
+            let (part, low) = places(channel);
+            put(
+                part,
+                0xB0 + low,
+                state.get_feedback() << 3 | state.get_algorithm().as_u8(),
+            );
+            let sensitivities = state.operator(0).get_ams() << 4 | state.get_pms();
+            put(
+                part,
+                0xB4 + low,
+                state.get_stereo().to_register() | sensitivities,
+            );
+        }
+        for (channel, state) in self.channels.iter().enumerate() {
+            let keyed = KEY_BIT_OPERATORS
+                .iter()
+                .enumerate()
+                .filter(|(_, &operator)| state.operator(operator).is_key_on())
+                .fold(0u8, |bits, (bit, _)| bits | 0x10 << bit);
+            let (part, low) = places(channel);
+            put(0, 0x28, keyed | (part as u8) << 2 | low);
+        }
+        image
     }
 
     /// Get channel index from register address and part

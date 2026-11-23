@@ -1,7 +1,9 @@
 //! Audio: the S-DSP's samples resampled at a frame's end into the host's
 //! ring, and the sound hooks a host calls (`SoundCore`).
 
-use retro_core::audio::{SoundCore, StemLayout, StemSet, StemTake};
+use retro_core::audio::{
+    SoundChipKind, SoundCore, SoundLog, SoundLogContents, StemLayout, StemSet, StemTake,
+};
 use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
 
@@ -29,6 +31,22 @@ impl SoundCore for SnesEmulator {
 
     fn take_stems(&mut self) -> Option<StemTake> {
         self.bus.apu_mut().take_stems()
+    }
+
+    fn sound_log_chips(&self) -> Vec<SoundChipKind> {
+        vec![SoundChipKind::SDsp]
+    }
+
+    fn start_sound_log(&mut self, contents: SoundLogContents) {
+        self.bus.apu_mut().start_sound_log(contents);
+    }
+
+    fn stop_sound_log(&mut self) {
+        self.bus.apu_mut().stop_sound_log();
+    }
+
+    fn take_sound_log(&mut self) -> Option<SoundLog> {
+        self.bus.apu_mut().take_sound_log()
     }
 }
 

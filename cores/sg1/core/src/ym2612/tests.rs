@@ -4,6 +4,7 @@ use retro_core::audio::{AudioChip, AudioDebugger, ChannelType};
 use retro_core::cpu::Clockable;
 
 use super::*;
+use retro_core::audio::SoundEvent;
 
 #[test]
 fn test_ym2612_creation() {
@@ -692,4 +693,132 @@ fn test_busy_clears_via_clock_without_advancing_cpu_cycle() {
 
     // Same contract through the data-port mirror E-Swat uses.
     assert_eq!(ym.read_port(1) & 0x80, 0x00);
+}
+
+/// A chip written with many registers: the LFO, both timers, channel 3's
+/// own frequencies in its special mode, the DAC, every operator of two
+/// channels, frequencies, algorithms, stereo, and keys.
+fn written_chip() -> Ym2612 {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    let mut write = |part: u8, register: u8, value: u8| {
+        ym.write_port(part * 2, register);
+        ym.write_port(part * 2 + 1, value);
+    };
+    for (register, value) in [
+        (0x22, 0x0B),
+        (0x24, 0x9A),
+        (0x25, 0x02),
+        (0x26, 0xC7),
+        (0x27, 0x45),
+    ] {
+        write(0, register, value);
+    }
+    for (register, value) in [
+        (0xAC, 0x1C),
+        (0xA8, 0x35),
+        (0xAD, 0x22),
+        (0xA9, 0x40),
+        (0xAE, 0x0B),
+        (0xAA, 0x99),
+    ] {
+        write(0, register, value);
+    }
+    write(0, 0x2B, 0x80);
+    write(0, 0x2A, 0x3C);
+    for part in 0..2u8 {
+        for slot in 0..4u8 {
+            let register = 1 + slot * 4;
+            let values: [(u8, u8); 7] = [
+                (0x30, 0x71),
+                (0x40, 0x1F),
+                (0x50, 0x9F),
+                (0x60, 0x85),
+                (0x70, 0x07),
+                (0x80, 0xA4),
+                (0x90, 0x0D),
+            ];
+            for (base, value) in values {
+                write(part, base + register, value.wrapping_add(slot + part));
+            }
+        }
+        write(part, 0xA5, 0x24);
+        write(part, 0xA1, 0x69);
+        write(part, 0xB1, 0x3A);
+        write(part, 0xB5, 0xB3);
+    }
+    write(0, 0xA6, 0x1A);
+    write(0, 0xA2, 0x55);
+    write(0, 0x28, 0xF1);
+    write(0, 0x28, 0x55);
+    ym
+}
+
+#[test]
+fn the_register_image_written_into_a_fresh_chip_gives_it_back() {
+    let ym = written_chip();
+    let image = ym.register_image();
+    let mut fresh = Ym2612::new(7_670_453, 44_100);
+    for &(register, value) in &image {
+        let port = ((register >> 8) as u8) * 2;
+        fresh.write_port(port, register as u8);
+        fresh.write_port(port + 1, value);
+    }
+    assert_eq!(fresh.register_image(), image);
+    assert!(
+        image.contains(&(0x141, 0x20)),
+        "part 1's operator registers"
+    );
+    assert!(image.contains(&(0x28, 0x55)), "channel 5's keys as written");
+    assert_eq!(
+        image.last(),
+        Some(&(0x28, 0x06)),
+        "channel 6's keys last: none"
+    );
+}
+
+#[test]
+fn an_ic_reset_logs_a_reset_and_the_registers_it_leaves() {
+    let mut ym = written_chip();
+    ym.set_sound_log(true);
+    ym.clock(1000);
+    ym.write_port(0, 0x22);
+    ym.write_port(1, 0x00);
+    ym.ic_reset();
+    let log = ym.take_sound_log();
+    assert_eq!(
+        log[0],
+        (
+            1000,
+            SoundEvent::Write {
+                register: 0x22,
+                value: 0x00
+            }
+        ),
+        "a write at the input clocks received"
+    );
+    assert_eq!(log[1], (1000, SoundEvent::Reset));
+    let left: Vec<(u16, u8)> = log[2..]
+        .iter()
+        .map(|&(clock, event)| match event {
+            SoundEvent::Write { register, value } if clock == 1000 => (register, value),
+            other => panic!("not the registers the reset left: {other:?} at {clock}"),
+        })
+        .collect();
+    assert_eq!(left, ym.register_image());
+    assert!(ym.take_sound_log().is_empty(), "taken");
+    ym.set_sound_log(false);
+    ym.write_port(0, 0x22);
+    ym.write_port(1, 0x08);
+    assert!(ym.take_sound_log().is_empty(), "off");
+}
+
+#[test]
+fn the_write_log_stamps_the_input_clocks_received() {
+    let mut ym = Ym2612::new(7_670_453, 44_100);
+    ym.enable_write_log();
+    ym.clock(321);
+    ym.write_port(0, 0x22);
+    ym.write_port(1, 0x08);
+    assert_eq!(ym.take_write_log()[0].clock, 321);
+    assert_eq!(ym.input_clocks(), 321);
 }

@@ -23,6 +23,8 @@ sound-conformance = []
 # The runner of CPU test vectors (`testing::singlestep`), which the CPU
 # crates' and the cores' tests run with their own CPU under test.
 singlestep = ["dep:flate2"]
+# `audio::vgm::gzip`, which makes a `.vgz` of a VGM.
+vgz = ["dep:flate2"]
 
 [dependencies]
 serde = { workspace = true }
@@ -31,7 +33,8 @@ thiserror = { workspace = true }
 bincode = "1.3"
 sha2 = "0.10"
 zstd = "0.13"  # Savestate envelope compression
-# The test vectors' gzipped files, read by `testing::singlestep`.
+# The test vectors' gzipped files, read by `testing::singlestep`, and the
+# `.vgz` files `audio::vgm::gzip` writes.
 flate2 = { version = "1.0", optional = true }
 
 # WASM-specific: js_sys::Date::now() in GenericInputManager::current_time_ms
