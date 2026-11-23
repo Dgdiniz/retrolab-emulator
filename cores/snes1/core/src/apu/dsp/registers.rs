@@ -86,9 +86,15 @@ pub(in crate::apu) struct VoiceDebug {
     pub volr: i8,
     /// The 14-bit pitch.
     pub pitch: u16,
-    pub adsr0: u8,
+    /// The ADSR1 register (`$x5`): ADSR on, the decay and attack rates.
     pub adsr1: u8,
+    /// The ADSR2 register (`$x6`): the sustain level and rate.
+    pub adsr2: u8,
     pub gain: u8,
+    /// The source number SRCN names: the sample the voice plays.
+    pub source: u8,
+    /// The address of the block the voice reads now.
+    pub block_address: u16,
     /// OUTX, signed.
     pub outx: i8,
     /// The envelope's level, 0..=2047.
@@ -159,8 +165,18 @@ impl SDsp {
         &self.regs
     }
 
+    /// The page of ARAM the directory register DIR names.
+    pub(in crate::apu) fn directory_register(&self) -> u8 {
+        self.regs[DIR]
+    }
+
+    /// Each voice's source number, SRCN.
+    pub(in crate::apu) fn sources(&self) -> [u8; 8] {
+        std::array::from_fn(|voice| self.vreg(voice, VoiceReg::Srcn))
+    }
+
     pub(in crate::apu) fn voice_debug(&self, voice: usize) -> VoiceDebug {
-        let adsr0 = self.vreg(voice, VoiceReg::Adsr1);
+        let adsr1 = self.vreg(voice, VoiceReg::Adsr1);
         let pitch = u16::from_le_bytes([
             self.vreg(voice, VoiceReg::PitchL),
             self.vreg(voice, VoiceReg::PitchH),
@@ -171,13 +187,15 @@ impl SDsp {
             voll: self.vreg(voice, VoiceReg::VolL) as i8,
             volr: self.vreg(voice, VoiceReg::VolR) as i8,
             pitch,
-            adsr0,
-            adsr1: self.vreg(voice, VoiceReg::Adsr2),
+            adsr1,
+            adsr2: self.vreg(voice, VoiceReg::Adsr2),
             gain: self.vreg(voice, VoiceReg::Gain),
+            source: self.vreg(voice, VoiceReg::Srcn),
+            block_address: self.voices[voice].block_address,
             outx: self.vreg(voice, VoiceReg::Outx) as i8,
             env_level: i32::from(envelope.level),
             env_mode: envelope.stage.code(),
-            adsr_enabled: adsr0 & 0x80 != 0,
+            adsr_enabled: adsr1 & 0x80 != 0,
             key_on: self.regs[KON] & bit != 0,
             ended: self.regs[ENDX] & bit != 0,
             noise: self.regs[NON] & bit != 0,

@@ -157,9 +157,259 @@ pub(super) fn decode_four(ring: &mut SampleRing, header: BlockHeader, bytes: [u8
     }
 }
 
+/// How a sample's last block ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum BrrEnd {
+    /// Its end block loops: the voice goes on from the loop address.
+    Loops,
+    /// Its end block does not loop: the voice falls silent on it.
+    Stops,
+    /// No end block in the 64 KiB a sample can run through.
+    Unended,
+}
+
+/// A sample decoded as the S-DSP decodes it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BrrSample {
+    /// Its values, sixteen a block, the end block's included, in the DSP's
+    /// own form: each a 15-bit sample doubled, as the interpolator reads
+    /// it.
+    pub pcm: Vec<i16>,
+    /// The blocks read.
+    pub blocks: usize,
+    /// The first value of the block the loop address names, when that
+    /// address is one of the sample's blocks.
+    pub loop_sample: Option<usize>,
+    pub ends: BrrEnd,
+}
+
+/// The most blocks a sample can run through: 64 KiB of nine-byte blocks.
+const MAX_BLOCKS: usize = 0x10000 / 9 + 1;
+
+/// Decode the sample at `start` of the 64 KiB `aram` (`loop_start` the
+/// loop address its directory entry gives) as a voice decodes it, from
+/// silence: block after block, each through the same `decode_four` a voice
+/// uses, until an end block, the addresses wrapping at 64 KiB.
+pub fn decode_sample(aram: &[u8], start: u16, loop_start: u16) -> BrrSample {
+    let byte = |at: u16| aram[usize::from(at)];
+    let mut ring = SampleRing::EMPTY;
+    let mut sample = BrrSample {
+        pcm: Vec::new(),
+        blocks: 0,
+        loop_sample: None,
+        ends: BrrEnd::Unended,
+    };
+    let mut address = start;
+    while sample.blocks < MAX_BLOCKS {
+        if address == loop_start && sample.loop_sample.is_none() {
+            sample.loop_sample = Some(sample.pcm.len());
+        }
+        let header = BlockHeader::decode(byte(address));
+        for pair in 0..4u16 {
+            let first = byte(address.wrapping_add(1 + pair * 2));
+            let second = byte(address.wrapping_add(2 + pair * 2));
+            decode_four(&mut ring, header, [first, second]);
+            sample
+                .pcm
+                .extend((-4..0).map(|offset| ring.at(offset) as i16));
+        }
+        sample.blocks += 1;
+        if header.ends {
+            sample.ends = match header.loops {
+                true => BrrEnd::Loops,
+                false => BrrEnd::Stops,
+            };
+            break;
+        }
+        address = address.wrapping_add(9);
+    }
+    sample
+}
+
+/// One entry of the sample directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DirectoryEntry {
+    /// The source number a voice names it by.
+    pub source: u8,
+    /// Where its first block is.
+    pub start: u16,
+    /// Where a looping end block sends the voice.
+    pub loop_start: u16,
+    /// The voices whose source number names it, bit `n` for voice `n`.
+    pub voices: u8,
+}
+
+/// The sample directory at page `page` of the 64 KiB `aram`: each of the
+/// 256 source numbers' start and loop addresses (four bytes an entry, low
+/// byte first, the addresses wrapping at 64 KiB), and the voices `sources`
+/// (each voice's source number) name it.
+pub fn directory(aram: &[u8], page: u8, sources: [u8; 8]) -> Vec<DirectoryEntry> {
+    let word = |at: u16| {
+        u16::from_le_bytes([aram[usize::from(at)], aram[usize::from(at.wrapping_add(1))]])
+    };
+    (0..=255u8)
+        .map(|source| {
+            let at = (u16::from(page) << 8).wrapping_add(u16::from(source) << 2);
+            DirectoryEntry {
+                source,
+                start: word(at),
+                loop_start: word(at.wrapping_add(2)),
+                voices: sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &named)| named == source)
+                    .fold(0, |voices, (voice, _)| voices | 1 << voice),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sample of three blocks at `$1000`: filter 0 shift 12, filter 1
+    /// shift 4 (the loop block), and filter 3 shift 8, the end, its loop
+    /// flag `end`'s.
+    fn three_blocks(end: u8) -> Vec<u8> {
+        let mut aram = vec![0u8; 0x10000];
+        let blocks: [(u8, [u8; 8]); 3] = [
+            (0xC0, [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]),
+            (0x44, [0x7F, 0x80, 0x01, 0xFF, 0x70, 0x0F, 0x88, 0x77]),
+            (0x8C | end, [0x11, 0x22, 0x33, 0x44, 0xCC, 0xDD, 0xEE, 0x99]),
+        ];
+        for (i, (header, data)) in blocks.iter().enumerate() {
+            let at = 0x1000 + i * 9;
+            aram[at] = *header;
+            aram[at + 1..at + 9].copy_from_slice(data);
+        }
+        aram
+    }
+
+    #[test]
+    fn a_sample_decodes_block_by_block_as_a_voice_decodes_it() {
+        let aram = three_blocks(0x03);
+        let sample = decode_sample(&aram, 0x1000, 0x1009);
+        assert_eq!(sample.blocks, 3);
+        assert_eq!(sample.pcm.len(), 48);
+        assert_eq!(sample.loop_sample, Some(16), "the second block");
+        assert_eq!(sample.ends, BrrEnd::Loops);
+        // The first block, filter 0 shift 12: each nibble << 12 >> 1, then
+        // doubled: 1 -> 0x1000, 2 -> 0x2000, 7 -> 0x7000, 8 (-8) -> -0x8000,
+        // F (-1) -> -0x1000.
+        assert_eq!(&sample.pcm[..4], &[0x1000, 0x2000, 0x3000, 0x4000]);
+        assert_eq!(&sample.pcm[6..8], &[0x7000, -0x8000]);
+        assert_eq!(&sample.pcm[14..16], &[-0x1000, 0]);
+        // Every value is the DSP's doubled form.
+        assert!(sample.pcm.iter().all(|v| v & 1 == 0));
+        // The same values a voice's ring holds, decoding the same bytes.
+        let mut ring = SampleRing::EMPTY;
+        let mut voice = Vec::new();
+        for block in 0..3 {
+            let at = 0x1000 + block * 9;
+            let header = BlockHeader::decode(aram[at]);
+            for pair in 0..4 {
+                decode_four(
+                    &mut ring,
+                    header,
+                    [aram[at + 1 + pair * 2], aram[at + 2 + pair * 2]],
+                );
+                voice.extend((-4..0).map(|o| ring.at(o) as i16));
+            }
+        }
+        assert_eq!(sample.pcm, voice);
+        assert_eq!(
+            retro_core::hash::fnv1a64(
+                &sample
+                    .pcm
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>()
+            ),
+            0xFF4F_49DA_8385_F1C8,
+            "pinned"
+        );
+    }
+
+    #[test]
+    fn a_sample_stops_on_an_end_without_loop_and_names_no_outside_loop() {
+        let aram = three_blocks(0x01);
+        let sample = decode_sample(&aram, 0x1000, 0x2000);
+        assert_eq!(
+            (sample.blocks, sample.ends, sample.loop_sample),
+            (3, BrrEnd::Stops, None)
+        );
+        let silent = vec![0u8; 0x10000];
+        let unended = decode_sample(&silent, 0x0000, 0x0000);
+        assert_eq!(unended.ends, BrrEnd::Unended);
+        assert_eq!(unended.blocks, MAX_BLOCKS);
+        assert_eq!(unended.loop_sample, Some(0));
+    }
+
+    #[test]
+    fn every_shift_and_filter_follows_the_chip_s_arithmetic() {
+        // One block a shift and filter, the nibbles 7, -8, 1, -1 ...: the
+        // values pinned as the chip's arithmetic gives them (shifts 13-15
+        // collapse to 0 or -2048 before the filter).
+        let mut aram = vec![0u8; 0x10000];
+        let mut at = 0x2000usize;
+        for shift in 0..16u8 {
+            for filter in 0..4u8 {
+                aram[at] = shift << 4 | filter << 2;
+                aram[at + 1..at + 9]
+                    .copy_from_slice(&[0x78, 0x1F, 0x7F, 0x80, 0x08, 0xF7, 0x31, 0xC4]);
+                at += 9;
+            }
+        }
+        aram[at - 9] |= 0x01;
+        let sample = decode_sample(&aram, 0x2000, 0x2000);
+        assert_eq!(sample.blocks, 64);
+        assert_eq!(sample.ends, BrrEnd::Stops);
+        // Shift 13, filter 0 (block 52): 7 collapses to 0, -8 to -2048,
+        // doubled to -0x1000; shift 12, filter 0 (block 48): 7 << 12 >> 1,
+        // doubled, is 0x7000.
+        assert_eq!(&sample.pcm[52 * 16..52 * 16 + 2], &[0, -0x1000]);
+        assert_eq!(sample.pcm[48 * 16], 0x7000);
+        assert_eq!(
+            retro_core::hash::fnv1a64(
+                &sample
+                    .pcm
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>()
+            ),
+            0x5854_B461_281B_725B,
+            "pinned"
+        );
+    }
+
+    #[test]
+    fn the_directory_gives_each_source_s_addresses_and_its_voices() {
+        let mut aram = vec![0u8; 0x10000];
+        aram[0x0300..0x0308].copy_from_slice(&[0x00, 0x10, 0x09, 0x10, 0x34, 0x12, 0x78, 0x56]);
+        // Page 0xFF wraps: source 0x40's entry is at 0xFF00 + 0x100 = 0x0000.
+        aram[0x0000..0x0004].copy_from_slice(&[0xCD, 0xAB, 0x01, 0xEF]);
+        let entries = directory(&aram, 0x03, [1, 0, 1, 7, 0, 0, 0, 2]);
+        assert_eq!(entries.len(), 256);
+        assert_eq!(
+            entries[0],
+            DirectoryEntry {
+                source: 0,
+                start: 0x1000,
+                loop_start: 0x1009,
+                voices: 0b0111_0010
+            }
+        );
+        assert_eq!(
+            (entries[1].start, entries[1].loop_start, entries[1].voices),
+            (0x1234, 0x5678, 0b101)
+        );
+        let wrapped = directory(&aram, 0xFF, [0; 8]);
+        assert_eq!(
+            (wrapped[0x40].start, wrapped[0x40].loop_start),
+            (0xABCD, 0xEF01)
+        );
+    }
 
     fn decoded(header: u8, bytes: [u8; 2]) -> [i32; 4] {
         let mut ring = SampleRing::EMPTY;

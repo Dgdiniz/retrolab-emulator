@@ -95,6 +95,24 @@ pub fn encode_wav_samples(samples: &SoundSamples, sample_rate: u32, channels: u1
     }
 }
 
+/// The WAV `wav` (as [`encode_wav`] or [`encode_wav_samples`] write one)
+/// with a `smpl` chunk after its data naming one loop, played forward for
+/// ever, from sample frame `start` to sample frame `end` (the last it
+/// plays) at `sample_rate`; the RIFF size grows to hold it. The chunk's
+/// other fields say nothing (no maker, no product, middle C as the unity
+/// note, no SMPTE offset).
+pub fn wav_with_loop(mut wav: Vec<u8>, sample_rate: u32, start: u32, end: u32) -> Vec<u8> {
+    let period_ns = 1_000_000_000 / sample_rate.max(1);
+    wav.extend_from_slice(b"smpl");
+    wav.extend_from_slice(&60u32.to_le_bytes());
+    for value in [0, 0, period_ns, 60, 0, 0, 0, 1, 0, 0, 0, start, end, 0, 0] {
+        wav.extend_from_slice(&u32::to_le_bytes(value));
+    }
+    let riff = (wav.len() - 8) as u32;
+    wav[4..8].copy_from_slice(&riff.to_le_bytes());
+    wav
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +123,32 @@ mod tests {
 
     fn u16_at(bytes: &[u8], off: usize) -> u16 {
         u16::from_le_bytes([bytes[off], bytes[off + 1]])
+    }
+
+    #[test]
+    fn a_loop_is_a_smpl_chunk_after_the_data() {
+        let wav = encode_wav_samples(&SoundSamples::I16(vec![1, 2, 3, 4]), 32_000, 1);
+        let looped = wav_with_loop(wav.clone(), 32_000, 1, 3);
+        assert_eq!(&looped[..4], b"RIFF");
+        assert_eq!(u32_at(&looped, 4) as usize, looped.len() - 8);
+        assert_eq!(&looped[8..wav.len()], &wav[8..]);
+        let smpl = wav.len();
+        assert_eq!(&looped[smpl..smpl + 4], b"smpl");
+        assert_eq!(u32_at(&looped, smpl + 4), 60);
+        assert_eq!(
+            u32_at(&looped, smpl + 16),
+            31_250,
+            "the sample period in ns"
+        );
+        assert_eq!(u32_at(&looped, smpl + 20), 60, "middle C");
+        assert_eq!(u32_at(&looped, smpl + 36), 1, "one loop");
+        assert_eq!(u32_at(&looped, smpl + 48), 0, "forward");
+        assert_eq!(
+            (u32_at(&looped, smpl + 52), u32_at(&looped, smpl + 56)),
+            (1, 3)
+        );
+        assert_eq!(u32_at(&looped, smpl + 64), 0, "for ever");
+        assert_eq!(looped.len(), smpl + 68);
     }
 
     #[test]

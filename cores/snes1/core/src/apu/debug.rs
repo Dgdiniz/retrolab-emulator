@@ -11,6 +11,7 @@
 
 use retro_core::audio::{
     AudioChipInfo, AudioDebugger, ChannelState, ChannelType, EnvelopePhase, EnvelopeState,
+    SamplePlayback,
 };
 
 use super::Apu;
@@ -87,7 +88,10 @@ impl AudioDebugger for Apu {
             // PSG-style per-channel taps `NoiseParams` models, so this
             // stays `None` even for noise-enabled voices.
             noise_params: None,
-            sample: None,
+            sample: Some(SamplePlayback {
+                source: u16::from(vd.source),
+                address: u32::from(vd.block_address),
+            }),
         })
     }
 
@@ -158,10 +162,10 @@ impl AudioDebugger for Apu {
 /// for the UI, not exact times.
 fn decode_envelope(vd: &super::dsp::VoiceDebug) -> EnvelopeState {
     let (attack, decay, sustain, release) = if vd.adsr_enabled {
-        let ar = (vd.adsr0 & 0x0f) as f32 / 15.0;
-        let dr = ((vd.adsr0 >> 4) & 0x07) as f32 / 7.0;
-        let sl = ((vd.adsr1 >> 5) & 0x07) as f32 / 7.0;
-        let sr = (vd.adsr1 & 0x1f) as f32 / 31.0;
+        let ar = (vd.adsr1 & 0x0f) as f32 / 15.0;
+        let dr = ((vd.adsr1 >> 4) & 0x07) as f32 / 7.0;
+        let sl = ((vd.adsr2 >> 5) & 0x07) as f32 / 7.0;
+        let sr = (vd.adsr2 & 0x1f) as f32 / 31.0;
         (ar, dr, sl, sr)
     } else {
         // GAIN mode: a single level/rate byte drives the envelope.

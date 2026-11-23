@@ -23,7 +23,7 @@
 
 use retro_core::video::VideoMemoryId;
 use retro_core::*;
-use retro_wasm::js::{plain_object, set_property, to_js, uint16_array, uint8_array};
+use retro_wasm::js::{int16_array, plain_object, set_property, to_js, uint16_array, uint8_array};
 use snes1_core::sound::Id666;
 use snes1_core::{CoprocessorMode, SnesEmulator, SnesSnapshotConsole};
 use wasm_bindgen::prelude::*;
@@ -297,9 +297,39 @@ fn spc_tag(tag: JsValue) -> Result<Id666, JsValue> {
     }
 }
 
-/// The SPC, the APU's state as an SPC player runs it.
+/// The SPC, the APU's state as an SPC player runs it; the BRR samples.
 #[wasm_bindgen]
 impl RetroEmulator {
+    /// The sample directory the S-DSP's registers name, 256 entries: `[{
+    /// source, start, loop_start, voices }]`, `voices` a bit a voice whose
+    /// source number names it.
+    #[wasm_bindgen(js_name = getSampleDirectory)]
+    pub fn get_sample_directory(&self) -> JsValue {
+        to_js(&self.snes.sample_directory())
+    }
+
+    /// The BRR sample at `start` of ARAM decoded as a voice decodes it,
+    /// `loopStart` its loop address: `{ pcm, blocks, loop_sample, ends }`,
+    /// `pcm` an `Int16Array` of its values in the DSP's form (each doubled),
+    /// `loop_sample` the first value of its loop block (`undefined` when
+    /// the loop names none of its blocks), `ends` `"Loops"`, `"Stops"` or
+    /// `"Unended"`.
+    #[wasm_bindgen(js_name = decodeBrr)]
+    pub fn decode_brr(&self, start: u16, loop_start: u16) -> JsValue {
+        let sample = self.snes.decode_brr(start, loop_start);
+        plain_object(&[
+            ("pcm", int16_array(&sample.pcm)),
+            ("blocks", JsValue::from(sample.blocks as u32)),
+            (
+                "loop_sample",
+                sample
+                    .loop_sample
+                    .map_or(JsValue::UNDEFINED, |at| JsValue::from(at as u32)),
+            ),
+            ("ends", to_js(&sample.ends)),
+        ])
+    }
+
     /// The APU as an SPC file (version 0.30) a player plays: its bytes,
     /// tagged with `tag` (`{ title, game, dumper, comment, date, seconds,
     /// fade_ms, artist }`, each optional; `undefined` for no tag). Between

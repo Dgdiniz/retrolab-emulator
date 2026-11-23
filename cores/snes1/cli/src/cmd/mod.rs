@@ -3,6 +3,7 @@
 //! the commands both tools share.
 
 pub mod apu_dump;
+pub mod brr_dump;
 pub mod ppu_dump;
 pub mod singlestep;
 pub mod spc_dump;
@@ -14,8 +15,8 @@ pub(crate) use retro_cli::output::open_output;
 
 use crate::console::SnesBoot;
 
-/// The SNES's own commands. `ppu-dump`'s and `spc-dump`'s arguments are
-/// boxed: they are much larger than the others'.
+/// The SNES's own commands. `ppu-dump`'s, `spc-dump`'s and `brr-dump`'s
+/// arguments are boxed: they are much larger than the others'.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run a ROM and summarise PPU state (+ optional dumps / PNGs).
@@ -24,6 +25,8 @@ pub enum Command {
     ApuDump(apu_dump::ApuDumpArgs<SnesBoot>),
     /// Run a ROM and write the APU's state as an SPC file a player plays.
     SpcDump(Box<spc_dump::SpcDumpArgs<SnesBoot>>),
+    /// Run a ROM and write its BRR samples as .brr, .wav and .json files.
+    BrrDump(Box<brr_dump::BrrDumpArgs<SnesBoot>>),
     /// Run the 65C816 SingleStepTests (Tom Harte) against the core.
     #[command(name = "singlestep-65816")]
     Singlestep65816(singlestep::Singlestep65816Args),
@@ -38,6 +41,7 @@ pub fn run(command: Command) -> Result<()> {
         Command::PpuDump(args) => ppu_dump::run(*args),
         Command::ApuDump(args) => apu_dump::run(args),
         Command::SpcDump(args) => spc_dump::run(*args),
+        Command::BrrDump(args) => brr_dump::run(*args),
         Command::Singlestep65816(args) => singlestep::run_65816(args),
         Command::SinglestepSpc700(args) => singlestep::run_spc700(args),
     }

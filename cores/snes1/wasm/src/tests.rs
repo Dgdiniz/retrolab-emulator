@@ -91,6 +91,28 @@ fn the_spc_is_the_apu_s_and_its_tag_the_host_s() {
 }
 
 #[wasm_bindgen_test]
+fn the_sample_directory_and_a_decode_read_aram() {
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.load_rom(&synth_lorom("BRR GAME")).unwrap();
+    let directory: js_sys::Array = emu.get_sample_directory().dyn_into().unwrap();
+    assert_eq!(directory.length(), 256);
+    assert_eq!(
+        retro_wasm::test_support::shape(&directory.get(0)),
+        "{loop_start: 0, source: 0, start: 0, voices: 255}",
+        "ARAM empty, every voice on source 0"
+    );
+    let sample = emu.decode_brr(0x0000, 0x0000);
+    let pcm: js_sys::Int16Array = property(&sample, "pcm").dyn_into().unwrap();
+    let blocks = property(&sample, "blocks").as_f64().unwrap() as u32;
+    assert_eq!(pcm.length(), blocks * 16);
+    assert_eq!(property(&sample, "loop_sample").as_f64(), Some(0.0));
+    assert_eq!(
+        property(&sample, "ends").as_string().as_deref(),
+        Some("Unended")
+    );
+}
+
+#[wasm_bindgen_test]
 fn test_breakpoint_add_list() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     let id = emu.add_breakpoint(0x008000, "execute".to_string(), None);

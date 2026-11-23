@@ -8,7 +8,7 @@ use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
 
 use super::SnesEmulator;
-use crate::apu::Apu;
+use crate::apu::{decode_sample, Apu, BrrSample, DirectoryEntry};
 use crate::sound::{build_spc, Id666};
 
 /// The stems are the S-DSP's, taken where its output is made, at its own
@@ -71,6 +71,17 @@ impl SnesEmulator {
     pub fn take_key_on_spc(&mut self, tag: &Id666) -> Option<Vec<u8>> {
         let state = self.bus.apu_mut().take_key_on_state()?;
         Some(build_spc(&state, tag))
+    }
+
+    /// The sample directory the S-DSP's registers name ([`Apu::sample_directory`]).
+    pub fn sample_directory(&self) -> Vec<DirectoryEntry> {
+        self.bus.apu().sample_directory()
+    }
+
+    /// The BRR sample at `start` of ARAM decoded as a voice decodes it,
+    /// `loop_start` its loop address ([`decode_sample`]).
+    pub fn decode_brr(&self, start: u16, loop_start: u16) -> BrrSample {
+        decode_sample(self.bus.apu().aram(), start, loop_start)
     }
 
     /// Pull every queued 32 kHz `i16` sample out of the APU, resample it

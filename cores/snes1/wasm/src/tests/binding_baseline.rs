@@ -524,16 +524,16 @@ fn what_the_dsp_readers_answer() {
     waveforms(&mut found, ", a headless frame", &mut emu);
     found.check(
         r#"
-getAudioChipChannels(0) => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: 0.4296875, enabled: true,... (2195 chars, fnv1a64 0xde6753957e414906)
+getAudioChipChannels(0) => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: 0.4296875, enabled: true,... (2461 chars, fnv1a64 0xb129daef6843f217)
 getAudioChipWaveform(0, 0, 32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioOutputWaveform(32) => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioChipWaveform(0, 7, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
 getAudioChipWaveform(0, 8, 8) => Float32Array(len 8, fnv1a64 0x0c8210784d8af5a5)
 getAudioOutputWaveform(0) => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
-getAudioChipChannels(0), muted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2192 chars, fnv1a64 0x19d2277ebbd3cd60)
+getAudioChipChannels(0), muted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2458 chars, fnv1a64 0x520b2513f1c13e79)
 getAudioChipWaveform(0, 0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioOutputWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getAudioChipChannels(0), unmuted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2193 chars, fnv1a64 0x8ea1edf393a14155)
+getAudioChipChannels(0), unmuted => [{attenuation: 127, channel_id: 0, channel_type: "Sample", current_output: -0.4375, enabled: true, e... (2459 chars, fnv1a64 0xa92a0c91b6ed85e0)
 getAudioChipWaveform(0, 0, 32), a headless frame => Float32Array(len 32, fnv1a64 0x1f8009ad9343ee95)
 getAudioOutputWaveform(32), a headless frame => Float32Array(len 32, fnv1a64 0xcec7f8f42777d7c5)
 "#,

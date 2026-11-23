@@ -61,6 +61,7 @@ use crate::debugger::TraceEntryBinarySpc700;
 use bus::{ApuBus, ApuState, DspLog};
 
 pub use bus::ARAM_SIZE;
+pub use dsp::{decode_sample, directory, BrrEnd, BrrSample, DirectoryEntry};
 
 /// SPC700 master clock in Hz (~1.024 MHz).
 const SPC_CLOCK_HZ: u64 = 1_024_000;
@@ -725,6 +726,21 @@ impl Apu {
                 log.logger.extend(image);
             }
         }
+    }
+
+    /// The page of ARAM the DSP's directory register names.
+    pub fn sample_directory_page(&self) -> u8 {
+        self.state.dsp.directory_register()
+    }
+
+    /// The sample directory the DSP's registers name: each source number's
+    /// start and loop addresses in ARAM, and the voices whose SRCN names it.
+    pub fn sample_directory(&self) -> Vec<DirectoryEntry> {
+        directory(
+            &self.state.aram[..],
+            self.state.dsp.directory_register(),
+            self.state.dsp.sources(),
+        )
     }
 
     /// From now on, keep the APU's state as it stands after the first
