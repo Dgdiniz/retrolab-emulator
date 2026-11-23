@@ -17,6 +17,12 @@
 //! - 6: 48.1 Hz
 //! - 7: 72.2 Hz
 
+/// One of the chip's own samples, in the units of the LFO's counter: the
+/// counter keeps fractions of a sample, 1/65536ths, since this core's output
+/// samples each last a fraction more than one of the chip's (see
+/// [`Lfo::clock`]).
+pub const CHIP_SAMPLE: u32 = 1 << 16;
+
 /// LFO (Low Frequency Oscillator)
 ///
 /// Provides vibrato (PM) and tremolo (AM) modulation.
@@ -30,11 +36,11 @@ pub struct Lfo {
     /// LFO phase accumulator (0-127)
     phase: u8,
 
-    /// LFO counter for frequency divider
+    /// The chip's samples since the phase last stepped, in [`CHIP_SAMPLE`]ths
     counter: u32,
 
-    /// LFO frequency divider values: calls of `clock` per phase step (the
-    /// chip's counts of FM samples per step; see `new`)
+    /// LFO frequency divider values: the chip's samples per phase step (see
+    /// `new`)
     frequency_dividers: [u32; 8],
 }
 
@@ -47,11 +53,11 @@ impl Lfo {
             phase: 0,
             counter: 0,
             // Samples each LFO step lasts, per rate setting. The chip's LFO is
-            // clocked once per FM sample (~53 kHz), not per chip clock, and a
-            // cycle is 128 steps: 108 samples a step is the 3.98 Hz of rate 0.
+            // clocked once per FM sample (one each 144 input clocks), not per
+            // chip clock, and a cycle is 128 steps: on the Mega Drive's 53,267
+            // samples a second (NTSC), rate 0's 108 a step make a cycle of 3.85 Hz.
             // The chip's own figures (ymfm lists them as counts of 109, 78, ...,
             // one more by its convention); checked against Genesis Plus GX.
-            // This core calls `clock` once per output sample instead.
             frequency_dividers: [
                 108, // 0: 3.98 Hz
                 77,  // 1: 5.56 Hz
@@ -87,20 +93,27 @@ impl Lfo {
         self.frequency
     }
 
-    /// Clock the LFO
+    /// Run the LFO for `chip_samples` of the chip's own samples, in
+    /// [`CHIP_SAMPLE`]ths.
     ///
-    /// The dividers count FM samples (clock / 144); `Ym2612::generate_one_sample`
-    /// calls this once per output sample.
-    pub fn clock(&mut self) {
+    /// The dividers count the chip's samples (one each 144 input clocks),
+    /// and this core makes output samples at the host's rate, each of which
+    /// lasts a fraction more than one of the chip's: about 1.2079 of them at
+    /// 44.1 kHz on an NTSC Mega Drive. `Ym2612::generate_one_sample` calls
+    /// this once per output sample with that figure. The phase steps each
+    /// time the count reaches the rate's divider, and the count keeps what
+    /// goes past it, so each step comes the divider's count of the chip's
+    /// samples after the one before, as on the chip.
+    pub fn clock(&mut self, chip_samples: u32) {
         if !self.enabled {
             return;
         }
 
-        self.counter += 1;
-        let divider = self.frequency_dividers[self.frequency as usize];
+        self.counter = self.counter.saturating_add(chip_samples);
+        let divider = self.frequency_dividers[self.frequency as usize] * CHIP_SAMPLE;
 
-        if self.counter >= divider {
-            self.counter = 0;
+        while self.counter >= divider {
+            self.counter -= divider;
             self.phase = (self.phase + 1) & 0x7F; // 0-127
         }
     }
@@ -231,7 +244,7 @@ mod tests {
 
         // LFO disabled, phase should not advance
         for _ in 0..10000 {
-            lfo.clock();
+            lfo.clock(CHIP_SAMPLE);
         }
 
         assert_eq!(lfo.get_phase(), 0);
@@ -244,7 +257,7 @@ mod tests {
 
         // Clock many times
         for _ in 0..10000 {
-            lfo.clock();
+            lfo.clock(CHIP_SAMPLE);
         }
 
         // Phase should have advanced
@@ -261,7 +274,7 @@ mod tests {
 
         // Clock until phase wraps around
         for _ in 0..100000 {
-            lfo.clock();
+            lfo.clock(CHIP_SAMPLE);
             let current_phase = lfo.get_phase();
 
             if current_phase < prev_phase {
@@ -346,7 +359,7 @@ mod tests {
 
         // Advance phase
         for _ in 0..10000 {
-            lfo.clock();
+            lfo.clock(CHIP_SAMPLE);
         }
 
         assert!(lfo.get_phase() > 0);
@@ -358,6 +371,35 @@ mod tests {
         assert!(!lfo.is_enabled());
         assert_eq!(lfo.get_frequency(), 0);
         assert_eq!(lfo.get_phase(), 0);
+    }
+
+    #[test]
+    fn a_step_lasts_the_rate_s_count_of_the_chip_s_samples() {
+        let mut lfo = Lfo::new();
+        lfo.set_control(0x08); // Enable, rate 0: 108 samples a step
+
+        for _ in 0..107 {
+            lfo.clock(CHIP_SAMPLE);
+        }
+        assert_eq!(lfo.get_phase(), 0);
+        lfo.clock(CHIP_SAMPLE);
+        assert_eq!(lfo.get_phase(), 1);
+    }
+
+    #[test]
+    fn the_fraction_of_a_sample_left_over_counts_towards_the_next_step() {
+        let mut lfo = Lfo::new();
+        lfo.set_control(0x0F); // Enable, rate 7: 5 samples a step
+
+        // One and a half of the chip's samples a call: the steps come at
+        // 5, 10 and 15 samples, after the 4th, 7th and 10th calls.
+        let steps: Vec<u8> = (0..10)
+            .map(|_| {
+                lfo.clock(CHIP_SAMPLE * 3 / 2);
+                lfo.get_phase()
+            })
+            .collect();
+        assert_eq!(steps, [0, 0, 0, 1, 1, 1, 2, 2, 2, 3]);
     }
 
     #[test]

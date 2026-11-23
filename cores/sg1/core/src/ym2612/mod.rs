@@ -92,6 +92,11 @@ pub struct Ym2612 {
     /// Clocks per output sample = clock_freq / sample_rate (~174 for typical values).
     clocks_per_sample: f32,
 
+    /// The chip's own samples (one each 144 input clocks) an output sample
+    /// lasts, in the LFO counter's units (`lfo::CHIP_SAMPLE` a sample):
+    /// the LFO counts the chip's samples, not this core's output samples.
+    chip_samples_per_sample: u32,
+
     /// Accumulated input clock cycles available for sample generation (pull model).
     /// Cycles are added by clock() and consumed by generate_samples().
     clock_accumulator: f32,
@@ -212,6 +217,15 @@ pub struct Ym2612 {
     sound_log_contents: SoundLogContents,
 }
 
+/// The chip's own samples, one each 144 input clocks, that an output sample
+/// at `sample_rate` lasts on an input clock of `clock_freq`, in the LFO
+/// counter's units (`lfo::CHIP_SAMPLE` a sample), to the nearest unit.
+fn chip_samples_per_sample(clock_freq: u32, sample_rate: u32) -> u32 {
+    let per_output_sample = 144 * u64::from(sample_rate.max(1));
+    let units = u64::from(clock_freq) * u64::from(lfo::CHIP_SAMPLE);
+    ((units + per_output_sample / 2) / per_output_sample) as u32
+}
+
 /// A single YM2612 data-port write captured by the optional sound-write log.
 ///
 /// `sample_pos` is the output-sample offset *within the current frame* at
@@ -255,6 +269,7 @@ impl Ym2612 {
             dac_enabled: false,
             dac_value: 0,
             clocks_per_sample: clock_freq as f32 / sample_rate as f32,
+            chip_samples_per_sample: chip_samples_per_sample(clock_freq, sample_rate),
             clock_accumulator: 0.0,
             timer_accumulator: 0.0,
             ch3_mode: 0,
@@ -392,10 +407,12 @@ impl Ym2612 {
         }
     }
 
-    /// The input clocks an output sample takes and the output samples
-    /// between envelope steps, from the clock and the sample rate.
+    /// The input clocks an output sample takes, the chip's samples it
+    /// lasts and the output samples between envelope steps, from the clock
+    /// and the sample rate.
     pub(super) fn retime(&mut self) {
         self.clocks_per_sample = self.clock_freq as f32 / self.sample_rate as f32;
+        self.chip_samples_per_sample = chip_samples_per_sample(self.clock_freq, self.sample_rate);
         self.eg_samples_per_tick = self.sample_rate as f32 / (self.clock_freq as f32 / 432.0);
     }
 

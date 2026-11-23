@@ -55,6 +55,38 @@ fn test_lfo_register_write() {
 }
 
 #[test]
+fn the_lfo_cycles_at_the_chip_s_own_rate_whatever_the_output_rate() {
+    // A cycle is 128 steps, at rate 0 of 108 of the chip's own samples
+    // each, and the chip makes one sample each 144 input clocks: the
+    // output samples a cycle lasts follow from that, not from the count.
+    let (clock, rate) = (7_670_454_u32, 44_100_u32);
+    let mut ym = Ym2612::new(clock, rate);
+    ym.write_register(0, 0x22, 0x08); // LFO on, rate 0
+
+    let mut samples = 0u32;
+    let mut steps = 0u32;
+    let mut phase = ym.lfo().get_phase();
+    while steps < 128 {
+        // Fewer input clocks than an output sample takes: at most one
+        // sample a call, so the phase is read after each.
+        ym.clock(16);
+        ym.catch_up();
+        samples += (ym.frame_samples.len() / 2) as u32;
+        ym.frame_samples.clear();
+        if ym.lfo().get_phase() != phase {
+            phase = ym.lfo().get_phase();
+            steps += 1;
+        }
+    }
+
+    let expected = 128.0 * 108.0 * 144.0 * f64::from(rate) / f64::from(clock);
+    assert!(
+        (f64::from(samples) - expected).abs() <= 1.0,
+        "a cycle took {samples} output samples, the chip's rate gives {expected:.2}"
+    );
+}
+
+#[test]
 fn test_dac_registers() {
     let mut ym = Ym2612::new(7_670_454, 44100);
 

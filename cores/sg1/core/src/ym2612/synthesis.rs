@@ -158,7 +158,7 @@ impl Ym2612 {
     /// Returns (left, right) in [-1.0, 1.0].
     /// Called ~735 times per frame (at 44.1 kHz / 60 fps) instead of ~128K times.
     fn generate_one_sample(&mut self) -> (f32, f32) {
-        self.lfo.clock();
+        self.lfo.clock(self.chip_samples_per_sample);
 
         // EG advance: hardware rate = clock_freq / 432 ~ 17.8 kHz.
         // eg_samples_per_tick = sample_rate / (clock_freq / 432) ~ 2.48
