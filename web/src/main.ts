@@ -284,8 +284,21 @@ async function initEmulator(): Promise<void> {
 
     initShaderUI()
 
-    perfOverlay = new PerformanceOverlay(emulator)
+    perfOverlay = new PerformanceOverlay(emulator, cpuSelectorLabels(bootCore))
     console.log('Performance overlay initialized (dblclick title to hide)')
+    // The overlay's program counters come from the CPU states the
+    // emulator writes at a pause, a step, a reset or a ROM load, after
+    // each of which the panels refresh; a force reset replaces the
+    // emulator it reads.
+    bridge.registerPanel('perf-overlay', {
+      update() {
+        perfOverlay.emulator = bridge.getEmulator()
+        perfOverlay.refreshProcessors()
+      },
+      dispose() {
+        // The overlay lives as long as the page.
+      },
+    })
 
     tracing = setupTracing(bridge, bootCore)
 

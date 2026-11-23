@@ -1235,6 +1235,11 @@ input[title],
     font-family: 'Consolas', monospace;
 }
 
+.callstack-return {
+    color: #858585;
+    margin-left: 12px;
+}
+
 .callstack-function {
     color: #dcdcaa;
     margin-left: 12px;

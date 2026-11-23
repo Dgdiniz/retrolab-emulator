@@ -32,6 +32,17 @@ export function ym2612StatusHtml(lfo, dac, timerA, timerB) {
     };
 }
 
+/**
+ * A channel's frequency as its card shows it, from a channel of
+ * `getAudioChipChannels()`: in hertz, 0 included (an FM channel whose
+ * frequency number is 0); `N/A` for the PSG's noise channel, for which the
+ * reader gives 0 as no frequency of its own, and where it gives none.
+ */
+export function channelFrequencyText(state) {
+    if (state.channel_type === 'Noise' || typeof state.frequency !== 'number') return 'N/A';
+    return `${state.frequency.toFixed(2)} Hz`;
+}
+
 export class AudioDebuggerMultiChip {
     constructor(emulator, containerId) {
         this.emulator = emulator;
@@ -451,7 +462,7 @@ export class AudioDebuggerMultiChip {
                 </div>
                 <div class="channel-row">
                     <span class="label">Freq:</span>
-                    <span class="value">${state.frequency ? state.frequency.toFixed(2) + ' Hz' : 'N/A'}</span>
+                    <span class="value">${channelFrequencyText(state)}</span>
                 </div>
                 <div class="channel-row">
                     <span class="label">Vol:</span>

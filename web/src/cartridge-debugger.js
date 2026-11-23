@@ -4,6 +4,82 @@
 
 import { RomLibraryManager } from './rom-library-manager.js';
 
+/** The colours of the chips' windows on the memory map, by chip number. */
+const CHIP_COLOURS = ['#FF9800', '#9C27B0', '#00BCD4', '#E91E63'];
+
+/**
+ * The colour the memory map draws a region in, from the label
+ * `getMemoryMap()` gives it (`"ROM"`, `"SRAM"`, `"Chip 0"`, `"OpenBus"`):
+ * the reader gives no colour of its own.
+ */
+export function regionColour(label) {
+    if (label === 'ROM') return '#4CAF50';
+    if (label === 'SRAM') return '#2196F3';
+    const chip = /^Chip (\d+)$/.exec(label);
+    if (chip) return CHIP_COLOURS[Number(chip[1]) % CHIP_COLOURS.length];
+    return '#757575';
+}
+
+/** An address as the memory map writes it: `0x` and six hex digits. */
+function mapAddress(address) {
+    return `0x${address.toString(16).toUpperCase().padStart(6, '0')}`;
+}
+
+/**
+ * A region's line in the memory map's legend, from a region of
+ * `getMemoryMap()`, `{ start, end, label, detail }`: its label, its
+ * addresses and, when there is one, its detail (the target's base, the
+ * slot's mask).
+ */
+export function memoryMapLegendText(region) {
+    const range = `${mapAddress(region.start)}-${mapAddress(region.end)}`;
+    return region.detail ? `${region.label} ${range} (${region.detail})` : `${region.label} ${range}`;
+}
+
+/** The manifest form's mapper for each mapper id of the cartridge's reader that has one. */
+const FORM_MAPPERS = {
+    GenesisSEGA: 'Sega',
+    GenesisSSF2: 'SSF2',
+    GenesisCodemasters: 'Codemasters',
+};
+
+/** The manifest form's region box for each region the cartridge's reader names that has one. */
+const FORM_REGIONS = { Japan: 'J', USA: 'U', Europe: 'E' };
+
+/**
+ * The manifest form's values for a cartridge, from what
+ * `getCartridgeInfo()` gives: its title; its regions as the form's boxes
+ * (the reader names them `"Japan"`, `"USA"`, `"Europe"`, and a region the
+ * form has no box for ticks none); the mapper `mapper_info.mapper_id`
+ * names; the SVP from `expansion_chip_info.chip_type`, and the J-Cart,
+ * which the form lists with the chips; the serial EEPROM, which the core
+ * drives over two wires (the form's I2C) and whose cartridge keeps its
+ * save in it, so with no SRAM; and the SRAM of any other cartridge with a
+ * save.
+ */
+export function manifestFromCartridgeInfo(info) {
+    const mapperId = info.mapper_info?.mapper_id;
+    const eeprom = mapperId === 'GenesisEEPROM';
+    let chip = 'None';
+    if (info.expansion_chip_info?.chip_type === 'SVP') chip = 'SVP';
+    else if (mapperId === 'GenesisJCart') chip = 'JCart';
+    const manifest = {
+        title: info.title || 'Unknown',
+        regions: (info.regions || []).map((region) => FORM_REGIONS[region]).filter(Boolean),
+        mapper: FORM_MAPPERS[mapperId] || 'None',
+        chip,
+        eeprom: eeprom ? 'I2C' : 'None',
+    };
+    if (info.sram_size > 0 && !eeprom) {
+        manifest.sram = {
+            start: '0x200000', // Default Genesis SRAM location
+            end: `0x${(0x200000 + info.sram_size - 1).toString(16).toUpperCase()}`,
+            odd_only: false,
+        };
+    }
+    return manifest;
+}
+
 export class CartridgeDebugger {
     constructor(emulator) {
         this.emulator = emulator;
@@ -307,15 +383,7 @@ export class CartridgeDebugger {
      * Update mapper state display
      */
     async updateMapperState() {
-        try {
-            const mapperState = await this.emulator.getMapperState();
-
-            // TODO: show the state through renderMapperState() instead of these placeholders
-            document.getElementById('mapper-registers').innerHTML = '<div class="empty-state">Mapper state display coming soon</div>';
-            document.getElementById('bank-configuration').innerHTML = '<div class="empty-state">Bank configuration display coming soon</div>';
-        } catch (error) {
-            console.log('[Cartridge Debugger] Mapper state not available');
-        }
+        await this.renderMapperState();
     }
 
     /**
@@ -567,24 +635,8 @@ export class CartridgeDebugger {
         try {
             const info = await this.emulator.getCartridgeInfo();
 
-            const manifest = {
-                title: info.title || 'Unknown',
-                regions: info.regions || [],
-                mapper: info.mapper?.type || 'None',
-                chip: info.expansion_chip?.type || 'None',
-                eeprom: 'None', // Not exposed in current WASM API
-            };
-
-            if (info.sram_size > 0) {
-                manifest.sram = {
-                    start: '0x200000', // Default Genesis SRAM location
-                    end: `0x${(0x200000 + info.sram_size - 1).toString(16).toUpperCase()}`,
-                    odd_only: false,
-                };
-            }
-
             document.getElementById('manifest-detection-source').textContent = info.detection_source || 'Header';
-            this.loadManifestIntoForm(manifest);
+            this.loadManifestIntoForm(manifestFromCartridgeInfo(info));
 
             console.log('[Manifest Editor] Loaded auto-detected manifest');
         } catch (error) {
@@ -631,15 +683,18 @@ export class CartridgeDebugger {
             const totalAddressSpace = 0x1000000; // 16MB (Genesis address space)
             const regions = memoryMap.regions;
 
-            // Draw each region
-            regions.forEach(region => {
+            // Draw each region `{ start, end, label, detail }`. The reader
+            // lists them in the order addresses resolve through them, so
+            // they are drawn from the last up: where two overlap, the one
+            // an address resolves to lies on top.
+            [...regions].reverse().forEach(region => {
                 const startRatio = region.start / totalAddressSpace;
                 const endRatio = region.end / totalAddressSpace;
                 const startY = startRatio * height;
                 const regionHeight = (endRatio - startRatio) * height;
 
                 // Draw region bar
-                ctx.fillStyle = region.color || '#4CAF50';
+                ctx.fillStyle = regionColour(region.label);
                 ctx.fillRect(50, startY, width - 200, regionHeight);
 
                 // Draw region border
@@ -653,13 +708,13 @@ export class CartridgeDebugger {
                 ctx.textAlign = 'right';
                 ctx.fillText(`0x${region.start.toString(16).toUpperCase().padStart(6, '0')}`, 45, startY + 12);
 
-                // Draw region type/description
+                // Draw region label
                 if (regionHeight > 20) {
                     ctx.textAlign = 'left';
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 13px sans-serif';
                     const textY = startY + regionHeight / 2 + 5;
-                    ctx.fillText(region.description, width - 190, textY);
+                    ctx.fillText(region.label, width - 190, textY);
                 }
             });
 
@@ -701,11 +756,11 @@ export class CartridgeDebugger {
 
             const colorBox = document.createElement('span');
             colorBox.className = 'legend-color';
-            colorBox.style.backgroundColor = region.color || '#4CAF50';
+            colorBox.style.backgroundColor = regionColour(region.label);
 
             const label = document.createElement('span');
             label.className = 'legend-label';
-            label.textContent = `${region.type}: ${region.description}`;
+            label.textContent = memoryMapLegendText(region);
 
             item.appendChild(colorBox);
             item.appendChild(label);

@@ -151,7 +151,8 @@ export function createDebuggerApi(bridge: DebugBridge, deps: DebuggerApiDeps): R
           meta.title || 'Unknown',
           slot,
           stateData,
-          { frameCount: emulator.getFrameCount ? emulator.getFrameCount() : 0 },
+          // The core's frame number, a bigint, stored as a number.
+          { frameCount: Number(emulator.getFrameNumber()) },
         )
         const slotName = slot === 0 ? 'Quick' : `Slot ${slot}`
         deps.setSaveStateInfo(`${slotName} saved`, 'ok')

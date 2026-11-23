@@ -4,9 +4,34 @@
  * on top of the canvas.
  */
 
+/**
+ * The program counters of CPU 0 and CPU 1 in the CPU states
+ * `getCpuStates()` gives, `[{ cpu_id, pc, flags, registers }]`, found by
+ * `cpu_id`; 0 for a CPU the states do not hold.
+ */
+export function processorPcs(states) {
+    const pcOf = (cpuId) => {
+        const state = Array.isArray(states) ? states.find((s) => s && s.cpu_id === cpuId) : undefined;
+        return typeof state?.pc === 'number' ? state.pc : 0;
+    };
+    return [pcOf(0), pcOf(1)];
+}
+
+/**
+ * What the overlay says of its program counters, beside them: the CPU
+ * states it reads are written at a pause, a step, a reset or a ROM load,
+ * and a running game does not write them.
+ */
+const PC_NOTE = 'As of the last pause, step, reset or ROM load: a running game does not update it.';
+
 export class PerformanceOverlay {
-    constructor(emulator) {
+    /**
+     * `cpuLabels` names CPU 0 and CPU 1 of the core running: `68000` and
+     * `Z80` on the Mega Drive, `65816` and `SPC700` on the SNES.
+     */
+    constructor(emulator, cpuLabels = ['68000', 'Z80']) {
         this.emulator = emulator;
+        this.cpuLabels = cpuLabels;
         this.overlay = null;
         this.visible = true;
         this.collapsed = false;
@@ -15,8 +40,7 @@ export class PerformanceOverlay {
         this.fps = 0;
         this.frameTime = 0;
         this.cpuUsage = 0;
-        this.pc68k = 0;
-        this.pcZ80 = 0;
+        this.pcs = [0, 0];
 
         // FPS calculation
         this.frameCount = 0;
@@ -56,13 +80,13 @@ export class PerformanceOverlay {
                 <span class="perf-value" id="perf-cpu">0%</span>
             </div>
             <div class="perf-separator"></div>
-            <div class="perf-item">
-                <span class="perf-label">68000 PC:</span>
-                <span class="perf-value mono" id="perf-pc68k">------</span>
+            <div class="perf-item" title="${PC_NOTE}">
+                <span class="perf-label">${this.cpuLabels[0]} PC:</span>
+                <span class="perf-value mono" id="perf-pc-0">------</span>
             </div>
-            <div class="perf-item">
-                <span class="perf-label">Z80 PC:</span>
-                <span class="perf-value mono" id="perf-pcz80">----</span>
+            <div class="perf-item" title="${PC_NOTE}">
+                <span class="perf-label">${this.cpuLabels[1]} PC:</span>
+                <span class="perf-value mono" id="perf-pc-1">----</span>
             </div>
         `;
 
@@ -153,21 +177,21 @@ export class PerformanceOverlay {
     updatePCValues() {
         try {
             if (this.emulator) {
-                // Get 68000 PC
-                const state68k = this.emulator.get_68k_state();
-                if (state68k) {
-                    this.pc68k = state68k.pc || 0;
-                }
-
-                // Get Z80 PC
-                const stateZ80 = this.emulator.get_z80_state();
-                if (stateZ80) {
-                    this.pcZ80 = stateZ80.pc || 0;
-                }
+                this.pcs = processorPcs(this.emulator.getCpuStates());
             }
         } catch (err) {
             // Silently ignore errors (ROM not loaded, etc)
         }
+    }
+
+    /**
+     * Read the program counters again and show them, leaving the frame
+     * figures as they are: for the stops at which the CPU states are
+     * written.
+     */
+    refreshProcessors() {
+        this.updatePCValues();
+        this.updatePCElements();
     }
 
     /**
@@ -195,17 +219,19 @@ export class PerformanceOverlay {
             cpuEl.className = 'perf-value ' + this.getCPUClass(this.cpuUsage);
         }
 
-        // 68000 PC
-        const pc68kEl = document.getElementById('perf-pc68k');
-        if (pc68kEl) {
-            pc68kEl.textContent = this.pc68k.toString(16).padStart(6, '0').toUpperCase();
-        }
+        this.updatePCElements();
+    }
 
-        // Z80 PC
-        const pcZ80El = document.getElementById('perf-pcz80');
-        if (pcZ80El) {
-            pcZ80El.textContent = this.pcZ80.toString(16).padStart(4, '0').toUpperCase();
-        }
+    /**
+     * Show the program counters: CPU 0's in six hex digits, CPU 1's in four.
+     */
+    updatePCElements() {
+        [6, 4].forEach((digits, cpuId) => {
+            const element = document.getElementById(`perf-pc-${cpuId}`);
+            if (element) {
+                element.textContent = this.pcs[cpuId].toString(16).padStart(digits, '0').toUpperCase();
+            }
+        });
     }
 
     /**
@@ -338,5 +364,7 @@ export class PerformanceOverlay {
 }
 
 // Export for use in debugger
-window.PerformanceOverlay = PerformanceOverlay;
+if (typeof window !== 'undefined') {
+    window.PerformanceOverlay = PerformanceOverlay;
+}
 
