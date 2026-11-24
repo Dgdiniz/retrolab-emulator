@@ -7,7 +7,7 @@
 
 use retro_core::audio::{
     encode_wav_samples, wav_with_loop, AudioChipInfo, ChannelState, SampleKind, SoundChipKind,
-    SoundLog, SoundSamples, StemTake,
+    SoundLog, SoundSamples, StemTake, WavMarks,
 };
 use retro_core::EmulatorCore;
 use wasm_bindgen::{JsCast, JsValue};
@@ -128,35 +128,68 @@ pub fn sample_kind(name: &str) -> Result<SampleKind, JsValue> {
 }
 
 /// The header of a WAV of `frames` sample frames of `channels` samples of
-/// `kind` at `sample_rate` ([`retro_core::audio::wav_header`]), or an error
-/// naming why a WAV's header cannot hold such a file.
+/// `kind` at `sample_rate`, followed by `trailer_bytes` bytes of other
+/// chunks ([`retro_core::audio::wav_header`]), or an error naming why a
+/// WAV's header cannot hold such a file.
 fn header_of(
     kind: SampleKind,
     sample_rate: u32,
     channels: u16,
     frames: u32,
+    trailer_bytes: u32,
 ) -> Result<Vec<u8>, JsValue> {
     if channels == 0 {
         return Err(JsValue::from_str("a WAV has at least one channel"));
     }
-    retro_core::audio::wav_header(kind, sample_rate, channels, frames).ok_or_else(|| {
-        JsValue::from_str(&format!(
-            "a WAV's header cannot hold {frames} frames of {channels} channels of {kind:?} \
-             samples at {sample_rate} Hz"
-        ))
-    })
+    retro_core::audio::wav_header(kind, sample_rate, channels, frames, trailer_bytes).ok_or_else(
+        || {
+            let after = match trailer_bytes {
+                0 => String::new(),
+                bytes => format!(" and {bytes} bytes after them"),
+            };
+            JsValue::from_str(&format!(
+                "a WAV's header cannot hold {frames} frames of {channels} channels of {kind:?} \
+                 samples at {sample_rate} Hz{after}"
+            ))
+        },
+    )
 }
 
 /// What `wavHeader` answers: the header of a WAV of `frames` sample frames
-/// of `channels` samples of the kind named `kind` at `sample_rate`, or an
+/// of `channels` samples of the kind named `kind` at `sample_rate`, whose
+/// samples are followed by `trailer_bytes` bytes of other chunks, or an
 /// error naming why there is none.
 pub fn wav_header(
     kind: &str,
     sample_rate: u32,
     channels: u16,
     frames: u32,
+    trailer_bytes: u32,
 ) -> Result<Vec<u8>, JsValue> {
-    header_of(sample_kind(kind)?, sample_rate, channels, frames)
+    header_of(
+        sample_kind(kind)?,
+        sample_rate,
+        channels,
+        frames,
+        trailer_bytes,
+    )
+}
+
+/// What `wavTrailer` answers: the chunks a WAV carries after its samples
+/// for the marks a host hands, `{ loop: [start, end], cues: [{ frame,
+/// label }] }` ([`retro_core::audio::wav_trailer`]), or an error naming
+/// what is wrong: marks of another shape, or a loop that ends before it
+/// starts.
+pub fn wav_trailer(sample_rate: u32, marks: JsValue) -> Result<Vec<u8>, JsValue> {
+    let marks: WavMarks = from_js(marks)?;
+    if let Some((start, end)) = marks.r#loop {
+        if start > end {
+            return Err(JsValue::from_str(&format!(
+                "the loop from frame {start} to frame {end} ends before it starts"
+            )));
+        }
+    }
+    Ok(retro_core::audio::wav_trailer(sample_rate, &marks))
 }
 
 /// What `encodeWavSamples` answers: the samples a host hands
@@ -184,7 +217,7 @@ pub fn wav_of(
     }
     let frames = u32::try_from(samples.len() / whole)
         .map_err(|_| JsValue::from_str("a WAV's header cannot hold so many frames"))?;
-    header_of(samples.kind(), sample_rate, channels, frames)?;
+    header_of(samples.kind(), sample_rate, channels, frames, 0)?;
     let wav = encode_wav_samples(&samples, sample_rate, channels);
     match (loop_start, loop_end) {
         (None, None) => Ok(wav),
@@ -215,8 +248,9 @@ pub fn wav_of(
 /// `armStems(mask)` and `takeStems()`, the log's `startSoundLog(writes,
 /// keys)`, `stopSoundLog()` and `takeSoundLog()`, and the associated WAV
 /// writers `encodeWav(samples, sampleRate, channels)`,
-/// `encodeWavSamples(samples, sampleRate, channels, loopStart, loopEnd)`
-/// and `wavHeader(kind, sampleRate, channels, frames)`.
+/// `encodeWavSamples(samples, sampleRate, channels, loopStart, loopEnd)`,
+/// `wavHeader(kind, sampleRate, channels, frames, trailerBytes)` and
+/// `wavTrailer(sampleRate, marks)`.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -523,24 +557,57 @@ macro_rules! audio_bindings {
 
             /// The header alone of a WAV of `frames` sample frames of
             /// `channels` interleaved samples of `kind`, `"I16"` or `"F32"`
-            /// as `getStemLayout` names it, at `sampleRate`: the bytes
-            /// `encodeWavSamples` writes before such samples. A file
+            /// as `getStemLayout` names it, at `sampleRate`, whose samples
+            /// are followed by `trailerBytes` bytes of other chunks (the
+            /// length of what `wavTrailer` gives; none when left out): the
+            /// bytes `encodeWavSamples` writes before such samples, its
+            /// RIFF size counting the chunks after them too. A file
             /// streamed to disk is this header, then the samples' bytes,
-            /// little-endian; one written before its frames are counted
-            /// starts with the header of none, written again over it once
-            /// they are. An error for another kind, no channel, or a file
-            /// whose sizes a WAV's header cannot hold.
+            /// little-endian, then the trailer; one written before its
+            /// frames are counted starts with the header of none, written
+            /// again over it once they are. An error for another kind, no
+            /// channel, or a file whose sizes a WAV's header cannot hold.
             #[wasm_bindgen(js_name = wavHeader)]
             pub fn wav_header(
                 kind: &str,
                 sample_rate: u32,
                 channels: u16,
                 frames: u32,
+                trailer_bytes: ::core::option::Option<u32>,
             ) -> ::core::result::Result<
                 ::std::vec::Vec<u8>,
                 $crate::__private::wasm_bindgen::JsValue,
             > {
-                $crate::audio::wav_header(kind, sample_rate, channels, frames)
+                $crate::audio::wav_header(
+                    kind,
+                    sample_rate,
+                    channels,
+                    frames,
+                    trailer_bytes.unwrap_or(0),
+                )
+            }
+
+            /// The chunks a WAV carries after its samples for `marks`,
+            /// `{ loop: [start, end], cues: [{ frame, label }] }`, either
+            /// left out for none: with a loop, a `smpl` chunk naming it,
+            /// played forward for ever from its first sample frame to its
+            /// last (the chunk `encodeWavSamples` writes for its loop);
+            /// with cues, a `cue ` chunk of a point at each one's sample
+            /// frame, numbered from 1 in their order, and a `LIST` chunk
+            /// of type `adtl` of a `labl` with each one's label; no byte
+            /// for no mark. A file streamed to disk ends with these bytes,
+            /// its header written by `wavHeader` with their length. An
+            /// error for marks of another shape or a loop that ends before
+            /// it starts.
+            #[wasm_bindgen(js_name = wavTrailer)]
+            pub fn wav_trailer(
+                sample_rate: u32,
+                marks: $crate::__private::wasm_bindgen::JsValue,
+            ) -> ::core::result::Result<
+                ::std::vec::Vec<u8>,
+                $crate::__private::wasm_bindgen::JsValue,
+            > {
+                $crate::audio::wav_trailer(sample_rate, marks)
             }
         }
     };

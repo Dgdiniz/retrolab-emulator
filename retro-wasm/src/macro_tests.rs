@@ -933,7 +933,7 @@ fn the_wav_writers_write_samples_of_their_kind_and_the_header_alone() {
             "{kind}"
         );
         // A file streamed to disk: the header, then the array's own bytes.
-        let mut streamed = PlainEmulator::wav_header(kind, 44_100, 2, 3).unwrap();
+        let mut streamed = PlainEmulator::wav_header(kind, 44_100, 2, 3, None).unwrap();
         streamed.extend(bytes);
         assert_eq!(streamed, wav, "{kind}");
         // With a loop: the same file, then its `smpl` chunk.
@@ -986,20 +986,136 @@ fn the_wav_writers_refuse_what_no_wav_holds() {
     );
     assert!(three(1, Some(0), Some(2)).is_ok());
     assert_eq!(
-        refusal(PlainEmulator::wav_header("i16", 32_000, 1, 1)),
+        refusal(PlainEmulator::wav_header("i16", 32_000, 1, 1, None)),
         "\"i16\" is not a sample kind: \"I16\" or \"F32\""
     );
     assert_eq!(
-        refusal(PlainEmulator::wav_header("I16", 32_000, 0, 1)),
+        refusal(PlainEmulator::wav_header("I16", 32_000, 0, 1, None)),
         "a WAV has at least one channel"
     );
     assert_eq!(
-        refusal(PlainEmulator::wav_header("F32", 44_100, 2, u32::MAX)),
+        refusal(PlainEmulator::wav_header("F32", 44_100, 2, u32::MAX, None)),
         "a WAV's header cannot hold 4294967295 frames of 2 channels of F32 samples at 44100 Hz"
     );
+    assert_eq!(
+        refusal(PlainEmulator::wav_header(
+            "I16",
+            32_000,
+            1,
+            0,
+            Some(u32::MAX)
+        )),
+        "a WAV's header cannot hold 0 frames of 1 channels of I16 samples at 32000 Hz and \
+         4294967295 bytes after them"
+    );
     // A refusal leaves the module answering.
-    let header = PlainEmulator::wav_header("F32", 44_100, 2, 0).unwrap();
+    let header = PlainEmulator::wav_header("F32", 44_100, 2, 0, None).unwrap();
     assert_eq!(header.len(), 58);
+}
+
+/// The marks a host hands `wavTrailer`: a loop, and two cues.
+fn host_marks() -> JsValue {
+    let cue = |frame: u32, label: &str| {
+        object(&[
+            ("frame", JsValue::from(frame)),
+            ("label", JsValue::from_str(label)),
+        ])
+    };
+    object(&[
+        (
+            "loop",
+            Array::of2(&JsValue::from(1), &JsValue::from(2)).into(),
+        ),
+        ("cues", Array::of2(&cue(0, "start"), &cue(2, "hit")).into()),
+    ])
+}
+
+#[wasm_bindgen_test]
+fn a_wav_s_marks_are_its_trailer_and_a_streamed_file_ends_with_it() {
+    let marks = retro_core::audio::WavMarks {
+        r#loop: Some((1, 2)),
+        cues: vec![
+            retro_core::audio::WavCue {
+                frame: 0,
+                label: "start".into(),
+            },
+            retro_core::audio::WavCue {
+                frame: 2,
+                label: "hit".into(),
+            },
+        ],
+    };
+    let trailer = PlainEmulator::wav_trailer(44_100, host_marks()).unwrap();
+    assert_eq!(
+        trailer,
+        retro_core::audio::wav_trailer(44_100, &marks),
+        "the marks as the host hands them"
+    );
+    // A file streamed to disk: the header counting the trailer, the
+    // samples' own bytes, then the trailer, the whole file at once.
+    let pcm = js_sys::Int16Array::from(&[1i16, -2, 32767, -32768, 0, 5][..]);
+    let mut streamed =
+        PlainEmulator::wav_header("I16", 44_100, 2, 3, Some(trailer.len() as u32)).unwrap();
+    streamed.extend(buffer_bytes(
+        &pcm.buffer(),
+        pcm.byte_offset(),
+        pcm.byte_length(),
+    ));
+    streamed.extend(&trailer);
+    let whole = PlainEmulator::encode_wav_samples(pcm.into(), 44_100, 2, None, None).unwrap();
+    assert_eq!(
+        streamed,
+        retro_core::audio::wav_with_marks(whole.clone(), 44_100, &marks)
+    );
+    // The loop alone is the chunk `encodeWavSamples` writes for its loop.
+    let loop_alone = object(&[(
+        "loop",
+        Array::of2(&JsValue::from(1), &JsValue::from(2)).into(),
+    )]);
+    let looped = PlainEmulator::encode_wav_samples(
+        js_sys::Int16Array::from(&[1i16, -2, 32767, -32768, 0, 5][..]).into(),
+        44_100,
+        2,
+        Some(1),
+        Some(2),
+    )
+    .unwrap();
+    assert_eq!(
+        PlainEmulator::wav_trailer(44_100, loop_alone).unwrap(),
+        &looped[whole.len()..]
+    );
+    assert!(PlainEmulator::wav_trailer(44_100, object(&[]))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        PlainEmulator::wav_header("I16", 44_100, 2, 3, Some(0)).unwrap(),
+        PlainEmulator::wav_header("I16", 44_100, 2, 3, None).unwrap(),
+        "no trailer is a trailer of none"
+    );
+}
+
+#[wasm_bindgen_test]
+fn the_trailer_refuses_marks_it_cannot_write() {
+    let refusal = |result: Result<Vec<u8>, JsValue>| result.unwrap_err().as_string().unwrap();
+    let backwards = object(&[(
+        "loop",
+        Array::of2(&JsValue::from(3), &JsValue::from(2)).into(),
+    )]);
+    assert_eq!(
+        refusal(PlainEmulator::wav_trailer(32_000, backwards)),
+        "the loop from frame 3 to frame 2 ends before it starts"
+    );
+    let unlabelled = object(&[(
+        "cues",
+        Array::of1(&object(&[("frame", JsValue::from(4))])).into(),
+    )]);
+    assert!(
+        refusal(PlainEmulator::wav_trailer(32_000, unlabelled)).contains("label"),
+        "a cue with no label"
+    );
+    assert!(PlainEmulator::wav_trailer(32_000, JsValue::from(7)).is_err());
+    // A refusal leaves the module answering.
+    assert!(PlainEmulator::wav_trailer(32_000, host_marks()).is_ok());
 }
 
 #[wasm_bindgen_test]
