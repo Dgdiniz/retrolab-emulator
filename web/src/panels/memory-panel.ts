@@ -7,7 +7,7 @@
  * itself consumes the shared pure-core helpers).
  *
  * Region sizing uses the `HexEditorDataSource` window: RAM/Z80/VRAM
- * load in one shot; ROM scrolls the full cartridge (up to 16 MiB) by
+ * load in one shot; ROM scrolls the cartridge's whole image by
  * re-reading a 1 MiB window as the user scrolls or jumps with the
  * address bar. Goto stays within the current region when possible,
  * no forced switch to "custom" for every jump. The currently-clicked
@@ -15,14 +15,25 @@
  * move. Hex-editor preferences (`memoryBytesPerLine`,
  * `editorShowOldByteOnEdit`) are read from the debugger settings store.
  *
- * On the Genesis the VRAM tab does not read the 68000's bus: the 68000
+ * On the Genesis two tabs do not read the 68000's bus, and neither is
+ * edited (`@debugger-core/memory-core`). The VRAM tab slices the core's
+ * copy of VRAM (`getVram()`), at VRAM addresses from 0: the 68000
  * reaches VRAM only through the VDP's ports, where every read moves the
- * VDP's address, so the tab slices the core's copy (`getVram()`) at VRAM
- * addresses from 0 and is read-only.
+ * VDP's address. The ROM tab slices the cartridge's ROM image
+ * (`getRomBytes()`), at offsets from 0, fetched once for each ROM the
+ * core holds: the bus shows 4 MiB of ROM at most, a larger cartridge's
+ * through its mapper's banks, and a save RAM switched in over the ROM
+ * hides the bytes under it.
  */
 
 import { parseHexAddress } from '@debugger-core/format-core'
-import { isSnapshotRegion, regionBaseAddress, type MemoryRegionId } from '@debugger-core/memory-core'
+import {
+  isImageRegion,
+  isReadonlyRegion,
+  isSnapshotRegion,
+  regionBaseAddress,
+  type MemoryRegionId,
+} from '@debugger-core/memory-core'
 import { sliceMemorySnapshot } from '@debugger-core/memory-regions-core'
 import type { HexEditorDataSource } from '@debugger-core/hex-editor-core'
 import { createHexEditor, type HexEditorHandle } from '../components/hex-editor'
@@ -32,16 +43,18 @@ import type { DebugBridge, PanelHandle } from '../debug-bridge'
 const INTERP_TOGGLE_KEY = 'retrolab-memory-show-interpretation'
 /**
  * Region sizes. RAM/Z80/VRAM are small enough that a single read
- * covers everything; ROM falls back to 16 MiB when the actual
- * cartridge size is unknown (rare, see `getRomSize` below).
+ * covers everything. The Genesis ROM tab is as long as the cartridge's
+ * image (`regionTotalSize`); a tab named `rom` on another core reads
+ * that core's bus over 16 MiB, as the goto window does.
  */
 const REGION_TOTAL_SIZE: Record<MemoryRegionId, number> = {
   ram: 0x10000,    // 64 KiB Work RAM
-  rom: 0x1000000,  // 16 MiB upper bound; refined per-tick via getRomSize
+  rom: 0x1000000,  // 16 MiB, the bus of a core whose tabs are not the Genesis ones
   vram: 0x10000,   // 64 KiB VRAM
   z80: 0x2000,     // 8 KiB Z80 RAM
 }
 const CUSTOM_TOTAL_SIZE = 0x1000000 // 16 MiB virtual window for goto-anywhere
+const NO_BYTES = new Uint8Array(0)
 
 // Settings reader. The web shell exposes a `Settings` instance on
 // `window.settings`; tests / early boot may not, so fall back to
@@ -77,8 +90,9 @@ function readShowOldByte(): boolean {
 export interface MemoryPanelOptions {
   /**
    * The `data-region` tabs are the Genesis ones (RAM, ROM, VRAM, Z80 of
-   * `@debugger-core/memory-core`). Only then is the VRAM tab read from
-   * the core's snapshot; another core's tab named `vram` reads its bus.
+   * `@debugger-core/memory-core`). Only then are the VRAM and ROM tabs
+   * read from the core's copies; another core's tabs of those names read
+   * its bus.
    */
   genesisRegions: boolean
 }
@@ -123,7 +137,7 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
   }
 
   // Per-region modified-offset sets. Tracking by region keeps a write
-  // to RAM from colouring a ROM byte at the same offset and vice-versa.
+  // to RAM from colouring a Z80 byte at the same offset and vice-versa.
   const modifiedByRegion: Record<string, Set<number>> = {
     ram: new Set<number>(),
     rom: new Set<number>(),
@@ -133,21 +147,34 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
   }
   let activeModified: Set<number> = modifiedByRegion.ram
 
-  function getRomSize(): number {
+  /**
+   * The cartridge's ROM image, which the ROM tab slices and the download
+   * saves. `getRomBytes()` copies the whole image at each call, so the
+   * copy is kept until the core is replaced or holds another file
+   * (`getCartridgeHash()`). Empty with no emulator or no cartridge, and
+   * when the core cannot hand one.
+   */
+  let romImage: { emulator: unknown; hash: unknown; bytes: Uint8Array } | null = null
+
+  function readRomImage(): Uint8Array {
     const emu = bridge.getEmulator()
-    if (!emu || typeof emu.getRomBytes !== 'function') return REGION_TOTAL_SIZE.rom
+    if (!emu) return NO_BYTES
     try {
-      const bytes = emu.getRomBytes() as Uint8Array | null
-      const len = bytes?.length ?? 0
-      return len > 0 ? len : REGION_TOTAL_SIZE.rom
-    } catch {
-      return REGION_TOTAL_SIZE.rom
+      const hash = emu.getCartridgeHash()
+      if (!romImage || romImage.emulator !== emu || romImage.hash !== hash) {
+        romImage = { emulator: emu, hash, bytes: emu.getRomBytes() as Uint8Array }
+      }
+      return romImage.bytes
+    } catch (err) {
+      console.error('Failed to read the ROM image:', err)
+      return NO_BYTES
     }
   }
 
   function regionTotalSize(): number {
     if (currentRegion === 'custom') return CUSTOM_TOTAL_SIZE
-    if (currentRegion === 'rom') return getRomSize()
+    // The image is the whole ROM; with no cartridge it is empty.
+    if (readsImage()) return readRomImage().length
     return REGION_TOTAL_SIZE[currentRegion]
   }
 
@@ -156,13 +183,24 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
     return options.genesisRegions && isSnapshotRegion(currentRegion)
   }
 
+  /** The active tab is the Genesis ROM tab, read from the cartridge's image. */
+  function readsImage(): boolean {
+    return options.genesisRegions && isImageRegion(currentRegion)
+  }
+
+  /** The active tab is a Genesis tab read from a copy, which no edit reaches. */
+  function isReadonly(): boolean {
+    return options.genesisRegions && isReadonlyRegion(currentRegion)
+  }
+
   function readWindow(offset: number, length: number): Uint8Array {
     const emu = bridge.getEmulator()
     if (!emu) return new Uint8Array(0)
     try {
-      // The snapshot is addressed from 0, so a window offset is its VRAM
-      // address.
+      // The snapshot and the image are addressed from 0, so a window
+      // offset is a VRAM address or an offset in the image.
       if (readsSnapshot()) return sliceMemorySnapshot(emu.getVram() as Uint8Array, offset, length)
+      if (readsImage()) return sliceMemorySnapshot(readRomImage(), offset, length)
       const start = activeState().currentAddress + (offset | 0)
       return emu.readMemory(start, length | 0) as Uint8Array
     } catch (err) {
@@ -184,6 +222,8 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
 
   let interp: InterpretationPaneHandle | null = null
   let hex: HexEditorHandle
+  /** The image the editor was mounted over, when it shows the ROM tab. */
+  let mountedImage: Uint8Array | null = null
 
   function updateCursorAddr(): void {
     if (!cursorAddrEl) return
@@ -194,17 +234,19 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
 
   function mountEditor(): HexEditorHandle {
     const st = activeState()
+    mountedImage = readsImage() ? readRomImage() : null
     return createHexEditor(memoryView!, {
       dataSource: buildDataSource(),
       baseAddress: st.currentAddress,
       bytesPerRow: readBytesPerRow(),
       showOldByteOnEdit: readShowOldByte(),
       enableUndo: true,
-      // The VRAM snapshot is a copy: an edit there would never reach VRAM.
-      readonly: readsSnapshot(),
+      // The VRAM snapshot and the ROM image are copies: an edit there
+      // would never reach the machine.
+      readonly: isReadonly(),
       modifiedOffsets: activeModified,
       onByteChange(offset, value) {
-        if (readsSnapshot()) return
+        if (isReadonly()) return
         const emu = bridge.getEmulator()
         if (!emu) return
         const cur = activeState()
@@ -332,8 +374,7 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
   function inCurrentRegion(addr: number): boolean {
     if (currentRegion === 'custom') return false
     const base = regionBaseAddress(currentRegion as MemoryRegionId)
-    const size = currentRegion === 'rom' ? getRomSize() : REGION_TOTAL_SIZE[currentRegion as MemoryRegionId]
-    return addr >= base && addr < base + size
+    return addr >= base && addr < base + regionTotalSize()
   }
 
   memoryAddress.addEventListener('keypress', (e) => {
@@ -363,13 +404,11 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
     const emu = bridge.getEmulator()
     if (!emu) return
     try {
-      // Prefer the emulator's live `getRomBytes()` (reflects the user's
-      // edits) over the cached `romMeta.data` (which is only the
-      // baseline that was loaded). Fall back to the baseline if the
-      // binding doesn't expose `getRomBytes` (older WASM revs).
-      const live = typeof emu.getRomBytes === 'function' ? emu.getRomBytes() as Uint8Array : null
+      // The cartridge's ROM image, as the ROM tab shows it; when the core
+      // hands none, the file the page loaded, if any.
+      const image = readRomImage()
       const meta = bridge.getRomMeta()
-      const bytes = live && live.length > 0 ? live : meta.data
+      const bytes = image.length > 0 ? image : meta.data
       if (!bytes || bytes.length === 0) return
       // `Blob` rejects `Uint8Array<SharedArrayBuffer>` even though the
       // payload is identical. Slicing into a fresh `Uint8Array` over a
@@ -384,10 +423,6 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
-      // The user has the edited bytes on disk now; clear the markers
-      // so the next round of edits is a fresh diff.
-      modifiedByRegion.rom?.clear()
-      hex.refresh()
     } catch (err) {
       console.error('Failed to download ROM:', err)
     }
@@ -411,6 +446,12 @@ export function initMemoryPanel(bridge: DebugBridge, options: MemoryPanelOptions
 
   return {
     update() {
+      // The editor takes the tab's size when it is mounted: over a ROM
+      // loaded since, mount it again where it was.
+      if (readsImage() && readRomImage() !== mountedImage) {
+        switchRegion(currentRegion)
+        return
+      }
       hex.refresh()
       ensureInterpUpdate()
     },

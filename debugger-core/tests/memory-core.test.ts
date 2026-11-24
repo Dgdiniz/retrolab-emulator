@@ -3,6 +3,8 @@ import {
   REGION_ADDRESSES,
   REGION_TABS,
   editAbsoluteAddress,
+  isImageRegion,
+  isReadonlyRegion,
   isSnapshotRegion,
   mergeSeenHashes,
   parseGotoAddress,
@@ -13,6 +15,15 @@ import {
 describe('memory-core > REGION_TABS', () => {
   it('lists the four standard regions in order', () => {
     expect(REGION_TABS.map((t) => t.id)).toEqual(['ram', 'rom', 'vram', 'z80'])
+  })
+
+  it('reads ROM from the cartridge image, VRAM from a snapshot, RAM and Z80 through the bus', () => {
+    expect(REGION_TABS.map((t) => [t.id, t.source])).toEqual([
+      ['ram', 'bus'],
+      ['rom', 'image'],
+      ['vram', 'snapshot'],
+      ['z80', 'bus'],
+    ])
   })
 })
 
@@ -26,6 +37,42 @@ describe('memory-core > isSnapshotRegion', () => {
 
   it('is false for an id no tab has', () => {
     expect(isSnapshotRegion('unknown')).toBe(false)
+  })
+})
+
+describe('memory-core > isImageRegion', () => {
+  it('reads only the ROM tab from the cartridge image', () => {
+    expect(isImageRegion('rom')).toBe(true)
+    expect(isImageRegion('ram')).toBe(false)
+    expect(isImageRegion('vram')).toBe(false)
+    expect(isImageRegion('z80')).toBe(false)
+  })
+
+  it('is false for an id no tab has', () => {
+    expect(isImageRegion('unknown')).toBe(false)
+  })
+})
+
+describe('memory-core > isReadonlyRegion', () => {
+  it('is true for the tabs read from a copy: the ROM image and the VRAM snapshot', () => {
+    expect(isReadonlyRegion('rom')).toBe(true)
+    expect(isReadonlyRegion('vram')).toBe(true)
+  })
+
+  it('is false for the tabs read through the bus', () => {
+    expect(isReadonlyRegion('ram')).toBe(false)
+    expect(isReadonlyRegion('z80')).toBe(false)
+  })
+
+  it('is false for an id no tab has, the goto window among them', () => {
+    expect(isReadonlyRegion('custom')).toBe(false)
+    expect(isReadonlyRegion('unknown')).toBe(false)
+  })
+
+  it('agrees with the table: read-only exactly where a tab is not read through the bus', () => {
+    for (const tab of REGION_TABS) {
+      expect(isReadonlyRegion(tab.id)).toBe(tab.source !== 'bus')
+    }
   })
 })
 

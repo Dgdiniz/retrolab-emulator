@@ -2,30 +2,50 @@
  * Pure helpers for the memory panel.
  *
  * The panel wires its state to the emulator bridge; this module owns the
- * lookup tables and deterministic helpers (region address map, address
- * parsing, save-ROM decision) so they can be unit tested without a UI
- * framework or a WASM bridge.
+ * Mega Drive's memory tabs (where each one reads its bytes, and which ones
+ * are read-only), the address helpers (a tab's base and label, the goto
+ * input, an edit's absolute address) and a list of hashes merged without
+ * repeats, so they can be unit tested without a UI framework or a WASM
+ * bridge.
  */
 
 import { parseHexAddress } from './format-core'
 
 /**
- * The Mega Drive's memory tabs. A `bus` tab is read through the 68000's
- * bus (`readMemory`) at the CPU address of its base. The VDP's VRAM is
- * not on that bus: the 68000 reaches it only through the VDP's ports,
- * where every read moves the VDP's address. So the `snapshot` tab shows
- * the core's copy of it (`getVram()`), at VRAM addresses from 0, and does
- * not edit it.
+ * The Mega Drive's memory tabs, each with the source it reads its bytes
+ * from:
+ *
+ * - `bus`: the 68000's bus (`readMemory`) at the CPU address of the tab's
+ *   base, edited through it (`writeMemoryDebug`);
+ * - `snapshot`: the core's copy of a memory the 68000 cannot read without
+ *   changing something, which the game changes as it runs. The 68000
+ *   reaches the VDP's VRAM only through the VDP's ports, where every read
+ *   moves the VDP's address, so its tab shows `getVram()`;
+ * - `image`: the cartridge's ROM image (`getRomBytes()`), which does not
+ *   change until another ROM is loaded. The bus does not show it whole:
+ *   the cartridge's window on it is 4 MiB, a larger cartridge pages its
+ *   ROM into that window through its mapper's banks, and a save RAM
+ *   switched in over the ROM hides the bytes under it.
+ *
+ * A `snapshot` or `image` tab is addressed from its first byte and is
+ * read-only: an edit of the copy would never reach the machine.
  */
 export const REGION_TABS = [
   { id: 'ram', label: 'RAM', source: 'bus' },
-  { id: 'rom', label: 'ROM', source: 'bus' },
+  { id: 'rom', label: 'ROM', source: 'image' },
   { id: 'vram', label: 'VRAM', source: 'snapshot' },
   { id: 'z80', label: 'Z80', source: 'bus' },
 ] as const
 
 export type MemoryRegionId = (typeof REGION_TABS)[number]['id']
 
+/** Where a tab reads its bytes from (`REGION_TABS`). */
+export type MemoryRegionSource = (typeof REGION_TABS)[number]['source']
+
+/**
+ * Each tab's base address: the CPU address a `bus` tab starts at, 0 for a
+ * `snapshot` or `image` tab.
+ */
 export const REGION_ADDRESSES: Record<MemoryRegionId, number> = {
   ram: 0xff0000,
   rom: 0x000000,
@@ -33,12 +53,37 @@ export const REGION_ADDRESSES: Record<MemoryRegionId, number> = {
   z80: 0xa00000,
 }
 
+/** The source of a tab; undefined for an id no tab has. */
+function regionSource(regionId: string): MemoryRegionSource | undefined {
+  return REGION_TABS.find((t) => t.id === regionId)?.source
+}
+
 /**
- * True for a tab read from the core's snapshot of a memory rather than
- * through the CPU's bus (the VRAM tab). False for an unknown id.
+ * True for the tab read from the core's snapshot of a memory (the VRAM
+ * tab). False for an unknown id.
  */
 export function isSnapshotRegion(regionId: string): boolean {
-  return REGION_TABS.find((t) => t.id === regionId)?.source === 'snapshot'
+  return regionSource(regionId) === 'snapshot'
+}
+
+/**
+ * True for the tab read from the cartridge's ROM image (the ROM tab). The
+ * image is the same until another ROM is loaded, and `getRomBytes()`
+ * copies all of it at each call, so a host fetches it once for each ROM
+ * rather than at each read. False for an unknown id.
+ */
+export function isImageRegion(regionId: string): boolean {
+  return regionSource(regionId) === 'image'
+}
+
+/**
+ * True for a tab that is not edited, one read from a copy (the ROM and
+ * VRAM tabs): a write to the copy would never reach the machine. False for
+ * a tab read through the bus and for an id no tab has.
+ */
+export function isReadonlyRegion(regionId: string): boolean {
+  const source = regionSource(regionId)
+  return source === 'snapshot' || source === 'image'
 }
 
 /**
