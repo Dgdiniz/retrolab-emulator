@@ -246,8 +246,8 @@ pub fn wav_of(
 /// `getAudioOutputWaveform(samples)`, the mixed sound; and the sound hooks
 /// over `SoundCore`: `renderFrames(frames)`, the stems' `getStemLayout()`,
 /// `armStems(mask)` and `takeStems()`, the log's `startSoundLog(writes,
-/// keys)`, `stopSoundLog()` and `takeSoundLog()`, and the associated WAV
-/// writers `encodeWav(samples, sampleRate, channels)`,
+/// keys, mailbox)`, `stopSoundLog()` and `takeSoundLog()`, and the
+/// associated WAV writers `encodeWav(samples, sampleRate, channels)`,
 /// `encodeWavSamples(samples, sampleRate, channels, loopStart, loopEnd)`,
 /// `wavHeader(kind, sampleRate, channels, frames, trailerBytes)` and
 /// `wavTrailer(sampleRate, marks)`.
@@ -481,16 +481,27 @@ macro_rules! audio_bindings {
                 }
             }
 
-            /// Start a sound log of the chips' register writes (`writes`)
-            /// and their channels' keys (`keys`), its first entries, at
-            /// time 0, the chips as they stand (their registers with
-            /// `writes`, a key-on for each channel sounding with `keys`);
-            /// what an earlier log left is dropped. Neither stops the log.
+            /// Start a sound log of the chips' register writes (`writes`),
+            /// their channels' keys (`keys`) and the values the main
+            /// processor writes into its sound processor's mailbox
+            /// (`mailbox`, none when left out), its first entries, at time
+            /// 0, the chips as they stand (their registers with `writes`, a
+            /// key-on for each channel sounding with `keys`); what an
+            /// earlier log left is dropped. None of them stops the log.
             #[wasm_bindgen(js_name = startSoundLog)]
-            pub fn start_sound_log(&mut self, writes: bool, keys: bool) {
+            pub fn start_sound_log(
+                &mut self,
+                writes: bool,
+                keys: bool,
+                mailbox: ::core::option::Option<bool>,
+            ) {
                 $crate::__private::retro_core::audio::SoundCore::start_sound_log(
                     &mut self.$core,
-                    $crate::__private::retro_core::audio::SoundLogContents { writes, keys },
+                    $crate::__private::retro_core::audio::SoundLogContents {
+                        writes,
+                        keys,
+                        mailbox: mailbox.unwrap_or(false),
+                    },
                 );
             }
 
@@ -502,8 +513,9 @@ macro_rules! audio_bindings {
 
             /// What the sound log took down since the last take, by whole
             /// frames: `{ clockHz, imageLen, interrupted, chips, records }`,
-            /// `records` a `Uint8Array` of 24 bytes an entry; `null` while no
-            /// log runs and nothing waits.
+            /// `records` a `Uint8Array` of 24 bytes an entry (the record
+            /// form, which grows only by new kinds: a mailbox's write is
+            /// kind 6); `null` while no log runs and nothing waits.
             #[wasm_bindgen(js_name = takeSoundLog)]
             pub fn take_sound_log(&mut self) -> $crate::__private::wasm_bindgen::JsValue {
                 match $crate::__private::retro_core::audio::SoundCore::take_sound_log(

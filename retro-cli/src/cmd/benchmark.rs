@@ -229,6 +229,7 @@ pub fn run<C: Console>(args: BenchmarkArgs<C::BootArgs>) -> Result<()> {
             emu.start_sound_log(SoundLogContents {
                 writes: true,
                 keys: true,
+                mailbox: false,
             });
         };
         let frame = |emu: &mut C::Emulator| {

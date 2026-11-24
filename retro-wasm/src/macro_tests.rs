@@ -1166,7 +1166,7 @@ fn the_stems_are_armed_by_mask_and_taken_by_whole_frames() {
 fn the_sound_log_is_taken_as_records_and_its_chips() {
     let mut emu = plain();
     assert!(emu.take_sound_log().is_null(), "no log runs");
-    emu.start_sound_log(true, false);
+    emu.start_sound_log(true, false, None);
     emu.render_frames(2);
     let log = emu.take_sound_log();
     assert_eq!(number(&log, "clockHz"), 1000.0);
@@ -1187,6 +1187,35 @@ fn the_sound_log_is_taken_as_records_and_its_chips() {
     assert_eq!(records[24], 10, "at its time");
     emu.stop_sound_log();
     assert!(emu.take_sound_log().is_null(), "stopped and taken");
+}
+
+#[wasm_bindgen_test]
+fn the_sound_log_takes_the_mailbox_down_when_asked() {
+    let records = |emu: &mut PlainEmulator| {
+        get(&emu.take_sound_log(), "records")
+            .dyn_into::<Uint8Array>()
+            .unwrap()
+            .to_vec()
+    };
+    let mut emu = plain();
+    emu.start_sound_log(false, false, Some(true));
+    emu.render_frames(2);
+    let log = records(&mut emu);
+    assert_eq!(log.len(), 4 * 24, "a write and a frame's end, a frame");
+    assert_eq!(
+        &log[..12],
+        &[5, 0, 0, 0, 0, 0, 0, 0, 6, 1, 1, 0],
+        "kind 6 at its time: the value, then the port"
+    );
+    assert_eq!(log[24 + 8], 2, "the frame's end");
+    assert_eq!(&log[48 + 8..48 + 12], &[6, 2, 1, 0], "the second frame's");
+    emu.start_sound_log(true, false, Some(false));
+    emu.render_frames(1);
+    assert_eq!(
+        records(&mut emu).len(),
+        2 * 24,
+        "no mailbox: the image and the end"
+    );
 }
 
 #[wasm_bindgen_test]

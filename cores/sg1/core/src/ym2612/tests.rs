@@ -10,10 +10,12 @@ use retro_core::audio::{SoundEvent, SoundLogContents};
 const WRITES: SoundLogContents = SoundLogContents {
     writes: true,
     keys: false,
+    mailbox: false,
 };
 const KEYS: SoundLogContents = SoundLogContents {
     writes: false,
     keys: true,
+    mailbox: false,
 };
 
 #[test]
@@ -1001,6 +1003,7 @@ fn a_key_write_logs_the_keys_it_changes() {
     ym.set_sound_log(SoundLogContents {
         writes: true,
         keys: true,
+        mailbox: false,
     });
     write(&mut ym, 0, 0x28, 0x11);
     let log = ym.take_sound_log();

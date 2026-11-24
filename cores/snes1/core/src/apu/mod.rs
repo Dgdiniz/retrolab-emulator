@@ -427,10 +427,24 @@ impl Apu {
 
     /// Main-CPU write of a mailbox port (`$2140-$2143`). Catches the
     /// SPC700 up first so the write is ordered correctly against the
-    /// SPC's own port traffic.
+    /// SPC's own port traffic; while the sound log takes the mailbox down,
+    /// the write goes into it at the sample the catch-up reached.
     pub fn write_port(&mut self, port: u8, value: u8, master_cycles: u64) {
         self.catch_up_to(master_cycles);
-        self.state.ports_cpu_to_apu[(port & 0x03) as usize] = value;
+        let port = port & 0x03;
+        self.state.ports_cpu_to_apu[usize::from(port)] = value;
+        if let Some(log) = self.state.sound_log.as_deref_mut() {
+            if log.logger.logs_mailbox() {
+                log.logger.extend([SoundLogEntry {
+                    time: log.samples,
+                    chip: 0,
+                    event: SoundEvent::Mailbox {
+                        port: u16::from(port),
+                        value,
+                    },
+                }]);
+            }
+        }
     }
 
     /// Read-only snapshot of the four SPC700 -> main-CPU mailbox ports
@@ -839,6 +853,55 @@ mod tests {
         let mut apu = Apu::new();
         apu.write_port(2, 0x5C, 0);
         assert_eq!(apu.spc_read(0x00F6), 0x5C);
+    }
+
+    /// While the log takes the mailbox down, each write of the main CPU's
+    /// is logged at its port with the samples the S-DSP made by then; a
+    /// read, and the SPC700's own writes back, are not the mailbox's.
+    #[test]
+    fn the_mailbox_s_writes_are_logged_at_the_sample_they_came() {
+        let mut apu = Apu::new();
+        apu.start_sound_log(SoundLogContents {
+            mailbox: true,
+            ..SoundLogContents::default()
+        });
+        let mut samples = Vec::new();
+        apu.write_port(0, 0x11, 7_000);
+        samples.push(apu.samples_emitted());
+        apu.read_port(1, 14_000);
+        apu.write_port(7, 0x22, 21_000);
+        samples.push(apu.samples_emitted());
+        apu.spc_write(0x00F5, 0x33);
+        apu.write_port(1, 0x44, 21_000);
+        samples.push(apu.samples_emitted());
+        assert!(0 < samples[0] && samples[0] < samples[1]);
+        let log = apu.take_sound_log().expect("a log runs");
+        let mailbox = |time, port, value| SoundLogEntry {
+            time,
+            chip: 0,
+            event: SoundEvent::Mailbox { port, value },
+        };
+        assert_eq!(
+            log.entries,
+            [
+                mailbox(samples[0], 0, 0x11),
+                mailbox(samples[1], 3, 0x22),
+                mailbox(samples[2], 1, 0x44)
+            ]
+        );
+        assert_eq!(apu.spc_read(0x00F7), 0x22, "the port took it");
+        apu.start_sound_log(SoundLogContents {
+            writes: true,
+            ..SoundLogContents::default()
+        });
+        apu.write_port(2, 0x55, 28_000);
+        let log = apu.take_sound_log().expect("a log runs");
+        assert!(
+            !log.entries
+                .iter()
+                .any(|entry| matches!(entry.event, SoundEvent::Mailbox { .. })),
+            "a log without the mailbox"
+        );
     }
 
     #[test]

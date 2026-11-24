@@ -68,6 +68,7 @@ pub fn run(args: BrrDumpArgs<SnesBoot>) -> Result<()> {
     emu.start_sound_log(SoundLogContents {
         writes: false,
         keys: true,
+        mailbox: false,
     });
     let mut keyed: BTreeMap<u8, Keyed> = BTreeMap::new();
     for frame in 0..frames {

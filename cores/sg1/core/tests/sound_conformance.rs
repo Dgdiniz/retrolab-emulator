@@ -1,7 +1,8 @@
 //! The sound conformance suite (`retro_core::audio::conformance`) on the
 //! Mega Drive: a program that loops on one instruction and writes no sound
-//! register, and a sound moment that keys an FM note on the YM2612's first
-//! channel and a tone on the PSG's second.
+//! register, a sound moment that keys an FM note on the YM2612's first
+//! channel and a tone on the PSG's second, and a program that writes the
+//! mailbox, the Z80's RAM, holding the Z80's bus.
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
 use retro_core::audio::{
@@ -57,6 +58,26 @@ fn other_rom() -> Vec<u8> {
     program("SOUND CONFORMANCE B")
 }
 
+/// Where the mailbox program writes in the Z80's RAM.
+const MAILBOX_PORT: u16 = 0x1F00;
+
+/// A program that takes the Z80's bus (the Z80 held in reset) and writes 0,
+/// 1, 2 and on into the Z80's RAM at `MAILBOX_PORT`, about fifty times a
+/// frame.
+fn mailbox_rom() -> Vec<u8> {
+    #[rustfmt::skip]
+    let code = [
+        0x33FC, 0x0100, 0x00A1, 0x1100, // move.w #$0100,($A11100).l  the bus
+        0x7000,                         // moveq #0,d0
+        0x13C0, 0x00A0, 0x1F00,         // loop: move.b d0,($A01F00).l
+        0x5200,                         // addq.b #1,d0
+        0x323C, 0x00FF,                 // move.w #$FF,d1
+        0x51C9, 0xFFFE,                 // dbra d1,*
+        0x60EE,                         // bra.s loop
+    ];
+    program_of("SOUND CONFORMANCE MAILBOX", &code)
+}
+
 fn build() -> GenesisEmulator {
     let mut emu = GenesisEmulator::new();
     emu.load_rom(&rom()).expect("the program loads");
@@ -84,6 +105,8 @@ fn mega_drive() -> SoundCoreUnderTest<GenesisEmulator> {
         every_frame: LOOP,
         rom: rom(),
         other_rom: other_rom(),
+        mailbox_rom: mailbox_rom(),
+        mailbox_port: MAILBOX_PORT,
     }
 }
 
@@ -187,6 +210,7 @@ fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
 const WRITES: SoundLogContents = SoundLogContents {
     writes: true,
     keys: false,
+    mailbox: false,
 };
 
 /// A machine past its warm-up, its log started, the sound moment made,

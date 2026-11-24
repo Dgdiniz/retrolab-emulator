@@ -7,10 +7,12 @@
 //! first take are the chips as they stood when the log began (the image),
 //! all at time 0: their registers, in a log of the writes, and a key-on for
 //! each channel then sounding, in a log of the keys. The times never go
-//! back; a frame's end is an entry of its own, in every log. A load, a reset
-//! or a power cycle between two takes marks the later one interrupted (every
-//! note held before it ends there), and the log goes on with the chips'
-//! image again at the time it stood at.
+//! back; a frame's end is an entry of its own, in every log. A log of the
+//! mailbox takes down each value the console's main processor writes into
+//! its sound processor's mailbox, the commands a sound driver is sent; it has
+//! no image. A load, a reset or a power cycle between two takes marks the
+//! later one interrupted (every note held before it ends there), and the log
+//! goes on with the chips' image again at the time it stood at.
 //!
 //! The record form ([`SoundLog::records`]) packs each entry in
 //! [`RECORD_BYTES`] bytes, little-endian, for a host that moves logs
@@ -47,6 +49,11 @@ pub enum SoundEvent {
     /// A channel's sample reached an end with no loop, and the voice fell
     /// silent there.
     SampleEnd { channel: u8 },
+    /// The console's main processor wrote `value` into the mailbox its
+    /// sound processor reads, at `port`: the port's number where the
+    /// mailbox is a set of ports, the address where it is the sound
+    /// processor's memory.
+    Mailbox { port: u16, value: u8 },
 }
 
 /// One entry of a [`SoundLog`]: when, which chip, what.
@@ -55,7 +62,7 @@ pub struct SoundLogEntry {
     /// In the log's clock ([`SoundLog::clock_hz`]), from when it began.
     pub time: u64,
     /// The chip, the index of [`crate::audio::SoundCore::sound_log_chips`]
-    /// (for a frame's end, the console's first chip).
+    /// (for a frame's end and a mailbox's write, the console's first chip).
     pub chip: u8,
     pub event: SoundEvent,
 }
@@ -73,6 +80,7 @@ pub enum SoundChipKind {
 
 /// What a log holds; every log holds the frames' ends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SoundLogContents {
     /// The chips' register writes, and their resets.
     pub writes: bool,
@@ -80,12 +88,15 @@ pub struct SoundLogContents {
     /// work them out of their writes: an entry where a channel's keyed
     /// state changes, none for a write that leaves it as it was.
     pub keys: bool,
+    /// Each value the main processor writes into its sound processor's
+    /// mailbox ([`SoundEvent::Mailbox`]), at the time it writes it.
+    pub mailbox: bool,
 }
 
 impl SoundLogContents {
     /// Whether it holds anything.
     pub fn any(&self) -> bool {
-        self.writes || self.keys
+        self.writes || self.keys || self.mailbox
     }
 }
 
@@ -113,15 +124,18 @@ const KIND_FRAME_END: u8 = 2;
 const KIND_KEY_ON: u8 = 3;
 const KIND_KEY_OFF: u8 = 4;
 const KIND_SAMPLE_END: u8 = 5;
+const KIND_MAILBOX: u8 = 6;
 
 impl SoundLog {
     /// The entries in the record form, [`RECORD_BYTES`] each: bytes 0-7 the
     /// time; byte 8 the kind in its low four bits (0 a write, 1 a reset, 2
-    /// a frame's end, 3 a key-on, 4 a key-off, 5 a sample's end) and the
-    /// chip in its high four. A write: byte 9 the value, bytes 10-11 the
-    /// register. A key-on: byte 9 the channel, bytes 10-11 the level, 12-15
-    /// the pitch, 16-23 the instrument. A key-off and a sample's end: byte 9
-    /// the channel. The bytes a kind does not use are zero.
+    /// a frame's end, 3 a key-on, 4 a key-off, 5 a sample's end, 6 a
+    /// mailbox's write) and the chip in its high four. A write: byte 9 the
+    /// value, bytes 10-11 the register. A key-on: byte 9 the channel, bytes
+    /// 10-11 the level, 12-15 the pitch, 16-23 the instrument. A key-off and
+    /// a sample's end: byte 9 the channel. A mailbox's write: byte 9 the
+    /// value, bytes 10-11 the port. The bytes a kind does not use are zero.
+    /// The form grows only by new kinds: a kind's bytes never change.
     pub fn records(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.entries.len() * RECORD_BYTES);
         for entry in &self.entries {
@@ -154,6 +168,11 @@ impl SoundLog {
                 SoundEvent::SampleEnd { channel } => {
                     record[9] = channel;
                     KIND_SAMPLE_END
+                }
+                SoundEvent::Mailbox { port, value } => {
+                    record[9] = value;
+                    record[10..12].copy_from_slice(&port.to_le_bytes());
+                    KIND_MAILBOX
                 }
             };
             record[8] = kind | entry.chip << 4;
@@ -192,6 +211,10 @@ impl SoundLog {
                     },
                     KIND_KEY_OFF => SoundEvent::KeyOff { channel: record[9] },
                     KIND_SAMPLE_END => SoundEvent::SampleEnd { channel: record[9] },
+                    KIND_MAILBOX => SoundEvent::Mailbox {
+                        port: u16::from_le_bytes([record[10], record[11]]),
+                        value: record[9],
+                    },
                     kind => return Err(format!("record {index}: no kind {kind}")),
                 };
                 Ok(SoundLogEntry {
@@ -255,6 +278,12 @@ impl SoundLogger {
     /// Whether the log takes the channels' keys down.
     pub fn logs_keys(&self) -> bool {
         self.contents.keys
+    }
+
+    /// Whether the log takes the main processor's writes into its sound
+    /// processor's mailbox down.
+    pub fn logs_mailbox(&self) -> bool {
+        self.contents.mailbox
     }
 
     /// Start a log holding `contents`, its first entries `image`, at time
@@ -355,12 +384,20 @@ mod tests {
                     chip: 0,
                     event: SoundEvent::SampleEnd { channel: 2 },
                 },
+                SoundLogEntry {
+                    time: 14,
+                    chip: 0,
+                    event: SoundEvent::Mailbox {
+                        port: 0x1F02,
+                        value: 0xA0,
+                    },
+                },
             ],
             image_len: 0,
             interrupted: false,
         };
         let records = log.records();
-        assert_eq!(records.len(), 6 * RECORD_BYTES);
+        assert_eq!(records.len(), 7 * RECORD_BYTES);
         assert_eq!(
             &records[..RECORD_BYTES],
             &[8, 7, 6, 5, 4, 3, 2, 1, 0x10, 0xCD, 0x2B, 0x1A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -382,11 +419,51 @@ mod tests {
             &records[5 * RECORD_BYTES + 8..5 * RECORD_BYTES + 10],
             &[5, 2]
         );
+        assert_eq!(
+            &records[6 * RECORD_BYTES..7 * RECORD_BYTES],
+            &[14, 0, 0, 0, 0, 0, 0, 0, 6, 0xA0, 0x02, 0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(SoundLog::entries_of(&records).unwrap(), log.entries);
         assert!(SoundLog::entries_of(&records[1..]).is_err());
         let mut bad = records.clone();
         bad[8] = 9;
         assert!(SoundLog::entries_of(&bad).is_err());
+    }
+
+    /// Records of the kinds the form had before the mailbox's, as a host
+    /// holding an older log hands them back: each reads as it always did.
+    #[test]
+    fn the_record_form_reads_every_kind_it_knew() {
+        #[rustfmt::skip]
+        let records: [u8; 6 * RECORD_BYTES] = [
+            1, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x9F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            2, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            3, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            4, 0, 0, 0, 0, 0, 0, 0, 0x03, 1, 0x7F, 0, 0x69, 0x22, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
+            5, 0, 0, 0, 0, 0, 0, 0, 0x04, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            6, 0, 0, 0, 0, 0, 0, 0, 0x05, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let entry = |time, chip, event| SoundLogEntry { time, chip, event };
+        assert_eq!(
+            SoundLog::entries_of(&records).unwrap(),
+            [
+                write(1, 1, 0, 0x9F),
+                entry(2, 0, SoundEvent::Reset),
+                entry(3, 0, SoundEvent::FrameEnd),
+                entry(
+                    4,
+                    0,
+                    SoundEvent::KeyOn {
+                        channel: 1,
+                        instrument: 0x0102_0304_0506_0708,
+                        pitch: 0x2269,
+                        level: 0x7F,
+                    }
+                ),
+                entry(5, 0, SoundEvent::KeyOff { channel: 1 }),
+                entry(6, 0, SoundEvent::SampleEnd { channel: 3 }),
+            ]
+        );
     }
 
     #[test]
@@ -410,6 +487,7 @@ mod tests {
         let contents = SoundLogContents {
             writes: true,
             keys: false,
+            mailbox: false,
         };
         logger.start(contents, vec![write(0, 0, 0x22, 0)]);
         logger.extend([write(4, 0, 0x28, 0xF0)]);
@@ -425,5 +503,19 @@ mod tests {
         logger.stop();
         assert!(!logger.is_on());
         assert_eq!(logger.take(1000), None);
+    }
+
+    #[test]
+    fn a_log_of_the_mailbox_alone_is_a_log() {
+        let mailbox = SoundLogContents {
+            mailbox: true,
+            ..SoundLogContents::default()
+        };
+        assert!(mailbox.any());
+        let mut logger = SoundLogger::default();
+        logger.start(mailbox, Vec::new());
+        assert!(logger.is_on() && logger.logs_mailbox());
+        assert!(!logger.logs_writes() && !logger.logs_keys());
+        assert!(!SoundLogContents::default().any());
     }
 }

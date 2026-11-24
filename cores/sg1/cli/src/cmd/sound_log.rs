@@ -126,6 +126,7 @@ fn record(
     emu.start_sound_log(SoundLogContents {
         writes: true,
         keys: false,
+        mailbox: false,
     });
     let mut whole: Option<SoundLog> = None;
     for frame in 0..frames {

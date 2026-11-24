@@ -14,6 +14,7 @@ use crate::timing::{GenesisTiming, VideoRegion};
 use crate::vdp::dma::{DmaTarget, MemoryDma};
 use crate::vdp::Vdp;
 use crate::ym2612::Ym2612;
+use retro_core::audio::SoundEvent;
 use retro_core::cartridge::{Cartridge, SOURCE_UNKNOWN, SOURCE_WORK_RAM};
 use retro_core::cpu::{Addressable, CyclesTrackable};
 
@@ -155,6 +156,11 @@ pub struct AddressBus {
     /// VDP reads their source straight from the cartridge and work RAM, so
     /// those reads never reach `watch_events`. Drained per step.
     watch_dmas: Vec<MemoryDma>,
+    /// The 68000's writes into the Z80's RAM while the sound log takes the
+    /// mailbox down, each a [`SoundEvent::Mailbox`] at its address in the
+    /// Z80's space, with [`Self::m68k_cycle`] when it came (its
+    /// instruction's start). A host setting, not saved.
+    mailbox_log: Option<Vec<(u64, SoundEvent)>>,
 }
 
 impl AddressBus {
@@ -189,6 +195,7 @@ impl AddressBus {
             debug_armed: false,
             watch_events: Vec::new(),
             watch_dmas: Vec::new(),
+            mailbox_log: None,
         }
     }
 
@@ -473,6 +480,22 @@ impl AddressBus {
     /// Get a mutable reference to the Z80 RAM in the bus memory
     pub fn z80_ram_mut(&mut self) -> &mut retro_core::memory::Ram {
         &mut self.memory.z80_ram
+    }
+
+    /// Log each byte the 68000 writes into the Z80's RAM (`true`), the
+    /// mailbox a sound driver on the Z80 reads, dropping what was logged
+    /// before; or stop. A host setting, not saved.
+    pub fn set_mailbox_log(&mut self, on: bool) {
+        self.mailbox_log = on.then(Vec::new);
+    }
+
+    /// What the mailbox's log holds since the last take: each write with the
+    /// 68000's cycle when it came ([`Self::m68k_cycle`]).
+    pub fn take_mailbox_log(&mut self) -> Vec<(u64, SoundEvent)> {
+        self.mailbox_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Create a Z80Bus with access to PSG, YM2612, bank register, cartridge ROM,
@@ -777,10 +800,13 @@ impl AddressBus {
     /// - 0x8000-0xFFFF: 68K memory window (banked, 32KB)
     fn z80_write(&mut self, addr: u16, value: u8) {
         match addr {
-            // Z80 RAM (8KB)
+            // Z80 RAM (8KB), the mailbox a sound driver on the Z80 reads
             0x0000..=0x1FFF => {
                 let z80_addr = (addr & 0x1FFF) as u32;
                 self.memory.z80_ram.write(z80_addr, value);
+                if let Some(log) = self.mailbox_log.as_mut() {
+                    log.push((self.m68k_cycle, SoundEvent::Mailbox { port: addr, value }));
+                }
             }
 
             // Z80 RAM mirror, not mirrored on this side: writes are dropped
@@ -1156,6 +1182,39 @@ mod tests {
 
         // Release bus
         bus.write(0xA11100, 0x00);
+    }
+
+    /// The mailbox's log takes the 68000's writes the Z80's RAM takes, each
+    /// at its address with the 68000's cycle: none while it does not hold
+    /// the bus, none to the RAM's mirror (the 68000 writes nothing there)
+    /// or to the YM2612, and a word as its two bytes, the high one first.
+    #[test]
+    fn the_mailbox_log_takes_the_writes_the_z80_s_ram_takes() {
+        let mut bus = AddressBus::new();
+        assert!(bus.take_mailbox_log().is_empty(), "no log");
+        bus.set_mailbox_log(true);
+        bus.m68k_cycle = 100;
+        bus.write(0xA01F00, 0x11);
+        bus.write(0xA11100, 0x01);
+        bus.write(0xA01F00, 0x22);
+        bus.m68k_cycle = 120;
+        bus.write_word(0xA01F02, 0x3344);
+        bus.write(0xA02F00, 0x55);
+        bus.write(0xA04000, 0x2B);
+        let mailbox = |port, value| SoundEvent::Mailbox { port, value };
+        assert_eq!(
+            bus.take_mailbox_log(),
+            [
+                (100, mailbox(0x1F00, 0x22)),
+                (120, mailbox(0x1F02, 0x33)),
+                (120, mailbox(0x1F03, 0x44)),
+            ]
+        );
+        assert!(bus.take_mailbox_log().is_empty(), "taken");
+        bus.set_mailbox_log(false);
+        bus.write(0xA01F00, 0x66);
+        assert!(bus.take_mailbox_log().is_empty(), "stopped");
+        assert_eq!(bus.read(0xA01F00), 0x66, "the RAM took it");
     }
 
     #[test]

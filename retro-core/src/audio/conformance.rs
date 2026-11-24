@@ -21,7 +21,9 @@
 //! chips' registers at time 0, never goes back in time, holds a frame's end
 //! for every frame, keeps the machine's time from frame to frame, says when
 //! a load came between two takes, and, holding the keys alone, holds the
-//! notes and no write.
+//! notes and no write; and, holding the mailbox, holds each value the main
+//! processor writes into its sound processor's mailbox, at its port and at
+//! its time in its frame.
 
 use crate::audio::sound_log::{SoundEvent, SoundLog, SoundLogContents};
 use crate::audio::stems::{SampleKind, StemLayout, StemSet, StemTake};
@@ -54,6 +56,13 @@ pub struct SoundCoreUnderTest<E> {
     pub rom: Vec<u8>,
     /// Another program, which a check loads in place of the first.
     pub other_rom: Vec<u8>,
+    /// A program whose main processor writes the values 0, 1, 2 and on,
+    /// wrapping at 256, one after another into its sound processor's
+    /// mailbox at `mailbox_port`, through every frame, and makes no sound.
+    pub mailbox_rom: Vec<u8>,
+    /// The port the mailbox program writes, as the log names it
+    /// ([`SoundEvent::Mailbox`]).
+    pub mailbox_port: u16,
 }
 
 impl<E: SoundCore> SoundCoreUnderTest<E> {
@@ -96,6 +105,7 @@ macro_rules! sound_conformance_tests {
             the_log_keeps_the_machine_s_time,
             a_load_interrupts_the_log,
             the_log_takes_the_keys_down,
+            the_log_takes_the_mailbox_down,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {
@@ -459,11 +469,12 @@ pub fn stems_sum_to_the_master<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
 const EVERYTHING: SoundLogContents = SoundLogContents {
     writes: true,
     keys: true,
+    mailbox: true,
 };
 
-/// The log changes nothing: with every write and key logged and the log
-/// taken after each frame, each frame's state hash, the host's samples and
-/// their count are those of a machine with no log.
+/// The log changes nothing: with every write, key and mailbox's write
+/// logged and the log taken after each frame, each frame's state hash, the
+/// host's samples and their count are those of a machine with no log.
 pub fn the_log_changes_nothing<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
     let mut logged = core.playing();
     let mut plain = core.playing();
@@ -491,6 +502,7 @@ pub fn the_log_changes_nothing<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
 const KEYS: SoundLogContents = SoundLogContents {
     writes: false,
     keys: true,
+    mailbox: false,
 };
 
 /// The log starts with the chips' registers, every one at time 0, before
@@ -683,6 +695,125 @@ pub fn the_log_takes_the_keys_down<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
         assert!(
             matches!(entry.event, SoundEvent::KeyOn { .. }) && entry.time == 0,
             "the image is key-ons at time 0"
+        );
+    }
+}
+
+/// The mailbox's writes in `log`, as (time, port, value).
+fn mailbox_of(log: &SoundLog) -> Vec<(u64, u16, u8)> {
+    log.entries
+        .iter()
+        .filter_map(|entry| match entry.event {
+            SoundEvent::Mailbox { port, value } => {
+                assert_eq!(entry.chip, 0, "a mailbox's write names the first chip");
+                Some((entry.time, port, value))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A log of the mailbox takes down each value the main processor writes
+/// into its sound processor's mailbox: with everything logged on the
+/// mailbox program, each frame's writes are at the program's port, each
+/// value one more than the one before, spread through the frame and each
+/// at a time between the end of the frame before and its own frame's end;
+/// the log changes nothing the machine holds or the host hears; a log of
+/// the mailbox alone holds nothing else but the frames' ends and starts
+/// with no image; and a log without the mailbox takes none of it down.
+pub fn the_log_takes_the_mailbox_down<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let running = || {
+        let mut emu = (core.build)();
+        emu.load_rom(&core.mailbox_rom)
+            .expect("the mailbox program loads");
+        for _ in 0..WARM_UP {
+            emu.run_frame();
+        }
+        emu
+    };
+    let mut logged = running();
+    let mut plain = running();
+    logged.start_sound_log(EVERYTHING);
+    let (mut last_end, mut last_value) = (0u64, None::<u8>);
+    for frame in 1..=FRAMES {
+        logged.render_frame();
+        plain.render_frame();
+        let log = logged.take_sound_log().expect("a log runs");
+        assert_eq!(
+            logged.state_hash(),
+            plain.state_hash(),
+            "frame {frame}: the machine with the mailbox logged parted from the plain one"
+        );
+        assert_eq!(
+            logged.get_audio_samples().to_vec(),
+            plain.get_audio_samples().to_vec(),
+            "frame {frame}: the host heard something else with the mailbox logged"
+        );
+        let end = log
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.event == SoundEvent::FrameEnd)
+            .expect("the frame's end")
+            .time;
+        let writes = mailbox_of(&log);
+        assert!(
+            writes.len() >= 2,
+            "frame {frame}: {} of the program's writes into the mailbox",
+            writes.len()
+        );
+        let mut latest = last_end;
+        for &(time, port, value) in &writes {
+            assert_eq!(port, core.mailbox_port, "frame {frame}: the program's port");
+            assert!(
+                time >= latest && time <= end,
+                "frame {frame}: a write at {time}, after {latest}, in a frame ending at {end}"
+            );
+            if let Some(last) = last_value {
+                assert_eq!(
+                    value,
+                    last.wrapping_add(1),
+                    "frame {frame}: each value one more than the one before"
+                );
+            }
+            latest = time;
+            last_value = Some(value);
+        }
+        assert!(
+            writes[0].0 < writes[writes.len() - 1].0,
+            "frame {frame}: the writes are spread through the frame"
+        );
+        last_end = end;
+    }
+
+    let mut alone = running();
+    alone.start_sound_log(SoundLogContents {
+        mailbox: true,
+        ..SoundLogContents::default()
+    });
+    alone.render_frame();
+    let log = alone.take_sound_log().expect("a log runs");
+    assert_eq!(log.image_len, 0, "the mailbox has no image");
+    assert!(
+        log.entries.iter().all(|entry| matches!(
+            entry.event,
+            SoundEvent::Mailbox { .. } | SoundEvent::FrameEnd
+        )),
+        "a log of the mailbox alone took a chip's write or key down"
+    );
+    assert!(!mailbox_of(&log).is_empty(), "the mailbox alone is logged");
+
+    let mut without = running();
+    without.start_sound_log(SoundLogContents {
+        mailbox: false,
+        ..EVERYTHING
+    });
+    for frame in 1..=FRAMES {
+        without.render_frame();
+        let log = without.take_sound_log().expect("a log runs");
+        assert!(
+            mailbox_of(&log).is_empty(),
+            "frame {frame}: a log without the mailbox took a write into it down"
         );
     }
 }

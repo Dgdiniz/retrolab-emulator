@@ -560,8 +560,20 @@ impl FakeMachine {
         }
         self.stems.frame_end(true);
         if self.sound_log.is_on() {
-            // A frame is 10 ticks of the log's clock, its end one entry.
+            // A frame is 10 ticks of the log's clock, its end one entry;
+            // with the mailbox, the frame's number written to port 1 half
+            // way through it.
             let time = self.frames * 10;
+            if self.sound_log.logs_mailbox() {
+                self.sound_log.extend([retro_core::audio::SoundLogEntry {
+                    time: time - 5,
+                    chip: 0,
+                    event: retro_core::audio::SoundEvent::Mailbox {
+                        port: 1,
+                        value: self.frames as u8,
+                    },
+                }]);
+            }
             self.sound_log.extend([retro_core::audio::SoundLogEntry {
                 time,
                 chip: 0,
@@ -617,15 +629,19 @@ impl retro_core::audio::SoundCore for FakeMachine {
         vec![retro_core::audio::SoundChipKind::Sn76489 { clock_hz: 1000 }]
     }
 
+    /// The image is the chip's one register, with the writes.
     fn start_sound_log(&mut self, contents: retro_core::audio::SoundLogContents) {
-        let image = vec![retro_core::audio::SoundLogEntry {
-            time: 0,
-            chip: 0,
-            event: retro_core::audio::SoundEvent::Write {
-                register: 0,
-                value: 0x9F,
-            },
-        }];
+        let image = match contents.writes {
+            true => vec![retro_core::audio::SoundLogEntry {
+                time: 0,
+                chip: 0,
+                event: retro_core::audio::SoundEvent::Write {
+                    register: 0,
+                    value: 0x9F,
+                },
+            }],
+            false => Vec::new(),
+        };
         self.sound_log.start(contents, image);
     }
 

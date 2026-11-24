@@ -126,6 +126,30 @@ mod tests {
         );
     }
 
+    /// A mailbox's write is stepped over as a key is: the file is the one
+    /// of the same log without it.
+    #[test]
+    fn a_mailbox_s_write_writes_nothing() {
+        let write = |register, value| SoundEvent::Write { register, value };
+        let writes = vec![
+            entry(0, 0, write(0x22, 0x08)),
+            entry(895_000, 0, SoundEvent::FrameEnd),
+            entry(900_000, 1, write(0, 0x9F)),
+            entry(1_790_000, 0, SoundEvent::FrameEnd),
+        ];
+        let mut with_mailbox = writes.clone();
+        let mailbox = |value| SoundEvent::Mailbox {
+            port: 0x1F00,
+            value,
+        };
+        with_mailbox.insert(1, entry(10, 0, mailbox(0xA0)));
+        with_mailbox.insert(4, entry(1_000_000, 0, mailbox(0xA1)));
+        assert_eq!(
+            encode_gym(&log(with_mailbox), &CHIPS, None).unwrap(),
+            encode_gym(&log(writes), &CHIPS, None).unwrap()
+        );
+    }
+
     #[test]
     fn a_gymx_header_holds_its_texts_cut_to_their_fields_and_the_loop() {
         let header = GymHeader {

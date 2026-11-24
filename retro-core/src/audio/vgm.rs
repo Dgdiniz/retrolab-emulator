@@ -429,6 +429,52 @@ mod tests {
         assert_eq!(u32_at(&vgm, 0x20), 27, "the samples from the loop on");
     }
 
+    /// A mailbox's write is stepped over as a key is: the file of a log with
+    /// them is the file of the same log with a key-off in each one's place,
+    /// the loop marked at a mailbox's write where its entry is one; and one
+    /// at the time of the entry before it leaves the file as it was.
+    #[test]
+    fn a_mailbox_s_write_is_stepped_over_as_a_key_is() {
+        let mailbox = |time, value| SoundLogEntry {
+            time,
+            chip: 0,
+            event: SoundEvent::Mailbox { port: 3, value },
+        };
+        let key_off = |time| SoundLogEntry {
+            time,
+            chip: 0,
+            event: SoundEvent::KeyOff { channel: 0 },
+        };
+        let writes = vec![
+            write(0, 0, 0x22, 0x08),
+            write(10, 1, 0, 0x9F),
+            write(400, 0, 0x28, 0xF0),
+        ];
+        let mut with_mailbox = writes.clone();
+        with_mailbox.insert(1, mailbox(5, 0x11));
+        with_mailbox.insert(3, mailbox(200, 0x12));
+        let mut with_keys = writes.clone();
+        with_keys.insert(1, key_off(5));
+        with_keys.insert(3, key_off(200));
+        let options = VgmOptions {
+            loop_entry: Some(3),
+            ..VgmOptions::default()
+        };
+        let vgm = encode_vgm(&log(with_mailbox), &[YM, PSG], &options).unwrap();
+        assert_eq!(
+            vgm,
+            encode_vgm(&log(with_keys), &[YM, PSG], &options).unwrap()
+        );
+        assert_eq!(u32_at(&vgm, 0x20), 200, "the loop from the mailbox's write");
+        assert_eq!(u32_at(&vgm, 0x18), 400, "the samples in all");
+        let mut beside = writes.clone();
+        beside.insert(2, mailbox(10, 0x13));
+        assert_eq!(
+            encode_vgm(&log(beside), &[YM, PSG], &VgmOptions::default()).unwrap(),
+            encode_vgm(&log(writes), &[YM, PSG], &VgmOptions::default()).unwrap()
+        );
+    }
+
     #[cfg(feature = "vgz")]
     #[test]
     fn a_vgz_is_the_vgm_gzipped() {

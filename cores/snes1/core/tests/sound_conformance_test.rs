@@ -1,11 +1,14 @@
 //! The sound conformance suite (`retro_core::audio::conformance`) on the
 //! SNES: a LoROM that loops on one instruction and never wakes the sound
-//! processor, which waits in its boot ROM, and a sound moment that writes
-//! a looping sample into ARAM and keys it on voice 0, routed to the echo
-//! with the echo's writes on.
+//! processor, which waits in its boot ROM, a sound moment that writes a
+//! looping sample into ARAM and keys it on voice 0, routed to the echo
+//! with the echo's writes on, and a LoROM that writes the mailbox's
+//! fourth port.
 
 use retro_core::audio::conformance::SoundCoreUnderTest;
-use retro_core::audio::{SoundCore, SoundSamples, StemLayout, StemTake};
+use retro_core::audio::{
+    SoundCore, SoundEvent, SoundLogContents, SoundSamples, StemLayout, StemTake,
+};
 use retro_core::{EmulatorCore, ExecutionMode};
 use snes1_core::SnesEmulator;
 
@@ -39,8 +42,14 @@ const DSP: [(u8, u8); 30] = [
 ];
 
 fn program(title: &[u8; 21]) -> Vec<u8> {
+    program_of(title, &[0x80, 0xFE]) // BRA LOOP
+}
+
+/// A LoROM that runs `code` from `LOOP`, the reset vector, in the 65C816's
+/// emulation mode.
+fn program_of(title: &[u8; 21], code: &[u8]) -> Vec<u8> {
     let mut chip = vec![0u8; 0x10_0000];
-    chip[..2].copy_from_slice(&[0x80, 0xFE]); // BRA LOOP
+    chip[..code.len()].copy_from_slice(code);
     let h = 0x7FB0;
     chip[h + 0x10..h + 0x10 + 21].copy_from_slice(title);
     chip[h + 0x25] = 0x20; // LoROM
@@ -61,6 +70,26 @@ fn rom() -> Vec<u8> {
 
 fn other_rom() -> Vec<u8> {
     program(b"SOUND CONFORMANCE B  ")
+}
+
+/// The port the mailbox program writes: port 3, `$2143`.
+const MAILBOX_PORT: u16 = 3;
+
+/// A LoROM that writes 0, 1, 2 and on into the mailbox's port 3, about a
+/// hundred and fifty times a frame. The sound processor waits in its boot
+/// ROM, which reads port 0 alone.
+fn mailbox_rom() -> Vec<u8> {
+    #[rustfmt::skip]
+    let code = [
+        0xA9, 0x00,       // lda #$00
+        0x8D, 0x43, 0x21, // loop: sta $2143
+        0x1A,             // inc a
+        0xA2, 0x40,       // ldx #$40
+        0xCA,             // delay: dex
+        0xD0, 0xFD,       // bne delay
+        0x80, 0xF5,       // bra loop
+    ];
+    program_of(b"SOUND CONFORMANCE M  ", &code)
 }
 
 fn build() -> SnesEmulator {
@@ -96,10 +125,42 @@ fn snes() -> SoundCoreUnderTest<SnesEmulator> {
         every_frame: LOOP,
         rom: rom(),
         other_rom: other_rom(),
+        mailbox_rom: mailbox_rom(),
+        mailbox_port: MAILBOX_PORT,
     }
 }
 
 retro_core::sound_conformance_tests!(snes());
+
+/// The mailbox is the S-CPU's four ports, mirrored every four bytes through
+/// `$217F`: a write to a mirror is its port's, in the order they came; what
+/// the sound processor writes back is not the mailbox's.
+#[test]
+fn the_mailbox_is_the_four_ports_and_their_mirrors() {
+    let mut emu = build();
+    for _ in 0..4 {
+        emu.run_frame();
+    }
+    emu.start_sound_log(SoundLogContents {
+        mailbox: true,
+        ..SoundLogContents::default()
+    });
+    emu.write_memory_debug(0x2140, &[0x11]);
+    emu.write_memory_debug(0x2147, &[0x22]);
+    emu.write_memory_debug(0x217D, &[0x33]);
+    emu.bus_mut().apu_mut().spc_write(0x00F5, 0x44);
+    emu.render_frame();
+    let log = emu.take_sound_log().expect("a log runs");
+    let writes: Vec<(u16, u8)> = log
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.event {
+            SoundEvent::Mailbox { port, value } => Some((port, value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writes, [(0, 0x11), (3, 0x22), (1, 0x33)]);
+}
 
 // -- The S-DSP's stems ---------------------------------------------------
 

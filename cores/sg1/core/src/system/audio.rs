@@ -85,10 +85,12 @@ fn stem_layout(rate: u32) -> StemLayout {
 }
 
 /// The sound log while a host logs. Each chip logs its writes (and the
-/// YM2612 its channels' keys) on its own input clock; each frame's end
-/// gathers them onto the master clock, the YM2612's before the PSG's at the
-/// same time, then the frame's end, at the master clocks the frame ran. A
-/// host setting, not saved.
+/// YM2612 its channels' keys) on its own input clock, and the bus the
+/// 68000's writes into the Z80's RAM, the mailbox, on the 68000's; each
+/// frame's end gathers them onto the master clock, the YM2612's before the
+/// PSG's and the PSG's before the mailbox's at the same time, then the
+/// frame's end, at the master clocks the frame ran. A host setting, not
+/// saved.
 #[derive(Debug, Default)]
 pub(super) struct SoundLogState {
     logger: SoundLogger,
@@ -122,6 +124,15 @@ fn spread_over(clock: u64, counted: (u64, u64), span: (u64, u64)) -> u64 {
     let into = clock.clamp(from, to) - from;
     let length = span.1.saturating_sub(span.0);
     span.0 + (u128::from(into) * u128::from(length) / u128::from(to - from)) as u64
+}
+
+/// The log's time of a write the bus stamped at master clock `master`, the
+/// log's time having run from `span.0` to `span.1` while the machine ran
+/// from master clock `from`: the master clocks since, kept inside that
+/// time (a write the host made between two frames bears the last
+/// instruction's stamp, from before the frame's end).
+fn at_master_clock(master: u64, from: u64, span: (u64, u64)) -> u64 {
+    (span.0 + master.saturating_sub(from)).min(span.1)
 }
 
 /// A recorder of the stems at `rate`, holding at most two seconds.
@@ -186,7 +197,8 @@ impl SoundCore for GenesisEmulator {
 
     /// The log's clock is the master clock. The YM2612 keys its channels;
     /// the PSG's tones have no keys, so a log of the keys names the
-    /// YM2612's alone.
+    /// YM2612's alone. The mailbox is the Z80's RAM, each write at its
+    /// address there.
     fn start_sound_log(&mut self, contents: SoundLogContents) {
         if !contents.any() {
             self.stop_sound_log();
@@ -260,21 +272,28 @@ impl GenesisEmulator {
         image
     }
 
-    /// Each chip logs what `contents` asks of it: the PSG its writes.
+    /// Each chip logs what `contents` asks of it, the PSG its writes; and
+    /// the bus the 68000's writes into the Z80's RAM, with the mailbox.
     fn set_chip_logs(&mut self, contents: SoundLogContents) {
-        self.bus.ym2612_mut().set_sound_log(contents);
+        self.bus.ym2612_mut().set_sound_log(SoundLogContents {
+            mailbox: false,
+            ..contents
+        });
         self.bus.psg_mut().set_sound_log(contents.writes);
+        self.bus.set_mailbox_log(contents.mailbox);
     }
 
-    /// What the chips logged since the log's mark, onto the log's clock,
-    /// by time; where the log stands now. Each chip's input clocks are
-    /// spread over the master clocks the machine ran since the mark: the
-    /// chips are not always clocked in step with the master clock (the PSG
-    /// gets more than its share of a line when the 68000 runs further past
-    /// the line's end than past the one before, and inside a line the
-    /// YM2612 runs ahead while the Z80 runs, then waits at the line's
-    /// budget), so a chip's own count would carry its entries away from
-    /// the other chip's and out of their frame.
+    /// What the chips and the mailbox logged since the log's mark, onto
+    /// the log's clock, by time; where the log stands now. Each chip's
+    /// input clocks are spread over the master clocks the machine ran since
+    /// the mark: the chips are not always clocked in step with the master
+    /// clock (the PSG gets more than its share of a line when the 68000
+    /// runs further past the line's end than past the one before, and
+    /// inside a line the YM2612 runs ahead while the Z80 runs, then waits
+    /// at the line's budget), so a chip's own count would carry its entries
+    /// away from the other chip's and out of their frame. The mailbox's
+    /// writes bear the 68000's cycle, which counts the master clock over
+    /// the 68000's divider: they go onto the log's clock as they are.
     fn gather_sound_log(&mut self) -> LogMark {
         let (from, now) = (self.sound_log.mark, self.log_now());
         if !self.sound_log.logger.is_on() {
@@ -293,7 +312,20 @@ impl GenesisEmulator {
                 event,
             }));
         }
-        let merged = merge_by_time(&chips[0], &chips[1]);
+        let mut merged = merge_by_time(&chips[0], &chips[1]);
+        let mailbox = self.bus.take_mailbox_log();
+        if !mailbox.is_empty() {
+            let divider = u64::from(self.region.cpu_divider());
+            let mailbox: Vec<SoundLogEntry> = mailbox
+                .into_iter()
+                .map(|(cycle, event)| SoundLogEntry {
+                    time: at_master_clock(cycle * divider, from.master, (from.time, now.time)),
+                    chip: 0,
+                    event,
+                })
+                .collect();
+            merged = merge_by_time(&merged, &mailbox);
+        }
         self.sound_log.logger.extend(merged);
         now
     }
