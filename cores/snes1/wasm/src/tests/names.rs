@@ -269,6 +269,26 @@ fn the_layers_are_the_backgrounds_field_for_field() {
 }
 
 #[wasm_bindgen_test]
+fn a_layer_s_map_is_the_ppu_s() {
+    let mut emu = running();
+    for bg in 0..4 {
+        let map = emu
+            .snes
+            .video_debugger()
+            .layer_map(bg)
+            .expect("each background has a map");
+        assert_eq!(
+            shape(&emu.layer_map(bg)),
+            shape(&retro_wasm::js::picture_object(&map)),
+            "BG{}",
+            bg + 1
+        );
+    }
+    assert!(emu.layer_map(4).is_null(), "the sprites have no map");
+    assert!(emu.layer_map(5).is_null());
+}
+
+#[wasm_bindgen_test]
 fn the_sound_chip_is_the_s_dsp_and_its_voices() {
     let mut emu = running();
     assert_eq!(

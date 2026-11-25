@@ -241,6 +241,25 @@ fn the_layers_read_their_maps_where_the_plane_registers_say() {
 }
 
 #[wasm_bindgen_test]
+fn a_layer_s_map_is_the_vdp_s() {
+    let mut emu = running();
+    for layer in 0..3 {
+        let map = emu
+            .genesis
+            .video_debugger()
+            .layer_map(layer)
+            .expect("planes A and B and the window have maps");
+        assert_eq!(
+            shape(&emu.layer_map(layer)),
+            shape(&retro_wasm::js::picture_object(&map)),
+            "layer {layer}"
+        );
+    }
+    assert!(emu.layer_map(3).is_null(), "the sprites have no map");
+    assert!(emu.layer_map(4).is_null());
+}
+
+#[wasm_bindgen_test]
 fn the_sound_chips_are_the_ym2612_then_the_psg() {
     let mut emu = running();
     let chips = js_sys::Array::from(&emu.get_audio_chips());

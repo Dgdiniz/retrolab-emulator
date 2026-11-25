@@ -197,7 +197,7 @@ impl SavestatePayload for FakeMachineState {
 
 /// A video chip with a small memory, a palette of four colours (words of
 /// 15 bits, low byte first), two layers and two sprites, the first linking
-/// to the second.
+/// to the second; layer 0 has a map, of two pixels.
 pub(crate) struct FakeVideo {
     vram: Vec<u8>,
     palette: [u16; 4],
@@ -428,6 +428,13 @@ impl VideoDebugger for FakeVideo {
             name: "fake-4",
             levels: &[0, 85, 170, 255],
         }
+    }
+    fn layer_map(&self, layer_id: u32) -> Option<PixelImage> {
+        (layer_id == 0).then(|| PixelImage {
+            width: 2,
+            height: 1,
+            rgba: vec![7, 8, 9, 255, 0, 0, 0, 0],
+        })
     }
 }
 

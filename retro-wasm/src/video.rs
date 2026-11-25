@@ -47,8 +47,9 @@ pub fn tile_request(
 /// `readVideoMemory(id)` and `writeVideoMemory(id, offset, bytes)`; the
 /// palette, `getPaletteMemory()`, `writePaletteMemory(colour_index,
 /// colours)` and `getPaletteColours()`; `getTileColours(...)`, tiles in
-/// colour; `getSpriteTable()`; `getLayerLayout(layer_id)`; and
-/// `getColourLevels()`, the levels the picture's colour channels take.
+/// colour; `getSpriteTable()`; `getLayerLayout(layer_id)`;
+/// `layerMap(layer_id)`, a layer's whole map; and `getColourLevels()`, the
+/// levels the picture's colour channels take.
 ///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
@@ -345,6 +346,25 @@ macro_rules! video_bindings {
                     .layer_layout(layer_id)
                 {
                     ::core::option::Option::Some(layout) => $crate::js::to_js(&layout),
+                    ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
+                }
+            }
+
+            /// Layer `layer_id`'s whole map (`getLayerInfo`'s ids) as one
+            /// picture, `{ width, height, data: Uint8Array }`, RGBA, drawn
+            /// from video memory as it stands: every cell of the map in its
+            /// place, its character in its palette with its flips, with no
+            /// scroll and no window, a pixel of colour 0 transparent (0 in
+            /// all four bytes); `null` for a layer that reads no map (the
+            /// sprites) and for one the chip lacks. What a console's map is
+            /// (its size, its cells, a map turned by a matrix) is documented
+            /// by the core. A copy.
+            #[wasm_bindgen(js_name = layerMap)]
+            pub fn layer_map(&mut self, layer_id: u32) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::EmulatorCore::video_debugger(&mut self.$core)
+                    .layer_map(layer_id)
+                {
+                    ::core::option::Option::Some(map) => $crate::js::picture_object(&map),
                     ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
                 }
             }

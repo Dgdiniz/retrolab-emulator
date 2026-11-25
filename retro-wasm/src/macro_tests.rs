@@ -1301,3 +1301,16 @@ fn the_sprite_table_the_layers_and_the_registers_answer_the_chip() {
     assert!(emu.get_layer_layout(2).is_null(), "a layer the chip lacks");
     assert_eq!(shape(&emu.get_video_registers()), "[]");
 }
+
+#[wasm_bindgen_test]
+fn a_layer_s_map_is_a_picture_or_null() {
+    let mut emu = plain();
+    let map = emu.layer_map(0);
+    assert_eq!((number(&map, "width"), number(&map, "height")), (2.0, 1.0));
+    assert_eq!(
+        get(&map, "data").dyn_into::<Uint8Array>().unwrap().to_vec(),
+        vec![7, 8, 9, 255, 0, 0, 0, 0]
+    );
+    assert!(emu.layer_map(1).is_null(), "a layer with no map");
+    assert!(emu.layer_map(2).is_null(), "a layer the chip lacks");
+}
