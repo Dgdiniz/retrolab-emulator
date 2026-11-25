@@ -286,6 +286,21 @@ fn genesis_of(double: bool) -> CoreUnderTest<GenesisEmulator> {
 
 retro_core::capture_conformance_tests!(genesis());
 
+/// The program's bytes are its image sets' (`tests/golden/images/conformance/`,
+/// and in interlace mode 2 `interlace/`), which the golden images
+/// (`image_goldens.rs`) and the command-line tools' tests of `images` load,
+/// as a host's own tests can: `RETRO_UPDATE_GOLDEN=1` writes them again.
+#[test]
+fn the_programs_are_the_image_sets_programs() {
+    let sets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/images");
+    for (set, double) in [("conformance", false), ("interlace", true)] {
+        retro_core::capture::image_goldens::hold_program(
+            &sets.join(set).join("program.bin"),
+            &program_of(double),
+        );
+    }
+}
+
 /// The suite on the program in interlace mode 2.
 mod double_resolution {
     use super::*;

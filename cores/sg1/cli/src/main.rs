@@ -6,6 +6,8 @@
 
 mod cmd;
 mod console;
+#[cfg(test)]
+mod image_goldens;
 mod trace_ref;
 
 fn main() -> anyhow::Result<()> {

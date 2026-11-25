@@ -30,8 +30,8 @@ js-sys = "0.3"
 # The capture, machine, frame and sound conformance suites, which
 # `tests/capture_conformance.rs`, `tests/emulator_conformance.rs`,
 # `tests/frame_conformance.rs` and `tests/sound_conformance.rs` run, the
-# golden-image harness, which the sprite export's test runs, and the
-# test-vector runner, which
+# golden-image harness, which `tests/image_goldens.rs` and the sprite
+# export's test run, and the test-vector runner, which
 # `tests/tom_harte_runner.rs` and `tests/singlestep_runner.rs` run; the
 # core's own build leaves them out.
 retro-core = { path = "../../../retro-core", features = ["capture-conformance", "emulator-conformance", "frame-conformance", "image-goldens", "singlestep", "sound-conformance"] }

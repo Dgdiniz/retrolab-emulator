@@ -363,3 +363,16 @@ fn snes() -> CoreUnderTest<SnesEmulator> {
 }
 
 retro_core::capture_conformance_tests!(snes());
+
+/// The program's bytes are its image set's (`tests/golden/images/conformance/`),
+/// which the golden images (`image_goldens.rs`) and the command-line tools'
+/// tests of `images` load, as a host's own tests can: `RETRO_UPDATE_GOLDEN=1`
+/// writes them again.
+#[test]
+fn the_program_is_the_image_set_s_program() {
+    retro_core::capture::image_goldens::hold_program(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/images/conformance/program.bin"),
+        &program(),
+    );
+}
