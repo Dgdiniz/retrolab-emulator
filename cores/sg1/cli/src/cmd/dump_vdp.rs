@@ -7,15 +7,16 @@
 //! memory and the registers the picture was drawn from, before the game's
 //! uploads in that frame's vertical blank.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
 use retro_cli::rom::{load, RomArgs};
 use retro_cli::{InputArgs, RunEnd};
+use retro_core::video::{PixelImage, VideoDebugger};
 use retro_core::{DebuggerCore, ExecutionMode};
 use sg1_core::vdp::window::WindowArea;
-use sg1_core::vdp::TRANSPARENT_RGB;
+use sg1_core::vdp::{LAYER_PLANE_A, LAYER_PLANE_B, LAYER_WINDOW, TRANSPARENT_RGB};
 use sg1_core::GenesisEmulator;
 
 use crate::console::{Genesis, GenesisBoot};
@@ -163,29 +164,13 @@ fn export_tiles_png(emu: &GenesisEmulator, path: &std::path::Path) -> Result<()>
     Ok(())
 }
 
-/// Render the plane A, plane B and window nametables as full tilemaps
-/// (per-cell palette + flip honoured), ignoring scroll, display-enable and
-/// the window's area, so the scene is visible even when the live composite
-/// is blanked. Writes three files with `_planeA` / `_planeB` / `_window`
-/// suffixes on the given path's stem.
-fn export_tilemap_png(emu: &GenesisEmulator, path: &std::path::Path) -> Result<()> {
-    let vdp = emu.vdp();
-    let regs = vdp.registers();
-    // Plane dimensions in cells from R16 (scroll size).
-    let cells = |bits: u8| -> u32 {
-        match bits & 0x03 {
-            0 => 32,
-            1 => 64,
-            _ => 128, // 2 is invalid on HW; treat like 128 for inspection
-        }
-    };
-    let w_cells = cells(regs[16]);
-    let h_cells = cells(regs[16] >> 4);
-
-    let planes = [
-        ("planeA", vdp.get_plane_a_nametable()),
-        ("planeB", vdp.get_plane_b_nametable()),
-    ];
+/// Write the whole maps of plane A, plane B and the window as PNGs, as
+/// the core draws them ([`VideoDebugger::layer_map`]): the raw tilemap with
+/// each cell's palette and flips, with no scroll, no display-enable and no
+/// window area, so the scene shows even when the live composite is blanked.
+/// Writes three files with `_planeA` / `_planeB` / `_window` suffixes on
+/// the given path's stem, their transparent pixels in [`TRANSPARENT_RGB`].
+fn export_tilemap_png(emu: &GenesisEmulator, path: &Path) -> Result<()> {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -194,18 +179,20 @@ fn export_tilemap_png(emu: &GenesisEmulator, path: &std::path::Path) -> Result<(
         .extension()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "png".to_string());
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
-    for (name, base) in planes {
+    for (name, layer) in [
+        ("planeA", LAYER_PLANE_A),
+        ("planeB", LAYER_PLANE_B),
+        ("window", LAYER_WINDOW),
+    ] {
         let out = parent.join(format!("{stem}_{name}.{ext}"));
-        render_nametable(emu, base, w_cells, h_cells, &out)?;
+        let map = emu
+            .vdp()
+            .layer_map(layer as u32)
+            .ok_or_else(|| anyhow::anyhow!("the VDP drew no map of {name}"))?;
+        save_map_png(&map, &out)?;
     }
-
-    // The window's table does not scroll and is as wide as the display
-    // mode's: 64 cells in H40, 32 in H32, by 32 rows.
-    let window_cells = if (regs[12] & 0x01) != 0 { 64 } else { 32 };
-    let out = parent.join(format!("{stem}_window.{ext}"));
-    render_nametable(emu, vdp.get_window_nametable(), window_cells, 32, &out)?;
     Ok(())
 }
 
@@ -219,49 +206,29 @@ fn pixel_rgb(palette: &[(u8, u8, u8, u8); 16], pix: u8) -> image::Rgb<u8> {
     image::Rgb([r, g, b])
 }
 
-/// Render one nametable (`base` byte offset in VRAM, `w_cells` x `h_cells`)
-/// to a PNG, transparent pixels in [`TRANSPARENT_RGB`].
-fn render_nametable(
-    emu: &GenesisEmulator,
-    base: u16,
-    w_cells: u32,
-    h_cells: u32,
-    path: &std::path::Path,
-) -> Result<()> {
-    use sg1_core::vdp::tiles::{build_rgba_palette, Tile};
-    let vram = emu.vdp().get_vram();
-    let cram = emu.vdp().get_cram();
-    let palettes: Vec<_> = (0..4).map(|p| build_rgba_palette(cram, p)).collect();
-
-    let (w, h) = (w_cells * 8, h_cells * 8);
-    let mut img = image::RgbImage::new(w, h);
-    for cy in 0..h_cells {
-        for cx in 0..w_cells {
-            let entry_off = base as usize + ((cy * w_cells + cx) * 2) as usize;
-            if entry_off + 1 >= vram.len() {
-                continue;
-            }
-            let entry = ((vram[entry_off] as u16) << 8) | vram[entry_off + 1] as u16;
-            let tile_idx = (entry & 0x07FF) as usize;
-            let pal = ((entry >> 13) & 0x03) as usize;
-            let hflip = (entry & 0x0800) != 0;
-            let vflip = (entry & 0x1000) != 0;
-            let toff = tile_idx * 32;
-            if toff + 32 > vram.len() {
-                continue;
-            }
-            let tile = Tile::decode(&vram[toff..toff + 32]);
-            for py in 0..8u32 {
-                for px in 0..8u32 {
-                    let pix = tile.get_pixel(px as u8, py as u8, hflip, vflip);
-                    img.put_pixel(cx * 8 + px, cy * 8 + py, pixel_rgb(&palettes[pal], pix));
-                }
-            }
-        }
-    }
+/// Save a map to a PNG, its transparent pixels in [`TRANSPARENT_RGB`].
+fn save_map_png(map: &PixelImage, path: &Path) -> Result<()> {
+    let (r, g, b) = TRANSPARENT_RGB;
+    let rgb: Vec<u8> = map
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[red, green, blue, alpha]| match alpha {
+            0 => [r, g, b],
+            _ => [red, green, blue],
+        })
+        .collect();
+    let img = image::RgbImage::from_raw(map.width, map.height, rgb)
+        .ok_or_else(|| anyhow::anyhow!("a {}x{} map", map.width, map.height))?;
     img.save(path)
         .with_context(|| format!("failed to save tilemap PNG: {}", path.display()))?;
-    println!("Tilemap PNG saved: {} ({}x{})", path.display(), w, h);
+    println!(
+        "Tilemap PNG saved: {} ({}x{})",
+        path.display(),
+        map.width,
+        map.height
+    );
     Ok(())
 }
 
@@ -614,6 +581,156 @@ mod tests {
         let (r, g, b) = TRANSPARENT_RGB;
         assert_eq!(pixel_rgb(&palette, 0), image::Rgb([r, g, b]));
         assert_eq!(pixel_rgb(&palette, 1), image::Rgb([0, 0, 0]));
+    }
+
+    /// A machine with no game whose VDP registers are set through the
+    /// control port, mode 5 first (the registers past 10 take no write in
+    /// mode 4), plane A at `$C000`, the window at `$B000` and plane B at
+    /// `$E000`, register 12 and register 16 as given, and whose VRAM and CRAM
+    /// are filled through the debugger's writes with values that look random
+    /// and are the same on every run.
+    fn scrambled(register_12: u8, register_16: u8, seed: u32) -> GenesisEmulator {
+        let mut emu = GenesisEmulator::new();
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let vram: Vec<u8> = (0..0x1_0000).map(|_| next() as u8).collect();
+        let cram: Vec<u16> = (0..64).map(|_| next() as u16 & 0x0EEE).collect();
+        emu.vdp_mut().write_vram_debug(0, &vram);
+        emu.vdp_mut().write_cram_debug(0, &cram);
+        for (register, value) in [
+            (1u16, 0x04u8),
+            (2, 0x30),
+            (3, 0x2C),
+            (4, 0x07),
+            (12, register_12),
+            (16, register_16),
+        ] {
+            emu.vdp_mut()
+                .write_word_port(0xC0_0004, 0x8000 | (register << 8) | u16::from(value));
+        }
+        emu
+    }
+
+    /// The hashes of the three files `export_tilemap_png` writes for a
+    /// machine, plane A's, plane B's and the window's, and their sizes.
+    fn tilemap_files(emu: &GenesisEmulator, case: &str) -> [(u64, (u32, u32)); 3] {
+        let dir =
+            std::env::temp_dir().join(format!("sg1-cli-tilemap-{}-{case}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        export_tilemap_png(emu, &dir.join("map.png")).unwrap();
+        let files = ["planeA", "planeB", "window"].map(|name| {
+            let path = dir.join(format!("map_{name}.png"));
+            let bytes = std::fs::read(&path).unwrap();
+            let size = image::open(&path).unwrap().to_rgb8().dimensions();
+            (retro_core::fnv1a64(&bytes), size)
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        files
+    }
+
+    /// The files `--tilemap-png` writes, held to the bytes they had when the
+    /// maps were drawn in this tool: every plane size the VDP takes, both
+    /// cell modes and interlace mode 2, over scrambled video memory.
+    #[test]
+    fn the_tilemap_pngs_keep_the_bytes_they_had() {
+        const PINNED: [(&str, u8, u8, [u64; 3]); 7] = [
+            (
+                "h40-64x32",
+                0x81,
+                0x01,
+                [
+                    0xC91F_F6DD_4173_38CA,
+                    0xB1CE_D057_CD97_98B4,
+                    0xE03F_620D_D9D7_8D5C,
+                ],
+            ),
+            (
+                "h32-32x32",
+                0x00,
+                0x00,
+                [
+                    0x1779_C8A8_1C1D_CFEB,
+                    0xE8FB_AA10_4245_024A,
+                    0xF936_8F33_9F8D_9ED3,
+                ],
+            ),
+            (
+                "h40-128x32",
+                0x81,
+                0x03,
+                [
+                    0xC7A1_898C_ED0F_9494,
+                    0xBE54_FE7D_0FF7_C96B,
+                    0x8D9C_AE18_E5ED_245D,
+                ],
+            ),
+            (
+                "h32-32x64",
+                0x00,
+                0x10,
+                [
+                    0x63A6_0634_4D95_60CA,
+                    0x600B_42A0_E27C_6102,
+                    0xBB94_7BFC_6A4B_1AD9,
+                ],
+            ),
+            (
+                "h40-64x64",
+                0x81,
+                0x11,
+                [
+                    0xF6DB_D0A3_8EEA_4DA6,
+                    0x3986_C991_CCF6_CDB5,
+                    0x9C4F_A4A0_2914_A170,
+                ],
+            ),
+            (
+                "h40-32x128",
+                0x81,
+                0x30,
+                [
+                    0x6C60_3442_9E92_9592,
+                    0x7FA4_36EF_A76D_4F55,
+                    0xFED9_ECD6_45A5_E528,
+                ],
+            ),
+            (
+                "interlace-64x32",
+                0x87,
+                0x01,
+                [
+                    0xF83E_188F_2B07_9B3A,
+                    0x6748_1859_F43A_49F4,
+                    0x6CFE_78E9_EB08_BD54,
+                ],
+            ),
+        ];
+        for (seed, (case, register_12, register_16, pinned)) in PINNED.into_iter().enumerate() {
+            let emu = scrambled(register_12, register_16, 101 + seed as u32);
+            let hashes = tilemap_files(&emu, case).map(|(hash, _)| hash);
+            assert_eq!(hashes, pinned, "{case}: {hashes:#018X?}");
+        }
+    }
+
+    /// A register 16 the VDP does not take draws the map at the size the
+    /// layer list reports for it: 64 by 64 cells for each value here.
+    #[test]
+    fn an_invalid_plane_size_draws_the_map_at_the_size_the_layers_report() {
+        for register_16 in [0x02, 0x22, 0x33] {
+            let emu = scrambled(0x81, register_16, 7);
+            let sizes =
+                tilemap_files(&emu, &format!("invalid-{register_16:02x}")).map(|(_, size)| size);
+            assert_eq!(
+                sizes,
+                [(512, 512), (512, 512), (512, 256)],
+                "register 16 {register_16:#04X}"
+            );
+        }
     }
 
     #[test]

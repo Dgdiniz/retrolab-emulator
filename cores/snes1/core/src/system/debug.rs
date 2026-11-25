@@ -43,11 +43,6 @@ impl SnesEmulator {
         self.bus.ppu().export_tile_image(source, palette)
     }
 
-    /// Background `bg` (`0..=3`) tilemap rendered to an RGBA image.
-    pub fn export_tilemap_image(&self, bg: usize) -> crate::ppu::ViewerImage {
-        self.bus.ppu().export_tilemap_image(bg)
-    }
-
     /// Per-background addressing + format snapshot ([`crate::ppu::BgLayout`])
     /// for the host's raw-layer (full-map) assembler.
     pub fn bg_layout(&self, bg: usize) -> crate::ppu::BgLayout {

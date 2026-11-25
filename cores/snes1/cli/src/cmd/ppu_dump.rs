@@ -20,6 +20,7 @@ use clap::Args;
 use retro_cli::parse::parse_hex_u32;
 use retro_cli::rom::{load, RomArgs};
 use retro_cli::{InputArgs, RunEnd};
+use retro_core::video::VideoDebugger;
 use retro_core::EmulatorCore;
 use snes1_core::{IoAccess, SnesEmulator};
 
@@ -152,8 +153,7 @@ pub fn run(args: PpuDumpArgs<SnesBoot>) -> Result<()> {
         save_rgba_png(path, img.width, img.height, img.rgba)?;
     }
     if let Some(path) = &args.tilemap_png {
-        let img = emu.export_tilemap_image(args.tilemap_bg.min(3));
-        save_rgba_png(path, img.width, img.height, img.rgba)?;
+        export_tilemap_png(&emu, args.tilemap_bg.min(3), path)?;
     }
 
     // -- Mutable read: TM/TS bytes + per-layer data via VideoDebugger --
@@ -400,6 +400,17 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Write background `bg`'s (`0..=3`) whole map as a PNG, as the core
+/// draws it ([`VideoDebugger::layer_map`]): Mode 7's plane in Mode 7,
+/// transparent where colour 0.
+fn export_tilemap_png(emu: &SnesEmulator, bg: usize, path: &Path) -> Result<()> {
+    let map = emu
+        .ppu()
+        .layer_map(bg as u32)
+        .ok_or_else(|| anyhow::anyhow!("the PPU drew no map of BG{}", bg + 1))?;
+    save_rgba_png(path, map.width, map.height, map.rgba)
+}
+
 fn save_rgba_png(path: &Path, w: u32, h: u32, rgba: Vec<u8>) -> Result<()> {
     let img = image::RgbaImage::from_raw(w, h, rgba)
         .ok_or_else(|| anyhow::anyhow!("failed to build {w}x{h} RGBA image"))?;
@@ -435,6 +446,126 @@ mod tests {
         assert_eq!(decode_screen_layers(0x13), "BG1 BG2 OBJ");
         assert_eq!(decode_screen_layers(0x10), "OBJ");
         assert_eq!(decode_screen_layers(0x0F), "BG1 BG2 BG3 BG4");
+    }
+
+    /// A machine with no game whose PPU registers are set through the bus
+    /// as `registers` lists them (address, value), and whose VRAM and CGRAM
+    /// are filled through the debugger's writes with values that look random
+    /// and are the same on every run.
+    fn scrambled(registers: &[(u32, u8)], seed: u32) -> SnesEmulator {
+        let mut emu = SnesEmulator::new();
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let vram: Vec<u8> = (0..0x1_0000).map(|_| next() as u8).collect();
+        let cgram: Vec<u16> = (0..256).map(|_| next() as u16 & 0x7FFF).collect();
+        emu.write_vram_debug(0, &vram);
+        emu.write_cgram_debug(0, &cgram);
+        for &(address, value) in registers {
+            emu.write_memory_debug(address, &[value]);
+        }
+        emu
+    }
+
+    /// The files `--tilemap-png` writes for each background, held to the
+    /// bytes they had when the maps were drawn as viewer exports of the PPU:
+    /// Mode 0's four backgrounds of every screen size, Mode 1 with 16 by 16
+    /// tiles, Mode 3 in direct colour, the hires Mode 5, and Mode 7's plane,
+    /// in direct colour and under EXTBG.
+    #[test]
+    fn the_tilemap_pngs_keep_the_bytes_they_had() {
+        type Case = (&'static str, &'static [(u32, u8)], [u64; 4]);
+        const PINNED: [Case; 6] = [
+            (
+                "mode0",
+                &[
+                    (0x2105, 0x00),
+                    (0x2107, 0x00),
+                    (0x2108, 0x21),
+                    (0x2109, 0x42),
+                    (0x210A, 0x63),
+                    (0x210B, 0x31),
+                    (0x210C, 0x75),
+                ],
+                [
+                    0x8553_226E_A080_1D0B,
+                    0xDB89_83DF_7989_2D96,
+                    0x15F1_EDBD_0B43_A265,
+                    0x17BA_3D80_5AEE_6C9F,
+                ],
+            ),
+            (
+                "mode1-16x16",
+                &[
+                    (0x2105, 0x21),
+                    (0x2107, 0x03),
+                    (0x2108, 0x41),
+                    (0x210B, 0x40),
+                ],
+                [
+                    0x0124_A083_FDCC_84D2,
+                    0xA4C4_9DE5_C7F8_CC29,
+                    0xE384_0C1F_5A20_40DB,
+                    0x015C_930C_1E6A_FEB0,
+                ],
+            ),
+            (
+                "mode3-direct",
+                &[(0x2105, 0x13), (0x2130, 0x01)],
+                [
+                    0xE8CF_72FE_47BE_734D,
+                    0xDAB5_235A_94BD_17F0,
+                    0x015C_930C_1E6A_FEB0,
+                    0x015C_930C_1E6A_FEB0,
+                ],
+            ),
+            (
+                "mode5-hires",
+                &[(0x2105, 0x25), (0x2107, 0x01)],
+                [
+                    0xC5EB_1CC5_FFF4_90E5,
+                    0xB366_6068_A994_21AC,
+                    0x6510_6EE0_7AC6_2C4C,
+                    0x6510_6EE0_7AC6_2C4C,
+                ],
+            ),
+            (
+                "mode7",
+                &[(0x2105, 0x07)],
+                [
+                    0xB6B0_E64F_0C06_BBEC,
+                    0x015C_930C_1E6A_FEB0,
+                    0x015C_930C_1E6A_FEB0,
+                    0x015C_930C_1E6A_FEB0,
+                ],
+            ),
+            (
+                "mode7-direct-extbg",
+                &[(0x2105, 0x07), (0x2130, 0x01), (0x2133, 0x40)],
+                [
+                    0x7F19_82C2_B323_1D20,
+                    0x872F_1C5F_31EF_649A,
+                    0x015C_930C_1E6A_FEB0,
+                    0x015C_930C_1E6A_FEB0,
+                ],
+            ),
+        ];
+        let dir = std::env::temp_dir().join(format!("snes1-cli-tilemap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (seed, (case, registers, pinned)) in PINNED.into_iter().enumerate() {
+            let emu = scrambled(registers, 201 + seed as u32);
+            let hashes = [0, 1, 2, 3].map(|bg| {
+                let path = dir.join(format!("{case}-bg{bg}.png"));
+                export_tilemap_png(&emu, bg, &path).unwrap();
+                retro_core::fnv1a64(&std::fs::read(&path).unwrap())
+            });
+            assert_eq!(hashes, pinned, "{case}: {hashes:#018X?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -723,6 +723,22 @@ pub trait VideoDebugger {
     /// reads its map and its characters; `None` for a layer the chip lacks.
     fn layer_layout(&self, layer_id: u32) -> Option<LayerLayout>;
 
+    /// Layer `layer_id`'s whole map (as [`Self::get_layer_data`] numbers
+    /// the layers) as one picture, drawn from video memory as it stands:
+    /// every cell of the map in its place, its character coloured through
+    /// its palette with its flips, as [`Self::palette_colours`] gives the
+    /// colours, with no scroll and no window. A pixel of colour 0 is
+    /// transparent, 0 in all four bytes; every other pixel is opaque. What
+    /// a console's map is (its size, its cells, a map turned by a matrix)
+    /// is the core's, documented by the core. `None` for a layer that
+    /// reads no map (the sprites) and for one the chip lacks.
+    ///
+    /// Default: `None`, for a chip that draws no map.
+    fn layer_map(&self, layer_id: u32) -> Option<PixelImage> {
+        let _ = layer_id;
+        None
+    }
+
     /// The levels the picture's colour channels take, and their name
     /// ([`ColourLevels`]).
     ///
@@ -1062,6 +1078,15 @@ mod tests {
         };
         assert_eq!(chip.colour_levels(), ColourLevels::NONE);
         assert!(ColourLevels::NONE.levels.is_empty());
+    }
+
+    #[test]
+    fn a_chip_that_draws_no_map_gives_none() {
+        let chip = Chip {
+            palette: [0; 4],
+            little_endian: false,
+        };
+        assert_eq!(chip.layer_map(0), None);
     }
 
     #[test]

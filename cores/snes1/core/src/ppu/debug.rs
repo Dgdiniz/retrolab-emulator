@@ -26,15 +26,12 @@ use retro_core::video::{
     VideoMemoryId, VideoMemoryInfo, VideoRegister,
 };
 
-use crate::ppu::render::{
-    bpp_for_bg, cgram_index, direct_color_word, is_hires_mode, palette_offset_for_bg, COLOUR_LEVELS,
-};
+use crate::ppu::render::{bpp_for_bg, palette_offset_for_bg, COLOUR_LEVELS};
 use crate::ppu::sprite::{
     parse_sprite, sprite_row_in_sprite, sprite_size, sprite_tile_number, SpriteAttrs,
 };
 use crate::ppu::tile::{
-    bg_entry_character, decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row,
-    fetch_bg_tilemap_entry, mode7_sample, sign_extend_13, tilemap_masks,
+    decode_tile_2bpp_row, decode_tile_4bpp_row, decode_tile_8bpp_row, sign_extend_13,
 };
 use crate::ppu::{LineState, Ppu, WindowEnable, LAYER_COUNT, LAYER_OBJ};
 
@@ -1133,6 +1130,12 @@ impl VideoDebugger for Ppu {
     fn colour_levels(&self) -> ColourLevels {
         COLOUR_LEVELS
     }
+
+    /// A background's whole map, Mode 7's plane in Mode 7, as
+    /// [`Ppu::map_image`] draws it.
+    fn layer_map(&self, layer_id: u32) -> Option<PixelImage> {
+        self.map_image(layer_id)
+    }
 }
 
 // -- Viewer exporters (inherent, SNES-specific) ----------------------
@@ -1140,11 +1143,12 @@ impl VideoDebugger for Ppu {
 // These produce host-ready images / descriptors for the debugger's
 // visualisers. They are inherent `Ppu` methods (not trait methods)
 // because their shapes are SNES-specific; `SnesEmulator` re-exposes
-// thin wrappers. All RGBA output reuses `bgr15_to_rgba8`; the tile sheet
-// decodes through `decode_vram_tile_4bpp`, and the tilemap still draws
-// each entry through the renderer's own fetch, character pick, decoders
-// and colour rules, so a viewer cannot diverge from the renderer's colour
-// or tile decode.
+// thin wrappers. All RGBA output reuses `bgr15_to_rgba8`, and the tile
+// sheet decodes through `decode_vram_tile_4bpp`, so a viewer cannot
+// diverge from the renderer's colour or tile decode. A background's whole
+// map is the trait's `layer_map` (`map_image.rs`), which draws each entry
+// through the renderer's own fetch, character pick, decoders and colour
+// rules.
 
 impl Ppu {
     /// The live Mode 7 matrix as signed 16-bit `[A, B, C, D, X, Y]`.
@@ -1293,127 +1297,6 @@ impl Ppu {
         ViewerImage {
             width,
             height,
-            rgba,
-        }
-    }
-
-    /// Background `bg`'s (`0..=3`) whole tilemap as an RGBA image, each
-    /// entry drawn as the renderer draws it under the current mode: its
-    /// character at the mode's depth (2, 4 or 8 bits a pixel), coloured
-    /// through its palette from the mode's first colour (Mode 0 gives each
-    /// background 32 colours of its own), or in direct colour where the
-    /// renderer takes it, with the entry's flips; 16 by 16 pixels where the
-    /// background takes 16x16 tiles, and 16 dots wide in the hires Modes 5
-    /// and 6, whose picture is 512 dots wide. Mode 7's plane (BG1, and BG2
-    /// under EXTBG) is its 128 by 128 map of 8 by 8 characters, 1024 by
-    /// 1024 pixels ([`Self::export_mode7_plane`]). Colour 0 of a character
-    /// is transparent; a background the mode does not draw gives the map's
-    /// size, transparent throughout.
-    pub fn export_tilemap_image(&self, bg: usize) -> ViewerImage {
-        let bg = bg.min(3);
-        match (self.bgmode & 0x07, bg) {
-            (7, 0) => return self.export_mode7_plane(false),
-            (7, 1) if self.mode7_extbg => return self.export_mode7_plane(true),
-            _ => {}
-        }
-        let hires = is_hires_mode(self.bgmode);
-        let tile16 = self.bg_tile_size[bg];
-        let screen_size = self.bg_screen_size[bg] & 0x03;
-        let (mask_x, mask_y) = tilemap_masks(screen_size, hires, tile16);
-        let width = u32::from(mask_x) + 1;
-        let height = u32::from(mask_y) + 1;
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-        let bpp = self.bg_bpp(bg);
-        let decode_row = match bpp {
-            2 => decode_tile_2bpp_row,
-            4 => decode_tile_4bpp_row,
-            8 => decode_tile_8bpp_row,
-            _ => {
-                return ViewerImage {
-                    width,
-                    height,
-                    rgba,
-                }
-            }
-        };
-        let screen_addr = self.bg_screen_addr[bg];
-        let tile_data = self.bg_tiledata_addr[bg];
-        let palette_offset = palette_offset_for_bg(self.bgmode, bg);
-        let direct = self.bg_direct_colour(bg);
-        let vram = self.vram();
-        let cgram = self.cgram();
-        for y in 0..=mask_y {
-            // Each 8-pixel run is one character's row: an entry covers a
-            // whole number of them.
-            for x in (0..=mask_x).step_by(8) {
-                let entry =
-                    fetch_bg_tilemap_entry(vram, screen_addr, screen_size, x, y, hires, tile16);
-                let character = bg_entry_character(entry, x, y, hires, tile16);
-                let pixels = decode_row(
-                    vram,
-                    character,
-                    tile_data,
-                    (y & 7) as u8,
-                    entry.flip_h,
-                    entry.flip_v,
-                );
-                let start = (u32::from(y) * width + u32::from(x)) as usize * 4;
-                for (column, &pixel) in pixels.iter().enumerate() {
-                    if pixel == 0 {
-                        continue;
-                    }
-                    let colour = if direct {
-                        direct_color_word(pixel, entry.palette)
-                    } else {
-                        cgram[usize::from(cgram_index(palette_offset, entry.palette, pixel, bpp))]
-                    };
-                    let at = start + column * 4;
-                    rgba[at..at + 4].copy_from_slice(&bgr15_to_rgba8(colour));
-                }
-            }
-        }
-        ViewerImage {
-            width,
-            height,
-            rgba,
-        }
-    }
-
-    /// Mode 7's plane, 1024 by 1024 pixels: its 128 by 128 map of 8 by 8
-    /// characters, read as the renderer samples it; each pixel BG1's 8-bit
-    /// colour through CGRAM, or in direct colour while CGWSEL's direct
-    /// colour is on, or (`extbg`) BG2's low 7 bits through CGRAM. Colour 0
-    /// is transparent.
-    fn export_mode7_plane(&self, extbg: bool) -> ViewerImage {
-        const SIDE: u32 = 1024;
-        let vram = self.vram();
-        let cgram = self.cgram();
-        let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
-        for y in 0..SIDE {
-            for x in 0..SIDE {
-                // Inside the plane every screen-over setting reads its map.
-                let Some(byte) = mode7_sample(vram, x as i32, y as i32, 0) else {
-                    continue;
-                };
-                let colour = if extbg {
-                    match byte & 0x7F {
-                        0 => continue,
-                        index => cgram[usize::from(index)],
-                    }
-                } else if byte == 0 {
-                    continue;
-                } else if self.direct_color {
-                    direct_color_word(byte, 0)
-                } else {
-                    cgram[usize::from(byte)]
-                };
-                let at = ((y * SIDE + x) * 4) as usize;
-                rgba[at..at + 4].copy_from_slice(&bgr15_to_rgba8(colour));
-            }
-        }
-        ViewerImage {
-            width: SIDE,
-            height: SIDE,
             rgba,
         }
     }

@@ -746,6 +746,12 @@ impl VideoDebugger for Vdp {
     fn colour_levels(&self) -> ColourLevels {
         COLOUR_LEVELS
     }
+
+    /// Plane A's, plane B's or the window's whole map, as
+    /// [`Vdp::map_image`] draws it.
+    fn layer_map(&self, layer_id: u32) -> Option<PixelImage> {
+        self.map_image(layer_id)
+    }
 }
 
 impl Vdp {

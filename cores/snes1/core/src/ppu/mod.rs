@@ -37,6 +37,7 @@
 //! | [`record`]   | what a capture asks to record: the settings each line was drawn with, the writes to video memory |
 //! | [`trace`]    | where each pixel of the held frame came from: a redraw that notes it, and the chosen sprites drawn alone |
 //! | [`line_reads`] | what each line of the held frame did, without drawing: the sprites it met, its window masks, its offset-per-tile columns |
+//! | `map_image`  | a background's whole map as one picture, Mode 7's plane in Mode 7 |
 //! | [`writes`]   | who wrote video memory, recorded live: the origin of every VRAM byte, the log of each frame's transfers and palette and sprite-table writes, and the debugger's palette and tile events |
 //! | `mod.rs`     | struct, [`PpuAccessCtx`], [`Ppu::reset`], [`Ppu::read_reg`] / [`Ppu::write_reg`] dispatch |
 //!
@@ -62,6 +63,7 @@ pub use debug::{
     BgLayout, PpuSettings, SpriteDescriptor, SpriteTileSettings, TileSetSource, ViewerImage,
 };
 pub mod line_reads;
+mod map_image;
 pub mod mode7;
 pub use line_reads::{OffsetPerTileTable, WindowMasks};
 pub mod oam;

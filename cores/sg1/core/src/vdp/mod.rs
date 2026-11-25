@@ -5,6 +5,7 @@
 mod colour;
 pub mod debug;
 pub mod dma;
+mod map_image;
 mod picture;
 pub mod planes;
 mod ports;
