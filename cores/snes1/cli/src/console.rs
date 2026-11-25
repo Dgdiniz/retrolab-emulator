@@ -128,6 +128,7 @@ impl Console for Snes {
         "trace-to-text",
         "determinism-check",
         "screenshot",
+        "images",
         "disasm",
         "ppu-dump",
         "apu-dump",

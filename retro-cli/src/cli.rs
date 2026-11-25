@@ -16,6 +16,7 @@ use crate::cmd::determinism_check::DeterminismCheckArgs;
 use crate::cmd::disasm::DisasmArgs;
 use crate::cmd::fingerprint::FingerprintArgs;
 use crate::cmd::golden::{GoldenArgs, GoldenCompareArgs, GoldenSetArgs};
+use crate::cmd::images::ImagesArgs;
 use crate::cmd::info::InfoArgs;
 use crate::cmd::manifest::ManifestArgs;
 use crate::cmd::memory::MemoryArgs;
@@ -80,6 +81,8 @@ pub enum SharedCommand<B: clap::Args, S: clap::Args> {
     TraceToText(TraceToTextArgs),
     /// Run a ROM and save the visible picture as a PNG (+ layer dumps).
     Screenshot(ScreenshotArgs<B, S>),
+    /// Run a ROM and save the video chip's images of its last frame as PNGs.
+    Images(ImagesArgs<B>),
     /// Benchmark the execution tiers (fast / light-debug / +trace /
     /// fast+recording / full, in host steps).
     Benchmark(BenchmarkArgs<B>),
@@ -349,6 +352,7 @@ pub fn command<C: Console>() -> clap::Command {
                 ))
             })
         })
+        .mut_subcommand("images", |s| images_help(s, C::VIDEO_CHIP, &facts))
         .mut_subcommand("audio-dump", |s| {
             s.about(format!(
                 "Run a ROM with audio capture and save the {} output as a WAV",
@@ -443,10 +447,15 @@ pub fn command<C: Console>() -> clap::Command {
 }
 
 /// What the help reads from a machine of the console: the rate its sound
-/// is made at, and the names of its picture's layers, by id.
+/// is made at, the names of its picture's layers, by id, the names of the
+/// layers that read a map, and the names of its video memories.
 struct MachineFacts {
     sample_rate: u32,
     layers: Vec<String>,
+    /// The layers that read a map ([`retro_core::video::VideoDebugger::layer_map`]).
+    mapped_layers: Vec<String>,
+    /// The video memories' names, as the console calls them (`VRAM`).
+    memories: Vec<&'static str>,
     /// The stems' names, rate and samples.
     stems: Vec<&'static str>,
     stem_rate: u32,
@@ -468,21 +477,113 @@ impl MachineFacts {
             _ => "32-bit float samples",
         };
         let debugger = emu.video_debugger();
-        let layers = (0..debugger.get_layer_count())
+        let layers: Vec<String> = (0..debugger.get_layer_count())
             .map(|id| {
                 debugger
                     .get_layer_data(id)
                     .map_or_else(|| format!("layer {id}"), |data| data.name)
             })
             .collect();
+        let mapped_layers = (0u32..)
+            .zip(&layers)
+            .filter(|&(id, _)| debugger.layer_map(id).is_some())
+            .map(|(_, name)| name.clone())
+            .collect();
+        let memories = debugger
+            .video_memories()
+            .iter()
+            .map(|memory| memory.name)
+            .collect();
         Self {
             sample_rate,
             layers,
+            mapped_layers,
+            memories,
             stems,
             stem_rate,
             stem_samples,
         }
     }
+}
+
+/// The help of `images`, naming the video chip, the files of the console's
+/// layers and those of its video memories.
+fn images_help(s: clap::Command, video_chip: &str, facts: &MachineFacts) -> clap::Command {
+    let files = |prefix: &str, layers: &[String]| {
+        join_words(
+            layers
+                .iter()
+                .map(|name| format!("`{prefix}_{}.png`", layer_file_name(name)))
+                .collect(),
+            "and",
+        )
+    };
+    let memories = join_words(
+        facts
+            .memories
+            .iter()
+            .map(|name| format!("`{}.bin`", name.to_ascii_lowercase()))
+            .collect(),
+        "and",
+    );
+    s.about(format!(
+        "Run a ROM and save the {video_chip}'s images of the run's last frame as PNGs: the \
+         picture, each layer alone, each layer's whole map, each sprite the frame drew, the \
+         tiles and the palette, with images.json listing every file"
+    ))
+    .after_help(
+        "The picture, `picture.png`, is always written; the other images are the ones the \
+         flags name, or all of them when none is named. images.json gives each file's kind, \
+         size and what it is.",
+    )
+    .mut_arg("frames", |a| {
+        a.help(
+            "Frames to run, e.g. `300`. The last stops at its capture boundary, its picture \
+             drawn and its vertical blank not begun, and every image is of it: the run records \
+             the settings each line is drawn with from the first frame on, each layer and the \
+             sprites are drawn again from that frame's lines, and the maps, the tiles and the \
+             palette are read from video memory and the palette as they stand there",
+        )
+    })
+    .mut_arg("output", |a| {
+        a.help("The folder the files go to, made if missing")
+    })
+    .mut_arg("layers", |a| {
+        a.help(format!(
+            "Each layer drawn alone ({}), RGBA, transparent (alpha 0) wherever the layer draws \
+             nothing",
+            files("layer", &facts.layers)
+        ))
+    })
+    .mut_arg("maps", |a| {
+        a.help(format!(
+            "Each layer's whole map ({}): every cell of the map the layer reads as video memory \
+             holds it, with no scroll, transparent where a character's colour is 0",
+            files("map", &facts.mapped_layers)
+        ))
+    })
+    .mut_arg("sprites", |a| {
+        a.help(
+            "Each sprite the frame drew, `sprite_NNN.png` by its slot in the sprite table, and \
+             `sprites.png`, those sprites together as the frame drew them, the size of the \
+             picture",
+        )
+    })
+    .mut_arg("tiles", |a| {
+        a.help(
+            "The video memory read as characters of 8 by 8 pixels of 4 bits, 16 a row, in each \
+             palette line in use, one whose colours 1 to 15 are not all 0 \
+             (`tiles_palette_NN.png`, NN the line); colour 0 is transparent",
+        )
+    })
+    .mut_arg("palette", |a| {
+        a.help("The palette, `palette.png`: 16 colours a row, each a square of 16 pixels")
+    })
+    .mut_arg("raw", |a| {
+        a.help(format!(
+            "Also write each video memory's bytes as the core keeps them ({memories})"
+        ))
+    })
 }
 
 /// `benchmark --mode`: its rows, named in the help with the console's main
@@ -746,6 +847,7 @@ fn run_shared<C: Console>(command: SharedCommand<C::BootArgs, C::ScreenshotArgs>
         SharedCommand::Compare(args) => crate::cmd::compare::run::<C>(args),
         SharedCommand::TraceToText(args) => crate::cmd::trace_to_text::run::<C>(args),
         SharedCommand::Screenshot(args) => crate::cmd::screenshot::run::<C>(args),
+        SharedCommand::Images(args) => crate::cmd::images::run::<C>(args),
         SharedCommand::Benchmark(args) => crate::cmd::benchmark::run::<C>(args),
         SharedCommand::Profile(args) => crate::cmd::profile::run::<C>(args),
         SharedCommand::AudioDump(args) => crate::cmd::audio_dump::run::<C>(args),

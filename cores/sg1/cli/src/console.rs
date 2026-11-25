@@ -137,6 +137,7 @@ impl Console for Genesis {
         "compare",
         "trace-to-text",
         "screenshot",
+        "images",
         "disasm",
         "memory",
         "dump-vdp",

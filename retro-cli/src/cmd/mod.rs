@@ -9,6 +9,7 @@ pub mod determinism_check;
 pub mod disasm;
 pub mod fingerprint;
 pub mod golden;
+pub mod images;
 pub mod info;
 pub mod manifest;
 pub mod memory;
