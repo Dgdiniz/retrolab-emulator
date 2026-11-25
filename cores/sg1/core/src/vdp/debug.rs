@@ -1464,45 +1464,21 @@ mod tests {
         vdp
     }
 
-    /// Golden-image lock for the sprite-export primitive.
-    ///
-    /// Encodes the exported RGBA to PNG via the `image` crate and compares
-    /// the decoded pixels against a committed reference under
-    /// `tests/golden/`. PNG is lossless, so decoded bytes equal the source
-    /// RGBA exactly.
-    ///
-    /// Regen path: delete the file, or run with `SG1_UPDATE_GOLDEN=1`:
-    ///   `SG1_UPDATE_GOLDEN=1 cargo test -p sg1-core export_sprite_image_matches_golden`
+    /// The sprite export held to the PNG `tests/golden/` keeps of it, by the
+    /// golden-image harness's check of one image: `RETRO_UPDATE_GOLDEN=1
+    /// cargo test -p sg1-core export_sprite_image_matches_golden` writes it
+    /// again.
     #[test]
     fn export_sprite_image_matches_golden() {
-        use std::path::Path;
-
         let vdp = vdp_with_rainbow_sprite();
         let img = vdp.export_sprite_image(0).expect("sprite 0 exports");
         assert_eq!((img.width, img.height), (8, 8));
-
-        let golden_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/golden/sprite_export_basic.png"
-        );
-        let encoded = image::RgbaImage::from_raw(img.width, img.height, img.rgba.clone())
-            .expect("rgba buffer matches dimensions");
-
-        if std::env::var("SG1_UPDATE_GOLDEN").is_ok() || !Path::new(golden_path).exists() {
-            if let Some(dir) = Path::new(golden_path).parent() {
-                std::fs::create_dir_all(dir).expect("create golden dir");
-            }
-            encoded.save(golden_path).expect("write golden png");
-        }
-
-        let golden = image::open(golden_path)
-            .expect("open golden png")
-            .to_rgba8();
-        assert_eq!(golden.dimensions(), (img.width, img.height));
-        assert_eq!(
-            golden.as_raw(),
-            &img.rgba,
-            "exported sprite drifted from golden"
+        retro_core::capture::image_goldens::hold_png(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/golden/sprite_export_basic.png"
+            )),
+            &img,
         );
     }
 

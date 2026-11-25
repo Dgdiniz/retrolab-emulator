@@ -20,6 +20,11 @@ emulator-conformance = []
 # The sound conformance suite (`audio::conformance`), which each core's
 # tests run against its own emulator.
 sound-conformance = []
+# The PNG files of a held frame's images (`capture::png`).
+png = ["dep:image"]
+# The golden-image harness (`capture::image_goldens`), which each core's
+# tests hold their images to.
+image-goldens = ["png"]
 # The runner of CPU test vectors (`testing::singlestep`), which the CPU
 # crates' and the cores' tests run with their own CPU under test.
 singlestep = ["dep:flate2"]
@@ -36,6 +41,10 @@ zstd = "0.13"  # Savestate envelope compression
 # The test vectors' gzipped files, read by `testing::singlestep`, and the
 # `.vgz` files `audio::vgm::gzip` writes.
 flate2 = { version = "1.0", optional = true }
+# The PNGs `capture::png` reads and writes. PNG only: the default
+# feature set drags in the avif encoder stack (ravif -> rav1e -> pulp), whose
+# const asserts fail to compile under -Clink-dead-code coverage builds.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 # WASM-specific: js_sys::Date::now() in GenericInputManager::current_time_ms
 [target.'cfg(target_arch = "wasm32")'.dependencies]

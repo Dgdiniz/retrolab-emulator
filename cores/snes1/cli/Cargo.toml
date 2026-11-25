@@ -22,7 +22,7 @@ spc700 = { path = "../../../cpus/spc700", features = ["singlestep"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"
-# PNG-only (see sg1-core): avoids the avif/rav1e subtree.
+# PNG-only (see retro-core): avoids the avif/rav1e subtree.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]

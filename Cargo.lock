@@ -813,6 +813,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "flate2",
+ "image",
  "js-sys",
  "serde",
  "serde_json",
@@ -930,7 +931,6 @@ dependencies = [
  "bincode",
  "chrono",
  "criterion",
- "image",
  "js-sys",
  "paste",
  "retro-core",

@@ -19,7 +19,10 @@
 //! it records, the fields of a line's settings, how it draws a frame again
 //! and how it reaches the boundary. [`CaptureCore`] is what a host calls.
 //!
-//! [`images`] names the images a host reads of a held frame.
+//! [`images`] names the images a host reads of a held frame; `png` (behind
+//! the `png` feature) writes and reads them as PNGs, and the golden-image
+//! harness (`image_goldens`, behind the `image-goldens` feature) holds a
+//! core's to the ones its tests keep.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +38,10 @@ mod writes;
 
 #[cfg(feature = "capture-conformance")]
 pub mod conformance;
+#[cfg(feature = "image-goldens")]
+pub mod image_goldens;
+#[cfg(feature = "png")]
+pub mod png;
 
 pub use frame::{FrameSnapshot, RenderedLayer};
 pub use lines::{distinct_palettes, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE};

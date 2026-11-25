@@ -23,6 +23,30 @@ pub const SWATCH: u32 = 16;
 /// grids read the video memory as.
 const CHARACTER_BYTES: u32 = 32;
 
+/// The file of an image set's folder that holds the program its images are
+/// of. An image set is a folder a core's tests keep: the program, a folder
+/// a frame of its images ([`frame_folder`]), each image a PNG named as
+/// [`frame_images`] names it, and their hashes ([`IMAGE_SET_HASHES`]).
+pub const IMAGE_SET_PROGRAM: &str = "program.bin";
+
+/// The file of an image set's folder that holds its images' hashes.
+pub const IMAGE_SET_HASHES: &str = "images.hashes";
+
+/// The folder of frame `frame`'s images in an image set's folder, the frame
+/// counted from 1: `frame-00008`.
+pub fn frame_folder(frame: u64) -> String {
+    format!("frame-{frame:05}")
+}
+
+/// The frame a folder of an image set named by [`frame_folder`] holds the
+/// images of; `None` for a name it does not give.
+pub fn folder_frame(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("frame-")?;
+    (digits.len() >= 5 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
 /// The colours of `colours` (RGBA, four bytes a colour, as
 /// [`crate::video::VideoDebugger::palette_colours`] gives them) as
 /// swatches, `per_row` of them a row from the top left, each a square of
@@ -411,6 +435,24 @@ mod tests {
         assert_eq!(palette_lines_in_use(&palette), [1, 3]);
         assert!(palette_lines_in_use(&[0; 32]).is_empty());
         assert_eq!(palette_lines_in_use(&[0, 0, 7]), [0], "a short last line");
+    }
+
+    #[test]
+    fn a_frame_s_folder_is_named_by_its_number_and_read_back() {
+        assert_eq!(frame_folder(8), "frame-00008");
+        assert_eq!(frame_folder(12345), "frame-12345");
+        assert_eq!(folder_frame("frame-00008"), Some(8));
+        assert_eq!(folder_frame(&frame_folder(600)), Some(600));
+        assert_eq!(folder_frame(&frame_folder(123_456)), Some(123_456));
+        for other in [
+            "frame-8",
+            "frame-0000a",
+            "frames-00008",
+            "images.hashes",
+            "",
+        ] {
+            assert_eq!(folder_frame(other), None, "{other}");
+        }
     }
 
     #[test]
