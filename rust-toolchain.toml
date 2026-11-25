@@ -1,0 +1,9 @@
+# The Rust release this workspace is built and checked with, on every
+# computer and in CI. A newer release can add lints that `clippy -D warnings`
+# then refuses, so moving to one is a change of its own, made with the fixes
+# its lints ask for.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
