@@ -4,6 +4,7 @@
 use anyhow::Result;
 use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
 use clap::{CommandFactory, FromArgMatches, ValueEnum};
+use retro_core::capture::images::layer_file_name;
 use retro_core::golden::GoldenConsole;
 use retro_core::EmulatorCore;
 
@@ -298,7 +299,7 @@ pub fn command<C: Console>() -> clap::Command {
         facts
             .layers
             .iter()
-            .map(|name| format!("`<stem>_{}`", crate::cmd::screenshot::layer_suffix(name)))
+            .map(|name| format!("`<stem>_{}`", layer_file_name(name)))
             .collect(),
         "and",
     );

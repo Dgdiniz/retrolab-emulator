@@ -18,6 +18,8 @@
 //! ([`FrameSnapshot`], [`RenderedLayer`]). A core keeps its mechanism: where
 //! it records, the fields of a line's settings, how it draws a frame again
 //! and how it reaches the boundary. [`CaptureCore`] is what a host calls.
+//!
+//! [`images`] names the images a host reads of a held frame.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,7 @@ use crate::emulator::EmulatorCore;
 use crate::video::{LineStateTable, PixelImage};
 
 mod frame;
+pub mod images;
 mod lines;
 mod pixels;
 mod sprites;

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use retro_core::capture::images::layer_file_name;
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::EmulatorCore;
 
@@ -180,11 +181,6 @@ fn shown_of(count: u32, show_only: Option<u32>, hide: Option<&str>) -> Result<Op
     ))
 }
 
-/// The file suffix of a layer named `name`: `Plane A` -> `plane_a`.
-pub(crate) fn layer_suffix(name: &str) -> String {
-    name.trim().to_ascii_lowercase().replace(' ', "_")
-}
-
 /// Write each layer of the held frame alone, then the console's other
 /// images of it, beside `output`: `<stem>_<layer>.<ext>`. Nothing runs
 /// between them, so every one comes from the frame of the screenshot, each
@@ -204,10 +200,10 @@ fn write_layers<C: Console>(emu: &mut C::Emulator, output: &Path) -> Result<()> 
     let mut images = Vec::new();
     let mut from_line_states = true;
     for layer in 0..count {
-        let suffix = emu
-            .video_debugger()
-            .get_layer_data(layer)
-            .map_or_else(|| format!("layer{layer}"), |data| layer_suffix(&data.name));
+        let suffix = emu.video_debugger().get_layer_data(layer).map_or_else(
+            || format!("layer{layer}"),
+            |data| layer_file_name(&data.name),
+        );
         let rendered = emu
             .render_layer(layer)
             .ok_or_else(|| anyhow::anyhow!("failed to render layer {suffix}: no such layer"))?;
@@ -268,13 +264,5 @@ mod tests {
             err(None, Some("9")),
             "--hide 9: not a layer (the layers are 0 to 3)"
         );
-    }
-
-    #[test]
-    fn a_layer_file_is_named_after_its_layer() {
-        assert_eq!(layer_suffix("Plane A"), "plane_a");
-        assert_eq!(layer_suffix("BG1"), "bg1");
-        assert_eq!(layer_suffix("OBJ"), "obj");
-        assert_eq!(layer_suffix("Sprites"), "sprites");
     }
 }
