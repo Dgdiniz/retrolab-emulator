@@ -8,8 +8,8 @@
 
 use js_sys::{Array, Object, Reflect};
 use retro_core::capture::{
-    CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites, PixelSources,
-    RenderedLayer, VideoMemorySources, WORDS_PER_RECORD,
+    CaptureRecording, DrawOrder, FrameSnapshot, FrameWrites, LinePalettes, LineSprites,
+    PixelSources, RenderedLayer, VideoMemorySources, WORDS_PER_RECORD,
 };
 use retro_core::video::LineStateTable;
 use wasm_bindgen::JsValue;
@@ -112,6 +112,27 @@ pub fn rendered_layer_object(layer: &RenderedLayer) -> JsValue {
         &JsValue::from_bool(layer.from_line_states),
     );
     obj
+}
+
+/// An array of `{ firstLine, lines, slots }`, one a run of lines in one
+/// order, `slots` an array of `{ layer, priority }`, front to back.
+pub fn draw_order_array(orders: &[DrawOrder]) -> JsValue {
+    let runs = Array::new();
+    for run in orders {
+        let slots = Array::new();
+        for slot in &run.slots {
+            slots.push(&plain_object(&[
+                ("layer", JsValue::from_f64(f64::from(slot.layer))),
+                ("priority", JsValue::from_f64(f64::from(slot.priority))),
+            ]));
+        }
+        runs.push(&plain_object(&[
+            ("firstLine", JsValue::from_f64(f64::from(run.first_line))),
+            ("lines", JsValue::from_f64(f64::from(run.lines))),
+            ("slots", slots.into()),
+        ]));
+    }
+    runs.into()
 }
 
 /// `{ frame, fromFirstLine, complete, memoryExact, rowsPerLine,
@@ -259,6 +280,7 @@ pub fn frame_writes_object(writes: &FrameWrites) -> JsValue {
 ///
 /// The methods, by their JavaScript names: `runToCaptureBoundary`,
 /// `atCaptureBoundary`, `captureFrameSnapshot`, `renderLayer(layer_id)`,
+/// `renderLayerPriority(layer_id, priority)`, `getDrawOrder`,
 /// `setCaptureRecording(options)`, `getCaptureRecording`, `getLineStates`,
 /// `getLinePalettes`, `pictureFromLineStates`, `getPixelSources(planes)`,
 /// `getLineSprites`, `renderSprites(selection)`, `getVideoMemorySources`,
@@ -361,6 +383,57 @@ macro_rules! capture_bindings {
                     }
                     ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
                 }
+            }
+
+            /// The held frame drawn again with one layer alone, as
+            /// `renderLayer` draws it, with only the layer's pixels of
+            /// priority `priority`: `{ width, height, data: Uint8Array,
+            /// fromLineStates }`, the shape of `renderLayer`, every other
+            /// pixel 0 in all four bytes; `null` for an id that is no
+            /// layer's, or on a core that does not split its layers. What a
+            /// pixel's priority is on each console (a cell's priority bit, a
+            /// sprite's priority) is documented by the core; `getDrawOrder`
+            /// names the priorities each layer has. The images of a layer's
+            /// priorities add up to the layer's. Nothing runs, and the
+            /// framebuffer and everything a savestate holds stay as they
+            /// were.
+            #[wasm_bindgen(js_name = renderLayerPriority)]
+            pub fn render_layer_priority(
+                &mut self,
+                layer_id: u32,
+                priority: u8,
+            ) -> $crate::__private::wasm_bindgen::JsValue {
+                match $crate::__private::retro_core::capture::CaptureCore::render_layer_priority(
+                    &mut self.$core,
+                    layer_id,
+                    priority,
+                ) {
+                    ::core::option::Option::Some(layer) => {
+                        $crate::capture::rendered_layer_object(&layer)
+                    }
+                    ::core::option::Option::None => $crate::__private::wasm_bindgen::JsValue::NULL,
+                }
+            }
+
+            /// The order the held frame's lines put the layers in: an array of
+            /// `{ firstLine, lines, slots }`, one for each run of lines in
+            /// one order, in the order the lines were drawn, covering every
+            /// line the frame draws; `slots` the places of the run, front to
+            /// back, each `{ layer, priority }`, the pixels of one priority
+            /// of one layer (the ids `renderLayer` takes, the priority
+            /// `renderLayerPriority` takes). Where two places both have a
+            /// pixel the console puts the earlier one's in front, before
+            /// what its screens, windows and colour effects then choose to
+            /// show. Lines are counted as `getDisplayInfo().grid` counts
+            /// them, from the first line the frame draws. Each line's order
+            /// is read from the line table where it holds the frame, else
+            /// from the state as it stands. An empty array on a core that
+            /// does not say.
+            #[wasm_bindgen(js_name = getDrawOrder)]
+            pub fn get_draw_order(&self) -> $crate::__private::wasm_bindgen::JsValue {
+                $crate::capture::draw_order_array(
+                    &$crate::__private::retro_core::capture::CaptureCore::draw_order(&self.$core),
+                )
             }
 
             /// Choose what the core records while frames run, for a capture
@@ -675,7 +748,7 @@ mod tests {
     use super::*;
     use crate::test_support::shape;
     use retro_core::capture::{
-        CaptureCore, FrameWrite, WriteKind, WriteLog, WriteOrigin, NO_PALETTE,
+        CaptureCore, DrawSlot, FrameWrite, WriteKind, WriteLog, WriteOrigin, NO_PALETTE,
     };
     use retro_core::cartridge::SourcePlace;
     use retro_core::debugger::DebuggerCore;
@@ -1288,6 +1361,26 @@ mod tests {
                 from_line_states: layer == 1,
             })
         }
+        fn render_layer_priority(&mut self, layer: u32, priority: u8) -> Option<RenderedLayer> {
+            (layer < 2).then(|| RenderedLayer {
+                image: picture(),
+                from_line_states: priority == 1,
+            })
+        }
+        fn draw_order(&self) -> Vec<DrawOrder> {
+            vec![
+                DrawOrder {
+                    first_line: 0,
+                    lines: 2,
+                    slots: vec![DrawSlot::new(1, 1), DrawSlot::new(0, 0)],
+                },
+                DrawOrder {
+                    first_line: 2,
+                    lines: 1,
+                    slots: vec![DrawSlot::new(0, 0)],
+                },
+            ]
+        }
         fn picture_from_line_states(&mut self) -> Option<PixelImage> {
             self.recording.line_states.then(picture)
         }
@@ -1393,6 +1486,7 @@ mod tests {
         assert_eq!((emulator.core.repaints, emulator.refreshes), (1, 2));
         // The readers draw nothing into the host's picture.
         let _ = emulator.render_layer(0);
+        let _ = emulator.render_layer_priority(0, 1);
         let _ = emulator.render_sprites(&[1]);
         let _ = emulator.picture_from_line_states();
         let _ = emulator.get_pixel_sources(None);
@@ -1428,6 +1522,28 @@ mod tests {
             shape(&emulator.get_capture_recording()),
             shape(&recording_to_js(emulator.core.recording))
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_layer_s_priority_and_the_draw_order_are_marshalled() {
+        let mut emulator = emulator();
+        assert_eq!(
+            shape(&emulator.render_layer_priority(1, 1)),
+            shape(&rendered_layer_object(&RenderedLayer {
+                image: picture(),
+                from_line_states: true,
+            }))
+        );
+        assert!(
+            emulator.render_layer_priority(2, 0).is_null(),
+            "no such layer"
+        );
+        assert_eq!(
+            shape(&emulator.get_draw_order()),
+            "[{firstLine: 0, lines: 2, slots: [{layer: 1, priority: 1}, {layer: 0, priority: \
+             0}]}, {firstLine: 2, lines: 1, slots: [{layer: 0, priority: 0}]}]"
+        );
+        assert_eq!(shape(&draw_order_array(&[])), "[]");
     }
 
     #[wasm_bindgen_test]

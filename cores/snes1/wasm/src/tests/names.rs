@@ -289,6 +289,32 @@ fn a_layer_s_map_is_the_ppu_s() {
 }
 
 #[wasm_bindgen_test]
+fn a_layer_s_priorities_and_the_draw_order_are_the_ppu_s() {
+    let mut emu = running();
+    let orders = retro_core::capture::CaptureCore::draw_order(&emu.snes);
+    assert_eq!(
+        shape(&emu.get_draw_order()),
+        shape(&retro_wasm::capture::draw_order_array(&orders))
+    );
+    let slots: Vec<_> = orders.iter().flat_map(|run| run.slots.clone()).collect();
+    assert!(!slots.is_empty());
+    for slot in slots {
+        let layer = retro_core::capture::CaptureCore::render_layer_priority(
+            &mut emu.snes,
+            slot.layer,
+            slot.priority,
+        )
+        .expect("a layer the draw order names");
+        assert_eq!(
+            shape(&emu.render_layer_priority(slot.layer, slot.priority)),
+            shape(&retro_wasm::capture::rendered_layer_object(&layer)),
+            "{slot:?}"
+        );
+    }
+    assert!(emu.render_layer_priority(5, 0).is_null());
+}
+
+#[wasm_bindgen_test]
 fn the_sound_chip_is_the_s_dsp_and_its_voices() {
     let mut emu = running();
     assert_eq!(
