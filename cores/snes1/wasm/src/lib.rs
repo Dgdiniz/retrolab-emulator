@@ -385,7 +385,7 @@ retro_wasm::machine_bindings!(
     retry_detected_mapping = true
 );
 retro_wasm::display_bindings!(RetroEmulator, snes, present = present);
-retro_wasm::audio_bindings!(RetroEmulator, snes);
+retro_wasm::audio_bindings!(RetroEmulator, snes, after_frame = refresh_present);
 retro_wasm::input_bindings!(RetroEmulator, snes);
 retro_wasm::debugger_bindings!(RetroEmulator, snes, after_step = refresh_present);
 retro_wasm::video_bindings!(RetroEmulator, snes);

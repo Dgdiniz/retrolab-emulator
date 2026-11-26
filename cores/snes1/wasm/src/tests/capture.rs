@@ -770,6 +770,27 @@ fn running_the_capture_program() -> RetroEmulator {
 }
 
 #[wasm_bindgen_test]
+fn rendered_frames_leave_the_last_one_s_picture() {
+    let mut played = RetroEmulator::new("snes").unwrap();
+    played.load_rom(&capture_program_rom()).unwrap();
+    played.set_audio_enabled(true);
+    let mut rendered = RetroEmulator::new("snes").unwrap();
+    rendered.load_rom(&capture_program_rom()).unwrap();
+    let before = rendered.get_framebuffer_data().to_vec();
+    for _ in 0..3 {
+        played.run_frame();
+    }
+    rendered.render_frames(3);
+    let picture = rendered.get_framebuffer_data().to_vec();
+    assert_ne!(picture, before, "the frames drew a picture");
+    assert_eq!(
+        picture,
+        played.get_framebuffer_data().to_vec(),
+        "the picture is the third frame's, as three frame calls leave it"
+    );
+}
+
+#[wasm_bindgen_test]
 fn the_capture_boundary_reads_as_before() {
     let mut emu = RetroEmulator::new("snes").unwrap();
     emu.load_rom(&capture_program_rom()).unwrap();

@@ -35,8 +35,8 @@ crate::debugger_bindings!(PlainEmulator, core);
 crate::video_bindings!(PlainEmulator, core);
 crate::cartridge_bindings!(PlainEmulator, core, mapper_label = label_in_capitals);
 
-/// The machine and picture macros with a present buffer, a hook that counts
-/// its calls, and the load's retry.
+/// The machine, picture and sound macros with a present buffer, a hook that
+/// counts its calls, and the load's retry.
 #[wasm_bindgen]
 pub struct PresentingEmulator {
     core: FakeMachine,
@@ -61,6 +61,7 @@ crate::machine_bindings!(
     retry_detected_mapping = true
 );
 crate::display_bindings!(PresentingEmulator, core, present = present);
+crate::audio_bindings!(PresentingEmulator, core, after_frame = refresh);
 
 /// A mapper label of the test's own: the default label in capitals.
 fn label_in_capitals(id: &MapperId) -> String {
@@ -138,6 +139,31 @@ fn the_picture_is_refreshed_after_each_call_that_can_change_it() {
         count(&emu),
         10,
         "no refresh after a headless frame or a refusal"
+    );
+}
+
+#[wasm_bindgen_test]
+fn the_render_refreshes_the_picture_after_its_frames() {
+    let mut emu = presenting();
+    emu.load_rom(&[1]).unwrap();
+    let before = emu.refreshes;
+    assert_eq!(
+        shape(&emu.render_frames(3)),
+        "{frames: 3, sound_turned_on: true}"
+    );
+    assert_eq!(emu.refreshes, before + 1, "one refresh, after the frames");
+    assert!(
+        emu.get_framebuffer_data()
+            .to_vec()
+            .iter()
+            .all(|&byte| byte == 3),
+        "the presented picture is the third frame's"
+    );
+    let mut plain = plain();
+    assert_eq!(
+        shape(&plain.render_frames(2)),
+        "{frames: 2, sound_turned_on: true}",
+        "the same answer with no hook"
     );
 }
 

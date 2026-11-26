@@ -252,13 +252,22 @@ pub fn wav_of(
 /// `wavHeader(kind, sampleRate, channels, frames, trailerBytes)` and
 /// `wavTrailer(sampleRate, marks)`.
 ///
+/// `after_frame = m` names a method of `$emulator` run after
+/// `renderFrames`, the one method here that runs frames, for a crate that
+/// keeps a copy of the picture (`machine_bindings!` and
+/// `capture_bindings!` take the same hook).
+///
 /// Each method's Rust name is its JavaScript name in snake case, which no
 /// other method of the struct may have. The crate expanding the macro
 /// depends on `wasm-bindgen` itself, as every crate declaring a
 /// `#[wasm_bindgen]` struct does.
 #[macro_export]
 macro_rules! audio_bindings {
-    ($emulator:ident, $core:ident $(,)?) => {
+    (
+        $emulator:ident, $core:ident
+        $(, after_frame = $after_frame:ident)?
+        $(,)?
+    ) => {
         #[$crate::__private::wasm_bindgen::prelude::wasm_bindgen]
         impl $emulator {
             /// Take every queued sample from the host's ring into a new
@@ -426,13 +435,17 @@ macro_rules! audio_bindings {
             /// Run `frames` frames of the loop a player's host runs, whatever
             /// the debugger has armed, with the sound on (turned on first if
             /// it is off, and left on): `{ frames, sound_turned_on }`. The
-            /// samples go to the host's ring as a frame call's do.
+            /// samples go to the host's ring as a frame call's do, and the
+            /// picture the framebuffer readers give is the last frame's, as
+            /// after `runFrame`.
             #[wasm_bindgen(js_name = renderFrames)]
             pub fn render_frames(&mut self, frames: u32) -> $crate::__private::wasm_bindgen::JsValue {
-                $crate::js::to_js(&$crate::__private::retro_core::audio::render_frames(
+                let report = $crate::__private::retro_core::audio::render_frames(
                     &mut self.$core,
                     frames,
-                ))
+                );
+                $(self.$after_frame();)?
+                $crate::js::to_js(&report)
             }
 
             /// The stems the console takes, `{ rate, kind, channels, master,
