@@ -14,10 +14,11 @@
 //! ([`VideoMemorySources`], [`WriteOrigin`], [`Writer`]), what each frame
 //! wrote ([`FrameWrite`], [`FrameWrites`], [`WriteLog`]), the line table's
 //! helpers ([`LinePalettes`], [`distinct_palettes`], [`TableColumns`],
-//! [`line_state!`](crate::line_state)) and the frame snapshot
-//! ([`FrameSnapshot`], [`RenderedLayer`]). A core keeps its mechanism: where
-//! it records, the fields of a line's settings, how it draws a frame again
-//! and how it reaches the boundary. [`CaptureCore`] is what a host calls.
+//! [`line_state!`](crate::line_state)), the frame snapshot
+//! ([`FrameSnapshot`], [`RenderedLayer`]) and the order the layers are put
+//! in ([`DrawSlot`], [`DrawOrder`]). A core keeps its mechanism: where it
+//! records, the fields of a line's settings, how it draws a frame again and
+//! how it reaches the boundary. [`CaptureCore`] is what a host calls.
 //!
 //! [`images`] names the images a host reads of a held frame; `png` (behind
 //! the `png` feature) writes and reads them as PNGs, and the golden-image
@@ -32,6 +33,7 @@ use crate::video::{LineStateTable, PixelImage};
 mod frame;
 pub mod images;
 mod lines;
+mod order;
 mod pixels;
 mod sprites;
 mod writes;
@@ -45,6 +47,7 @@ pub mod png;
 
 pub use frame::{FrameSnapshot, RenderedLayer};
 pub use lines::{distinct_palettes, LinePalettes, TableColumns, NO_COLUMN, NO_PALETTE};
+pub use order::{draw_order_runs, DrawOrder, DrawSlot};
 pub use pixels::{drawn_by, layer, planes, tile_value, NoTrace, PixelSources, PixelTrace, NO_CELL};
 pub use sprites::{line_flags, LineSprites, SpriteFate, LINE_SPRITES_STRIDE};
 pub use writes::{
@@ -167,6 +170,38 @@ pub trait CaptureCore: EmulatorCore {
     /// backdrop's included. Drawn from the line table where it holds the
     /// frame, as [`RenderedLayer::from_line_states`] says.
     fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer>;
+
+    /// Layer `layer` of the held frame drawn alone with only its pixels of
+    /// priority `priority`, as [`Self::render_layer`] draws the layer: a
+    /// pixel of the layer whose priority is `priority` is opaque, in the
+    /// layer's own colour, and every other pixel is 0 in all four bytes.
+    /// What a pixel's priority is on a console (a cell's priority bit, a
+    /// sprite's priority) the core documents; [`Self::draw_order`] names
+    /// the priorities each layer has and where the console puts them. The
+    /// images of a layer's priorities add up to the layer's: each pixel
+    /// [`Self::render_layer`] draws is in one of them. `None` where
+    /// [`Self::render_layer`] gives none.
+    ///
+    /// Default: `None`, for a core that does not split its layers.
+    fn render_layer_priority(&mut self, layer: u32, priority: u8) -> Option<RenderedLayer> {
+        let _ = (layer, priority);
+        None
+    }
+
+    /// The order the held frame's lines put the layers in, each place the
+    /// pixels of one priority of one layer ([`DrawOrder`], [`DrawSlot`]):
+    /// one entry for each run of lines in one order, in the order the lines
+    /// were drawn, covering every line the frame draws. Each line's order
+    /// is read from the settings it was drawn with where the line table
+    /// holds the frame (as [`Self::render_layer`] draws), else from the
+    /// state as it stands. Stacked from the last place to the first, the
+    /// images [`Self::render_layer_priority`] draws give the layers as the
+    /// console puts them on a line of the run.
+    ///
+    /// Default: empty, for a core that does not say.
+    fn draw_order(&self) -> Vec<DrawOrder> {
+        Vec::new()
+    }
 
     /// The picture drawn again from the line table into a buffer of its own,
     /// cut as the picture the host shows is: only while the table holds the

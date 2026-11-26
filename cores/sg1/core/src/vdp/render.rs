@@ -5,7 +5,7 @@
 //! geometry. In interlace mode 2 a line is drawn into both fields' rows,
 //! its cells 8 pixels by 16 ([`super::picture`]).
 
-use retro_core::capture::{NoTrace, PixelTrace};
+use retro_core::capture::{draw_order_runs, DrawOrder, DrawSlot, NoTrace, PixelTrace};
 
 use super::picture::{Interlace, DOUBLE_CELL_ROWS, NORMAL_CELL_ROWS};
 use super::sources::{self, LineTrace};
@@ -15,7 +15,34 @@ use super::{
     TRANSPARENT_RGB,
 };
 
+/// The order the compositor puts the layers in, on every line, front to
+/// back ([`Vdp::draw_order`]): a pixel's priority is its map cell's
+/// priority bit (plane A, plane B, the window) or its sprite's, 1 high and
+/// 0 low. A high sprite pixel is in front of every plane; a high plane
+/// pixel in front of a low sprite one; a low sprite pixel in front of the
+/// low planes; of two planes' pixels of one priority, plane A's in front of
+/// plane B's. The window takes plane A's place wherever it covers the
+/// screen, so it shares plane A's two places: the two never hold a pixel in
+/// the same place.
+pub(super) const DRAW_ORDER: [DrawSlot; 8] = [
+    DrawSlot::new(LAYER_SPRITES as u32, 1),
+    DrawSlot::new(LAYER_PLANE_A as u32, 1),
+    DrawSlot::new(LAYER_WINDOW as u32, 1),
+    DrawSlot::new(LAYER_PLANE_B as u32, 1),
+    DrawSlot::new(LAYER_SPRITES as u32, 0),
+    DrawSlot::new(LAYER_PLANE_A as u32, 0),
+    DrawSlot::new(LAYER_WINDOW as u32, 0),
+    DrawSlot::new(LAYER_PLANE_B as u32, 0),
+];
+
 impl Vdp {
+    /// The order the frame's lines put the layers in: every line the frame
+    /// draws ([`Self::drawn_height`]) in [`DRAW_ORDER`], one run from line
+    /// 0, in every mode.
+    pub fn draw_order(&self) -> Vec<DrawOrder> {
+        draw_order_runs((0..self.drawn_height()).map(|line| (line, &DRAW_ORDER[..])))
+    }
+
     /// Render backdrop color to entire framebuffer.
     pub(super) fn render_backdrop(&mut self) {
         // Register 7 contains backdrop color
@@ -725,6 +752,7 @@ impl Vdp {
                     origin_b
                 };
                 trace.notes().pen(x, origin);
+                trace.notes().plane_priorities(x, plane_a_bit, plane_b_bit);
             }
 
             if let Some((dbg_x, dbg_y)) = self.debug_pixel {

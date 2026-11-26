@@ -23,7 +23,7 @@ use super::{record, Ppu, LAYER_COUNT, LAYER_OBJ};
 /// One past the last scanline a frame can draw: the overscan frame's 239
 /// visible lines end at line 239, and the active-region gate drops the
 /// lines past the overscan setting in force.
-const FIRST_LINE_PAST_OVERSCAN: u16 = 240;
+pub(super) const FIRST_LINE_PAST_OVERSCAN: u16 = 240;
 
 /// What drawing the frame again changes that is not the picture: the
 /// sprite range and time flags STAT77 reads and the address the sprite
@@ -150,6 +150,27 @@ impl Ppu {
         let image = self.picture_drawn_again(from_table, &mut NoTrace::<FrameTrace>::new());
         self.isolated_layer = None;
         Ok(image)
+    }
+
+    /// The held frame drawn again with only `layer`'s pixels of priority
+    /// `priority` in it, as [`Self::render_layer`] draws the layer: a pixel
+    /// of the layer of that priority is opaque, every other pixel has alpha
+    /// 0. A background pixel's priority is its tile's priority bit (0 or
+    /// 1); in Mode 7 BG1's pixels have none, every one 0, and EXTBG's BG2
+    /// takes its pixel's top bit. A sprite pixel's is its sprite's priority
+    /// (0 to 3). The images of a layer's priorities add up to
+    /// [`Self::render_layer`]'s, each of its pixels in one; where the
+    /// console puts each priority among the other layers' is
+    /// [`Self::draw_order`]. Another index is [`ExportError::OutOfRange`].
+    pub fn render_layer_priority(
+        &mut self,
+        layer: usize,
+        priority: u8,
+    ) -> Result<PixelImage, ExportError> {
+        self.isolated_priority = Some(priority);
+        let image = self.render_layer(layer);
+        self.isolated_priority = None;
+        image
     }
 
     /// The frame's picture drawn again from its line table, into a buffer
@@ -316,6 +337,9 @@ impl Ppu {
             return;
         }
         let brightness = self.display_brightness;
+        // A pass of one priority keeps the layer's pixels of that priority.
+        let priority = self.isolated_priority;
+        let kept = move |pixel_priority: u8| priority.is_none_or(|wanted| wanted == pixel_priority);
         let mut put = |x: usize, colour: u16| {
             let [r, g, b] = if brightness == 0 {
                 [0, 0, 0]
@@ -333,7 +357,10 @@ impl Ppu {
                 let column = if hires || pseudo { x >> 1 } else { x };
                 let pixel = obj_row[column];
                 // A sprite render draws the chosen sprites alone.
-                if pixel.opaque && (!T::ON || trace.notes().draws_sprite_at(column)) {
+                if pixel.opaque
+                    && kept(pixel.prio)
+                    && (!T::ON || trace.notes().draws_sprite_at(column))
+                {
                     put(x, pixel.color);
                 }
             }
@@ -366,7 +393,7 @@ impl Ppu {
         }
         for x in 0..visible_w {
             let pixel = row[if pseudo { x >> 1 } else { x }];
-            if pixel.opaque {
+            if pixel.opaque && kept(u8::from(pixel.priority)) {
                 put(x, pixel.color);
             }
         }
@@ -475,6 +502,195 @@ mod tests {
         ppu.display_disable = true;
         let blank = ppu.render_layer(0).expect("BG1");
         assert!(alphas(&blank.rgba).all(|alpha| alpha == 0));
+    }
+
+    /// Mode 1 with BG1, BG2 and the sprites on the main screen over a
+    /// green backdrop, drawing on the first eight lines layers of every
+    /// priority over one another, each cell eight pixels of one colour:
+    /// BG1's entries of columns 0 to 3 are tile 1 (red), of priority 1 in
+    /// columns 1 and 3; BG2's entries of columns 0 to 5 tile 1 of palette 1
+    /// (blue), of priority 1 in columns 0, 2, 3 and 5; four sprites of
+    /// tile 0x40 (white), of priorities 3, 0, 1 and 2 at x 0, 16, 32 and 48.
+    fn priority_ppu() -> Ppu {
+        let mut ppu = layered_ppu();
+        ppu.bg_main_enable[1] = true;
+        ppu.bg_screen_addr[1] = 0x1000;
+        ppu.bg_tiledata_addr[1] = 0x2000;
+        ppu.bg_voffset[1] = 0xFFFF;
+        for column in 0..4 {
+            let high = if column % 2 == 1 { 0x2000 } else { 0 };
+            ppu.vram[column] = high | 0x0001;
+        }
+        for column in 0..6 {
+            let high = if [0, 2, 3, 5].contains(&column) {
+                0x2000
+            } else {
+                0
+            };
+            ppu.vram[0x800 + column] = high | 0x0400 | 0x0001;
+        }
+        ppu.cgram[17] = 0x7C00; // BG2 blue
+        ppu.cgram[129] = 0x7FFF; // sprites white
+        for (slot, (x, priority)) in [(0u8, 3u8), (16, 0), (32, 1), (48, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            set_sprite(&mut ppu, slot, x, 0, 0x40, priority << 4);
+        }
+        for slot in 4..128 {
+            set_sprite(&mut ppu, slot, 0, 0xF0, 0x40, 0);
+        }
+        ppu
+    }
+
+    /// The columns of row `y` of an RGBA image 256 wide that are opaque.
+    fn opaque_columns(rgba: &[u8], y: usize) -> Vec<usize> {
+        (0..256)
+            .filter(|x| rgba[(y * 256 + x) * 4 + 3] != 0)
+            .collect()
+    }
+
+    /// The pixels of every cell of `cells`, eight a cell.
+    fn cells(cells: &[usize]) -> Vec<usize> {
+        cells
+            .iter()
+            .flat_map(|cell| cell * 8..cell * 8 + 8)
+            .collect()
+    }
+
+    #[test]
+    fn a_layer_s_pixels_split_by_their_tile_s_or_sprite_s_priority() {
+        let mut ppu = priority_ppu();
+        let mut columns = |layer: usize, priority: u8| {
+            let image = ppu.render_layer_priority(layer, priority).expect("a layer");
+            opaque_columns(&image.rgba, 3)
+        };
+        assert_eq!(columns(0, 1), cells(&[1, 3]));
+        assert_eq!(columns(0, 0), cells(&[0, 2]));
+        assert_eq!(columns(1, 1), cells(&[0, 2, 3, 5]));
+        assert_eq!(columns(1, 0), cells(&[1, 4]));
+        for (priority, cell) in [(3, 0), (0, 2), (1, 4), (2, 6)] {
+            assert_eq!(
+                columns(LAYER_OBJ, priority),
+                cells(&[cell]),
+                "priority {priority}"
+            );
+        }
+        assert!(columns(0, 2).is_empty(), "a tile has two priorities");
+        assert_eq!(
+            ppu.render_layer_priority(5, 0),
+            Err(ExportError::OutOfRange)
+        );
+        assert_eq!(ppu.isolated_priority, None);
+
+        // A layer's priorities add up to the layer, pixel for pixel.
+        for (layer, priorities) in [(0, 0..2), (1, 0..2), (LAYER_OBJ, 0..4)] {
+            let whole = ppu.render_layer(layer).expect("a layer").rgba;
+            let mut added = vec![0u8; whole.len()];
+            for priority in priorities {
+                let part = ppu.render_layer_priority(layer, priority).expect("a layer");
+                for (sum, byte) in added.iter_mut().zip(&part.rgba) {
+                    *sum |= byte;
+                }
+            }
+            assert_eq!(added, whole, "layer {layer}");
+        }
+    }
+
+    #[test]
+    fn the_layers_stacked_in_the_draw_order_are_the_picture() {
+        let mut ppu = priority_ppu();
+        let mut fb = Framebuffer::new(256, 224);
+        ppu.redraw_frame(&mut fb);
+        let orders = ppu.draw_order();
+        assert_eq!(
+            (orders.len(), orders[0].first_line, orders[0].lines),
+            (1, 0, 224)
+        );
+        let images: Vec<Vec<u8>> = orders[0]
+            .slots
+            .iter()
+            .map(|slot| {
+                ppu.render_layer_priority(slot.layer as usize, slot.priority)
+                    .expect("a layer")
+                    .rgba
+            })
+            .collect();
+        for x in 0..64 {
+            let at = (3 * 256 + x) * 4;
+            let front = images.iter().find(|image| image[at + 3] != 0);
+            let expected = front.map_or([0x00, 0xFF, 0x00], |image| {
+                [image[at], image[at + 1], image[at + 2]]
+            });
+            assert_eq!(fb.data[at..at + 3], expected, "column {x}");
+        }
+        // Mode 1's rules: a priority 3 sprite over BG2's priority 1 tile
+        // (cell 0); BG1's priority 1 tile over BG2's priority 0 one (cell
+        // 1); BG2's priority 1 tile over a priority 0 sprite and BG1's
+        // priority 0 tile (cell 2); BG1 over BG2, both of priority 1 (cell
+        // 3); BG2's priority 0 tile over a priority 1 sprite (cell 4); a
+        // priority 2 sprite over the backdrop (cell 6).
+        let colour = |x: usize| rgba_at(&fb.data, 256, x, 3);
+        let (red, blue, white) = (
+            [0xFF, 0x00, 0x00, 0xFF],
+            [0x00, 0x00, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        );
+        assert_eq!(
+            [
+                colour(4),
+                colour(12),
+                colour(20),
+                colour(28),
+                colour(36),
+                colour(52)
+            ],
+            [white, red, blue, red, blue, white]
+        );
+    }
+
+    #[test]
+    fn mode_7_s_bg1_has_one_priority_and_extbg_s_bg2_takes_the_pixel_s_top_bit() {
+        let mut ppu = layered_ppu();
+        ppu.bgmode = 7;
+        ppu.m7a = 0x0100;
+        ppu.m7d = 0x0100;
+        ppu.mode7_extbg = true;
+        ppu.bg_main_enable[1] = true;
+        // Every cell of the plane is character 0, whose pixels are 0x83 (top
+        // bit set) in columns 0 to 3 and 0x05 in columns 4 to 7.
+        for row in 0..8 {
+            for column in 0..8 {
+                let pixel: u16 = if column < 4 { 0x83 } else { 0x05 };
+                ppu.vram[row * 8 + column] = pixel << 8;
+            }
+        }
+        for index in [0x83, 0x05, 0x03] {
+            ppu.cgram[index] = 0x001F;
+        }
+        let mut columns = |layer: usize, priority: u8| {
+            let image = ppu.render_layer_priority(layer, priority).expect("a layer");
+            opaque_columns(&image.rgba, 3)
+        };
+        assert_eq!(
+            columns(0, 0),
+            (0..256).collect::<Vec<_>>(),
+            "BG1, all of it"
+        );
+        assert!(columns(0, 1).is_empty(), "BG1 has no priority bit");
+        let top_bit: Vec<usize> = (0..256).filter(|x| x % 8 < 4).collect();
+        let no_top_bit: Vec<usize> = (0..256).filter(|x| x % 8 >= 4).collect();
+        assert_eq!(columns(1, 1), top_bit);
+        assert_eq!(columns(1, 0), no_top_bit);
+        ppu.mode7_extbg = false;
+        assert!(
+            ppu.render_layer_priority(1, 1)
+                .expect("BG2")
+                .rgba
+                .iter()
+                .all(|&byte| byte == 0),
+            "no BG2 without EXTBG"
+        );
     }
 
     #[test]

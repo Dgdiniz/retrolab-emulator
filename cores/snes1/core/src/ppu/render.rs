@@ -53,12 +53,13 @@
 //! mid-frame switches the renderer on/off for the extra rows
 //! without rescheduling.
 
-use retro_core::capture::{NoTrace, PixelTrace};
+use retro_core::capture::{draw_order_runs, DrawOrder, DrawSlot, NoTrace, PixelTrace};
 use retro_core::video::ColourLevels;
 use retro_core::Framebuffer;
 
 use crate::ppu::colormath::{color_add, color_sub};
 use crate::ppu::picture::WovenRow;
+use crate::ppu::redraw::FIRST_LINE_PAST_OVERSCAN;
 use crate::ppu::trace::{pixel_layer, source_code, FrameTrace, MathOutcome, RowColumns};
 use crate::ppu::window::{col_region, window_inside};
 use crate::ppu::{window_layer, Ppu, LAYER_OBJ};
@@ -494,11 +495,7 @@ impl Ppu {
         // variant; Mode 7 reuses the same slot for the EXTBG flag
         // (`$2133` bit 6). OBJ is gated per-plane by `obj_main_enable`
         // / `obj_sub_enable`.
-        let priority_variant = if self.bgmode == 7 {
-            self.mode7_extbg
-        } else {
-            self.bg3_priority
-        };
+        let priority_variant = priority_variant(self.bgmode, self.bg3_priority, self.mode7_extbg);
         let backdrop = self.cgram()[0];
 
         // Main screen. Window layer-clip is applied whether or not
@@ -1010,31 +1007,25 @@ pub(crate) fn direct_color_word(pixel: u8, palette_number: u8) -> u16 {
     red | (green << 5) | (blue << 10)
 }
 
-/// One entry in a per-mode priority list: either a BG layer (split by
-/// its per-pixel priority bit) or the OBJ layer at a given 2-bit
-/// sprite priority. The compositor walks the list top-to-bottom and
-/// keeps the first opaque pixel per column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Layer {
-    /// A background layer, gated on its high/low priority bit.
-    Bg { id: u8, high: bool },
-    /// The sprite layer at one of the four OBJ priorities.
-    Obj { prio: u8 },
+/// A background's pixels in a priority list: BG `id` (`0..=3`, the
+/// layer list's ids) of priority bit `high`.
+const fn bg(id: u8, high: bool) -> DrawSlot {
+    DrawSlot::new(id as u32, high as u8)
 }
 
-impl Layer {
-    const fn bg(id: u8, high: bool) -> Self {
-        Self::Bg { id, high }
-    }
-    const fn obj(prio: u8) -> Self {
-        Self::Obj { prio }
-    }
+/// The sprites' pixels in a priority list, of sprite priority `prio`
+/// (`0..=3`).
+const fn obj(prio: u8) -> DrawSlot {
+    DrawSlot::new(LAYER_OBJ as u32, prio)
 }
 
 /// Per-mode priority list in highest-to-lowest order, interleaving the
 /// four OBJ priorities with the BG layers as fullsnes's priority table
 /// gives it (checked against bsnes-plus). The BG layers keep their relative
-/// order; the four `Obj` slots sit in between.
+/// order, each split by its per-pixel priority bit; the four OBJ slots sit
+/// in between. The compositor walks the list top-to-bottom and keeps the
+/// first opaque pixel per column, and [`Ppu::draw_order`] reports it as it
+/// stands, front to back.
 ///
 /// Mode 1's `bg3_priority` (`$2105` bit 3) lifts BG3's high-prio
 /// pixels above everything (including OBJ3), used by menu overlays
@@ -1043,80 +1034,67 @@ impl Layer {
 ///
 /// Mode 7 overloads `bg3_priority` to carry the EXTBG flag
 /// (`$2133` bit 6). Without EXTBG the plane is BG1 (sandwiched by the
-/// four OBJ priorities); with it, BG2 splits by its per-pixel priority
-/// bit around BG1.
-fn priority_layers(bgmode: u8, bg3_priority: bool) -> &'static [Layer] {
-    static MODE0: &[Layer] = &[
-        Layer::obj(3),
-        Layer::bg(0, true),
-        Layer::bg(1, true),
-        Layer::obj(2),
-        Layer::bg(0, false),
-        Layer::bg(1, false),
-        Layer::obj(1),
-        Layer::bg(2, true),
-        Layer::bg(3, true),
-        Layer::obj(0),
-        Layer::bg(2, false),
-        Layer::bg(3, false),
+/// four OBJ priorities), whose pixels have no priority bit (0); with it,
+/// BG2 splits by its pixel's top bit around BG1.
+fn priority_layers(bgmode: u8, bg3_priority: bool) -> &'static [DrawSlot] {
+    static MODE0: &[DrawSlot] = &[
+        obj(3),
+        bg(0, true),
+        bg(1, true),
+        obj(2),
+        bg(0, false),
+        bg(1, false),
+        obj(1),
+        bg(2, true),
+        bg(3, true),
+        obj(0),
+        bg(2, false),
+        bg(3, false),
     ];
-    static MODE1_NORMAL: &[Layer] = &[
-        Layer::obj(3),
-        Layer::bg(0, true),
-        Layer::bg(1, true),
-        Layer::obj(2),
-        Layer::bg(0, false),
-        Layer::bg(1, false),
-        Layer::obj(1),
-        Layer::bg(2, true),
-        Layer::obj(0),
-        Layer::bg(2, false),
+    static MODE1_NORMAL: &[DrawSlot] = &[
+        obj(3),
+        bg(0, true),
+        bg(1, true),
+        obj(2),
+        bg(0, false),
+        bg(1, false),
+        obj(1),
+        bg(2, true),
+        obj(0),
+        bg(2, false),
     ];
-    static MODE1_BG3_LIFTED: &[Layer] = &[
-        Layer::bg(2, true),
-        Layer::obj(3),
-        Layer::bg(0, true),
-        Layer::bg(1, true),
-        Layer::obj(2),
-        Layer::bg(0, false),
-        Layer::bg(1, false),
-        Layer::obj(1),
-        Layer::obj(0),
-        Layer::bg(2, false),
+    static MODE1_BG3_LIFTED: &[DrawSlot] = &[
+        bg(2, true),
+        obj(3),
+        bg(0, true),
+        bg(1, true),
+        obj(2),
+        bg(0, false),
+        bg(1, false),
+        obj(1),
+        obj(0),
+        bg(2, false),
     ];
-    static MODE_TWO_BG: &[Layer] = &[
-        Layer::obj(3),
-        Layer::bg(0, true),
-        Layer::obj(2),
-        Layer::bg(1, true),
-        Layer::obj(1),
-        Layer::bg(0, false),
-        Layer::obj(0),
-        Layer::bg(1, false),
+    static MODE_TWO_BG: &[DrawSlot] = &[
+        obj(3),
+        bg(0, true),
+        obj(2),
+        bg(1, true),
+        obj(1),
+        bg(0, false),
+        obj(0),
+        bg(1, false),
     ];
-    static MODE_ONE_BG: &[Layer] = &[
-        Layer::obj(3),
-        Layer::bg(0, true),
-        Layer::obj(2),
-        Layer::obj(1),
-        Layer::bg(0, false),
-        Layer::obj(0),
-    ];
-    static MODE7_NORMAL: &[Layer] = &[
-        Layer::obj(3),
-        Layer::obj(2),
-        Layer::obj(1),
-        Layer::bg(0, false),
-        Layer::obj(0),
-    ];
-    static MODE7_EXTBG: &[Layer] = &[
-        Layer::obj(3),
-        Layer::obj(2),
-        Layer::bg(1, true),
-        Layer::obj(1),
-        Layer::bg(0, false),
-        Layer::obj(0),
-        Layer::bg(1, false),
+    static MODE_ONE_BG: &[DrawSlot] = &[obj(3), bg(0, true), obj(2), obj(1), bg(0, false), obj(0)];
+    static MODE7_NORMAL: &[DrawSlot] = &[obj(3), obj(2), obj(1), bg(0, false), obj(0)];
+    static MODE7_EXTBG: &[DrawSlot] = &[
+        obj(3),
+        obj(2),
+        bg(1, true),
+        obj(1),
+        bg(0, false),
+        obj(0),
+        bg(1, false),
     ];
     match bgmode {
         0 => MODE0,
@@ -1137,6 +1115,52 @@ fn priority_layers(bgmode: u8, bg3_priority: bool) -> &'static [Layer] {
             }
         }
         _ => &[],
+    }
+}
+
+/// The variant of mode `bgmode`'s priority list a line takes
+/// ([`priority_layers`]): Mode 7's EXTBG bit `extbg` in Mode 7, Mode 1's
+/// BG3 priority bit `bg3_priority` in every other mode (only Mode 1 has
+/// two lists).
+fn priority_variant(bgmode: u8, bg3_priority: bool, extbg: bool) -> bool {
+    if bgmode == 7 {
+        extbg
+    } else {
+        bg3_priority
+    }
+}
+
+impl Ppu {
+    /// The order the held frame's lines put the layers in
+    /// ([`DrawOrder`]): each line's priority list ([`priority_layers`]),
+    /// front to back, the one the compositor walks. A line's mode, its
+    /// BG3 priority bit and its EXTBG bit are read from the settings it was
+    /// drawn with where the line table holds the frame
+    /// ([`Self::draws_from_line_states`]), else from the registers as they
+    /// stand, for every line the frame draws. Lines are counted from the
+    /// first drawn, scanline 1 line 0, as the picture's grid counts them.
+    pub fn draw_order(&self) -> Vec<DrawOrder> {
+        let layers = |bgmode: u8, bg3_priority: bool, extbg: bool| {
+            priority_layers(bgmode, priority_variant(bgmode, bg3_priority, extbg))
+        };
+        match self.recorders.lines.as_deref() {
+            Some(table) if self.draws_from_line_states() => {
+                draw_order_runs(table.lines().iter().map(|(scanline, state)| {
+                    (
+                        u32::from(*scanline).saturating_sub(1),
+                        layers(state.bgmode, state.bg3_priority, state.mode7_extbg),
+                    )
+                }))
+            }
+            _ => {
+                let slots = layers(self.bgmode, self.bg3_priority, self.mode7_extbg);
+                draw_order_runs(
+                    (1..FIRST_LINE_PAST_OVERSCAN)
+                        .filter(|&scanline| self.in_active_scanline(scanline))
+                        .map(|scanline| (u32::from(scanline) - 1, slots)),
+                )
+            }
+        }
     }
 }
 
@@ -1221,43 +1245,43 @@ fn composite_screen(
         color_exempt: false,
     }; MAX_SCANLINE_WIDTH];
     let mut written = [false; MAX_SCANLINE_WIDTH];
-    for layer in priority_layers(bgmode, bg3_priority) {
-        match *layer {
-            Layer::Bg { id, high } => {
-                let row = &rows[id as usize];
-                let clip = &clips[id as usize];
-                for x in 0..width {
-                    if written[x] || clip[lo(x)] {
-                        continue;
-                    }
-                    if row[x].opaque && row[x].priority == high {
-                        out[x] = ScreenPixel {
-                            color: row[x].color,
-                            source: PixelSource::Bg(id),
-                            color_exempt: false,
-                        };
-                        written[x] = true;
-                    }
-                }
+    for slot in priority_layers(bgmode, bg3_priority) {
+        if slot.layer == LAYER_OBJ as u32 {
+            if !obj_enabled {
+                continue;
             }
-            Layer::Obj { prio } => {
-                if !obj_enabled {
+            let prio = slot.priority;
+            let clip = &clips[4];
+            for x in 0..width {
+                if written[x] || clip[lo(x)] {
                     continue;
                 }
-                let clip = &clips[4];
-                for x in 0..width {
-                    if written[x] || clip[lo(x)] {
-                        continue;
-                    }
-                    let o = &obj_row[lo(x)];
-                    if o.opaque && o.prio == prio {
-                        out[x] = ScreenPixel {
-                            color: o.color,
-                            source: PixelSource::Obj,
-                            color_exempt: o.palette < 4,
-                        };
-                        written[x] = true;
-                    }
+                let o = &obj_row[lo(x)];
+                if o.opaque && o.prio == prio {
+                    out[x] = ScreenPixel {
+                        color: o.color,
+                        source: PixelSource::Obj,
+                        color_exempt: o.palette < 4,
+                    };
+                    written[x] = true;
+                }
+            }
+        } else {
+            let id = slot.layer as u8;
+            let high = slot.priority != 0;
+            let row = &rows[id as usize];
+            let clip = &clips[id as usize];
+            for x in 0..width {
+                if written[x] || clip[lo(x)] {
+                    continue;
+                }
+                if row[x].opaque && row[x].priority == high {
+                    out[x] = ScreenPixel {
+                        color: row[x].color,
+                        source: PixelSource::Bg(id),
+                        color_exempt: false,
+                    };
+                    written[x] = true;
                 }
             }
         }
@@ -1387,16 +1411,13 @@ mod tests {
         let l = priority_layers(0, false);
         assert_eq!(l.len(), 12);
         // OBJ3 sits at the very top, BG4-low at the very bottom.
-        assert_eq!(l[0], Layer::obj(3));
-        assert_eq!(l[1], Layer::bg(0, true));
-        assert_eq!(l[11], Layer::bg(3, false));
+        assert_eq!(l[0], obj(3));
+        assert_eq!(l[1], bg(0, true));
+        assert_eq!(l[11], bg(3, false));
         // The four OBJ priorities are all present, descending.
         let objs: Vec<u8> = l
             .iter()
-            .filter_map(|x| match x {
-                Layer::Obj { prio } => Some(*prio),
-                Layer::Bg { .. } => None,
-            })
+            .filter_map(|x| (x.layer == LAYER_OBJ as u32).then_some(x.priority))
             .collect();
         assert_eq!(objs, [3, 2, 1, 0]);
     }
@@ -1407,16 +1428,16 @@ mod tests {
         assert_eq!(
             l,
             [
-                Layer::obj(3),
-                Layer::bg(0, true),
-                Layer::bg(1, true),
-                Layer::obj(2),
-                Layer::bg(0, false),
-                Layer::bg(1, false),
-                Layer::obj(1),
-                Layer::bg(2, true),
-                Layer::obj(0),
-                Layer::bg(2, false),
+                obj(3),
+                bg(0, true),
+                bg(1, true),
+                obj(2),
+                bg(0, false),
+                bg(1, false),
+                obj(1),
+                bg(2, true),
+                obj(0),
+                bg(2, false),
             ]
         );
     }
@@ -1425,9 +1446,9 @@ mod tests {
     fn priority_layers_mode1_bg3_lifted() {
         let l = priority_layers(1, true);
         // BG3 high lifts above even OBJ3.
-        assert_eq!(l[0], Layer::bg(2, true));
-        assert_eq!(l[1], Layer::obj(3));
-        assert_eq!(l[2], Layer::bg(0, true));
+        assert_eq!(l[0], bg(2, true));
+        assert_eq!(l[1], obj(3));
+        assert_eq!(l[2], bg(0, true));
     }
 
     #[test]
@@ -1436,10 +1457,9 @@ mod tests {
             let l = priority_layers(mode, false);
             // 2 BGs x 2 priorities + 4 OBJ slots = 8 entries.
             assert_eq!(l.len(), 8, "mode {mode}");
-            assert!(l.iter().all(|x| match x {
-                Layer::Bg { id, .. } => *id == 0 || *id == 1,
-                Layer::Obj { .. } => true,
-            }));
+            assert!(l
+                .iter()
+                .all(|x| x.layer == LAYER_OBJ as u32 || x.layer <= 1));
         }
     }
 
@@ -1448,15 +1468,77 @@ mod tests {
         let l = priority_layers(6, false);
         assert_eq!(
             l,
+            [obj(3), bg(0, true), obj(2), obj(1), bg(0, false), obj(0),]
+        );
+    }
+
+    #[test]
+    fn the_draw_order_reads_the_registers_for_every_line_drawn_with_no_table() {
+        let mut ppu = Ppu::new();
+        ppu.bgmode = 1;
+        ppu.bg3_priority = true;
+        let order = |ppu: &Ppu| -> Vec<(u32, u32, &'static [DrawSlot])> {
+            ppu.draw_order()
+                .iter()
+                .map(|run| {
+                    let slots = priority_layers(
+                        ppu.bgmode,
+                        priority_variant(ppu.bgmode, ppu.bg3_priority, ppu.mode7_extbg),
+                    );
+                    assert_eq!(run.slots, slots);
+                    (run.first_line, run.lines, slots)
+                })
+                .collect()
+        };
+        assert_eq!(order(&ppu), [(0, 224, priority_layers(1, true))]);
+        ppu.overscan = true;
+        assert_eq!(order(&ppu), [(0, 239, priority_layers(1, true))]);
+        ppu.bgmode = 7;
+        ppu.mode7_extbg = true;
+        assert_eq!(
+            order(&ppu),
+            [(0, 239, priority_layers(7, true))],
+            "Mode 7 reads EXTBG, not the BG3 priority bit"
+        );
+    }
+
+    #[test]
+    fn the_draw_order_follows_each_line_s_settings_where_the_table_holds_the_frame() {
+        use retro_core::capture::CaptureRecording;
+        let mut ppu = Ppu::new();
+        ppu.set_recording_frame(1);
+        ppu.set_capture_recording(CaptureRecording {
+            line_states: true,
+            ..Default::default()
+        });
+        ppu.bgmode = 1;
+        for scanline in 1..=224 {
+            if scanline == 101 {
+                ppu.bgmode = 7;
+                ppu.mode7_extbg = true;
+            }
+            ppu.record_line_state(scanline);
+        }
+        ppu.note_picture_finished();
+        ppu.bgmode = 3;
+        let runs: Vec<(u32, u32, Vec<DrawSlot>)> = ppu
+            .draw_order()
+            .into_iter()
+            .map(|run| (run.first_line, run.lines, run.slots))
+            .collect();
+        assert_eq!(
+            runs,
             [
-                Layer::obj(3),
-                Layer::bg(0, true),
-                Layer::obj(2),
-                Layer::obj(1),
-                Layer::bg(0, false),
-                Layer::obj(0),
+                (0, 100, priority_layers(1, false).to_vec()),
+                (100, 124, priority_layers(7, true).to_vec())
             ]
         );
+        // A register the debugger edits makes the frame drawn from the
+        // registers as they stand.
+        ppu.note_registers_edited();
+        let runs = ppu.draw_order();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].slots, priority_layers(3, false));
     }
 
     #[test]
@@ -1695,13 +1777,7 @@ mod tests {
     fn priority_layers_mode7_normal_sandwiches_bg1_in_obj() {
         assert_eq!(
             priority_layers(7, false),
-            [
-                Layer::obj(3),
-                Layer::obj(2),
-                Layer::obj(1),
-                Layer::bg(0, false),
-                Layer::obj(0),
-            ]
+            [obj(3), obj(2), obj(1), bg(0, false), obj(0),]
         );
     }
 
@@ -1710,13 +1786,13 @@ mod tests {
         assert_eq!(
             priority_layers(7, true),
             [
-                Layer::obj(3),
-                Layer::obj(2),
-                Layer::bg(1, true),
-                Layer::obj(1),
-                Layer::bg(0, false),
-                Layer::obj(0),
-                Layer::bg(1, false),
+                obj(3),
+                obj(2),
+                bg(1, true),
+                obj(1),
+                bg(0, false),
+                obj(0),
+                bg(1, false),
             ]
         );
     }

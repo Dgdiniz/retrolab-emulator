@@ -2,8 +2,8 @@
 //! console, and the picture and snapshot helpers it reads.
 
 use retro_core::capture::{
-    CaptureCore, CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites,
-    PixelSources, RenderedLayer, VideoMemorySources,
+    CaptureCore, CaptureRecording, DrawOrder, FrameSnapshot, FrameWrites, LinePalettes,
+    LineSprites, PixelSources, RenderedLayer, VideoMemorySources,
 };
 use retro_core::cartridge::{SourcePlace, SOURCE_UNKNOWN};
 use retro_core::video::{
@@ -218,6 +218,30 @@ impl CaptureCore for SnesEmulator {
             image,
             from_line_states,
         })
+    }
+
+    /// `layer` as [`Self::render_layer`] takes it; `priority` a background
+    /// pixel's tile priority bit (0 or 1; in Mode 7 BG1's pixels are all 0
+    /// and EXTBG's BG2 takes the pixel's top bit) or a sprite's priority (0
+    /// to 3) ([`crate::ppu::Ppu::render_layer_priority`]).
+    fn render_layer_priority(&mut self, layer: u32, priority: u8) -> Option<RenderedLayer> {
+        let from_line_states = self.draws_from_line_states();
+        let image = self
+            .bus
+            .ppu_mut()
+            .render_layer_priority(layer as usize, priority)
+            .ok()?;
+        Some(RenderedLayer {
+            image,
+            from_line_states,
+        })
+    }
+
+    /// Each line's priority list for its mode, Mode 1's BG3 priority bit
+    /// and Mode 7's EXTBG bit ([`crate::ppu::Ppu::draw_order`]): BG1 to BG4
+    /// are layers 0 to 3, the sprites 4.
+    fn draw_order(&self) -> Vec<DrawOrder> {
+        self.bus.ppu().draw_order()
     }
 
     /// Answers only when the line table holds a whole frame, from its line 1

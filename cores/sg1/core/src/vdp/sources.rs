@@ -322,6 +322,10 @@ pub(super) struct LineTrace {
     pub(super) sprite_slot: [u8; LINE_WIDTH],
     sprite_tile: [u32; LINE_WIDTH],
     sprite_flips: [u16; LINE_WIDTH],
+    /// The priority bits of the planes' map entries the composite read, per
+    /// column: bit 0 plane A's (the window's where the window covers), bit
+    /// 1 plane B's.
+    plane_high: [u8; LINE_WIDTH],
     /// Where the pixel the composite left in the line's index buffers came
     /// from, per column.
     pen_layer: [u16; LINE_WIDTH],
@@ -357,6 +361,7 @@ impl LineTrace {
             sprite_slot: [0; LINE_WIDTH],
             sprite_tile: [0; LINE_WIDTH],
             sprite_flips: [0; LINE_WIDTH],
+            plane_high: [0; LINE_WIDTH],
             pen_layer: [layer::BACKDROP; LINE_WIDTH],
             pen_tile: [0; LINE_WIDTH],
             pen_cell: [NO_CELL; LINE_WIDTH],
@@ -452,6 +457,15 @@ impl LineTrace {
             layer: DRAWN_BY_SPRITE | self.sprite_flips[x],
             tile: self.sprite_tile[x],
             cell: u16::from(self.sprite_slot[x]),
+        }
+    }
+
+    /// The composite read column `x`'s map entries with priority bits
+    /// `plane_a` (plane A's, or the window's where it covers) and
+    /// `plane_b`.
+    pub(super) fn plane_priorities(&mut self, x: usize, plane_a: bool, plane_b: bool) {
+        if x < LINE_WIDTH {
+            self.plane_high[x] = u8::from(plane_a) | (u8::from(plane_b) << 1);
         }
     }
 
@@ -787,6 +801,18 @@ impl Vdp {
                 rgba,
             },
             from_line_states,
+        }
+    }
+
+    /// The priority of `layer`'s pixel at column `x` of the line last
+    /// composited with `trace`: the priority bit of the map entry plane A,
+    /// plane B or the window read there, or of the sprite pixel in front,
+    /// 1 high and 0 low.
+    pub(super) fn layer_priority(&self, layer: usize, x: usize, trace: &LineTrace) -> u8 {
+        match layer {
+            LAYER_PLANE_B => (trace.plane_high[x] >> 1) & 1,
+            LAYER_SPRITES => u8::from(self.sprite_line_priority[x]),
+            _ => trace.plane_high[x] & 1,
         }
     }
 

@@ -674,6 +674,12 @@ pub struct Ppu {
     /// for the length of that pass, never part of a savestate.
     pub(crate) isolated_layer: Option<usize>,
 
+    /// The one priority of the layer a [`Ppu::render_layer_priority`] pass
+    /// draws, as the layer's pixels carry it (a background tile's priority
+    /// bit, a sprite's priority); `None` for every pixel of the layer. Set
+    /// only for the length of that pass, never part of a savestate.
+    pub(crate) isolated_priority: Option<u8>,
+
     // -- Frame-global display-size state (transient, not savestated) --
     /// ORs whether each visible scanline of the current frame is 512 wide
     /// (a hires mode, Mode 5/6, or pseudo-hires) so
@@ -835,6 +841,7 @@ impl Ppu {
             sprite_tile_cache,
             debug_layer_disable: Default::default(),
             isolated_layer: None,
+            isolated_priority: None,
             frame_hires: false,
             render_interlace: false,
             line_hires: [false; MAX_OUTPUT_ROWS],

@@ -5,8 +5,8 @@ use super::GenesisEmulator;
 #[cfg(doc)]
 use crate::debugger::GenesisDebugger;
 use retro_core::capture::{
-    CaptureCore, CaptureRecording, FrameSnapshot, FrameWrites, LinePalettes, LineSprites,
-    PixelSources, RenderedLayer, VideoMemorySources,
+    CaptureCore, CaptureRecording, DrawOrder, FrameSnapshot, FrameWrites, LinePalettes,
+    LineSprites, PixelSources, RenderedLayer, VideoMemorySources,
 };
 use retro_core::video::{crop_rgba, LineStateTable, PixelImage, VideoDebugger};
 #[cfg(doc)]
@@ -143,6 +143,23 @@ impl CaptureCore for GenesisEmulator {
     /// ([`crate::vdp::Vdp::render_layer_image`]).
     fn render_layer(&mut self, layer: u32) -> Option<RenderedLayer> {
         self.bus.vdp_mut().render_layer_image(layer as usize)
+    }
+
+    /// `priority` is a plane's or the window's map cell priority bit, or a
+    /// sprite's priority bit: 1 high, 0 low
+    /// ([`crate::vdp::Vdp::render_layer_priority`]).
+    fn render_layer_priority(&mut self, layer: u32, priority: u8) -> Option<RenderedLayer> {
+        self.bus
+            .vdp_mut()
+            .render_layer_priority(layer as usize, priority)
+    }
+
+    /// One order in every line ([`crate::vdp::Vdp::draw_order`]), front to
+    /// back: the high sprites, plane A's and the window's high cells, plane
+    /// B's high cells, the low sprites, plane A's and the window's low
+    /// cells, plane B's low cells.
+    fn draw_order(&self) -> Vec<DrawOrder> {
+        self.bus.vdp().draw_order()
     }
 
     fn picture_from_line_states(&mut self) -> Option<PixelImage> {

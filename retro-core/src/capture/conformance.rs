@@ -14,13 +14,21 @@
 //! frame, write video memory every frame both by transfer and through the
 //! ports, and show its sprites in some frames and none in others. The first
 //! check holds it to that, so that no other check passes for want of
-//! anything to see.
+//! anything to see. In a frame that shows its sprites, nothing but the
+//! layers' priorities, and whether a layer is shown at all, may choose what
+//! shows: no window and no colour effect over a layer shown.
 //!
 //! A check that compares two machines runs both on the same frame loops in
 //! the same order: a core's loops may part by a sample of sound over a long
 //! run, which is no concern of the capture contract.
 
 use std::collections::BTreeSet;
+
+mod layers;
+pub use layers::{
+    a_layer_s_priorities_add_up_to_the_layer, the_draw_order_covers_the_frame_s_lines_once,
+    the_layers_stacked_in_the_draw_order_are_the_picture,
+};
 
 use crate::capture::{
     drawn_by, layer, line_flags, planes, CaptureCore, CaptureRecording, FrameWrite, LineSprites,
@@ -128,6 +136,9 @@ macro_rules! capture_conformance_tests {
             the_snapshot_s_grid_is_the_display_s,
             the_picture_is_whole_lines_of_the_line_table,
             a_sprite_s_picture_box_holds_where_its_lines_drew_it,
+            the_draw_order_covers_the_frame_s_lines_once,
+            a_layer_s_priorities_add_up_to_the_layer,
+            the_layers_stacked_in_the_draw_order_are_the_picture,
         );
     };
     (@each $core:expr; $($check:ident),+ $(,)?) => {

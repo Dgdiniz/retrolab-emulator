@@ -123,6 +123,24 @@ impl Vdp {
     /// whose contents are put back after with the rest of `DrawState`: the
     /// framebuffer and everything a savestate holds stay as they were.
     pub fn render_layer_image(&mut self, layer: usize) -> Option<RenderedLayer> {
+        self.render_layer_pixels(layer, None)
+    }
+
+    /// One layer of the frame drawn again with only its pixels of priority
+    /// `priority`, as [`Self::render_layer_image`] draws the layer: plane
+    /// A's, plane B's and the window's pixels take their map cell's
+    /// priority bit, a sprite's pixels its sprite's, 1 high and 0 low
+    /// ([`super::render::DRAW_ORDER`] says where each goes). The images of a
+    /// layer's two priorities add up to [`Self::render_layer_image`]'s.
+    /// `None` for a layer that is none of the debugger's.
+    pub fn render_layer_priority(&mut self, layer: usize, priority: u8) -> Option<RenderedLayer> {
+        self.render_layer_pixels(layer, Some(priority))
+    }
+
+    /// [`Self::render_layer_image`], with only the pixels of priority
+    /// `priority` when one is given: each line composited with a trace
+    /// that notes the planes' priority bits ([`LineTrace`]).
+    fn render_layer_pixels(&mut self, layer: usize, priority: Option<u8>) -> Option<RenderedLayer> {
         if layer >= LAYER_COUNT {
             return None;
         }
@@ -133,9 +151,16 @@ impl Vdp {
         let kept = DrawState::keep(self);
         let hidden = self.debug_layer_disable.take();
         let debug_pixel = self.debug_pixel.take();
+        let mut trace = priority.map(|priority| (priority, LineTrace::new()));
         let from_line_states = self.redraw_rows(lines, |vdp, line, row| {
             let start = vdp.picture_row(line) * width * 4;
-            vdp.draw_layer_row(layer, line, row, &mut rgba[start..start + width * 4]);
+            let pixels = &mut rgba[start..start + width * 4];
+            match trace.as_mut() {
+                Some((priority, trace)) => {
+                    vdp.draw_layer_row_of_priority(layer, *priority, line, row, pixels, trace)
+                }
+                None => vdp.draw_layer_row(layer, line, row, pixels),
+            }
         });
         self.debug_pixel = debug_pixel;
         self.debug_layer_disable = hidden;
@@ -463,6 +488,32 @@ impl Vdp {
         self.colour_row(row, pixels, |vdp, x| vdp.layer_pixel(layer, x));
     }
 
+    /// [`Self::draw_layer_row`] with only `layer`'s pixels of priority
+    /// `priority`: the line composited with `trace`, which notes the
+    /// priority bit of each plane's pixel ([`Self::layer_priority`]).
+    fn draw_layer_row_of_priority(
+        &mut self,
+        layer: usize,
+        priority: u8,
+        line: u16,
+        row: Option<&LineRecord>,
+        pixels: &mut [u8],
+        trace: &mut LineTrace,
+    ) {
+        if !self.row_is_drawn(row) {
+            return;
+        }
+        self.composite_scanline_with(line, trace);
+        let trace: &LineTrace = trace;
+        self.colour_row(row, pixels, |vdp, x| {
+            if vdp.layer_priority(layer, x, trace) == priority {
+                vdp.layer_pixel(layer, x)
+            } else {
+                None
+            }
+        });
+    }
+
     /// Colour `pixels` (one row of a layer's picture) from the line last
     /// composited: `pixel` gives the colour of column `x`, or `None` where
     /// the row stays transparent. The columns are coloured with the palette
@@ -549,6 +600,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::super::recording::JOURNAL_CAPACITY;
+    use super::super::LAYER_SPRITES;
     use super::*;
     use retro_core::capture::CaptureRecording;
 
@@ -620,6 +672,152 @@ mod tests {
         assert!(!red_at(&vdp, &picture, 0, 150));
         assert!(red_at(&vdp, &picture, 8, 150), "line 150 had eight pixels");
         assert_eq!(picture, framebuffer);
+    }
+
+    /// A VDP with the display on in the 40-cell mode, planes of 64 cells by
+    /// 32, drawing on lines 0 to 7 both planes and two sprites of both
+    /// priorities over one another, every cell eight pixels of one colour:
+    /// plane A's cells of
+    /// columns 0 to 3 are tile 1 (red), of high priority in columns 1 and
+    /// 3; plane B's cells of columns 0 to 5 tile 2 (green), high in columns
+    /// 0, 2, 3 and 5; sprite 0 is a cell of tile 3 (blue) of high priority at
+    /// x 0, linked to sprite 1, the same cell of low priority at x 16.
+    fn priority_vdp() -> Vdp {
+        let mut vdp = Vdp::new();
+        for (register, value) in [
+            (1, 0x44),
+            (2, 0x30),
+            (4, 0x07),
+            (5, 0x78),
+            (12, 0x81),
+            (13, 0x3F),
+            (15, 0x02),
+            (16, 0x01),
+        ] {
+            vdp.set_test_register(register, value);
+        }
+        for tile in 1..=3u8 {
+            vdp.write_vram_debug(u32::from(tile) * 32, &[tile * 0x11; 32]);
+        }
+        vdp.write_cram_debug(1, &[0x000E, 0x00E0, 0x0E00]);
+        for column in 0..4u16 {
+            let high: u16 = if column % 2 == 1 { 0x8000 } else { 0 };
+            vdp.write_vram_debug(0xC000 + 2 * u32::from(column), &(high | 1).to_be_bytes());
+        }
+        for column in 0..6u16 {
+            let high: u16 = if [0, 2, 3, 5].contains(&column) {
+                0x8000
+            } else {
+                0
+            };
+            vdp.write_vram_debug(0xE000 + 2 * u32::from(column), &(high | 2).to_be_bytes());
+        }
+        let sprite = |x: u16, link: u16, high: u16| -> Vec<u8> {
+            [0x0080, link, high | 3, 0x0080 + x]
+                .iter()
+                .flat_map(|word: &u16| word.to_be_bytes())
+                .collect()
+        };
+        vdp.write_vram_debug(0xF000, &sprite(0, 1, 0x8000));
+        vdp.write_vram_debug(0xF008, &sprite(16, 0, 0));
+        vdp
+    }
+
+    /// The pixels of row `y` of an RGBA image 320 wide that are opaque.
+    fn opaque_columns(rgba: &[u8], y: usize) -> Vec<usize> {
+        (0..320)
+            .filter(|x| rgba[(y * 320 + x) * 4 + 3] != 0)
+            .collect()
+    }
+
+    #[test]
+    fn a_layer_s_pixels_split_by_their_cell_s_or_sprite_s_priority() {
+        let mut vdp = priority_vdp();
+        let columns = |vdp: &mut Vdp, layer: usize, priority: u8| {
+            let image = vdp.render_layer_priority(layer, priority).expect("a layer");
+            opaque_columns(&image.image.rgba, 3)
+        };
+        let cells = |cells: &[usize]| -> Vec<usize> {
+            cells
+                .iter()
+                .flat_map(|cell| cell * 8..cell * 8 + 8)
+                .collect()
+        };
+        assert_eq!(columns(&mut vdp, LAYER_PLANE_A, 1), cells(&[1, 3]));
+        assert_eq!(columns(&mut vdp, LAYER_PLANE_A, 0), cells(&[0, 2]));
+        assert_eq!(columns(&mut vdp, LAYER_PLANE_B, 1), cells(&[0, 2, 3, 5]));
+        assert_eq!(columns(&mut vdp, LAYER_PLANE_B, 0), cells(&[1, 4]));
+        assert_eq!(columns(&mut vdp, LAYER_SPRITES, 1), cells(&[0]));
+        assert_eq!(columns(&mut vdp, LAYER_SPRITES, 0), cells(&[2]));
+        assert!(columns(&mut vdp, LAYER_WINDOW, 0).is_empty(), "no window");
+        assert!(columns(&mut vdp, LAYER_PLANE_A, 2).is_empty());
+        assert!(vdp.render_layer_priority(LAYER_COUNT, 0).is_none());
+
+        // The two priorities add up to the layer, pixel for pixel.
+        for layer in [LAYER_PLANE_A, LAYER_PLANE_B, LAYER_SPRITES] {
+            let whole = vdp.render_layer_image(layer).expect("a layer").image.rgba;
+            let low = vdp.render_layer_priority(layer, 0).expect("a layer");
+            let high = vdp.render_layer_priority(layer, 1).expect("a layer");
+            let added: Vec<u8> = low
+                .image
+                .rgba
+                .iter()
+                .zip(&high.image.rgba)
+                .map(|(low, high)| low | high)
+                .collect();
+            assert_eq!(added, whole, "layer {layer}");
+        }
+    }
+
+    #[test]
+    fn the_layers_stacked_in_the_draw_order_are_the_picture() {
+        let mut vdp = priority_vdp();
+        vdp.rerender_current_frame();
+        let picture = vdp.framebuffer_picture(320, 224);
+        assert_eq!(
+            vdp.draw_order(),
+            [retro_core::capture::DrawOrder {
+                first_line: 0,
+                lines: 224,
+                slots: super::super::render::DRAW_ORDER.to_vec()
+            }]
+        );
+        let images: Vec<Vec<u8>> = super::super::render::DRAW_ORDER
+            .iter()
+            .map(|slot| {
+                vdp.render_layer_priority(slot.layer as usize, slot.priority)
+                    .expect("a layer")
+                    .image
+                    .rgba
+            })
+            .collect();
+        let shown = |x: usize| -> Option<usize> {
+            let at = (3 * 320 + x) * 4;
+            images.iter().position(|image| image[at + 3] != 0)
+        };
+        for x in 0..64 {
+            let at = (3 * 320 + x) * 4;
+            match shown(x) {
+                Some(place) => assert_eq!(images[place][at..at + 3], picture[at..at + 3]),
+                None => assert_eq!(picture[at..at + 3], [0, 0, 0], "the backdrop"),
+            }
+        }
+        // Where every layer has a pixel the hardware's rules show: a high
+        // sprite over a low plane A and a high plane B (cell 0); a high
+        // plane A over a low plane B (cell 1); a high plane B over a low
+        // plane A and a low sprite (cell 2); plane A over plane B when both
+        // are high (cell 3).
+        let colour_at = |x: usize| picture[(3 * 320 + x) * 4..(3 * 320 + x) * 4 + 3].to_vec();
+        let (red, green, blue) = (
+            Vdp::convert_genesis_color(0x000E),
+            Vdp::convert_genesis_color(0x00E0),
+            Vdp::convert_genesis_color(0x0E00),
+        );
+        let rgb = |(r, g, b): (u8, u8, u8)| vec![r, g, b];
+        assert_eq!(
+            [colour_at(4), colour_at(12), colour_at(20), colour_at(28)],
+            [rgb(blue), rgb(red), rgb(green), rgb(red)]
+        );
     }
 
     #[test]
