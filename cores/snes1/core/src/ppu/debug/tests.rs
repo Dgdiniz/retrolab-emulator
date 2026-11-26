@@ -546,7 +546,7 @@ fn check_placements(overscan: bool, obj_interlace: bool, placements: &[Placement
         assert_eq!((entry.index, entry.y), (0, y), "{what}: the sprite table");
 
         let (painted, height) = rows_sprite_0_paints(&mut ppu);
-        assert_eq!(height, if overscan { 240 } else { 224 }, "{what}");
+        assert_eq!(height, if overscan { 239 } else { 224 }, "{what}");
         let expected: Vec<i32> = paints
             .iter()
             .flat_map(|&(first, last)| first..=last)

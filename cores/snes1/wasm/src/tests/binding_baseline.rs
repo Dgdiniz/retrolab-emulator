@@ -383,10 +383,10 @@ after a frame of 239 lines => {frame: 4n, region: "ntsc", stateHash: "bigint", s
 display after a frame of 239 lines => {data: Uint8ClampedArray(len 229376, fnv1a64 0xab440d62f2dac5c3), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0xdd3fe33805e1a8b9)
 isShowOverscanEnabled, shown => true
 after a frame of 239 lines shown => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after a frame of 239 lines shown => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0x0bcd9fd48d1992f6)
+display after a frame of 239 lines shown => {data: Uint8ClampedArray(len 244736, fnv1a64 0x94981b0a059357ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0xdf9b422104ebaec0)
 isShowOverscanEnabled, cropped => false
 after setShowOverscan(false) => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setShowOverscan(false) => {data: Uint8ClampedArray(len 245760, fnv1a64 0xd66f1f6f584a37ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0xb1a7bcf84ddf199f)
+display after setShowOverscan(false) => {data: Uint8ClampedArray(len 244736, fnv1a64 0x94981b0a059357ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0x9e817165905c246d)
 "#,
     );
 }

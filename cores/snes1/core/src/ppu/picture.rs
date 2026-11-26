@@ -23,6 +23,10 @@ use super::Ppu;
 /// with the eighth line drawn.
 pub(super) const CROPPED_OVERSCAN_LINES: u32 = 7;
 
+/// The lines an overscan frame draws, scanlines 1 to 239: its picture's
+/// height when the host shows the overscan.
+const OVERSCAN_LINES_DRAWN: u32 = 239;
+
 impl Ppu {
     /// Live display resolution in pixels as `(width, height)`.
     ///
@@ -36,7 +40,9 @@ impl Ppu {
     /// Height is 224 by default, doubled to 448 for *any* hires frame.
     /// An overscan frame (`$2133` bit 2) is cropped to the same 224
     /// (448) NTSC TV window unless the host enables `show_overscan`, in
-    /// which case the full 240 (480) is reported. Interlace hires
+    /// which case the 239 lines the renderer draws (scanlines 1 to 239,
+    /// [`Ppu::in_active_scanline`]) are reported, 478 rows hires: the
+    /// picture holds no row that no line drew. Interlace hires
     /// (`render_interlace`)
     /// reaches 448 by weaving both fields into distinct rows during
     /// rendering; non-interlace hires reaches the same 448 by vertically
@@ -59,9 +65,9 @@ impl Ppu {
         // frame is cropped to 224 (the renderer still draws all 239
         // lines; [`Self::finalize_frame`] centers the visible window so
         // the host crops from row 0). Only the explicit `show_overscan`
-        // toggle exposes the full 240-line frame.
+        // toggle exposes the whole overscan frame, the 239 lines drawn.
         let base_h = if self.overscan && self.show_overscan {
-            240
+            OVERSCAN_LINES_DRAWN
         } else {
             224
         };
@@ -460,9 +466,9 @@ mod tests {
         // Overscan hires, cropped to the TV window by default: 512x448.
         ppu.overscan = true;
         assert_eq!(ppu.active_display_size(), (512, 448));
-        // Overscan hires with the toggle on: full 512x480.
+        // Overscan hires with the toggle on: the 239 lines drawn, 512x478.
         ppu.set_show_overscan(true);
-        assert_eq!(ppu.active_display_size(), (512, 480));
+        assert_eq!(ppu.active_display_size(), (512, 478));
     }
 
     #[test]
@@ -563,9 +569,44 @@ mod tests {
         ppu.overscan = true;
         // Default: overscan is cropped to the 224-line NTSC TV window.
         assert_eq!(ppu.active_display_size(), (256, 224));
-        // Toggle on: the full 240-line frame is exposed.
+        // Toggle on: the 239 lines the frame draws are exposed.
         ppu.set_show_overscan(true);
-        assert_eq!(ppu.active_display_size(), (256, 240));
+        assert_eq!(ppu.active_display_size(), (256, 239));
+    }
+
+    #[test]
+    fn every_row_of_a_shown_overscan_picture_is_drawn() {
+        // A frame drawn line by line over a framebuffer of a colour no line
+        // draws: every row the reported picture holds is a line's (the
+        // backdrop's black at alpha 255), lo-res, hires and woven hires.
+        for (bgmode, interlace) in [(1, false), (5, false), (5, true)] {
+            let mut ppu = Ppu::new();
+            ppu.display_disable = false;
+            ppu.display_brightness = 15;
+            ppu.overscan = true;
+            ppu.interlace = interlace;
+            ppu.bgmode = bgmode;
+            ppu.set_show_overscan(true);
+            let mut fb = Framebuffer::new(512, 480);
+            fb.data.fill(0xAB);
+            for scanline in 1..=240 {
+                ppu.render_scanline(scanline, &mut fb);
+            }
+            ppu.finalize_frame(&mut fb);
+            let (width, height) = ppu.active_display_size();
+            let stride = fb.width as usize * 4;
+            for row in 0..height as usize {
+                let pixels = &fb.data[row * stride..row * stride + width as usize * 4];
+                assert!(
+                    pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 0xFF),
+                    "mode {bgmode}, interlace {interlace}: row {row} of {height} is not drawn"
+                );
+            }
+        }
     }
 
     #[test]

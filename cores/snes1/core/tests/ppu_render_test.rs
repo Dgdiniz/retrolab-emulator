@@ -1548,10 +1548,10 @@ fn active_display_size_reports_hires_dimensions() {
     bus.ppu_mut().render_scanline(1, &mut fb);
     assert_eq!(bus.ppu().active_display_size(), (512, 448));
 
-    // Mode 5 + overscan (non-interlace) -> 512x480.
+    // Mode 5 + overscan (non-interlace) -> 512x478, the 239 lines drawn.
     set_setini(&mut bus, 0x04);
     bus.ppu_mut().render_scanline(1, &mut fb);
-    assert_eq!(bus.ppu().active_display_size(), (512, 480));
+    assert_eq!(bus.ppu().active_display_size(), (512, 478));
 
     // Mode 5 + interlace ($2133 bit 0) -> 512x448 (two woven fields,
     // same height as the line-doubled non-interlace case).
@@ -1559,10 +1559,10 @@ fn active_display_size_reports_hires_dimensions() {
     bus.ppu_mut().render_scanline(1, &mut fb);
     assert_eq!(bus.ppu().active_display_size(), (512, 448));
 
-    // Mode 5 + overscan + interlace -> 512x480 (worst case).
+    // Mode 5 + overscan + interlace -> 512x478 (worst case).
     set_setini(&mut bus, 0x05);
     bus.ppu_mut().render_scanline(1, &mut fb);
-    assert_eq!(bus.ppu().active_display_size(), (512, 480));
+    assert_eq!(bus.ppu().active_display_size(), (512, 478));
 
     // Interlace is ignored outside hires: lo-res stays single-field.
     set_bgmode(&mut bus, 0, false);
@@ -1570,17 +1570,17 @@ fn active_display_size_reports_hires_dimensions() {
     bus.ppu_mut().render_scanline(1, &mut fb);
     assert_eq!(bus.ppu().active_display_size(), (256, 224));
 
-    // Mode 0 + overscan -> 256x240.
+    // Mode 0 + overscan -> 256x239.
     set_setini(&mut bus, 0x04);
     bus.ppu_mut().render_scanline(1, &mut fb);
-    assert_eq!(bus.ppu().active_display_size(), (256, 240));
+    assert_eq!(bus.ppu().active_display_size(), (256, 239));
 }
 
 #[test]
 fn active_display_size_crops_overscan_to_tv_window_by_default() {
     // Default host behavior (no show_overscan toggle) matches
     // bsnes-plus / snes9x NTSC output: an overscan frame is reported at
-    // the 224-line (448 hires) TV window, not the full 240/480.
+    // the 224-line (448 hires) TV window, not the whole 239/478.
     let (mut bus, _) = fresh_test_setup(15);
     let mut fb = fresh_fb_hires();
 
@@ -1598,7 +1598,7 @@ fn active_display_size_crops_overscan_to_tv_window_by_default() {
 
     // Enabling the toggle restores the full overscan dimensions.
     bus.ppu_mut().set_show_overscan(true);
-    assert_eq!(bus.ppu().active_display_size(), (512, 480));
+    assert_eq!(bus.ppu().active_display_size(), (512, 478));
 }
 
 #[test]
@@ -1853,9 +1853,9 @@ fn mode7_active_display_size_is_256_by_224() {
     // Overscan stays cropped to 224 by default; width stays 256.
     set_setini(&mut bus, 0x04);
     assert_eq!(bus.ppu().active_display_size(), (256, 224));
-    // The toggle exposes the full 240-line frame.
+    // The toggle exposes the whole overscan frame, its 239 lines.
     bus.ppu_mut().set_show_overscan(true);
-    assert_eq!(bus.ppu().active_display_size(), (256, 240));
+    assert_eq!(bus.ppu().active_display_size(), (256, 239));
 }
 
 // -------------------------------------------------------------

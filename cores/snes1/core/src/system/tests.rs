@@ -706,10 +706,10 @@ fn display_info_sync_tracks_hires_and_overscan() {
     assert_eq!(emu.get_display_info().width, 512);
     assert_eq!(emu.get_display_info().height, 448);
 
-    // The overscan toggle exposes the full 512x480 frame and the
+    // The overscan toggle exposes the whole frame, 512x478, and the
     // setter re-syncs display info immediately.
     emu.set_show_overscan(true);
-    assert_eq!(emu.get_display_info().height, 480);
+    assert_eq!(emu.get_display_info().height, 478);
     emu.set_show_overscan(false);
     assert_eq!(emu.get_display_info().height, 448);
 

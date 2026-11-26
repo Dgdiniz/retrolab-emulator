@@ -381,8 +381,8 @@ macro_rules! machine_bindings {
 
             /// A host's display preference, never part of a savestate: show
             /// the lines a console draws past its picture's usual height
-            /// (the SNES's 240-line frames; `false`, the default, crops them
-            /// to the 224-line window). It survives a reset and a
+            /// (the SNES's overscan frames, 239 lines; `false`, the default,
+            /// crops them to the 224-line window). It survives a reset and a
             /// savestate's load; a console that draws no such lines ignores
             /// it.
             #[wasm_bindgen(js_name = setShowOverscan)]

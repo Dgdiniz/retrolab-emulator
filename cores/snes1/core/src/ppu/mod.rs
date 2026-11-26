@@ -600,8 +600,8 @@ pub struct Ppu {
     /// When `false` (default) the visible frame is cropped to the
     /// 224-line NTSC "TV window": an overscan frame drops the top 7
     /// and bottom 8 scanlines, which is what bsnes-plus and snes9x
-    /// show by default. When `true`, the full 240-line (480
-    /// hires) overscan frame is exposed. This is a UI toggle, so it
+    /// show by default. When `true`, the whole overscan frame, the 239
+    /// lines drawn (478 rows hires), is exposed. This is a UI toggle, so it
     /// persists across reset and savestate restore, it is set by the
     /// host, never by emulated code.
     show_overscan: bool,
@@ -1360,7 +1360,8 @@ impl Ppu {
 
     /// Host display preference: see [`Self::show_overscan`]. When
     /// `false` (default) overscan frames are cropped to the 224-line
-    /// NTSC TV window; when `true` the full 240-line frame is exposed.
+    /// NTSC TV window; when `true` the whole overscan frame, its 239
+    /// lines, is exposed.
     pub fn set_show_overscan(&mut self, show: bool) {
         self.show_overscan = show;
     }

@@ -160,7 +160,7 @@ impl Console for Snes {
     const VIDEO_CHIP: &'static str = "PPU";
     const SOUND_CHIPS: &'static str = "S-DSP";
     const LAYER_NOTES: &'static str = "";
-    const OVERSCAN_HELP: &'static str = "Show the full overscan frame (240/480 tall) instead of \
+    const OVERSCAN_HELP: &'static str = "Show the full overscan frame (239/478 tall) instead of \
         cropping to the 224-line NTSC TV window. Off by default, matching bsnes-plus / snes9x \
         output";
     const CHIP_STATE_EXAMPLE: &'static str = "S-DD1 `DECOMPS > 0` + DMA shadow";
