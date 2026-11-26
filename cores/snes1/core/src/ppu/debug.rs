@@ -118,21 +118,19 @@ impl Ppu {
     /// The box sprite `s` covers on the picture, its position `(x, y)` as
     /// [`sprite_position`] gives it: the lines it covers (its height,
     /// halved under OBJ interlace, where a field shows every other row),
-    /// counted from the line drawn into the picture's first row, on the
-    /// picture's grid ([`Ppu::picture_grid`]).
+    /// laid on the picture's grid from where the picture starts
+    /// ([`Ppu::picture_grid`]: the overscan lines a cut frame leaves out are
+    /// above its first row).
     fn sprite_picture(&self, s: &SpriteAttrs, x: i32, y: i32) -> PictureRect {
         let lines = if self.obj_interlace {
             s.height >> 1
         } else {
             s.height
         };
-        // The lines of the frame above the picture's first row: the
-        // overscan lines a cropped frame leaves out.
-        let above = self.first_row_line() as i32 - 1;
         PictureRect::on_grid(
             self.picture_grid(),
             x,
-            y - above,
+            y,
             u32::from(s.width),
             u32::from(lines),
         )

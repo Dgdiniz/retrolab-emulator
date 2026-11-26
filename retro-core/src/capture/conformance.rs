@@ -989,8 +989,9 @@ pub fn the_picture_is_whole_lines_of_the_line_table<E: CaptureCore>(core: &CoreU
 }
 
 /// Every sprite a line of the held frame drew lies inside the box the
-/// sprite list gives it on the picture: the box starts at the sprite's x
-/// and spans its width, each dot taking the grid's columns, and holds every
+/// sprite list gives it on the picture: the box starts at the sprite's dot
+/// and line laid from where the picture starts, and spans its width, each
+/// dot taking the grid's columns and each line its rows, and holds every
 /// row of each line the picture shows that drew it. The sprite table gives
 /// the same box.
 pub fn a_sprite_s_picture_box_holds_where_its_lines_drew_it<E: CaptureCore>(
@@ -1002,6 +1003,8 @@ pub fn a_sprite_s_picture_box_holds_where_its_lines_drew_it<E: CaptureCore>(
     let frame = snapshot.frame;
     let columns = i64::from(snapshot.grid.columns_per_dot);
     let rows = i64::from(snapshot.grid.rows_per_line);
+    let first_dot = i64::from(snapshot.grid.first_dot);
+    let first_line = i64::from(snapshot.grid.first_line);
     let table = emu.line_states().expect("the line table is kept");
     let sprites = emu.line_sprites().expect("a program is loaded");
     let video = emu.video_debugger();
@@ -1033,11 +1036,16 @@ pub fn a_sprite_s_picture_box_holds_where_its_lines_drew_it<E: CaptureCore>(
             assert_eq!(
                 (x, i64::from(found.width)),
                 (
-                    i64::from(sprites.x[entry]) * columns,
+                    (i64::from(sprites.x[entry]) - first_dot) * columns,
                     i64::from(sprites.width[entry]) * columns
                 ),
                 "frame {frame}, line {number}: sprite {slot}'s box does not start at its x and \
                  span its width"
+            );
+            assert_eq!(
+                y,
+                (i64::from(sprite.y) - first_line) * rows,
+                "frame {frame}, line {number}: sprite {slot}'s box does not start on its line"
             );
             assert!(
                 y <= top && top + rows <= y + i64::from(found.height),

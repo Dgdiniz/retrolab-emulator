@@ -18,6 +18,11 @@ use retro_core::{Framebuffer, PictureGrid};
 use super::render::{MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH};
 use super::Ppu;
 
+/// The lines an overscan frame draws above the TV window, which its picture
+/// leaves out unless the host shows the overscan: the picture then starts
+/// with the eighth line drawn.
+pub(super) const CROPPED_OVERSCAN_LINES: u32 = 7;
+
 impl Ppu {
     /// Live display resolution in pixels as `(width, height)`.
     ///
@@ -70,16 +75,37 @@ impl Ppu {
     /// its two rows of a
     /// line two fields woven when the frame latched the interlace bit
     /// ([`Self::frame_interlaced`]), else one drawing repeated; any other
-    /// frame at one column a dot and one row a line.
+    /// frame at one column a dot and one row a line. The picture starts
+    /// with the first dot of the first line drawn (scanline 1), or of the
+    /// eighth when an overscan frame is cut to the TV window
+    /// ([`Self::lines_above_picture`]).
     pub fn picture_grid(&self) -> PictureGrid {
+        let first_line = self.lines_above_picture();
         if self.frame_hires {
             PictureGrid {
                 columns_per_dot: 2,
                 rows_per_line: 2,
                 woven: self.render_interlace,
+                first_dot: 0,
+                first_line,
             }
         } else {
-            PictureGrid::ONE
+            PictureGrid {
+                first_line,
+                ..PictureGrid::ONE
+            }
+        }
+    }
+
+    /// The lines the frame draws above its picture: the overscan lines
+    /// above the TV window ([`CROPPED_OVERSCAN_LINES`]) when an overscan
+    /// frame is cut to it, which [`Self::finalize_frame`] does unless the
+    /// host shows the overscan; none otherwise.
+    pub(super) fn lines_above_picture(&self) -> u32 {
+        if self.overscan && !self.show_overscan {
+            CROPPED_OVERSCAN_LINES
+        } else {
+            0
         }
     }
 
@@ -200,11 +226,9 @@ impl Ppu {
             return;
         }
         let fb_height = fb.height as usize;
-        let (offset_rows, disp_h) = if self.frame_hires {
-            (14usize, 448usize)
-        } else {
-            (7usize, 224usize)
-        };
+        let rows_per_line = if self.frame_hires { 2 } else { 1 };
+        let offset_rows = CROPPED_OVERSCAN_LINES as usize * rows_per_line;
+        let disp_h = 224 * rows_per_line;
         let copy_rows = disp_h.min(fb_height.saturating_sub(offset_rows));
         if copy_rows == 0 {
             return;
@@ -449,6 +473,7 @@ mod tests {
             columns_per_dot: 2,
             rows_per_line: 2,
             woven: true,
+            ..PictureGrid::ONE
         };
         for scanline in 1..240u16 {
             for grid_field in 0..2u8 {
@@ -489,7 +514,8 @@ mod tests {
                 PictureGrid {
                     columns_per_dot: 2,
                     rows_per_line: 2,
-                    woven
+                    woven,
+                    ..PictureGrid::ONE
                 }
             );
             let (width, height) = ppu.active_display_size();
@@ -503,6 +529,32 @@ mod tests {
             PictureGrid::ONE,
             "a lo-res frame weaves nothing"
         );
+    }
+
+    #[test]
+    fn the_picture_starts_at_the_eighth_line_drawn_when_the_overscan_is_cut() {
+        let mut ppu = Ppu::new();
+        assert_eq!(ppu.picture_grid().first_line, 0);
+        ppu.overscan = true;
+        for hires in [false, true] {
+            ppu.frame_hires = hires;
+            let grid = ppu.picture_grid();
+            assert_eq!(
+                (grid.first_dot, grid.first_line),
+                (0, 7),
+                "the seven lines above the TV window are cut, hires {hires}"
+            );
+            assert_eq!(
+                grid.first_line * u32::from(grid.rows_per_line),
+                if hires { 14 } else { 7 },
+                "the rows finalize_frame cuts"
+            );
+        }
+        ppu.set_show_overscan(true);
+        assert_eq!(ppu.picture_grid().first_line, 0, "nothing is cut");
+        ppu.overscan = false;
+        ppu.set_show_overscan(false);
+        assert_eq!(ppu.picture_grid().first_line, 0);
     }
 
     #[test]

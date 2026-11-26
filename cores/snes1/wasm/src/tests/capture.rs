@@ -810,8 +810,8 @@ fn the_frame_snapshot_reads_as_before() {
     let expected = [
         concat!(
             "{atBoundary: false, frame: 0, framebuffer: Uint8Array(len 229376, ",
-            "fnv1a64 0xc9b1e505f9a82325), grid: {columns_per_dot: 1, rows_per_line: 1, ",
-            "woven: false}, height: 224, oam: Uint8Array(len 544, ",
+            "fnv1a64 0xc9b1e505f9a82325), grid: {columns_per_dot: 1, first_dot: 0, ",
+            "first_line: 0, rows_per_line: 1, woven: false}, height: 224, oam: Uint8Array(len 544, ",
             "fnv1a64 0x9986ba9af2021da5), palette: Uint16Array(len 256, ",
             "fnv1a64 0x7da144b97d054b25), ppuSettings: {addsub_mode: false, ",
             "bg3_priority: false, bg_main_enable: [false, false, false, false], ",
@@ -862,8 +862,8 @@ fn the_frame_snapshot_reads_as_before() {
         ),
         concat!(
             "{atBoundary: true, frame: 3, framebuffer: Uint8Array(len 229376, ",
-            "fnv1a64 0x75f379eed654dafa), grid: {columns_per_dot: 1, rows_per_line: 1, ",
-            "woven: false}, height: 224, oam: Uint8Array(len 544, ",
+            "fnv1a64 0x75f379eed654dafa), grid: {columns_per_dot: 1, first_dot: 0, ",
+            "first_line: 0, rows_per_line: 1, woven: false}, height: 224, oam: Uint8Array(len 544, ",
             "fnv1a64 0xb3c3b956cfe107de), palette: Uint16Array(len 256, ",
             "fnv1a64 0x82bce97466c89cfc), ppuSettings: {addsub_mode: false, ",
             "bg3_priority: false, bg_main_enable: [true, false, false, false], ",

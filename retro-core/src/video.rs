@@ -54,15 +54,20 @@ pub struct PictureRect {
 
 impl PictureRect {
     /// The box that dots `x` to `x + width` of lines `y` to `y + height`
-    /// cover on a picture laid on `grid`, the lines counted from the
-    /// picture's first: every dot is `grid.columns_per_dot` columns and
-    /// every line `grid.rows_per_line` rows.
+    /// cover on a picture laid on `grid`, the dots and lines counted as a
+    /// sprite's box counts them ([`PictureGrid`]): the picture starts at
+    /// dot `grid.first_dot` of line `grid.first_line`, every dot is
+    /// `grid.columns_per_dot` columns and every line `grid.rows_per_line`
+    /// rows.
     pub fn on_grid(grid: PictureGrid, x: i32, y: i32, width: u32, height: u32) -> Self {
         let columns = grid.columns_per_dot;
         let rows = grid.rows_per_line;
+        let first_dot = i32::try_from(grid.first_dot).unwrap_or(i32::MAX);
+        let first_line = i32::try_from(grid.first_line).unwrap_or(i32::MAX);
         Self {
-            x: x.saturating_mul(i32::from(columns)),
-            y: y.saturating_mul(i32::from(rows)),
+            x: x.saturating_sub(first_dot)
+                .saturating_mul(i32::from(columns)),
+            y: y.saturating_sub(first_line).saturating_mul(i32::from(rows)),
             width: width.saturating_mul(u32::from(columns)),
             height: height.saturating_mul(u32::from(rows)),
         }
@@ -1104,6 +1109,7 @@ mod tests {
             columns_per_dot: 2,
             rows_per_line: 2,
             woven: true,
+            ..PictureGrid::ONE
         };
         assert_eq!(
             PictureRect::on_grid(twice, -4, 10, 16, 32),
@@ -1113,6 +1119,40 @@ mod tests {
                 width: 32,
                 height: 64
             }
+        );
+    }
+
+    #[test]
+    fn a_box_is_laid_from_where_the_picture_starts() {
+        let cut = PictureGrid {
+            first_dot: 3,
+            first_line: 7,
+            ..PictureGrid::ONE
+        };
+        assert_eq!(
+            PictureRect::on_grid(cut, -4, 10, 16, 32),
+            PictureRect {
+                x: -7,
+                y: 3,
+                width: 16,
+                height: 32
+            }
+        );
+        let twice = PictureGrid {
+            columns_per_dot: 2,
+            rows_per_line: 2,
+            first_line: 7,
+            ..PictureGrid::ONE
+        };
+        assert_eq!(
+            PictureRect::on_grid(twice, 0, 2, 8, 8),
+            PictureRect {
+                x: 0,
+                y: -10,
+                width: 16,
+                height: 16
+            },
+            "a line above the picture's first lies above its first row"
         );
     }
 

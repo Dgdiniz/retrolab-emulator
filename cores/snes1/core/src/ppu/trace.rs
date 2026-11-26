@@ -19,6 +19,7 @@
 use retro_core::capture::{drawn_by, layer, planes, tile_value, PixelSources, PixelTrace, NO_CELL};
 use retro_core::video::PixelImage;
 
+use super::picture::CROPPED_OVERSCAN_LINES;
 use super::render::{
     PixelSource, Screen, ScreenRow, MAX_OUTPUT_ROWS, MAX_SCANLINE_WIDTH, NORMAL_SCANLINE_WIDTH,
 };
@@ -711,11 +712,9 @@ pub(crate) fn normalize_rows<T: Copy>(data: &mut [T], shape: &PictureShape) {
         }
     }
     if shape.overscan && !shape.show_overscan {
-        let (offset_rows, shown_rows) = if shape.frame_hires {
-            (14, 448)
-        } else {
-            (7, 224)
-        };
+        let rows_per_line = if shape.frame_hires { 2 } else { 1 };
+        let offset_rows = CROPPED_OVERSCAN_LINES as usize * rows_per_line;
+        let shown_rows = 224 * rows_per_line;
         let copy_rows = shown_rows.min(MAX_OUTPUT_ROWS - offset_rows);
         data.copy_within(offset_rows * stride..(offset_rows + copy_rows) * stride, 0);
     }

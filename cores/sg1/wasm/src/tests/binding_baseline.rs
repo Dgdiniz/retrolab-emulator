@@ -341,7 +341,7 @@ fn the_machine_calls_and_what_each_leaves() {
     found.value("after loadStateAnyRom", machine(&emu));
     found.check(
         r#"
-getSystemInfo, new => {audio: {bits_per_sample: 16, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (3253 chars, fnv1a64 0x1d8c4dec750bf140)
+getSystemInfo, new => {audio: {bits_per_sample: 16, channels: 2, sample_rate: 44100}, cpus: [{address_width: 24, architect... (3282 chars, fnv1a64 0x88fe86091b83318d)
 getRomInfo, new => undefined
 after new => {frame: 0n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu68k", "z80", "vdp", "psg", "ym2612", "io", "bus", "timing", "ram", "z80_ram", "cartridge", "frame_count", "extension"]}
 getBuildId, up to the commit => "sg1@0.1.0+"
@@ -391,9 +391,9 @@ fn what_the_display_readers_answer() {
     found.value("display, headless frame", display(&emu));
     found.check(
         r#"
-display, new => {data: Uint8ClampedArray(len 286720, fnv1a64 0xe97846eb7709a325), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x8c0fb41cddd1d928)
-display, six frames => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x0ade6390f6b35e18)
-display, headless frame => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (424 chars, fnv1a64 0x0ade6390f6b35e18)
+display, new => {data: Uint8ClampedArray(len 286720, fnv1a64 0xe97846eb7709a325), displayInfo: {aspect_ratio: 1.3333... (453 chars, fnv1a64 0xe3fcd670b6143355)
+display, six frames => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (453 chars, fnv1a64 0x4bf0f195cf679ca9)
+display, headless frame => {data: Uint8ClampedArray(len 286720, fnv1a64 0x90450a1e4b4824fc), displayInfo: {aspect_ratio: 1.3333... (453 chars, fnv1a64 0x4bf0f195cf679ca9)
 "#,
     );
 }

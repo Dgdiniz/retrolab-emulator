@@ -92,9 +92,19 @@ pub struct DisplayInfo {
 }
 
 /// How a frame's picture lies over the console's grid of dots and lines:
-/// the picture columns a dot takes, the picture rows a line gives, and
-/// whether a line's rows are two fields woven together. The picture's
-/// first row is its first line's.
+/// the picture columns a dot takes, the picture rows a line gives, whether
+/// a line's rows are two fields woven together, and where the picture
+/// starts.
+///
+/// Dots and lines are counted as a sprite's box counts them
+/// ([`crate::video::SpriteData`]): a line from the first line the frame
+/// draws, a dot from the first dot of a line. The picture's first column
+/// shows dot [`Self::first_dot`] and its first row line
+/// [`Self::first_line`], so the picture's column `c` and row `r` show dot
+/// `first_dot + c / columns_per_dot` of line `first_line + r /
+/// rows_per_line`, of field `r % rows_per_line` on a woven picture; the
+/// other way, [`crate::video::PictureRect::on_grid`] lays a box of dots
+/// and lines on the picture, and [`Self::row`] gives a field's row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PictureGrid {
     /// Picture columns per dot: 2 on a picture drawn at two columns a dot
@@ -107,22 +117,33 @@ pub struct PictureGrid {
     /// field of its own. `false` when a line's rows repeat one drawing of
     /// it, and when a line gives one row.
     pub woven: bool,
+    /// The dot the picture's first column shows: 0 unless the picture
+    /// leaves dots at the start of each line out.
+    pub first_dot: u32,
+    /// The line the picture's first row shows: 0 unless the picture
+    /// leaves lines the frame draws above it out (the SNES's overscan
+    /// frame cut to the TV window).
+    pub first_line: u32,
 }
 
 impl PictureGrid {
-    /// One picture column a dot and one row a line.
+    /// One picture column a dot and one row a line, from the first dot of
+    /// the first line drawn.
     pub const ONE: Self = Self {
         columns_per_dot: 1,
         rows_per_line: 1,
         woven: false,
+        first_dot: 0,
+        first_line: 0,
     };
 
     /// The picture row that shows field `field` of line `line`, the line
-    /// counted from the picture's first. This is the one rule for which
-    /// field goes on which row: a woven picture draws field 0 of a line on
-    /// the line's first row (an even row) and field 1 on its second (an
-    /// odd row); on any other picture every field of a line is drawn on
-    /// the line's first row, and a doubled line repeats it on the next.
+    /// counted from the picture's first ([`Self::first_line`] less). This
+    /// is the one rule for which field goes on which row: a woven picture
+    /// draws field 0 of a line on the line's first row (an even row) and
+    /// field 1 on its second (an odd row); on any other picture every
+    /// field of a line is drawn on the line's first row, and a doubled line
+    /// repeats it on the next.
     pub fn row(&self, line: u32, field: u8) -> u32 {
         let rows = u32::from(self.rows_per_line.max(1));
         let first = line.saturating_mul(rows);
@@ -803,9 +824,9 @@ mod tests {
     #[test]
     fn a_woven_picture_puts_field_0_on_even_rows_and_field_1_on_odd_ones() {
         let grid = PictureGrid {
-            columns_per_dot: 1,
             rows_per_line: 2,
             woven: true,
+            ..PictureGrid::ONE
         };
         assert_eq!([grid.row(0, 0), grid.row(0, 1)], [0, 1]);
         assert_eq!([grid.row(5, 0), grid.row(5, 1)], [10, 11]);
@@ -817,7 +838,7 @@ mod tests {
         let grid = PictureGrid {
             columns_per_dot: 2,
             rows_per_line: 2,
-            woven: false,
+            ..PictureGrid::ONE
         };
         assert_eq!([grid.row(7, 0), grid.row(7, 1)], [14, 14]);
     }
@@ -828,10 +849,23 @@ mod tests {
             columns_per_dot: 2,
             rows_per_line: 2,
             woven: true,
+            first_dot: 0,
+            first_line: 7,
         };
         assert_eq!(
             serde_json::to_string(&grid).unwrap(),
-            r#"{"columns_per_dot":2,"rows_per_line":2,"woven":true}"#
+            r#"{"columns_per_dot":2,"rows_per_line":2,"woven":true,"first_dot":0,"first_line":7}"#
         );
+    }
+
+    #[test]
+    fn the_rows_of_a_line_do_not_depend_on_where_the_picture_starts() {
+        let grid = PictureGrid {
+            rows_per_line: 2,
+            woven: true,
+            first_line: 7,
+            ..PictureGrid::ONE
+        };
+        assert_eq!([grid.row(0, 0), grid.row(0, 1)], [0, 1]);
     }
 }

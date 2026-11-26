@@ -107,13 +107,14 @@ impl Vdp {
     /// How the picture lies over the dots and lines: one column a dot in
     /// both widths; one row a line, or in interlace mode 2 two rows a line,
     /// the line's two fields woven, the even field on its first row and the
-    /// odd field on its second.
+    /// odd field on its second. In every mode the picture starts with the
+    /// first dot of the first line drawn: it leaves no line or dot out.
     pub fn picture_grid(&self) -> PictureGrid {
         match self.interlace {
             Interlace::Double => PictureGrid {
-                columns_per_dot: 1,
                 rows_per_line: 2,
                 woven: true,
+                ..PictureGrid::ONE
             },
             Interlace::Off | Interlace::Normal => PictureGrid::ONE,
         }

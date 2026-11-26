@@ -322,6 +322,8 @@ mod double_resolution {
             columns_per_dot: 1,
             rows_per_line: 2,
             woven: true,
+            first_dot: 0,
+            first_line: 0,
         };
         let display = emu.get_display_info();
         assert_eq!(

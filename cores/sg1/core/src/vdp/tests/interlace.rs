@@ -169,8 +169,14 @@ fn the_interlace_mode_is_register_12_s_as_the_frame_began() {
         columns_per_dot: 1,
         rows_per_line: 2,
         woven: true,
+        first_dot: 0,
+        first_line: 0,
     };
-    assert_eq!(vdp.picture_grid(), woven);
+    assert_eq!(
+        vdp.picture_grid(),
+        woven,
+        "starting at the first line drawn"
+    );
     assert_eq!((vdp.drawn_height(), vdp.picture_height()), (224, 448));
     vdp.set_test_register(1, 0x4C);
     vdp.scanline(0);

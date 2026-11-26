@@ -177,8 +177,14 @@ macro_rules! display_bindings {
 
             /// The display's description: the size of the picture the core's
             /// framebuffer holds, its aspect, refresh rate and pixel format,
-            /// and `grid` (`{ columns_per_dot, rows_per_line, woven }`), how
-            /// the picture lies over the console's dots and lines.
+            /// and `grid` (`{ columns_per_dot, rows_per_line, woven,
+            /// first_dot, first_line }`), how the picture lies over the
+            /// console's dots and lines: the picture columns a dot takes,
+            /// the rows a line gives, whether a line's two rows are two
+            /// fields woven, and the dot and the line the picture's first
+            /// column and row show, counted as a sprite's `x` and `y` count
+            /// them (from the first dot of a line and the first line the
+            /// frame draws).
             #[wasm_bindgen(js_name = getDisplayInfo)]
             pub fn get_display_info(&self) -> $crate::__private::wasm_bindgen::JsValue {
                 $crate::js::to_js($crate::__private::retro_core::EmulatorCore::get_display_info(

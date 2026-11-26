@@ -73,8 +73,9 @@ pub fn recording_to_js(recording: CaptureRecording) -> JsValue {
 /// snapshot's shared fields, in this order, with `console` writing the
 /// console's own keys into the object after `palette` and before
 /// `registers`. `grid` is a plain object (`{ columns_per_dot,
-/// rows_per_line, woven }`, as `getDisplayInfo` gives it) and `registers`
-/// an array of plain objects (`{ index, name, value, description }`).
+/// rows_per_line, woven, first_dot, first_line }`, as `getDisplayInfo`
+/// gives it) and `registers` an array of plain objects (`{ index, name,
+/// value, description }`).
 pub fn frame_snapshot_object<C>(
     snapshot: &FrameSnapshot<C>,
     console: impl FnOnce(&C, &Object),
@@ -829,6 +830,8 @@ mod tests {
                 columns_per_dot: 2,
                 rows_per_line: 1,
                 woven: false,
+                first_dot: 0,
+                first_line: 7,
             },
             framebuffer: picture().rgba,
             vram: vec![0xAA, 0xBB],
@@ -874,7 +877,8 @@ mod tests {
             shape(&value),
             format!(
                 "{{atBoundary: true, frame: 12, framebuffer: {}, grid: {{columns_per_dot: 2, \
-                 rows_per_line: 1, woven: false}}, height: 1, palette: {}, registers: \
+                 first_dot: 0, first_line: 7, rows_per_line: 1, woven: false}}, height: 1, \
+                 palette: {}, registers: \
                  [{{description: \"display on\", index: 1, name: \"Mode\", value: 68}}], vram: \
                  {}, vsram: {}, width: 2}}",
                 typed("Uint8Array", 8, &picture().rgba),

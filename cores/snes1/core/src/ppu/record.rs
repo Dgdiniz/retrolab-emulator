@@ -902,14 +902,12 @@ impl Ppu {
             .is_some_and(LineRecorder::redraws_frame)
     }
 
-    /// The line drawn into the picture's first row: 8 when the overscan
-    /// lines above the TV window are cropped, else 1.
+    /// The line drawn into the picture's first row, numbered as the line
+    /// table numbers lines (the scanline, 1 the first drawn): 8 when the
+    /// overscan lines above the TV window are cut, else 1
+    /// ([`Ppu::lines_above_picture`]).
     pub(super) fn first_row_line(&self) -> u32 {
-        if self.overscan && !self.show_overscan {
-            8
-        } else {
-            1
-        }
+        1 + self.lines_above_picture()
     }
 
     /// The three video memories, borrowed together.
