@@ -205,6 +205,14 @@ impl<'a> CartridgeBuilder<'a> {
     /// Consume the builder and produce a boxed cartridge. See
     /// [`BuildError`] for failure modes.
     pub fn build(self) -> Result<Box<SnesCartridge>, BuildError> {
+        self.build_reporting_preset().map(|(cart, _)| cart)
+    }
+
+    /// [`Self::build`], with the preset the cartridge is built as: the
+    /// forced one, else the manifest's, else the detector's. What the
+    /// emulator reports of the cartridge it installs is that preset, never
+    /// what the header alone says.
+    pub fn build_reporting_preset(self) -> Result<(Box<SnesCartridge>, PresetKind), BuildError> {
         // Move the consumed buffers out of `self` up front so the DSP
         // and plain-cartridge construction paths below can each take
         // ownership without partial-move headaches.
@@ -567,7 +575,7 @@ impl<'a> CartridgeBuilder<'a> {
         if let Some(id) = battery_chip {
             cart = cart.with_battery_chip(id);
         }
-        Ok(Box::new(cart))
+        Ok((Box::new(cart), effective_kind))
     }
 }
 

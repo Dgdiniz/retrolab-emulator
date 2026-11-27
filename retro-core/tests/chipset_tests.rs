@@ -701,6 +701,73 @@ fn the_battery_chip_is_the_lowest_id_with_a_battery() {
     assert_eq!(set.battery(), Some(&[0xAB; 4][..]));
 }
 
+/// A chip that hosts a CPU of its own, as the SNES's SA-1, Super FX and Cx4
+/// do: it reports the CPU's registers, its program counter `pc`.
+struct CpuChip(OpaqueChip, u32);
+
+impl CpuChip {
+    fn boxed(chip_type: ExpansionChipType, pc: u32) -> Box<dyn Coprocessor> {
+        Box::new(Self(
+            OpaqueChip(ExpansionChipInfo {
+                name: "cpu".into(),
+                chip_type,
+                description: String::new(),
+                features: Vec::new(),
+            }),
+            pc,
+        ))
+    }
+}
+
+impl Coprocessor for CpuChip {
+    fn info(&self) -> &ExpansionChipInfo {
+        self.0.info()
+    }
+    fn read(&mut self, offset: u32, master_cycle: u64) -> u8 {
+        self.0.read(offset, master_cycle)
+    }
+    fn write(&mut self, _offset: u32, _value: u8, _master_cycle: u64) {}
+    fn reset(&mut self, _master_clock_hz: u64) {}
+    fn serialize(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn restore(&mut self, _data: &[u8], _master_clock_hz: u64) {}
+    fn debug_state(&self) -> ExpansionChipState {
+        self.0.debug_state()
+    }
+    fn label(&self) -> &str {
+        "cpu"
+    }
+    fn secondary_cpu_state(&self) -> Option<retro_core::CpuState> {
+        Some(retro_core::CpuState {
+            cpu_id: 0,
+            registers: Vec::new(),
+            pc: self.1,
+            flags: 0,
+        })
+    }
+}
+
+#[test]
+fn the_chip_that_hosts_a_cpu_is_the_one_whose_registers_the_set_reports() {
+    let mut set = ChipSet::default();
+    assert!(set.secondary_cpu_chip().is_none(), "no chip");
+    set.insert(1, FakeChip::boxed(ExpansionChipType::DSP1, "no CPU"));
+    assert!(
+        set.secondary_cpu_chip().is_none(),
+        "a chip with no CPU of its own"
+    );
+    set.insert(6, CpuChip::boxed(ExpansionChipType::SuperFX, 0x6000));
+    set.insert(3, CpuChip::boxed(ExpansionChipType::SA1, 0x3000));
+    let host = set.secondary_cpu_chip().expect("two chips host a CPU");
+    assert_eq!(
+        host.info().chip_type,
+        ExpansionChipType::SA1,
+        "the lowest id"
+    );
+    assert_eq!(set.secondary_cpu_state().map(|cpu| cpu.pc), Some(0x3000));
+}
+
 /// A console's own subtrait of the chip trait, for a set that reads more
 /// of its chips than the trait gives.
 trait Mapper: Coprocessor {

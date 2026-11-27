@@ -1,9 +1,8 @@
 //! What the host is told about the console: its CPUs (a cartridge's own
 //! CPU among them) and the pad's buttons.
 
+use retro_core::cartridge::ExpansionChipType;
 use retro_core::{ButtonInfo, CpuArchitecture, CpuInfo, CpuLocation};
-
-use crate::cartridge::PresetKind;
 
 /// The two CPUs every SNES console has: the 5A22 main CPU (65C816 core) and
 /// the SPC700 audio CPU. A cartridge coprocessor that hosts its own steppable
@@ -33,16 +32,17 @@ pub(super) fn snes_base_cpus() -> Vec<CpuInfo> {
 }
 
 /// CPU-roster entry (slot 2) for a cartridge's steppable secondary CPU, keyed
-/// off the installed preset. The SA-1 contributes its second 65816
-/// (`Mos65816`), the Super FX the GSU (`SuperFx`) and the Cx4 the HG51B
-/// (`Hg51b`). Each reports its own clock: about 10.74 MHz for the SA-1 and
-/// for the GSU at its default CLSR divider, 20 MHz for the Cx4. Every entry
-/// gets the 24-bit-address debugger treatment, but the architecture tag
-/// drives which register / flag layout the panel renders.
-pub(super) fn secondary_cpu_info(preset: Option<PresetKind>) -> CpuInfo {
-    let (name, architecture, clock_speed) = match preset {
-        Some(PresetKind::SuperFx) => ("Super FX GSU", CpuArchitecture::SuperFx, 10_740_000),
-        Some(PresetKind::Cx4) => ("Cx4 HG51B", CpuArchitecture::Hg51b, 20_000_000),
+/// off the chip that hosts it. The Super FX contributes the GSU (`SuperFx`),
+/// the Cx4 the HG51B (`Hg51b`), and the SA-1, the one other chip that hosts
+/// a CPU, its second 65816 (`Mos65816`). Each reports its own clock: about
+/// 10.74 MHz for the SA-1 and for the GSU at its default CLSR divider,
+/// 20 MHz for the Cx4. Every entry gets the 24-bit-address debugger
+/// treatment, but the architecture tag drives which register / flag layout
+/// the panel renders.
+pub(super) fn secondary_cpu_info(chip: ExpansionChipType) -> CpuInfo {
+    let (name, architecture, clock_speed) = match chip {
+        ExpansionChipType::SuperFX => ("Super FX GSU", CpuArchitecture::SuperFx, 10_740_000),
+        ExpansionChipType::CX4 => ("Cx4 HG51B", CpuArchitecture::Hg51b, 20_000_000),
         _ => ("SA-1 (WDC 65C816)", CpuArchitecture::Mos65816, 10_740_000),
     };
     CpuInfo {
@@ -109,10 +109,4 @@ pub(super) fn snes_button_layout() -> Vec<ButtonInfo> {
         entry("Start", BTN_START),
         entry("Select", BTN_SELECT),
     ]
-}
-
-/// Stable name for a preset (used as the `mapper` field of
-/// [`RomInfo`]).
-pub(super) fn preset_kind_name(kind: PresetKind) -> String {
-    kind.name().to_string()
 }

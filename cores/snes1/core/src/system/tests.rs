@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::scheduler::EventKind;
+use retro_core::cartridge::{CartridgeDebugger, ExpansionChipType, MapperId};
 use retro_core::cpu::Addressable;
 use retro_core::savestate::RomCheck;
 use retro_core::{CpuArchitecture, ExecutionMode, InputState};
@@ -169,6 +170,148 @@ fn manifest_override_changes_installed_plan() {
     emu.load_rom(&rom).expect("loads after clear");
     assert_eq!(emu.get_save_ram().map(<[u8]>::len), Some(2048));
     assert_eq!(emu.bus.cartridge().unwrap().map_plan().name, "hirom");
+}
+
+/// What the machine says of the cartridge it built: the mapper
+/// `get_rom_info` names, the cartridge debugger's mapper id, the preset, and
+/// the CPU in slot 2 by name and architecture.
+#[derive(Debug, PartialEq)]
+struct Reported {
+    mapper: Option<String>,
+    mapper_id: Option<MapperId>,
+    preset: Option<PresetKind>,
+    cartridge_cpu: Option<(String, CpuArchitecture)>,
+}
+
+fn reported(emu: &mut SnesEmulator) -> Reported {
+    Reported {
+        mapper: emu.get_rom_info().and_then(|info| info.mapper),
+        mapper_id: emu
+            .map_plan_debugger()
+            .get_mapper_state()
+            .map(|state| state.mapper_id),
+        preset: emu.preset_kind(),
+        cartridge_cpu: emu
+            .system_info()
+            .cpus
+            .get(CARTRIDGE_CPU)
+            .map(|cpu| (cpu.name.clone(), cpu.architecture)),
+    }
+}
+
+/// A manifest staged with a preset the header does not give is the
+/// cartridge the machine reports; with no manifest, or the detected one,
+/// it reports the header's.
+#[test]
+fn a_staged_manifest_s_preset_is_the_one_the_machine_reports() {
+    let rom = synth_hirom_2kib_sram_rom();
+    let mut emu = SnesEmulator::new();
+    emu.load_rom(&rom).expect("loads via detection");
+    let detected = reported(&mut emu);
+    assert_eq!(
+        detected,
+        Reported {
+            mapper: Some("HiROM".to_string()),
+            mapper_id: Some(MapperId::SnesHiROM),
+            preset: Some(PresetKind::HiRom),
+            cartridge_cpu: None,
+        }
+    );
+
+    let manifest = emu.detected_manifest(&rom);
+    emu.set_cartridge_manifest_override(Some(manifest.clone()));
+    emu.load_rom(&rom)
+        .expect("loads with the detected manifest");
+    assert_eq!(reported(&mut emu), detected, "the same cartridge");
+
+    let mut lorom = manifest;
+    lorom.mapping.preset = "lorom".to_string();
+    emu.set_cartridge_manifest_override(Some(lorom));
+    emu.load_rom(&rom).expect("loads as LoROM");
+    assert_eq!(
+        reported(&mut emu),
+        Reported {
+            mapper: Some("LoROM".to_string()),
+            mapper_id: Some(MapperId::SnesLoROM),
+            preset: Some(PresetKind::LoRom),
+            cartridge_cpu: None,
+        }
+    );
+    assert_eq!(emu.header().map(|h| h.map_mode), Some(0x21), "the header's");
+
+    emu.set_cartridge_manifest_override(None);
+    emu.load_rom(&rom).expect("loads after clear");
+    assert_eq!(reported(&mut emu), detected);
+}
+
+/// The chip a staged manifest builds names the CPU in slot 2, and so what
+/// the slot traces: a preset's own chip, or a Super FX that a LoROM board
+/// declares, whatever the header says.
+#[cfg(all(feature = "chip-sa1", feature = "chip-superfx", feature = "chip-cx4"))]
+#[test]
+fn the_chip_a_staged_manifest_builds_names_the_cartridge_cpu() {
+    let rom = synth_hirom_2kib_sram_rom();
+    let mut emu = SnesEmulator::new();
+    let detected = emu.detected_manifest(&rom);
+    let load = |emu: &mut SnesEmulator, manifest: CartridgeManifest| {
+        emu.set_cartridge_manifest_override(Some(manifest));
+        emu.load_rom(&rom).expect("loads with the manifest");
+        reported(emu)
+    };
+    let cases = [
+        (
+            "superfx",
+            "Super FX",
+            "Super FX GSU",
+            CpuArchitecture::SuperFx,
+            true,
+        ),
+        ("cx4", "Cx4", "Cx4 HG51B", CpuArchitecture::Hg51b, true),
+        (
+            "sa1",
+            "SA-1",
+            "SA-1 (WDC 65C816)",
+            CpuArchitecture::Mos65816,
+            false,
+        ),
+    ];
+    for (preset, mapper, cpu, architecture, traced) in cases {
+        let mut manifest = detected.clone();
+        manifest.mapping.preset = preset.to_string();
+        let found = load(&mut emu, manifest);
+        assert_eq!(found.mapper.as_deref(), Some(mapper), "{preset}");
+        assert_eq!(
+            found.cartridge_cpu,
+            Some((cpu.to_string(), architecture)),
+            "{preset}"
+        );
+        assert_eq!(
+            emu.trace_to_text(CARTRIDGE_CPU, &[]).is_some(),
+            traced,
+            "{preset}: the slot traces the chip's CPU"
+        );
+    }
+
+    let on_lorom = crate::cartridge::parse_manifest(
+        r#"{"core":"snes1","version":"1.0","rom":{"sha256":"","size":4194304},
+        "mapping":{"preset":"lorom"},
+        "chips":[{"id":8,"kind":"superfx","mapping":{"bank_range":["0x00","0x3F"],
+        "offset_range":["0x3000","0x34FF"],"target":{"kind":"ChipMmio","chip_id":8},
+        "speed":"Fast"}}]}"#,
+    )
+    .expect("parses");
+    let found = load(&mut emu, on_lorom);
+    assert_eq!(found.preset, Some(PresetKind::LoRom));
+    assert_eq!(found.mapper_id, Some(MapperId::SnesLoROM));
+    assert_eq!(
+        found.cartridge_cpu,
+        Some(("Super FX GSU".to_string(), CpuArchitecture::SuperFx)),
+        "the chip names the CPU, not the preset"
+    );
+
+    emu.set_cartridge_manifest_override(None);
+    emu.load_rom(&rom).expect("loads after clear");
+    assert_eq!(reported(&mut emu).cartridge_cpu, None, "the slot goes");
 }
 
 #[test]
@@ -545,17 +688,6 @@ fn destination_region_str_known_codes() {
     assert_eq!(destination_region_str(0x02), "Europe");
     assert_eq!(destination_region_str(0x09), "Germany");
     assert_eq!(destination_region_str(0xFF), "Unknown");
-}
-
-#[test]
-fn preset_kind_name_lorom_hirom_exhirom_custom() {
-    assert_eq!(preset_kind_name(PresetKind::LoRom), "LoROM");
-    assert_eq!(preset_kind_name(PresetKind::HiRom), "HiROM");
-    assert_eq!(preset_kind_name(PresetKind::ExHiRom), "ExHiROM");
-    assert_eq!(preset_kind_name(PresetKind::Sdd1), "S-DD1");
-    assert_eq!(preset_kind_name(PresetKind::Spc7110), "SPC7110");
-    assert_eq!(preset_kind_name(PresetKind::Sa1), "SA-1");
-    assert_eq!(preset_kind_name(PresetKind::Custom), "Custom");
 }
 
 #[test]
@@ -1091,13 +1223,16 @@ fn nmi_delivery_falls_back_to_window_when_main_thread_does_not_poll() {
 
 #[test]
 fn the_third_cpu_reports_its_own_clock() {
-    assert_eq!(secondary_cpu_info(None).clock_speed, 10_740_000);
     assert_eq!(
-        secondary_cpu_info(Some(PresetKind::SuperFx)).clock_speed,
+        secondary_cpu_info(ExpansionChipType::SA1).clock_speed,
         10_740_000
     );
     assert_eq!(
-        secondary_cpu_info(Some(PresetKind::Cx4)).clock_speed,
+        secondary_cpu_info(ExpansionChipType::SuperFX).clock_speed,
+        10_740_000
+    );
+    assert_eq!(
+        secondary_cpu_info(ExpansionChipType::CX4).clock_speed,
         20_000_000
     );
 }

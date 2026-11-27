@@ -73,7 +73,7 @@ use crate::scheduler::{schedule_frame_events, EventKind, TimingProfile};
 use retro_core::frame::EventQueue;
 
 use debug::SpcPeekBus;
-use descriptors::{preset_kind_name, secondary_cpu_info, snes_base_cpus, snes_button_layout};
+use descriptors::{secondary_cpu_info, snes_base_cpus, snes_button_layout};
 
 /// Stereo capacity of the host audio ring buffer (interleaved L/R,
 /// 44.1 kHz `f32`).
@@ -483,7 +483,9 @@ impl SnesEmulator {
         self.header.as_ref()
     }
 
-    /// Detected/forced mapper kind for the currently loaded ROM.
+    /// The preset the installed cartridge was built as: a staged
+    /// manifest's when one was staged at its load, else the one the header
+    /// gives. `None` before a load.
     pub fn preset_kind(&self) -> Option<PresetKind> {
         self.preset_kind
     }
@@ -908,8 +910,8 @@ impl EmulatorCore for SnesEmulator {
             // the installed plan (builder precedence: manifest > header).
             builder = builder.with_manifest(manifest.clone()).skip_sha256_check();
         }
-        let cart = match builder.build() {
-            Ok(cart) => cart,
+        let (cart, preset) = match builder.build_reporting_preset() {
+            Ok(built) => built,
             Err(e) => {
                 if let crate::cartridge::BuildError::UnsupportedChip { chip } = &e {
                     self.last_unsupported_chip = Some(chip);
@@ -922,19 +924,16 @@ impl EmulatorCore for SnesEmulator {
         // already validated the ROM, but it doesn't expose the
         // header on the trait, we re-run detection (and fall back
         // to a plain offset sweep for manifest-driven layouts that
-        // the detector would have rejected).
-        let detected = detect_preset_with_threshold(data, i32::MIN);
-        let (header_opt, preset_opt) = match detected {
-            Some(DetectedPreset { kind, header, .. }) => (Some(header), Some(kind)),
-            None => {
-                let header = HEADER_CANDIDATES
-                    .iter()
-                    .find_map(|&offset| try_parse_header(data, offset));
-                (header, None)
-            }
+        // the detector would have rejected). The preset is the one the
+        // cartridge was built as, a staged manifest's when one is
+        // staged, never this detection's.
+        self.header = match detect_preset_with_threshold(data, i32::MIN) {
+            Some(DetectedPreset { header, .. }) => Some(header),
+            None => HEADER_CANDIDATES
+                .iter()
+                .find_map(|&offset| try_parse_header(data, offset)),
         };
-        self.header = header_opt;
-        self.preset_kind = preset_opt;
+        self.preset_kind = Some(preset);
         self.rom_size = data.len();
         // Another game's coverage says nothing of this one's code: it is
         // cleared, while loading the same image again keeps it. The image
@@ -1004,15 +1003,17 @@ impl EmulatorCore for SnesEmulator {
         // two-CPU console. Rebuild the roster (which clamps `set_focused_cpu`)
         // from the base on every load so a hot-swap back to a plain ROM drops
         // the extra slot, and mirror it into the debugger (whose copy backs
-        // `get_cpu_info`).
-        let has_secondary = self
+        // `get_cpu_info`). The chip that hosts the CPU names it, whatever
+        // preset the cartridge was built as: a manifest can put a Super FX
+        // on a LoROM board.
+        let cartridge_cpu_chip = self
             .bus
             .cartridge()
-            .map(|c| c.secondary_cpu_state().is_some())
-            .unwrap_or(false);
+            .and_then(|c| c.chips().secondary_cpu_chip())
+            .map(|chip| chip.info().chip_type);
         let mut cpus = snes_base_cpus();
-        if has_secondary {
-            cpus.push(secondary_cpu_info(self.preset_kind));
+        if let Some(chip) = cartridge_cpu_chip {
+            cpus.push(secondary_cpu_info(chip));
         }
         // The cartridge's CPU decides what slot 2 traces: the GSU's or the
         // Cx4's entries, or nothing (the SA-1, a cartridge with no CPU). A
@@ -1027,6 +1028,12 @@ impl EmulatorCore for SnesEmulator {
         Ok(())
     }
 
+    /// The header's title, region and checksum, the file's size, and the
+    /// mapper of the cartridge built ([`CartridgeInfo::mapper_info`], which
+    /// the Mega Drive's reads too): a staged manifest's preset when one is
+    /// staged.
+    ///
+    /// [`CartridgeInfo::mapper_info`]: retro_core::cartridge::CartridgeInfo::mapper_info
     fn get_rom_info(&self) -> Option<RomInfo> {
         let header = self.header.as_ref()?;
         Some(RomInfo {
@@ -1034,7 +1041,11 @@ impl EmulatorCore for SnesEmulator {
             region: destination_region_str(header.destination).to_string(),
             size: self.rom_size,
             checksum: header.checksum as u32,
-            mapper: self.preset_kind.map(preset_kind_name),
+            mapper: self
+                .bus
+                .cartridge()
+                .and_then(|cart| cart.info().mapper_info.as_ref())
+                .map(|mapper| mapper.name.clone()),
             title_confidence: "high".to_string(),
         })
     }

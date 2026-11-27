@@ -689,6 +689,18 @@ impl<C: ?Sized + Coprocessor> ChipSetOf<C> {
             .find_map(|c| c.secondary_cpu_state())
     }
 
+    /// The first present chip that hosts a steppable secondary CPU: the
+    /// chip whose CPU [`Self::secondary_cpu_state`] reports, for a console
+    /// to name that CPU by the chip ([`Coprocessor::info`]). `None` when no
+    /// chip hosts one.
+    pub fn secondary_cpu_chip(&self) -> Option<&C> {
+        self.chips
+            .iter()
+            .flatten()
+            .map(|chip| &**chip)
+            .find(|chip| chip.secondary_cpu_state().is_some())
+    }
+
     /// Single-step the first present chip's steppable secondary CPU by one
     /// instruction. `None` when no chip hosts one.
     pub fn step_secondary_cpu(&mut self) -> Option<crate::emulator::StepResult> {

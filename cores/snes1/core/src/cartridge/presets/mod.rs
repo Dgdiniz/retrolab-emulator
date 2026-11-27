@@ -208,7 +208,19 @@ mod tests {
             MapperId::Custom("my-board".to_string()),
             "a manifest's own plan is named by the plan"
         );
-        assert_eq!(PresetKind::Sa1.name(), "SA-1");
-        assert_eq!(PresetKind::Custom.name(), "Custom");
+        let names = [
+            (PresetKind::LoRom, "LoROM"),
+            (PresetKind::HiRom, "HiROM"),
+            (PresetKind::ExHiRom, "ExHiROM"),
+            (PresetKind::Sdd1, "S-DD1"),
+            (PresetKind::Spc7110, "SPC7110"),
+            (PresetKind::Sa1, "SA-1"),
+            (PresetKind::SuperFx, "Super FX"),
+            (PresetKind::Cx4, "Cx4"),
+            (PresetKind::Custom, "Custom"),
+        ];
+        for (kind, name) in names {
+            assert_eq!(kind.name(), name);
+        }
     }
 }

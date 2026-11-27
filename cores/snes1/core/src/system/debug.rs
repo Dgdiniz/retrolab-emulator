@@ -92,18 +92,24 @@ impl SnesEmulator {
     /// A [`CartridgeDebugger`](retro_core::cartridge::CartridgeDebugger) over
     /// the installed cartridge, bound to the live breakpoint list:
     /// memory-map / ROM / SRAM regions from the installed
-    /// [`crate::cartridge::MapPlan`], the mapper state (the preset's
-    /// [`crate::cartridge::PresetKind::mapper_id`]), the per-chip coprocessor
-    /// snapshots, and ROM/SRAM breakpoints delegating into the emulator's
-    /// own breakpoint list. The same surface as the Mega Drive's;
-    /// [`EmulatorCore::cartridge_debugger`] is it boxed.
+    /// [`crate::cartridge::MapPlan`], the mapper state (the mapper the
+    /// cartridge was built with, its
+    /// [`CartridgeInfo::mapper_info`](retro_core::cartridge::CartridgeInfo::mapper_info):
+    /// the [`crate::cartridge::PresetKind::mapper_id`] of its preset), the
+    /// per-chip coprocessor snapshots, and ROM/SRAM breakpoints delegating
+    /// into the emulator's own breakpoint list. The same surface as the Mega
+    /// Drive's; [`EmulatorCore::cartridge_debugger`] is it boxed.
     pub fn map_plan_debugger(
         &mut self,
     ) -> retro_core::cartridge::MapPlanDebugger<'_, crate::cartridge::MapSlot> {
         let plan = self.bus.cartridge_plan().cloned().unwrap_or_default();
         let rom_size = self.rom_size as u32;
         let sram_size = self.bus.cartridge_sram().map(<[u8]>::len).unwrap_or(0) as u32;
-        let mapper_id = self.preset_kind.map(|kind| kind.mapper_id(&plan.name));
+        let mapper_id = self
+            .bus
+            .cartridge()
+            .and_then(|cart| cart.info().mapper_info.as_ref())
+            .map(|mapper| mapper.mapper_id.clone());
         // Snapshot every coprocessor's state and label up front (owned), so
         // the immutable cartridge borrow ends before we borrow the
         // breakpoint list mutably below.

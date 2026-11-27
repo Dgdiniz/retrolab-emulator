@@ -228,8 +228,9 @@ impl Console for Snes {
     }
 
     /// The file and its size, then the header: its title and how sure the
-    /// detector is of it, the region, the mapping, the sizes, the vectors
-    /// and the checksum.
+    /// detector is of it, the region, the mapping (the preset the cartridge
+    /// was built as, a manifest's when one is given, beside the header's
+    /// map mode and speed), the sizes, the vectors and the checksum.
     fn write_rom_header(
         emu: &SnesEmulator,
         rom: &[u8],
@@ -252,7 +253,7 @@ impl Console for Snes {
             )?;
             writeln!(out, "Region:      {}", info.region)?;
         }
-        let mapper = emu.preset_kind().map_or("unknown", preset_name);
+        let mapper = emu.preset_kind().map_or("unknown", PresetKind::name);
         let Some(h) = emu.header() else {
             return writeln!(out, "Mapper:      {mapper} (no parsed header)");
         };
@@ -322,21 +323,6 @@ impl Console for Snes {
 
     fn run_command(command: crate::cmd::Command) -> Result<()> {
         crate::cmd::run(command)
-    }
-}
-
-/// The name `info` gives a cartridge's mapping.
-fn preset_name(kind: PresetKind) -> &'static str {
-    match kind {
-        PresetKind::LoRom => "LoROM",
-        PresetKind::HiRom => "HiROM",
-        PresetKind::ExHiRom => "ExHiROM",
-        PresetKind::Sdd1 => "S-DD1",
-        PresetKind::Spc7110 => "SPC7110",
-        PresetKind::Sa1 => "SA-1",
-        PresetKind::SuperFx => "Super FX",
-        PresetKind::Cx4 => "Cx4",
-        PresetKind::Custom => "Custom",
     }
 }
 
