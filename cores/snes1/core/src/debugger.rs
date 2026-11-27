@@ -221,7 +221,7 @@ impl ConsoleDebug for SnesDebugConsole {
             code: snes_events::DMA_DONE,
             kind: EventKind::TransferDone,
             label: "DMA done",
-            description: "A general DMA channel finished its block, by the B-bus port it wrote",
+            description: "A general DMA channel finished its block, by its B-bus port",
             param: EventParam::Choice {
                 label: "B-bus port",
                 options: &[

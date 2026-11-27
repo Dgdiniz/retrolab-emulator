@@ -11,7 +11,7 @@
 //!
 //! ## Framebuffer presentation
 //!
-//! The core renders into a worst-case 512x240 [`Framebuffer`] with the
+//! The core renders into a worst-case 512x480 [`Framebuffer`] with the
 //! active image in a top-left sub-rectangle at the full `fb.width`
 //! stride. The renderer uploads a `width x height` texture straight from
 //! [`RetroEmulator::get_framebuffer_ptr`] / `get_framebuffer_len`, so it
@@ -333,12 +333,13 @@ impl RetroEmulator {
     /// The files of sample `source` (0-255) of the directory the S-DSP's
     /// registers name, read from ARAM as it stands, keyed on at `pitches`
     /// by `voices` (each once, in the order they came): `{ brr,
-    /// brr_looped, wav, info }`, `brr` its blocks as they sit in ARAM,
-    /// `brr_looped` the same after the 2-byte loop header AddmusicK and
-    /// BRRtools read, `wav` its values as a 32 kHz WAV with its loop as a
-    /// voice plays it, pass after pass until it repeats, the passes it
-    /// repeats in a `smpl` chunk (each a `Uint8Array`), and `info` the text
-    /// of its JSON description; the bytes `brr-dump` writes of the sample.
+    /// brr_looped, wav, info }`, `brr` its blocks as they sit in ARAM
+    /// (whole 9-byte blocks, which BRRtools reads, its loop given with
+    /// `-l`), `brr_looped` the same after the 2-byte loop header AddmusicK
+    /// reads, `wav` its values as a 32 kHz WAV with its loop as a voice
+    /// plays it, pass after pass until it repeats, the passes it repeats in
+    /// a `smpl` chunk (each a `Uint8Array`), and `info` the text of its JSON
+    /// description; the bytes `brr-dump` writes of the sample.
     #[wasm_bindgen(js_name = encodeBrrSample)]
     pub fn encode_brr_sample(&self, source: u8, pitches: Vec<u32>, voices: Vec<u8>) -> JsValue {
         let files = self.snes.sample_files(source, pitches, voices);

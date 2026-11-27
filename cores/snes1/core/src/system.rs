@@ -86,9 +86,10 @@ const AUDIO_RING_CAPACITY: usize = 8192;
 
 /// Worst-case SNES output width in pixels (Mode 5/6 hires).
 const MAX_FB_WIDTH: u32 = 512;
-/// Worst-case SNES output height in pixels: 240 visible lines with
-/// overscan, doubled to 480 by Mode 5/6 interlace (`$2133` bit 0),
-/// which the renderer weaves into a single 512x480 frame.
+/// The framebuffer's height in rows: room for the tallest picture, an
+/// overscan frame's 239 lines at the two rows a line a hires frame takes
+/// (two fields woven with interlace, `$2133` bit 0, else each line drawn
+/// twice): 478 rows.
 const MAX_FB_HEIGHT: u32 = 480;
 /// Default non-hires width reported via `DisplayInfo` at boot.
 const DEFAULT_FB_WIDTH: u32 = 256;
@@ -191,9 +192,9 @@ pub struct SnesEmulator {
     /// clears it first.
     cartridge_manifest_override: Option<CartridgeManifest>,
 
-    /// Host display preference: when `true`, expose the full 240-line
-    /// overscan frame; when `false` (default), crop to the 224-line NTSC
-    /// TV window. Stored here (not just on the PPU) so it survives the
+    /// Host display preference: when `true`, expose the 239 lines an
+    /// overscan frame draws; when `false` (default), crop to the 224-line
+    /// NTSC TV window. Stored here (not just on the PPU) so it survives the
     /// wholesale bus rebuild in [`EmulatorCore::load_rom`], `reset`
     /// re-applies it to the live PPU. It is a UI toggle, never emulated
     /// state, so it is intentionally outside savestate.
@@ -1110,8 +1111,11 @@ impl EmulatorCore for SnesEmulator {
 
     /// When `false` (default) overscan frames are cropped to the 224-line
     /// NTSC TV window (matching bsnes-plus / snes9x default output); when
-    /// `true` the full 240-line frame is exposed. Applies immediately and
-    /// survives reset / savestate restore.
+    /// `true` the 239 lines an overscan frame draws are exposed. The
+    /// display's size and grid follow at once; the framebuffer keeps the
+    /// frame finished before the change, cropped or not as it was then,
+    /// until the next frame is finished. It survives reset / savestate
+    /// restore.
     fn set_show_overscan(&mut self, show: bool) {
         self.show_overscan = show;
         self.bus.ppu_mut().set_show_overscan(show);

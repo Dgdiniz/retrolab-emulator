@@ -46,12 +46,14 @@
 //!
 //! ## Overscan
 //!
-//! With `$2133` bit 2 set the visible region extends from 224 to
-//! 240 lines. The scheduler always fires `RenderPos` for SNES
-//! lines `1..=240` and [`Ppu::in_active_scanline`] gates the lower
-//! end based on the live overscan bit, so flipping overscan
-//! mid-frame switches the renderer on/off for the extra rows
-//! without rescheduling.
+//! With `$2133` bit 2 set a frame draws 239 lines (scanlines 1 to
+//! 239) where it draws 224 without. The scheduler always fires
+//! `RenderPos` for SNES lines `1..=240` and [`Ppu::in_active_scanline`]
+//! gates the lower end based on the live overscan bit, so flipping
+//! overscan mid-frame switches the renderer on or off for the extra
+//! lines without rescheduling. They draw only before the vertical
+//! blank, which the bit as it stood when the frame began places:
+//! line 240 with overscan, else 225 on NTSC and 240 on PAL.
 
 use retro_core::capture::{draw_order_runs, DrawOrder, DrawSlot, NoTrace, PixelTrace};
 use retro_core::video::ColourLevels;
@@ -198,8 +200,9 @@ impl Ppu {
     /// plane.
     ///
     /// Skips line 0 (top pre-render) and any scanline beyond the
-    /// active region. The active region is 224 lines normally and
-    /// 240 lines with overscan (`$2133` bit 2); the live bit is
+    /// active region. The active region is 224 lines normally
+    /// (scanlines 1 to 224) and 239 with overscan (`$2133` bit 2,
+    /// scanlines 1 to 239); the live bit is
     /// consulted via [`Ppu::in_active_scanline`] so that
     /// mid-frame overscan toggles flip the gate without rescheduling
     /// the H-event timeline.

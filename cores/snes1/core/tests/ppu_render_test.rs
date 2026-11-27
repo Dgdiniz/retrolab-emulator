@@ -1462,7 +1462,7 @@ fn mode6_offset_per_tile_uses_bg3_lookup() {
 }
 
 // -------------------------------------------------------------
-// Overscan (240 visible lines via $2133 bit 2)
+// Overscan (239 visible lines via $2133 bit 2)
 // -------------------------------------------------------------
 
 #[test]

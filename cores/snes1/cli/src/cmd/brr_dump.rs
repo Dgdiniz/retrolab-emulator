@@ -1,11 +1,12 @@
 //! `brr-dump`: run a ROM and write its BRR samples as files: each sample's
-//! blocks as a `.brr` (raw, or after the 2-byte loop header AddmusicK and
-//! BRRtools read), its values as a 32 kHz WAV with its loop as a voice
-//! plays it (pass after pass until the loop repeats, the passes it repeats
-//! marked as the loop), and a `.json` of what it is (its source number, the
-//! directory, its start and loop, its blocks, how it ends, the passes of
-//! its loop the WAV holds and how many of them repeat, and the pitches and
-//! voices it was keyed on at).
+//! blocks as a `.brr` (raw, whole 9-byte blocks, which BRRtools reads, its
+//! loop given with `-l`; or after the 2-byte loop header AddmusicK reads),
+//! its values as a 32 kHz WAV with its loop as a voice plays it (pass after
+//! pass until the loop repeats, the passes it repeats marked as the loop),
+//! and a `.json` of what it is (its source number, the directory, its start
+//! and loop, its blocks, how it ends, the passes of its loop the WAV holds
+//! and how many of them repeat, and the pitches and voices it was keyed on
+//! at).
 //!
 //! The samples are read from ARAM at the end of the run, through the
 //! directory then in force; the pitches and voices are the key-ons the

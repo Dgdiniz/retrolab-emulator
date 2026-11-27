@@ -581,8 +581,9 @@ pub struct Ppu {
     /// Bit 3: pseudo-hires (mode-5 style without enabling mode 5
     /// proper): the line is 512 columns, the sub screen on the even ones.
     pseudo_hires: bool,
-    /// Bit 2: overscan, extends visible scanlines from 224 to
-    /// 240, shifts the VBlank gate accordingly.
+    /// Bit 2: overscan, which extends the lines drawn from 224
+    /// (scanlines 1 to 224) to 239 (scanlines 1 to 239) and moves
+    /// the PPU's vertical-blank gate from line 225 to line 240.
     overscan: bool,
     /// Bit 1: sprite interlace.
     obj_interlace: bool,

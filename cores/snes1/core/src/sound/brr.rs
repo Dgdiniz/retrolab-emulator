@@ -1,9 +1,10 @@
-//! A BRR sample as files: the `.brr` of its blocks, as they sit in ARAM or
-//! after the 2-byte loop header AddmusicK and BRRtools read (the loop
-//! block's place in bytes from the sample's start, low byte first); the WAV
-//! of its values at the S-DSP's 32 kHz, the rate a pitch of 0x1000 plays it
-//! at, its loop played as a voice plays it until it repeats, the passes it
-//! repeats in a `smpl` chunk; and what `sample.json` says of it.
+//! A BRR sample as files: the `.brr` of its blocks, as they sit in ARAM
+//! (whole 9-byte blocks, which BRRtools reads, its loop given with `-l`) or
+//! after the 2-byte loop header AddmusicK reads (the loop block's place in
+//! bytes from the sample's start, low byte first); the WAV of its values at
+//! the S-DSP's 32 kHz, the rate a pitch of 0x1000 plays it at, its loop
+//! played as a voice plays it until it repeats, the passes it repeats in a
+//! `smpl` chunk; and what `sample.json` says of it.
 
 use retro_core::audio::{encode_wav_samples, wav_with_loop, SoundSamples};
 use serde::Serialize;
