@@ -348,10 +348,36 @@ macro_rules! savestate_codec {
 /// reads its payload and stops, so a build older than an extension loads
 /// the state as if the extension were not there. Fields are only ever
 /// appended, and `VERSION` counts the sets appended; a build reads a newer
-/// set as far as it knows it.
+/// set as far as it knows it, and an older set through
+/// [`SavestateExtension::read_older`].
 pub trait SavestateExtension: Serialize + DeserializeOwned + Default + PartialEq {
     /// The sets of fields this build knows; 0 for a console with none.
     const VERSION: u32;
+
+    /// The extension an older build wrote at `version`, below
+    /// [`Self::VERSION`]. `bytes` are its fields, what follows the
+    /// version, read with [`read_extension_part`] as that build wrote
+    /// them; the sets appended since take what the machine holds without
+    /// them. bincode reads every field in order, so an older set, which
+    /// ends before the sets appended since, cannot be read as this
+    /// build's. The default refuses; a console overrides it once it
+    /// appends a set.
+    fn read_older(version: u32, bytes: &[u8]) -> Result<Self, String> {
+        let _ = bytes;
+        Err(format!(
+            "savestate extension version {version} is not read by this build"
+        ))
+    }
+}
+
+/// Fields of an extension an older build wrote, read with the options
+/// [`open`] reads an extension with: how a console's
+/// [`SavestateExtension::read_older`] reads an older set.
+pub fn read_extension_part<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    use bincode::Options;
+    bincode_options()
+        .deserialize(bytes)
+        .map_err(|e| format!("savestate extension unreadable: {e}"))
 }
 
 impl SavestateExtension for () {
@@ -512,11 +538,22 @@ pub fn open<P: SavestatePayload>(
         if rest.is_empty() {
             P::Extension::default()
         } else {
-            let (_version, extension): (u32, P::Extension) =
-                bincode_options().deserialize(rest).map_err(|e| {
-                    LoadStateError::Unreadable(format!("savestate extension unreadable: {e}"))
-                })?;
-            extension
+            // The version first: a set this build knows, or a newer one it
+            // reads as far as it knows it, is read whole; an older one is
+            // the console's to read.
+            let version: u32 = bincode_options().deserialize(rest).map_err(|e| {
+                LoadStateError::Unreadable(format!("savestate extension unreadable: {e}"))
+            })?;
+            if version >= P::Extension::VERSION {
+                let (_version, extension): (u32, P::Extension) =
+                    bincode_options().deserialize(rest).map_err(|e| {
+                        LoadStateError::Unreadable(format!("savestate extension unreadable: {e}"))
+                    })?;
+                extension
+            } else {
+                let fields = &rest[std::mem::size_of::<u32>()..];
+                P::Extension::read_older(version, fields).map_err(LoadStateError::Unreadable)?
+            }
         }
     };
     Ok((envelope.payload, extension))
@@ -851,6 +888,24 @@ mod tests {
         assert_eq!(env.created_at, 5);
     }
 
+    /// The test payload sealed with `extension` after it as it stands: a
+    /// version and fields another build wrote.
+    fn sealed_with_extension_bytes(extension: &[u8]) -> Vec<u8> {
+        let mut bytes = bincode::serialize(&SaveStateEnvelope {
+            envelope_version: RETRO_SAVESTATE_ENVELOPE_VERSION,
+            core_id: "test".to_string(),
+            core_version: 2,
+            rom_hash: "aa11".to_string(),
+            created_at: 0,
+            payload: test_payload(),
+        })
+        .unwrap();
+        bytes.extend_from_slice(extension);
+        let mut sealed = RETRO_SAVESTATE_MAGIC.to_vec();
+        sealed.extend(zstd::encode_all(&bytes[..], 3).unwrap());
+        sealed
+    }
+
     #[test]
     fn a_newer_extension_is_read_as_far_as_this_build_knows_it() {
         #[derive(Serialize)]
@@ -859,18 +914,8 @@ mod tests {
             flag: Option<u8>,
             later: u64,
         }
-        let payload = test_payload();
-        let mut bytes = bincode::serialize(&SaveStateEnvelope {
-            envelope_version: RETRO_SAVESTATE_ENVELOPE_VERSION,
-            core_id: "test".to_string(),
-            core_version: 2,
-            rom_hash: "aa11".to_string(),
-            created_at: 0,
-            payload: payload.clone(),
-        })
-        .unwrap();
-        bytes.extend(
-            bincode::serialize(&(
+        let sealed = sealed_with_extension_bytes(
+            &bincode::serialize(&(
                 2u32,
                 Newer {
                     busy: 4,
@@ -880,8 +925,6 @@ mod tests {
             ))
             .unwrap(),
         );
-        let mut sealed = RETRO_SAVESTATE_MAGIC.to_vec();
-        sealed.extend(zstd::encode_all(&bytes[..], 3).unwrap());
         let (_, x) = open::<TestPayload>(&sealed, Some(ROM), RomCheck::SameRom).unwrap();
         assert_eq!(
             x,
@@ -889,6 +932,123 @@ mod tests {
                 busy: 4,
                 flag: Some(1)
             }
+        );
+    }
+
+    /// The test console in a later build, whose extension appended a set:
+    /// `later`, which the machine holds at 0 without it.
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct LaterPayload {
+        version: u32,
+        ram: Vec<u8>,
+        title: String,
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+    struct LaterExtension {
+        busy: u32,
+        flag: Option<u8>,
+        later: u64,
+    }
+
+    impl SavestateExtension for LaterExtension {
+        const VERSION: u32 = 2;
+
+        fn read_older(version: u32, bytes: &[u8]) -> Result<Self, String> {
+            match version {
+                1 => {
+                    let (busy, flag): (u32, Option<u8>) = read_extension_part(bytes)?;
+                    Ok(Self {
+                        busy,
+                        flag,
+                        later: 0,
+                    })
+                }
+                _ => Err(format!("no version {version}")),
+            }
+        }
+    }
+
+    impl SavestatePayload for LaterPayload {
+        crate::savestate_codec!();
+
+        const FORMAT: SavestateFormat = SavestateFormat {
+            core_id: "test",
+            version: 2,
+        };
+        type Extension = LaterExtension;
+        fn validate(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn hash_parts(&self) -> Vec<(&'static str, u64)> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn an_older_extension_is_read_by_the_console_from_its_own_fields() {
+        // The earlier build seals its set.
+        let older = seal(
+            &test_payload(),
+            &TestExtension {
+                busy: 4,
+                flag: Some(1),
+            },
+            "aa11",
+            0,
+        )
+        .unwrap();
+        let (payload, x) = open::<LaterPayload>(&older, Some(ROM), RomCheck::SameRom).unwrap();
+        assert_eq!(payload.ram, test_payload().ram);
+        assert_eq!(
+            x,
+            LaterExtension {
+                busy: 4,
+                flag: Some(1),
+                later: 0
+            }
+        );
+        // The later build's own set reads whole, and the earlier build
+        // reads it as far as it knows it.
+        let later = LaterExtension {
+            busy: 5,
+            flag: None,
+            later: 77,
+        };
+        let sealed = seal(&payload, &later, "aa11", 0).unwrap();
+        let (_, x) = open::<LaterPayload>(&sealed, Some(ROM), RomCheck::SameRom).unwrap();
+        assert_eq!(x, later);
+        let (_, x) = open::<TestPayload>(&sealed, Some(ROM), RomCheck::SameRom).unwrap();
+        assert_eq!(
+            x,
+            TestExtension {
+                busy: 5,
+                flag: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_extension_no_reader_knows_is_refused_with_its_text() {
+        let sealed = sealed_with_extension_bytes(&bincode::serialize(&(0u32, 9u32)).unwrap());
+        assert_eq!(
+            refusal(&sealed, Some(ROM), RomCheck::SameRom),
+            "savestate extension version 0 is not read by this build"
+        );
+        // A console's reader refuses in its own words, and a set cut short
+        // is unreadable.
+        let older = sealed_with_extension_bytes(&bincode::serialize(&(0u32, 1u8)).unwrap());
+        assert_eq!(
+            open::<LaterPayload>(&older, Some(ROM), RomCheck::SameRom).unwrap_err(),
+            LoadStateError::Unreadable("no version 0".into())
+        );
+        let short = sealed_with_extension_bytes(&bincode::serialize(&(1u32, 9u16)).unwrap());
+        let text = open::<LaterPayload>(&short, Some(ROM), RomCheck::SameRom)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.starts_with("savestate extension unreadable: "),
+            "{text}"
         );
     }
 
