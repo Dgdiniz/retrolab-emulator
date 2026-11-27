@@ -129,15 +129,16 @@ fn the_picture_is_refreshed_after_each_call_that_can_change_it() {
     emu.load_state(&state).unwrap();
     emu.load_state_any_rom(&state).unwrap();
     assert_eq!(count(&emu), 10, "the two loads");
+    emu.set_show_overscan(true);
+    assert_eq!(count(&emu), 11, "the overscan setting");
 
     emu.run_frame_headless();
-    emu.set_show_overscan(true);
     assert!(emu.load_rom(&[]).is_err());
     assert!(emu.set_region("secam").is_err());
     assert!(emu.load_state(&[1, 2, 3]).is_err());
     assert_eq!(
         count(&emu),
-        10,
+        11,
         "no refresh after a headless frame or a refusal"
     );
 }

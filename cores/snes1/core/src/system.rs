@@ -1111,15 +1111,32 @@ impl EmulatorCore for SnesEmulator {
 
     /// When `false` (default) overscan frames are cropped to the 224-line
     /// NTSC TV window (matching bsnes-plus / snes9x default output); when
-    /// `true` the 239 lines an overscan frame draws are exposed. The
-    /// display's size and grid follow at once; the framebuffer keeps the
-    /// frame finished before the change, cropped or not as it was then,
-    /// until the next frame is finished. It survives reset / savestate
-    /// restore.
+    /// `true` the 239 lines an overscan frame draws are exposed. Where the
+    /// line table holds the frame the framebuffer shows, that frame is
+    /// drawn again from it with the new setting, and the display follows.
+    /// Otherwise, while the overscan bit (`$2133` bit 2) is clear, as it is
+    /// after a load or a reset, the setting changes neither the display's
+    /// size nor its grid, and the PPU takes it at once; while the bit is
+    /// set the PPU takes it when the next frame opens
+    /// (`take_overscan_setting`), so the framebuffer, the display's size
+    /// and grid and the sprites' boxes keep the frame held until then. It
+    /// survives reset / savestate restore.
     fn set_show_overscan(&mut self, show: bool) {
         self.show_overscan = show;
-        self.bus.ppu_mut().set_show_overscan(show);
-        self.sync_display_info();
+        if self.bus.ppu().show_overscan_enabled() == show {
+            return;
+        }
+        if self.draws_from_line_states() {
+            // The line table holds every line of the frame and the video
+            // memory each read, so the frame comes out as it was drawn,
+            // cropped to the TV window or not as the new setting asks; the
+            // drawing puts back the state it moves.
+            self.bus.ppu_mut().set_show_overscan(show);
+            self.repaint_held_frame();
+            self.sync_display_info();
+        } else if !self.bus.ppu().overscan() {
+            self.bus.ppu_mut().set_show_overscan(show);
+        }
     }
 
     fn show_overscan_enabled(&self) -> bool {

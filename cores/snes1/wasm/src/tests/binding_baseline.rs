@@ -322,6 +322,8 @@ fn the_machine_calls_and_what_each_leaves() {
     found.value("isShowOverscanEnabled, shown", shown);
     emu.run_frame();
     after(&mut found, "a frame of 239 lines shown", &emu);
+    // Nothing records the line table here, so the frame held cannot be
+    // drawn again: the picture and the display keep it until the next one.
     emu.set_show_overscan(false);
     let shown = emu.is_show_overscan_enabled();
     found.value("isShowOverscanEnabled, cropped", shown);
@@ -386,7 +388,7 @@ after a frame of 239 lines shown => {frame: 5n, region: "ntsc", stateHash: "bigi
 display after a frame of 239 lines shown => {data: Uint8ClampedArray(len 244736, fnv1a64 0x94981b0a059357ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0xdf9b422104ebaec0)
 isShowOverscanEnabled, cropped => false
 after setShowOverscan(false) => {frame: 5n, region: "ntsc", stateHash: "bigint", stateHashParts: ["cpu", "wram", "ppu", "apu", "dma", "system_regs", "controllers", "sram", "coprocessors", "bus", "scheduler", "timing", "frame_count"]}
-display after setShowOverscan(false) => {data: Uint8ClampedArray(len 244736, fnv1a64 0x94981b0a059357ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0x9e817165905c246d)
+display after setShowOverscan(false) => {data: Uint8ClampedArray(len 244736, fnv1a64 0x94981b0a059357ee), displayInfo: {aspect_ratio: 1.1428... (453 chars, fnv1a64 0xdf9b422104ebaec0)
 "#,
     );
 }

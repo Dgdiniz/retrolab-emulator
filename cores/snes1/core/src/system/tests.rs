@@ -838,11 +838,21 @@ fn display_info_sync_tracks_hires_and_overscan() {
     assert_eq!(emu.get_display_info().width, 512);
     assert_eq!(emu.get_display_info().height, 448);
 
-    // The overscan toggle exposes the whole frame, 512x478, and the
-    // setter re-syncs display info immediately.
+    // The overscan shown exposes the whole frame, 512x478. With the
+    // overscan bit set and no line table to draw the frame shown again, a
+    // setting leaves that frame's display as it is; the PPU takes it when
+    // the next frame opens.
     emu.set_show_overscan(true);
+    assert_eq!(emu.get_display_info().height, 448, "the frame shown");
+    emu.take_overscan_setting();
+    emu.bus.ppu_mut().render_scanline(1, &mut emu.framebuffer);
+    emu.sync_display_info();
     assert_eq!(emu.get_display_info().height, 478);
     emu.set_show_overscan(false);
+    assert_eq!(emu.get_display_info().height, 478, "the frame shown");
+    emu.take_overscan_setting();
+    emu.bus.ppu_mut().render_scanline(1, &mut emu.framebuffer);
+    emu.sync_display_info();
     assert_eq!(emu.get_display_info().height, 448);
 
     // Mode 5 + interlace ($2133 bit 0, overscan off) -> 512x448

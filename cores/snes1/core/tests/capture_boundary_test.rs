@@ -382,6 +382,80 @@ fn a_step_from_a_boundary_past_the_frames_end_closes_the_frame() {
     assert_eq!(stepped.state_hash(), whole.state_hash());
 }
 
+/// `LDA #$04` / `STA $2133`: SETINI's overscan bit, so the frames after
+/// the one it is written in draw 239 lines.
+const OVERSCAN_ON: [u8; 5] = [0xA9, 0x04, 0x8D, 0x33, 0x21];
+
+/// The program, with the overscan bit set first.
+fn overscan_rom(reset_code: &[u8]) -> Vec<u8> {
+    let mut code = OVERSCAN_ON.to_vec();
+    code.extend_from_slice(reset_code);
+    build_rom_with(&code)
+}
+
+/// The display's size and grid.
+fn display_of(emu: &SnesEmulator) -> (u32, u32, retro_core::PictureGrid) {
+    let display = emu.get_display_info();
+    (display.width, display.height, display.grid)
+}
+
+#[test]
+fn an_overscan_setting_given_after_a_load_draws_as_one_given_before_it() {
+    // Right after a load the overscan bit is clear, so the setting changes
+    // nothing the display describes and the PPU takes it at once: the first
+    // frame, in which the program sets the bit, is drawn with it.
+    let rom = overscan_rom(&RESET_CODE);
+    let mut before = SnesEmulator::new();
+    before.set_show_overscan(true);
+    before.load_rom(&rom).expect("the program loads");
+    let mut after = SnesEmulator::new();
+    after.load_rom(&rom).expect("the program loads");
+    let display = display_of(&after);
+    after.set_show_overscan(true);
+    assert_eq!(
+        display_of(&after),
+        display,
+        "nothing the display describes changes"
+    );
+    for frame in 1..=2 {
+        before.run_frame();
+        after.run_frame();
+        assert_eq!(display_of(&after), display_of(&before), "frame {frame}");
+        assert_eq!(
+            after.get_framebuffer().data,
+            before.get_framebuffer().data,
+            "frame {frame}"
+        );
+    }
+    assert_eq!(display_of(&after).1, 239, "the frames draw their 239 lines");
+}
+
+#[test]
+fn a_frame_a_step_from_the_boundary_opens_is_drawn_with_the_overscan_setting() {
+    // The frame held at its boundary shows 224 lines. Nothing records the
+    // line table and the overscan bit is set, so a setting given there
+    // waits for the next frame; the step that leaves the boundary past the
+    // frame's end opens that frame.
+    let mut emu = SnesEmulator::new();
+    emu.load_rom(&overscan_rom(&LONG_DMA_RESET_CODE))
+        .expect("the program loads");
+    emu.run_to_capture_boundary();
+    assert!(
+        emu.master_cycles() >= 262 * 1364,
+        "the clock is past the first frame's end"
+    );
+    let held = display_of(&emu);
+    assert_eq!(held.1, 224);
+    emu.set_show_overscan(true);
+    assert!(emu.show_overscan_enabled());
+    assert_eq!(display_of(&emu), held, "the held frame keeps its display");
+    emu.step_cpu(0);
+    assert_eq!(emu.frame_count(), 1, "leaving the boundary closed frame 1");
+    emu.run_frame();
+    assert_eq!(emu.frame_count(), 2);
+    assert_eq!(display_of(&emu).1, 239, "frame 2 is drawn with the setting");
+}
+
 // -------------------------------------------------------------
 // Audio
 // -------------------------------------------------------------

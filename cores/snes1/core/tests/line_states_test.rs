@@ -277,6 +277,12 @@ fn hdma_window(line: u16) -> (u8, u8) {
 /// masks BG1 on the main screen). The table entry written at line `n`
 /// draws line `n + 1`.
 fn hdma_scene_rom() -> Vec<u8> {
+    hdma_scene_rom_with(false)
+}
+
+/// The HDMA scene, with SETINI's overscan (`$2133` bit 2) on when
+/// `overscan` is: a frame of 239 lines, each with a backdrop of its own.
+fn hdma_scene_rom_with(overscan: bool) -> Vec<u8> {
     const TILES: usize = 0x1_0000;
     const MAP: usize = 0x1_4000;
     const PALETTE: usize = 0x1_6000;
@@ -292,6 +298,9 @@ fn hdma_scene_rom() -> Vec<u8> {
     store(&mut code, 0x01, 0x212C); // BG1 on the main screen
     store(&mut code, 0x02, 0x2123); // window 1 on BG1
     store(&mut code, 0x01, 0x212E); // and masking it on the main screen
+    if overscan {
+        store(&mut code, 0x04, 0x2133);
+    }
     vram_address(&mut code, 0x0000);
     dma(&mut code, 0x01, 0x18, lorom(TILES), 16 * 32);
     vram_address(&mut code, 0x0400);
@@ -1536,4 +1545,72 @@ fn busy_bus_rom() -> Vec<u8> {
     }
     table.push(0x00);
     build_rom(0x2_0000, &code, &[0x40], &[0x40], &[(0x8000, table)])
+}
+
+// -------------------------------------------------------------
+// The overscan setting changed while a frame is held
+// -------------------------------------------------------------
+
+/// The overscan scene after three whole frames, its overscan shown or cut
+/// to the TV window, the line table armed or not.
+fn overscan_scene(show: bool, line_states: bool) -> SnesEmulator {
+    let mut emu = SnesEmulator::new();
+    if line_states {
+        emu.set_capture_recording(line_states_on());
+    }
+    emu.set_show_overscan(show);
+    emu.load_rom(&hdma_scene_rom_with(true))
+        .expect("the program loads");
+    for _ in 0..3 {
+        emu.run_frame();
+    }
+    emu
+}
+
+/// Every sprite's boxes, in the console's dots and lines and on the
+/// picture, as text.
+fn sprite_boxes(emu: &mut SnesEmulator) -> String {
+    format!("{:?}", emu.video_debugger().get_sprite_data())
+}
+
+#[test]
+fn an_overscan_setting_changed_while_a_frame_is_held_draws_it_again_from_the_line_table() {
+    for show in [true, false] {
+        let mut held = overscan_scene(show, true);
+        let hash = held.state_hash();
+        held.set_show_overscan(!show);
+        let drawn = overscan_scene(!show, true);
+        assert_eq!(held.get_display_info().height, if show { 224 } else { 239 });
+        assert_eq!(
+            picture(&held),
+            picture(&drawn),
+            "the held frame, as a frame drawn with the setting shows it"
+        );
+        assert_eq!(held.get_display_info().grid, drawn.get_display_info().grid);
+        assert_eq!(held.state_hash(), hash, "the machine does not move");
+    }
+}
+
+#[test]
+fn without_the_line_table_the_held_frame_keeps_its_setting_until_the_next_frame() {
+    for show in [true, false] {
+        let mut held = overscan_scene(show, false);
+        let before = picture(&held);
+        let grid = held.get_display_info().grid;
+        let sprites = sprite_boxes(&mut held);
+        held.set_show_overscan(!show);
+        assert_eq!(held.show_overscan_enabled(), !show, "the host's setting");
+        assert_eq!(picture(&held), before, "the framebuffer and the display");
+        assert_eq!(held.get_display_info().grid, grid);
+        assert_eq!(sprite_boxes(&mut held), sprites, "the sprites' boxes");
+
+        held.run_frame();
+        let mut drawn = overscan_scene(!show, false);
+        drawn.run_frame();
+        assert_eq!(
+            picture(&held),
+            picture(&drawn),
+            "the next frame is drawn with the setting"
+        );
+    }
 }

@@ -375,11 +375,22 @@ pub trait EmulatorCore {
     /// Show the lines a console draws past its picture's usual height (a
     /// host's display preference, never part of a savestate); a console
     /// that draws none keeps the default, which changes nothing.
+    ///
+    /// The framebuffer and the display's description agree at every
+    /// moment: where the console can draw the frame it holds again exactly
+    /// (from its line table, as [`CaptureCore::repaint_held_frame`] draws
+    /// it), the held frame shows the new setting at once; otherwise both
+    /// keep the held picture, and every frame begun after the call is drawn
+    /// with the setting.
+    ///
+    /// [`CaptureCore::repaint_held_frame`]: crate::capture::CaptureCore::repaint_held_frame
     fn set_show_overscan(&mut self, show: bool) {
         let _ = show;
     }
 
-    /// Whether those lines are shown; `false` on a console that draws none.
+    /// The setting [`Self::set_show_overscan`] was given last, with which
+    /// every frame begun after it is drawn; `false` on a console that
+    /// draws none, whatever was set.
     fn show_overscan_enabled(&self) -> bool {
         false
     }

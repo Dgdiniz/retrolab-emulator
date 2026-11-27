@@ -141,9 +141,9 @@ macro_rules! __flag_or_false {
 ///
 /// `after_frame = m` names a method of `$emulator` run after each call that
 /// can change the picture (`reset`, `hardReset`, `powerOnReset`,
-/// `runFrame`, `runUntilVBlank`, `saveState`, and `loadRom`, `setRegion`,
-/// `loadState` and `loadStateAnyRom` when they succeed), never after
-/// `runFrameHeadless`, whose picture nobody sees.
+/// `runFrame`, `runUntilVBlank`, `saveState`, `setShowOverscan`, and
+/// `loadRom`, `setRegion`, `loadState` and `loadStateAnyRom` when they
+/// succeed), never after `runFrameHeadless`, whose picture nobody sees.
 /// `retry_detected_mapping = true` makes `loadRom` retry a refused load
 /// with the detected mapping.
 ///
@@ -384,17 +384,22 @@ macro_rules! machine_bindings {
             /// (the SNES's overscan frames, 239 lines; `false`, the default,
             /// crops them to the 224-line window). It survives a reset and a
             /// savestate's load; a console that draws no such lines ignores
-            /// it.
+            /// it. The picture and `getDisplayInfo` agree at once: the frame
+            /// held is drawn again with the setting where the core can draw
+            /// it exactly, else both keep it, and every frame begun after the
+            /// call is drawn with the setting.
             #[wasm_bindgen(js_name = setShowOverscan)]
             pub fn set_show_overscan(&mut self, show: bool) {
                 $crate::__private::retro_core::EmulatorCore::set_show_overscan(
                     &mut self.$core,
                     show,
                 );
+                $(self.$after_frame();)?
             }
 
-            /// Whether those lines are shown; `false` on a console that draws
-            /// none.
+            /// The setting `setShowOverscan` was given last, with which every
+            /// frame begun after it is drawn; `false` on a console that draws
+            /// none, whatever was set.
             #[wasm_bindgen(js_name = isShowOverscanEnabled)]
             pub fn is_show_overscan_enabled(&self) -> bool {
                 $crate::__private::retro_core::EmulatorCore::show_overscan_enabled(&self.$core)

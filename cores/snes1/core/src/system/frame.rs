@@ -503,6 +503,17 @@ impl SnesEmulator {
         if self.master_cycles >= self.frame_base_cycle + self.timing.cycles_per_frame() {
             self.end_of_frame_bookkeeping();
             self.frame_base_cycle = self.master_cycles;
+            self.take_overscan_setting();
+        }
+    }
+
+    /// A frame opens, and takes the host's overscan setting if the PPU does
+    /// not have it yet: `set_show_overscan` leaves it to the next frame
+    /// while the overscan bit is set and the frame shown cannot be drawn
+    /// again.
+    pub(super) fn take_overscan_setting(&mut self) {
+        if self.bus.ppu().show_overscan_enabled() != self.show_overscan {
+            self.bus.ppu_mut().set_show_overscan(self.show_overscan);
         }
     }
 
@@ -573,6 +584,7 @@ impl FrameMachine for SnesEmulator {
             Some(end) => self.frame_base_cycle = end.saturating_sub(frame_cycles),
             None => self.frame_base_cycle = self.master_cycles,
         }
+        self.take_overscan_setting();
         self.frame_base_cycle + frame_cycles
     }
 

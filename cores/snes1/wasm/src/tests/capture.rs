@@ -322,6 +322,48 @@ fn recording_sprites() -> RetroEmulator {
     emu
 }
 
+/// A machine running [`synth_lorom`] with the line table kept, its
+/// overscan (`$2133` bit 2) on, shown or cut to the TV window, and the
+/// sprites of [`recording_sprites`] over a red backdrop at the top-left,
+/// after two whole frames.
+fn recording_overscan(show: bool) -> RetroEmulator {
+    let mut emu = RetroEmulator::new("snes").unwrap();
+    emu.set_capture_recording(recording_options(&[("lineStates", true)]));
+    emu.set_show_overscan(show);
+    emu.load_rom(&synth_lorom("OVERSCAN")).unwrap();
+    emu.write_palette_memory(0, &[0x001F]);
+    emu.write_palette_memory(129, &[0x03E0]);
+    emu.write_vram(0, &[0x00FF; 8]);
+    emu.write_memory_debug(0x2133, &[0x04]);
+    emu.write_memory_debug(0x212C, &[0x10]);
+    emu.write_memory_debug(0x2100, &[0x0F]);
+    emu.run_frame();
+    emu.run_frame();
+    emu
+}
+
+/// With the line table holding the frame, a change of the overscan
+/// setting hands out that frame drawn again with it, at once, and the
+/// display says the same size.
+#[wasm_bindgen_test]
+fn the_overscan_setting_draws_the_frame_held_again_from_the_line_table() {
+    for (show, rows) in [(true, 239.0), (false, 224.0)] {
+        let mut held = recording_overscan(!show);
+        held.set_show_overscan(show);
+        let drawn = recording_overscan(show);
+        assert_eq!(f64::from(held.get_framebuffer_height()), rows);
+        assert_eq!(
+            property(&held.get_display_info(), "height").as_f64(),
+            Some(rows)
+        );
+        assert_eq!(
+            held.get_framebuffer_data().to_vec(),
+            drawn.get_framebuffer_data().to_vec(),
+            "shown {show}: the frame as one drawn with the setting"
+        );
+    }
+}
+
 #[wasm_bindgen_test]
 fn the_line_sprites_are_a_plain_object_of_copies() {
     let mut idle = RetroEmulator::new("snes").unwrap();
