@@ -24,6 +24,12 @@ use retro_core::cpu::Clockable;
 /// oldest samples instead of growing without bound.
 const MAX_PSG_FRAME_SAMPLES: usize = 8192;
 
+/// How many samples `generate_samples` may render ahead of this chip's own
+/// clock accumulator to give the count the system's converter asked for:
+/// two quantisations of the same time disagree by about a sample, and past
+/// that the caller is asking for sound the machine has not reached.
+const MAX_BORROWED_SAMPLES: usize = 2;
+
 /// Latch type for the SN76489 register write protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LatchType {
@@ -315,40 +321,7 @@ impl Psg {
 
         while self.clock_accumulator >= self.cycles_per_sample {
             self.clock_accumulator -= self.cycles_per_sample;
-
-            // The SN76489 divides its input clock by 16 for the internal
-            // tone/noise generators (~223.7 kHz on Genesis). Advance the divider
-            // and clock channels for every 16 input clocks consumed this sample.
-            self.internal_clock_accumulator += self.cycles_per_sample;
-            while self.internal_clock_accumulator >= 16.0 {
-                self.clock_channels();
-                self.internal_clock_accumulator -= 16.0;
-            }
-
-            self.frame_samples.push(self.get_mixed_output());
-            if let Some(stems) = self.stems.as_deref_mut() {
-                let outputs = [
-                    self.tone_channels[0].raw_output(),
-                    self.tone_channels[1].raw_output(),
-                    self.tone_channels[2].raw_output(),
-                    self.noise_channel.raw_output(),
-                ];
-                let muted = [
-                    self.tone_channels[0].muted,
-                    self.tone_channels[1].muted,
-                    self.tone_channels[2].muted,
-                    self.noise_channel.muted,
-                ];
-                stems.0.extend_from_slice(&outputs);
-                stems
-                    .1
-                    .push(outputs.iter().zip(muted).any(|(&out, m)| m && out != 0.0));
-            }
-
-            if self.waveform_decimation.is_multiple_of(16) {
-                self.store_waveform_sample();
-            }
-            self.waveform_decimation = self.waveform_decimation.wrapping_add(1);
+            self.render_sample();
         }
 
         // Bound the buffer if the host stops draining it.
@@ -360,6 +333,45 @@ impl Psg {
                 stems.1.drain(..excess);
             }
         }
+    }
+
+    /// One output sample, its input clocks already taken from the
+    /// accumulator: the channels clocked through them, and the sample staged
+    /// with its stems and its waveform.
+    fn render_sample(&mut self) {
+        // The SN76489 divides its input clock by 16 for the internal
+        // tone/noise generators (~223.7 kHz on Genesis). Advance the divider
+        // and clock channels for every 16 input clocks consumed this sample.
+        self.internal_clock_accumulator += self.cycles_per_sample;
+        while self.internal_clock_accumulator >= 16.0 {
+            self.clock_channels();
+            self.internal_clock_accumulator -= 16.0;
+        }
+
+        self.frame_samples.push(self.get_mixed_output());
+        if let Some(stems) = self.stems.as_deref_mut() {
+            let outputs = [
+                self.tone_channels[0].raw_output(),
+                self.tone_channels[1].raw_output(),
+                self.tone_channels[2].raw_output(),
+                self.noise_channel.raw_output(),
+            ];
+            let muted = [
+                self.tone_channels[0].muted,
+                self.tone_channels[1].muted,
+                self.tone_channels[2].muted,
+                self.noise_channel.muted,
+            ];
+            stems.0.extend_from_slice(&outputs);
+            stems
+                .1
+                .push(outputs.iter().zip(muted).any(|(&out, m)| m && out != 0.0));
+        }
+
+        if self.waveform_decimation.is_multiple_of(16) {
+            self.store_waveform_sample();
+        }
+        self.waveform_decimation = self.waveform_decimation.wrapping_add(1);
     }
 
     /// Stage each sample's channels for the stems from now on (`true`), or
@@ -603,6 +615,23 @@ impl AudioChip for Psg {
         // reflects state up to *now*; sub-frame accuracy comes from `catch_up()`
         // at each `write`.
         self.catch_up();
+
+        // A sample short of the count asked for is rendered on time borrowed
+        // from the next frame, as the YM2612's are: the converter owns the
+        // frame's count, and this chip's accumulator is a second,
+        // floating-point quantisation of the same time, so on some frames it
+        // lands a sample short, which would reach the mixer as a sample of
+        // silence inside a tone. Each borrowed sample is charged to the
+        // accumulator, so the chip gives the time back on a later frame and
+        // its rate is unchanged.
+        if self.rendering_enabled {
+            let mut borrowed = 0;
+            while self.frame_samples.len() < output.len() && borrowed < MAX_BORROWED_SAMPLES {
+                self.clock_accumulator -= self.cycles_per_sample;
+                self.render_sample();
+                borrowed += 1;
+            }
+        }
 
         let n = output.len().min(self.frame_samples.len());
         output[..n].copy_from_slice(&self.frame_samples[..n]);

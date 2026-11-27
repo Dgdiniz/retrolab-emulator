@@ -248,7 +248,7 @@ impl GenesisEmulator {
             .unwrap()
             .connect_device(Box::new(Genesis3ButtonDevice::new()));
 
-        Self {
+        let mut emulator = Self {
             debugger: genesis_debugger(system_info.clone()),
             input_manager: GenericInputManager::new(2, pad_defaults()),
             system_info,
@@ -323,7 +323,10 @@ impl GenesisEmulator {
             opcode_read: std::cell::Cell::new(None),
             interrupt_cycles: 0,
             capture_recording: CaptureRecording::default(),
-        }
+        };
+        // The sound clock at the power-on's master cycles.
+        emulator.derive_sound_clocks();
+        emulator
     }
 
     /// Get VDP reference for debugging.
@@ -717,6 +720,7 @@ impl EmulatorCore for GenesisEmulator {
         self.last_step_cycles = 0;
         self.z80_irq_pending = false;
         self.running = true;
+        self.derive_sound_clocks();
 
         // Drop any queued samples (this is a real reset, not
         // mid-stream: the host is expected to drain after) and

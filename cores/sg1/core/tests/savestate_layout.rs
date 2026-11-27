@@ -255,6 +255,17 @@ fn stopped_holding_the_extension() -> GenesisEmulator {
     emu
 }
 
+/// What a load holds of `extension`, less what it derives from the master
+/// clock instead of reading: the credit of the PSG's clock in the frame
+/// stopped part of the way through. A build that counted the credit within
+/// the line wrote its own.
+fn less_what_a_load_derives(mut extension: GenesisExtension) -> GenesisExtension {
+    if let Some(frame) = extension.frame.as_mut() {
+        frame.psg_credit = 0;
+    }
+    extension
+}
+
 #[test]
 fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
     let dir = fixture_dir();
@@ -303,9 +314,16 @@ fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
             .expect("the program loads");
         emu.load_state(&bytes, RomCheck::SameRom)
             .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
+        let held = emu.savestate_extension();
+        let master_cycles = payload.timing.master_cycles;
         assert_eq!(
-            emu.savestate_extension(),
-            extension,
+            held.frame.as_ref().map(|frame| frame.psg_credit),
+            Some((master_cycles * 7 % 15) as u32),
+            "{name}: the PSG's credit, derived from the master clock"
+        );
+        assert_eq!(
+            less_what_a_load_derives(held),
+            less_what_a_load_derives(extension.clone()),
             "{name}: what the load holds"
         );
         assert_eq!(emu.cpu().pc, STOP, "{name}: the stop");

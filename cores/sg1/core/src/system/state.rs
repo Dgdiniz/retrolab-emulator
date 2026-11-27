@@ -159,7 +159,7 @@ impl GenesisEmulator {
             line_started: self.line_started,
             grid: run.grid,
             budget: run.budget,
-            psg_credit: run.psg_credit,
+            psg_credit: run.psg_clock.credit(),
             psg_clocked: run.psg_clocked,
             z80_target: run.z80_target,
             z80_credit: run.z80_credit,
@@ -193,7 +193,8 @@ impl GenesisEmulator {
     /// from the extension, or at its none when the extension holds none of
     /// it, so a state with nothing after its payload leaves no fill, no
     /// busy time and no frame in progress, whatever the loading machine
-    /// had.
+    /// had. The sound clock is derived from the master clock, as a reset
+    /// derives it.
     pub(super) fn restore_extension(&mut self, extension: GenesisExtension) {
         let line_end = self.line_end_beam();
         self.bus
@@ -209,7 +210,6 @@ impl GenesisEmulator {
             self.line = LineRun {
                 grid: frame.grid,
                 budget: frame.budget,
-                psg_credit: frame.psg_credit,
                 psg_clocked: frame.psg_clocked,
                 z80_target: frame.z80_target,
                 z80_credit: frame.z80_credit,
@@ -225,6 +225,7 @@ impl GenesisEmulator {
                 .vdp_mut()
                 .set_frame_being_drawn(self.frame_count + 1);
         }
+        self.derive_sound_clocks();
     }
 
     /// Build the full machine snapshot shared by [`EmulatorCore::save_state`]

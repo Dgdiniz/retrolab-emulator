@@ -386,12 +386,18 @@ const RECORDED: &[(&str, &str)] = &[
     ("new machine", "mode Running | region ntsc | audio true"),
     // A load leaves the mode as it was.
     ("after load_rom", "mode Running | region ntsc | audio true | frames 0"),
-    ("frame 1: state hash", "a1a1eb1c57fb6620"),
-    ("frame 1: parts", "cpu68k=6b077e1553b1b732 z80=d833438a3ed05bdb vdp=83f41ad2b93b85bb psg=4eed1aa85cfb3e35 ym2612=efc29b4251347646 io=3c6fedfeb6914524 bus=93dce42ef61c1e7c timing=f49acf6a880a28eb ram=9c59a697fe657b9c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=0000000000000001"),
-    ("frame 60: state hash", "ccd7b2fd1e4ebd75"),
-    ("frame 60: parts", "cpu68k=0cc0c7e4121110fe z80=d833438a3ed05bdb vdp=a0e86f1e16e58e83 psg=c30663dccdf0fa93 ym2612=828155374cb1c3fc io=5ccb29e732035f28 bus=93dce42ef61c1e7c timing=c8e9547137799345 ram=48632110ad257b4c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000003c"),
-    ("frame 300: state hash", "cbd72df6ea1a5e2d"),
-    ("frame 300: parts", "cpu68k=62884b7c10d28f84 z80=d833438a3ed05bdb vdp=7ef7614cd4cafe58 psg=a88151fc562fed75 ym2612=f5c0e15a2a0bb7e4 io=042a3110292eaa1d bus=55e7561ce03d8a3a timing=97f881ccbb702d8e ram=d9ad915fdcd57c38 z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000012c"),
+    // The PSG has its time at each step from a clock it carries across
+    // lines, and borrows up to two samples at a frame's end: its part of
+    // the state moves from the first frame, and with it every hash below
+    // taken after a frame has run, the sound once the tone plays, and the
+    // hash right after the reset button, which keeps the PSG's tone
+    // counters where its clock left them.
+    ("frame 1: state hash", "e604730d4b8590f9"),
+    ("frame 1: parts", "cpu68k=6b077e1553b1b732 z80=d833438a3ed05bdb vdp=83f41ad2b93b85bb psg=1f9662da27002306 ym2612=efc29b4251347646 io=3c6fedfeb6914524 bus=93dce42ef61c1e7c timing=f49acf6a880a28eb ram=9c59a697fe657b9c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=0000000000000001"),
+    ("frame 60: state hash", "79e012b19293486d"),
+    ("frame 60: parts", "cpu68k=0cc0c7e4121110fe z80=d833438a3ed05bdb vdp=a0e86f1e16e58e83 psg=a40280d2c2f8894b ym2612=828155374cb1c3fc io=5ccb29e732035f28 bus=93dce42ef61c1e7c timing=c8e9547137799345 ram=48632110ad257b4c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000003c"),
+    ("frame 300: state hash", "50b7bb4642a5a22b"),
+    ("frame 300: parts", "cpu68k=62884b7c10d28f84 z80=d833438a3ed05bdb vdp=7ef7614cd4cafe58 psg=172b3cf901202af7 ym2612=f5c0e15a2a0bb7e4 io=042a3110292eaa1d bus=55e7561ce03d8a3a timing=97f881ccbb702d8e ram=d9ad915fdcd57c38 z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000012c"),
     ("the envelope", "envelope 1 | core sg1 | version 3 | rom hash 5bdbda6d2a59f3d8650fdf88c75783d2d48f0468d10570953ffcbeb2cc24105b | payload version 3 | title \"MACHINE BASELINE\""),
     ("load: envelope", "Ok | the saved machine's state: true"),
     ("load: legacy", "Ok | the saved machine's state: true"),
@@ -413,20 +419,20 @@ const RECORDED: &[(&str, &str)] = &[
     // cycle the state hash covers what the savestate's extension holds
     // then: the first frame after the reset, and the beam before the
     // 68000's first step.
-    ("reset: right after", "hash 8f2c3896786e4f91 | work RAM d96dbf20b7991b11 boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
-    ("reset: two frames later", "hash f0c9f6440172de78 | work RAM 071a9068ba8c33b4 boots 2 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
+    ("reset: right after", "hash 985d07ce3c91cbfa | work RAM d96dbf20b7991b11 boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
+    ("reset: two frames later", "hash bf869324f3346251 | work RAM 071a9068ba8c33b4 boots 2 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
     // The app's Reset is a power cycle that keeps the save: a new 68000,
     // whose user stack pointer is clear (the reset button keeps it); the
     // mode is kept.
     ("hard_reset: right after", "hash 9370832a4b3e1532 | work RAM eb05052ea5b62325 boots 0 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
-    ("hard_reset: two frames later", "hash c8de137910717fca | work RAM d3f8a09307d72bfa boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
+    ("hard_reset: two frames later", "hash 405c205ff5da5552 | work RAM d3f8a09307d72bfa boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
     // Netplay's power cycle keeps the mode.
     ("power_on_reset: right after", "hash a719edc7e0f0d532 | work RAM eb05052ea5b62325 boots 0 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 0"),
-    ("power_on_reset: two frames later", "hash 7e3b75fdbecdffca | work RAM d3f8a09307d72bfa boots 1 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 2"),
+    ("power_on_reset: two frames later", "hash e2ae367709b0d552 | work RAM d3f8a09307d72bfa boots 1 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 2"),
     ("sound, frame 1", "1470 samples 07ee79f5ea4a1265"),
-    ("sound, frame 60", "1472 samples c9261c5eebf2bb25"),
-    ("sound, frame 300", "1472 samples b36d9a838a611b25"),
-    ("sound, 300 frames", "441568 samples a4de362dcebd88c9"),
+    ("sound, frame 60", "1472 samples 65c966c5c4bc5825"),
+    ("sound, frame 300", "1472 samples aea7fc908a40a125"),
+    ("sound, 300 frames", "441568 samples 560863c21801acc9"),
     // Each button's id is the bit the six-button pad reads it from.
     // The display's grid says where the picture starts: `first_dot`, `first_line`.
     ("system info", "{\"name\":\"Sega Genesis\",\"short_name\":\"genesis\",\"manufacturer\":\"Sega\",\"year\":1988,\"cpus\":[{\"id\":0,\"name\":\"Motorola 68000\",\"architecture\":\"M68000\",\"clock_speed\":7670454,\"registers\":[{\"name\":\"D0\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D1\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D2\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D3\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D4\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D5\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D6\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D7\",\"size_bits\":32,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"A0\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A1\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A2\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A3\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A4\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A5\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A6\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"A7\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"PC\",\"size_bits\":32,\"display_format\":\"Address\",\"category\":\"Special\"},{\"name\":\"SR\",\"size_bits\":16,\"display_format\":\"Binary\",\"category\":\"Flags\"}],\"location\":\"Motherboard\",\"address_width\":24},{\"id\":1,\"name\":\"Zilog Z80\",\"architecture\":\"Z80\",\"clock_speed\":3579545,\"registers\":[{\"name\":\"A\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"F\",\"size_bits\":8,\"display_format\":\"Binary\",\"category\":\"Flags\"},{\"name\":\"B\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"C\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"D\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"E\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"H\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"L\",\"size_bits\":8,\"display_format\":\"Hexadecimal\",\"category\":\"General\"},{\"name\":\"PC\",\"size_bits\":16,\"display_format\":\"Address\",\"category\":\"Special\"},{\"name\":\"SP\",\"size_bits\":16,\"display_format\":\"Address\",\"category\":\"Special\"},{\"name\":\"IX\",\"size_bits\":16,\"display_format\":\"Address\",\"category\":\"Address\"},{\"name\":\"IY\",\"size_bits\":16,\"display_format\":\"Address\",\"category\":\"Address\"}],\"location\":\"Motherboard\",\"address_width\":16}],\"display\":{\"width\":320,\"height\":224,\"aspect_ratio\":1.3333334,\"refresh_rate\":59.922745,\"pixel_format\":\"RGBA8888\",\"grid\":{\"columns_per_dot\":1,\"rows_per_line\":1,\"woven\":false,\"first_dot\":0,\"first_line\":0}},\"audio\":{\"sample_rate\":44100,\"channels\":2,\"bits_per_sample\":16},\"input\":{\"max_players\":2,\"button_layout\":[{\"name\":\"Up\",\"id\":0},{\"name\":\"Down\",\"id\":1},{\"name\":\"Left\",\"id\":2},{\"name\":\"Right\",\"id\":3},{\"name\":\"A\",\"id\":6},{\"name\":\"B\",\"id\":4},{\"name\":\"C\",\"id\":5},{\"name\":\"Start\",\"id\":7},{\"name\":\"X\",\"id\":10},{\"name\":\"Y\",\"id\":9},{\"name\":\"Z\",\"id\":8},{\"name\":\"Mode\",\"id\":11}]}}"),
@@ -434,7 +440,7 @@ const RECORDED: &[(&str, &str)] = &[
     // hash, right after the power cycle, as the resets' above).
     ("set_region_str(pal)", "region pal | refresh 49.7015 | hash aa6d2532ea142717"),
     // The machine power-cycled in the region, as the line above.
-    ("a PAL machine, 60 frames", "frames 60 | hash de277ebf626300b0 | refresh 49.7015"),
+    ("a PAL machine, 60 frames", "frames 60 | hash 6daf320ad4b2f20c | refresh 49.7015"),
     ("set_region_str(secam)", "Err(\"unknown region 'secam' (expected 'ntsc' or 'pal')\")"),
 ];
 

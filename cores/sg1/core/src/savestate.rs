@@ -691,8 +691,11 @@ pub struct GenesisFrameState {
     pub line_started: bool,
     /// The line's counters once its start ran (all 0 before): the clock
     /// less the 68000 cycles the line has spent, the line's 68000 budget,
-    /// the PSG's credit and clocks given, the Z80's target, credit and
-    /// cycles run, the YM2612's clocks given.
+    /// the PSG's credit and its clocks given in the line, the Z80's target,
+    /// credit and cycles run, the YM2612's clocks given. The PSG's credit is
+    /// its clock's, which a load derives from the master clock; a build
+    /// that counted the credit and the clocks within the line reads them as
+    /// its own.
     pub grid: u64,
     pub budget: u32,
     pub psg_credit: u32,

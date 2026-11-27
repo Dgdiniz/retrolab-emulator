@@ -251,20 +251,9 @@ impl GenesisEmulator {
         self.last_step_cycles = total;
         hooks.raised(self, Self::video_event_hit);
 
-        // Spread the PSG's per-scanline budget across the line so register
-        // writes resolve to ~1 output sample via Psg::catch_up instead of
-        // collapsing to the line end. The PSG clocks at master/15 regardless
-        // of the Z80 bus, so spend 7 numerator per 68K (master/7) cycle and
-        // carry the /15 remainder within the line.
-        run.psg_credit += total * 7;
-        let psg_step = run.psg_credit / 15;
-        run.psg_credit %= 15;
-        if psg_step > 0 {
-            hooks.chip_start("PSG");
-            self.bus.psg_mut().clock(psg_step);
-            hooks.chip_finish(0);
-            run.psg_clocked += psg_step;
-        }
+        // The PSG has the step's time at once, so a register write lands on
+        // the output sample of its own time.
+        self.psg_time_passes(run, hooks);
 
         // Update HBLANK approximation based on 68K cycle position
         let spent = (self.master_cycles - run.grid) as u32;
@@ -321,6 +310,21 @@ impl GenesisEmulator {
             elapsed: u64::from(total),
             instruction,
         })
+    }
+
+    /// Master time passes to the present for the PSG: every whole clock of
+    /// its clock since the last pass, which it runs at once. The PSG clocks
+    /// at master/15 whether or not the Z80 has its bus.
+    #[inline(always)]
+    pub(super) fn psg_time_passes<H: StepHooks<Self>>(&mut self, run: &mut LineRun, hooks: &mut H) {
+        let clocks = run.psg_clock.pass_to(self.master_cycles) as u32;
+        run.psg_clock.ran(clocks);
+        if clocks > 0 {
+            hooks.chip_start("PSG");
+            self.bus.psg_mut().clock(clocks);
+            hooks.chip_finish(0);
+            run.psg_clocked += clocks;
+        }
     }
 
     /// Run the Z80 until its count for the line reaches `until`: its
