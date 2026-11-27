@@ -20,8 +20,9 @@
 //! guarantee deterministic behavior across hosts and platforms.
 
 /// Greatest common divisor (Euclidean algorithm). Used to simplify
-/// the (num, den) ratio so multiplications stay small.
-const fn gcd(mut a: u64, mut b: u64) -> u64 {
+/// the (num, den) ratio so multiplications stay small, here and in a
+/// sub-processor clock's ratio.
+pub(crate) const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = b;
         b = a % b;

@@ -12,13 +12,14 @@
 //! The main system advances in master clocks. The APU is caught up
 //! *lazily*: whenever the main CPU touches a mailbox port (and once
 //! per frame), [`Apu::catch_up_to`] runs the SPC700 forward to the SPC
-//! cycle that corresponds to the current master cycle. Two
-//! [`IntegerRateConverter`]s, both keyed on the same master-cycle
-//! counter, drive this:
+//! cycle that corresponds to the current master cycle. Two clocks, both
+//! passed the same master-cycle counter, drive this:
 //!
-//! - `spc_sync` (1.024 MHz / master clock) gives the target SPC cycle.
-//! - `dsp_clock` (32 kHz / master clock) gives the target cumulative
-//!   sample count.
+//! - `spc_clock`, the SPC700's [`SubClock`] (1.024 MHz / master clock),
+//!   gives the SPC cycles owed; the last instruction's overshoot past the
+//!   present is its lead, which the next window pays.
+//! - `dsp_clock`, an [`IntegerRateConverter`] (32 kHz / master clock),
+//!   gives the target cumulative sample count.
 //!
 //! Because both are exact integer functions of the master cycle, the
 //! SPC clock and the sample clock cannot drift against each other, by
@@ -50,11 +51,12 @@ mod ipl;
 mod timers;
 
 use retro_core::audio::{
-    AudioRingBuffer, IntegerRateConverter, SampleKind, ScopeRing, SoundEvent, SoundLog,
-    SoundLogContents, SoundLogEntry, StemChannel, StemLayout, StemRecorder, StemSet, StemSum,
-    StemTake,
+    AudioRingBuffer, IntegerRateConverter, RateConverterState, SampleKind, ScopeRing, SoundEvent,
+    SoundLog, SoundLogContents, SoundLogEntry, StemChannel, StemLayout, StemRecorder, StemSet,
+    StemSum, StemTake,
 };
 use retro_core::cpu::Addressable;
+use retro_core::sub_clock::{Ratio, SubClock};
 use spc700::Spc700;
 
 use crate::debugger::TraceEntryBinarySpc700;
@@ -84,9 +86,9 @@ const SPC_CYCLES_PER_DSP_SAMPLE: u64 = SPC_CLOCK_HZ / DSP_SAMPLE_RATE_HZ;
 /// the oldest samples.
 const AUDIO_RING_CAPACITY: usize = 8192;
 
-/// Master clock the converters are seeded with at construction. The
-/// real region clock (NTSC vs PAL) is bound in [`Apu::reset`], which
-/// every boot path runs before the APU is stepped.
+/// Master clock the SPC700's and the samples' clocks are seeded with at
+/// construction. The real region clock (NTSC vs PAL) is bound in
+/// [`Apu::reset`], which every boot path runs before the APU is stepped.
 const DEFAULT_MASTER_CLOCK_HZ: u64 = 21_477_270;
 
 /// The stems, in index order: each voice through its volumes and the main
@@ -178,13 +180,14 @@ impl ApuStems {
 pub struct Apu {
     spc700: Spc700,
     state: ApuState,
-    /// Maps master cycles -> cumulative SPC700 cycles.
-    spc_sync: IntegerRateConverter,
+    /// The SPC700's clock against the master clock: the cycles it owes,
+    /// or its last instruction's overshoot past the present.
+    spc_clock: SubClock<Ratio>,
     /// Maps master cycles -> cumulative 32 kHz samples.
     dsp_clock: IntegerRateConverter,
-    /// SPC700 cycles actually executed since reset. Tracks the
-    /// `spc_sync` target within one instruction (it may overshoot the
-    /// target by the length of the last instruction, never more).
+    /// SPC700 cycles actually executed since reset. Ahead of the cycles
+    /// due by `spc_clock`'s lead: the length of the last instruction at
+    /// most, never more.
     apu_cycles: u64,
     /// Cumulative 32 kHz samples emitted since reset. Exact function of
     /// the master cycle, so it never drifts.
@@ -216,14 +219,14 @@ pub(crate) struct KeyOnLatch {
 
 impl Apu {
     /// Build a powered-on APU: zeroed ARAM, IPL ROM mapped in, and the
-    /// SPC700 booted from the IPL reset vector. The converters are
+    /// SPC700 booted from the IPL reset vector. Both clocks are
     /// seeded with the NTSC master clock; [`Apu::reset`] rebinds them
     /// to the actual region clock.
     pub fn new() -> Self {
         let mut apu = Self {
             spc700: Spc700::new(),
             state: ApuState::new(),
-            spc_sync: IntegerRateConverter::new(SPC_CLOCK_HZ, DEFAULT_MASTER_CLOCK_HZ),
+            spc_clock: SubClock::new(Ratio::new(SPC_CLOCK_HZ, DEFAULT_MASTER_CLOCK_HZ)),
             dsp_clock: IntegerRateConverter::new(DSP_SAMPLE_RATE_HZ, DEFAULT_MASTER_CLOCK_HZ),
             apu_cycles: 0,
             dsp_samples_emitted: 0,
@@ -237,13 +240,13 @@ impl Apu {
         apu
     }
 
-    /// Reset the APU and rebind the rate converters to `master_clock_hz`
+    /// Reset the APU and rebind both clocks to `master_clock_hz`
     /// (so PAL and NTSC consoles produce the right sample cadence).
     /// ARAM is preserved; the register-level state, the SPC700, and
-    /// both converters are re-anchored to cycle 0.
+    /// both clocks are re-anchored to cycle 0.
     pub fn reset(&mut self, master_clock_hz: u64) {
         self.state.reset_registers();
-        self.spc_sync = IntegerRateConverter::new(SPC_CLOCK_HZ, master_clock_hz);
+        self.spc_clock = SubClock::new(Ratio::new(SPC_CLOCK_HZ, master_clock_hz));
         self.dsp_clock = IntegerRateConverter::new(DSP_SAMPLE_RATE_HZ, master_clock_hz);
         self.apu_cycles = 0;
         self.dsp_samples_emitted = 0;
@@ -265,33 +268,33 @@ impl Apu {
     /// Advance the APU up to the master cycle `master_cycles`.
     ///
     /// Steps the SPC700 (ticking the timers with each instruction's
-    /// cycle cost) until it reaches the corresponding SPC cycle,
+    /// cycle cost) until it has run the SPC cycles it owes,
     /// interleaving 32 kHz sample generation as the SPC clock advances
     /// (one sample per [`SPC_CYCLES_PER_DSP_SAMPLE`] SPC cycles) so a DSP
     /// register write is observed at the sample it lands on rather than
-    /// coalesced against the window's final state. Both halves are
-    /// re-anchored to the *ideal* target so the small per-instruction
-    /// overshoot in the SPC clock can never accumulate into drift, and
-    /// the window's sample total stays pinned to the drift-free
-    /// `dsp_clock` count.
+    /// coalesced against the window's final state. The SPC700's clock
+    /// keeps its last instruction's overshoot as a lead the next window
+    /// pays, so it never accumulates into drift, and the window's sample
+    /// total stays pinned to the drift-free `dsp_clock` count.
     pub fn catch_up_to(&mut self, master_cycles: u64) {
-        // Catch-up is monotonic. A target at or behind the anchor we
-        // already advanced to is a no-op, this happens routinely
+        // Catch-up is monotonic. A target at or behind the master cycle
+        // already reached is a no-op, this happens routinely
         // because the mailbox `apu_cycle` lags `master_cycles` whenever
         // an event handler (HDMA, the FrameEnd hook) bumps the master
         // clock without refreshing the per-instruction snapshot. Both
-        // converters share the same anchor, so one check covers both.
-        if master_cycles <= self.spc_sync.reference_cycles() {
+        // clocks are passed the same master cycle, so one check covers
+        // both.
+        if master_cycles <= self.spc_clock.passed_to() {
             return;
         }
-        let spc_target = self.spc_sync.cycles_to_samples(master_cycles);
+        self.spc_clock.pass_to(master_cycles);
         // Cumulative 32 kHz samples due by this master cycle, the
         // drift-free authority for the window's total. Computed up front
         // so the step loop below can interleave sample generation as the
         // SPC clock advances, instead of batching it after every register
         // write has already landed.
         let dsp_target = self.dsp_clock.cycles_to_samples(master_cycles);
-        while self.apu_cycles < spc_target {
+        while self.spc_clock.owes() {
             if self.spc_trace_enabled {
                 self.capture_spc_trace_entry();
             }
@@ -305,6 +308,7 @@ impl Apu {
             // against a pathological zero so it always terminates.
             .max(1);
             self.apu_cycles += cycles as u64;
+            self.spc_clock.ran(cycles);
             self.state.timer0.tick(cycles);
             self.state.timer1.tick(cycles);
             self.state.timer2.tick(cycles);
@@ -326,11 +330,10 @@ impl Apu {
                 self.dsp_samples_emitted = due;
             }
         }
-        self.spc_sync.advance(master_cycles, spc_target);
 
         // Flush any remaining samples up to the exact drift-free target.
         // The SPC clock can stop a sample or two short of the sample clock
-        // at the window edge (the two converters round independently), so
+        // at the window edge (the two clocks round independently), so
         // this top-up keeps the cumulative count exact and the cadence
         // drift-free over any run length.
         if dsp_target > self.dsp_samples_emitted {
@@ -551,8 +554,8 @@ impl Apu {
     }
 
     /// Capture the whole APU, SPC700, ARAM, mailbox ports, aux,
-    /// timers, the S-DSP, CONTROL, and both drift-free rate converter
-    /// anchors, into a snapshot. The host audio ring is *not* captured:
+    /// timers, the S-DSP, CONTROL, and both drift-free clocks' anchors,
+    /// into a snapshot. The host audio ring is *not* captured:
     /// it refills from the restored DSP on the next catch-up.
     pub fn to_savestate(&self) -> crate::savestate::ApuSaveState {
         crate::savestate::ApuSaveState {
@@ -566,7 +569,14 @@ impl Apu {
             timer2: self.state.timer2.to_savestate(),
             dsp: self.state.dsp.to_savestate(),
             control: self.state.control,
-            spc_sync: self.spc_sync.state(),
+            // The clock in the converter's form, which the layout holds: its
+            // master cycle, the SPC cycles due by it (those run, less the
+            // lead) and the credit.
+            spc_sync: RateConverterState {
+                reference_cycles: self.spc_clock.passed_to(),
+                samples_at_reference: self.apu_cycles.wrapping_add_signed(-self.spc_clock.lead()),
+                remainder: u64::from(self.spc_clock.credit()),
+            },
             dsp_clock: self.dsp_clock.state(),
             apu_cycles: self.apu_cycles,
             dsp_samples_emitted: self.dsp_samples_emitted,
@@ -574,9 +584,9 @@ impl Apu {
     }
 
     /// Restore the whole APU from a snapshot. `master_clock_hz` is the
-    /// console region clock the rate converters re-derive their ratio
+    /// console region clock both clocks re-derive their ratio
     /// from, the persisted state only carries the drifting anchor, not
-    /// the ratio, so a region-correct converter is rebuilt here. The
+    /// the ratio, so region-correct clocks are rebuilt here. The
     /// host audio ring is cleared (it is rebuilt from the restored DSP).
     pub fn from_savestate(&mut self, s: &crate::savestate::ApuSaveState, master_clock_hz: u64) {
         s.spc700.restore(&mut self.spc700);
@@ -589,8 +599,12 @@ impl Apu {
         self.state.timer2.from_savestate(&s.timer2);
         self.state.dsp.from_savestate(&s.dsp);
         self.state.control = s.control;
-        self.spc_sync =
-            IntegerRateConverter::from_state(SPC_CLOCK_HZ, master_clock_hz, &s.spc_sync);
+        self.spc_clock = SubClock::from_parts(
+            Ratio::new(SPC_CLOCK_HZ, master_clock_hz),
+            s.spc_sync.reference_cycles,
+            u32::try_from(s.spc_sync.remainder).unwrap_or(u32::MAX),
+            s.apu_cycles.wrapping_sub(s.spc_sync.samples_at_reference) as i64,
+        );
         self.dsp_clock =
             IntegerRateConverter::from_state(DSP_SAMPLE_RATE_HZ, master_clock_hz, &s.dsp_clock);
         self.apu_cycles = s.apu_cycles;
@@ -923,6 +937,35 @@ mod tests {
             master += 300 + (step % 37); // irregular master-cycle deltas
             apu.catch_up_to(master);
             assert_eq!(apu.samples_emitted(), reference.cycles_to_samples(master));
+        }
+    }
+
+    #[test]
+    fn the_spc700_runs_the_cycles_due_and_saves_its_clock_in_the_converters_form() {
+        let mut apu = Apu::new();
+        let reference = IntegerRateConverter::new(SPC_CLOCK_HZ, DEFAULT_MASTER_CLOCK_HZ);
+        let mut master = 0u64;
+        for step in 1..=400u64 {
+            master += 700 + (step * 37) % 5_000;
+            apu.catch_up_to(master);
+            let due = reference.cycles_to_samples(master);
+            let lead = apu.spc_cycles() - due;
+            assert!(lead < 16, "ran {} for {due} due", apu.spc_cycles());
+            let saved = apu.to_savestate();
+            assert_eq!(saved.spc_sync.reference_cycles, master);
+            assert_eq!(saved.spc_sync.samples_at_reference, due);
+            assert_eq!(
+                saved.spc_sync.remainder,
+                (master * reference.num()) % reference.den()
+            );
+            if step % 50 == 0 {
+                let mut loaded = Apu::new();
+                loaded.from_savestate(&saved, DEFAULT_MASTER_CLOCK_HZ);
+                let again = loaded.to_savestate();
+                assert_eq!(again.spc_sync, saved.spc_sync);
+                assert_eq!(again.apu_cycles, saved.apu_cycles);
+                assert_eq!(loaded.spc_clock, apu.spc_clock);
+            }
         }
     }
 

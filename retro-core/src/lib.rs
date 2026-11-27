@@ -20,6 +20,7 @@ pub mod input;
 pub mod input_schedule;
 pub mod memory;
 pub mod savestate;
+pub mod sub_clock;
 pub mod testing;
 pub mod types;
 pub mod video;
@@ -39,6 +40,7 @@ pub use savestate::{
     RomIdentity, SaveStateEnvelope, SavestateExtension, SavestateFormat, SavestatePayload,
     RETRO_SAVESTATE_ENVELOPE_VERSION, RETRO_SAVESTATE_MAGIC,
 };
+pub use sub_clock::SubClock;
 pub use types::*;
 
 // Re-export cartridge types
