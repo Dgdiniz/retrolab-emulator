@@ -30,6 +30,11 @@ pub trait ClockRatio: Copy {
         let den = u64::from(self.den());
         ((master % den) * u64::from(self.num()) % den) as u32
     }
+    /// Where a sub-processor `lead` cycles past the present stands on the
+    /// master clock, with `credit` of the present's next cycle: in master
+    /// cycles past the present, rounded down, `(lead * den - credit) / num`
+    /// (below 0, behind it).
+    fn master_lead(self, lead: i64, credit: u32) -> i64;
 }
 
 /// A ratio the master clock's own divisors fix, the same in every region:
@@ -59,6 +64,15 @@ impl<const NUM: u32, const DEN: u32> ClockRatio for FixedRatio<NUM, DEN> {
         );
         let weighted = span as u32 * NUM + credit;
         (u64::from(weighted / DEN), weighted % DEN)
+    }
+
+    #[inline(always)]
+    fn master_lead(self, lead: i64, credit: u32) -> i64 {
+        debug_assert!(
+            lead.unsigned_abs() <= u64::from(i32::MAX as u32 / DEN),
+            "a lead of {lead} cycles is past what a fixed ratio's 32-bit arithmetic holds"
+        );
+        i64::from((lead as i32 * DEN as i32 - credit as i32).div_euclid(NUM as i32))
     }
 }
 
@@ -106,6 +120,11 @@ impl ClockRatio for Ratio {
         let weighted = span * u64::from(self.num) + u64::from(credit);
         let den = u64::from(self.den);
         (weighted / den, (weighted % den) as u32)
+    }
+
+    #[inline]
+    fn master_lead(self, lead: i64, credit: u32) -> i64 {
+        (lead * i64::from(self.den) - i64::from(credit)).div_euclid(i64::from(self.num))
     }
 }
 
@@ -232,6 +251,14 @@ impl<R: ClockRatio> SubClock<R> {
     #[inline]
     pub fn lead(&self) -> i64 {
         self.lead
+    }
+
+    /// Where the sub-processor stands on the master clock: master cycles
+    /// past the present, rounded down (below 0, behind it). A chip that
+    /// follows the sub-processor's time is brought there.
+    #[inline]
+    pub fn master_lead(&self) -> i64 {
+        self.ratio.master_lead(self.lead, self.credit)
     }
 
     /// The ratio the clock divides the master clock by.
@@ -375,6 +402,43 @@ mod tests {
             2,
             "the instruction past the present still ends there"
         );
+    }
+
+    #[test]
+    fn the_place_on_the_master_clock_is_the_lead_less_the_credit() {
+        // At master time 34 the credit is 238 modulo 15, 13 master clocks
+        // of the next Z80 cycle: a Z80 at its due cycle stands 13 master
+        // clocks behind the present, 2 68000 cycles rounded down.
+        let at = SubClock::at(Sevenths::default(), 34);
+        assert_eq!(at.credit(), 13);
+        assert_eq!(at.master_lead(), -2);
+        assert_eq!(at.with_lead(2).master_lead(), 2);
+        assert_eq!(at.with_lead(-3).master_lead(), -9);
+        // On any clock, the place in master cycles is the floor of where
+        // the sub-processor stands, counted from master time 0, less the
+        // present.
+        for ratio in [
+            Ratio::new(7, 15),
+            Ratio::new(1_024_000, 21_477_270),
+            Ratio::new(3, 2),
+        ] {
+            let mut clock = SubClock::new(ratio);
+            let mut master = 0u64;
+            let mut owed = 0i64;
+            for (step, span) in spans(3, 500, 2_000).into_iter().enumerate() {
+                master += span;
+                owed += clock.pass_to(master) as i64;
+                if step % 3 == 0 {
+                    clock.ran(5);
+                }
+                // The sub-processor has run `owed + lead` cycles: in master
+                // cycles, `(owed + lead) * den / num`.
+                let (num, den) = (i64::from(ratio.num()), i64::from(ratio.den()));
+                let ran = owed + clock.lead();
+                let place = (ran * den).div_euclid(num) - master as i64;
+                assert_eq!(clock.master_lead(), place, "at {master}");
+            }
+        }
     }
 
     #[test]

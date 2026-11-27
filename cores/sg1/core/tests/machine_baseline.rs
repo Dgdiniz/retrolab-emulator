@@ -393,12 +393,15 @@ const RECORDED: &[(&str, &str)] = &[
     // hash right after the reset button, which keeps the PSG's tone
     // counters where its clock left them. A tone's half period then lasts
     // its period, one clock less than it did, which moves the same values.
-    ("frame 1: state hash", "a27c515a37b75664"),
-    ("frame 1: parts", "cpu68k=6b077e1553b1b732 z80=d833438a3ed05bdb vdp=83f41ad2b93b85bb psg=148ad39d29317651 ym2612=efc29b4251347646 io=3c6fedfeb6914524 bus=93dce42ef61c1e7c timing=f49acf6a880a28eb ram=9c59a697fe657b9c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=0000000000000001"),
-    ("frame 60: state hash", "2947b178f9bd8843"),
-    ("frame 60: parts", "cpu68k=0cc0c7e4121110fe z80=d833438a3ed05bdb vdp=a0e86f1e16e58e83 psg=0921816a5f226ba9 ym2612=828155374cb1c3fc io=5ccb29e732035f28 bus=93dce42ef61c1e7c timing=c8e9547137799345 ram=48632110ad257b4c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000003c"),
-    ("frame 300: state hash", "1b2505f2b625c6c9"),
-    ("frame 300: parts", "cpu68k=62884b7c10d28f84 z80=d833438a3ed05bdb vdp=7ef7614cd4cafe58 psg=1faffe04e802e599 ym2612=f5c0e15a2a0bb7e4 io=042a3110292eaa1d bus=55e7561ce03d8a3a timing=97f881ccbb702d8e ram=d9ad915fdcd57c38 z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000012c"),
+    // The YM2612 is brought to the present after each step, where it
+    // stopped at the line's budget and was topped up at the line's end:
+    // its part of the state moves from the first frame too.
+    ("frame 1: state hash", "ed4dd3cff0f982cc"),
+    ("frame 1: parts", "cpu68k=6b077e1553b1b732 z80=d833438a3ed05bdb vdp=83f41ad2b93b85bb psg=148ad39d29317651 ym2612=17a38648a4e597de io=3c6fedfeb6914524 bus=93dce42ef61c1e7c timing=f49acf6a880a28eb ram=9c59a697fe657b9c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=0000000000000001"),
+    ("frame 60: state hash", "4e90b9042c8a86a7"),
+    ("frame 60: parts", "cpu68k=0cc0c7e4121110fe z80=d833438a3ed05bdb vdp=a0e86f1e16e58e83 psg=0921816a5f226ba9 ym2612=e09aa8f9061d4690 io=5ccb29e732035f28 bus=93dce42ef61c1e7c timing=c8e9547137799345 ram=48632110ad257b4c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000003c"),
+    ("frame 300: state hash", "e6ea5ae78df271e5"),
+    ("frame 300: parts", "cpu68k=62884b7c10d28f84 z80=d833438a3ed05bdb vdp=7ef7614cd4cafe58 psg=1faffe04e802e599 ym2612=309b88fed5e0d178 io=042a3110292eaa1d bus=55e7561ce03d8a3a timing=97f881ccbb702d8e ram=d9ad915fdcd57c38 z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=000000000000012c"),
     ("the envelope", "envelope 1 | core sg1 | version 3 | rom hash 5bdbda6d2a59f3d8650fdf88c75783d2d48f0468d10570953ffcbeb2cc24105b | payload version 3 | title \"MACHINE BASELINE\""),
     ("load: envelope", "Ok | the saved machine's state: true"),
     ("load: legacy", "Ok | the saved machine's state: true"),
@@ -425,15 +428,15 @@ const RECORDED: &[(&str, &str)] = &[
     // frame after the reset), and the hash covers its bytes, so the four
     // hashes taken then move with them.
     ("reset: right after", "hash 52f3fdbb91973d7c | work RAM d96dbf20b7991b11 boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
-    ("reset: two frames later", "hash 058d4d644976f9f6 | work RAM 071a9068ba8c33b4 boots 2 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
+    ("reset: two frames later", "hash 3d44d75a6fb05cd0 | work RAM 071a9068ba8c33b4 boots 2 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
     // The app's Reset is a power cycle that keeps the save: a new 68000,
     // whose user stack pointer is clear (the reset button keeps it); the
     // mode is kept.
     ("hard_reset: right after", "hash 33ded4d8588b6c51 | work RAM eb05052ea5b62325 boots 0 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 0"),
-    ("hard_reset: two frames later", "hash b0f401e456c8023a | work RAM d3f8a09307d72bfa boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
+    ("hard_reset: two frames later", "hash 7da9207e1f13df88 | work RAM d3f8a09307d72bfa boots 1 | save RAM 3eeeb248c6ea2325 | mode Running | breakpoints 1 | region ntsc | frames 2"),
     // Netplay's power cycle keeps the mode.
     ("power_on_reset: right after", "hash 1d079dcf90162c51 | work RAM eb05052ea5b62325 boots 0 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 0"),
-    ("power_on_reset: two frames later", "hash d3e4cef8d4fb023a | work RAM d3f8a09307d72bfa boots 1 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 2"),
+    ("power_on_reset: two frames later", "hash f5d83fd4995e1f88 | work RAM d3f8a09307d72bfa boots 1 | save RAM 0d65b7532d396325 | mode Running | breakpoints 0 | region ntsc | frames 2"),
     ("sound, frame 1", "1470 samples 5e69999edbdcc165"),
     ("sound, frame 60", "1472 samples 0a9b3f1504e81c25"),
     ("sound, frame 300", "1472 samples 0e157796cae55c25"),
@@ -445,7 +448,7 @@ const RECORDED: &[(&str, &str)] = &[
     // hash, right after the power cycle, as the resets' above).
     ("set_region_str(pal)", "region pal | refresh 49.7015 | hash d017218dea2316fc"),
     // The machine power-cycled in the region, as the line above.
-    ("a PAL machine, 60 frames", "frames 60 | hash 3feb530e2fdfc29e | refresh 49.7015"),
+    ("a PAL machine, 60 frames", "frames 60 | hash 6f01a84cd124656e | refresh 49.7015"),
     ("set_region_str(secam)", "Err(\"unknown region 'secam' (expected 'ntsc' or 'pal')\")"),
 ];
 

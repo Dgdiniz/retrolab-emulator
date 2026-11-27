@@ -18,6 +18,10 @@ use retro_core::sub_clock::{FixedRatio, SubClock};
 /// the 68000's, in both regions. The PSG's input clock is the Z80's.
 pub(super) type Z80Ratio = FixedRatio<7, 15>;
 
+/// The YM2612's clock against the 68000's: both run at a seventh of the
+/// master clock.
+pub(super) type YmRatio = FixedRatio<1, 1>;
+
 /// A line's counters, which each 68000 step moves: in local variables for
 /// a run of steps to the line's end ([`FrameMachine::begin_run`] copies them
 /// out of the machine, [`FrameMachine::end_run`] writes them back), and in
@@ -36,12 +40,17 @@ pub struct LineRun {
     /// its last instruction's overshoot past the present kept as its lead.
     /// The PSG, on the same clock, runs at once for every whole clock of it.
     pub(super) z80_clock: SubClock<Z80Ratio>,
-    /// The PSG's and the Z80's clocks given in the line, which a frame
-    /// stopped part of the way through keeps for a build that gives them
-    /// the rest of their line at its end.
+    /// The YM2612's clock against the 68000's, which goes on from line to
+    /// line: the YM2612 follows the Z80 where the Z80 writes to it, and is
+    /// brought to the present after each step; its lead is where the Z80
+    /// took it past the present. It runs at the 68000's rate, so it
+    /// carries no credit.
+    pub(super) ym_clock: SubClock<YmRatio>,
+    /// The PSG's, the Z80's and the YM2612's clocks given in the line,
+    /// which a frame stopped part of the way through keeps for a build that
+    /// gives them the rest of their line at its end.
     pub(super) psg_clocked: u32,
     pub(super) z80_executed: u32,
-    /// The YM2612's clocks given.
     pub(super) ym_clocked: u32,
     /// The Z80's interrupt line as the run has it (copied from and back to
     /// `z80_irq_pending`), and whether the Z80 is traced.
@@ -80,13 +89,17 @@ impl GenesisEmulator {
         }
     }
 
-    /// The sound clock a reset and a load start from: in step with the
+    /// The sound clocks a reset and a load start from: in step with the
     /// master clock since the machine's power-on, so neither keeps a
     /// credit of its own; the Z80 `z80_lead` cycles past the present, as
-    /// a savestate keeps it (0 at a reset).
+    /// a savestate keeps it (0 at a reset), and the YM2612 where the Z80
+    /// took it, or at the present.
     pub(super) fn derive_sound_clocks(&mut self, z80_lead: i64) {
         self.line.z80_clock =
             SubClock::at(Z80Ratio::default(), self.master_cycles).with_lead(z80_lead);
+        let ym_lead = self.line.z80_clock.master_lead().max(0);
+        self.line.ym_clock =
+            SubClock::at(YmRatio::default(), self.master_cycles).with_lead(ym_lead);
     }
 
     /// Advance every cartridge coprocessor to the current master cycle. Run
@@ -193,15 +206,18 @@ impl GenesisEmulator {
             grid: line_start.saturating_sub(u64::from(self.frame_cycle_overshoot)),
             budget,
             z80_clock: self.line.z80_clock,
+            ym_clock: self.line.ym_clock,
             ..LineRun::default()
         };
         // The interrupt's entry and the transfer's stall are the sound
-        // clock's time too, and the Z80 runs through them (the 68000 is the
-        // one held), so its writes there land in their time.
+        // clocks' time too, and the Z80 runs through them (the 68000 is the
+        // one held), so its writes there land in their time: the YM2612
+        // owes them before the Z80 runs, and then follows it.
         let mut run = self.run_cursor();
         if self.sound_time_passes(&mut run, hooks) && run.z80_clock.owes() {
             self.catch_up_z80(&mut run, hooks);
         }
+        self.ym_to_present(&mut run, hooks);
         self.z80_irq_pending = run.z80_irq;
         self.line = run;
         // The beam counts the line from its start: the cycles the line
@@ -213,9 +229,8 @@ impl GenesisEmulator {
     }
 
     /// The end of the line: the Z80 run to the present, the 68000's
-    /// overshoot carried into the next line, the YM2612 given the rest of
-    /// its line, and the I/O clocked by the line. The PSG has had its time
-    /// at each step.
+    /// overshoot carried into the next line, and the I/O clocked by the
+    /// line. The PSG and the YM2612 have had their time at each step.
     fn end_line<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
         let mut run = self.run_cursor();
         let budget = run.budget;
@@ -236,13 +251,6 @@ impl GenesisEmulator {
         // budget pays (a line with no ROM to run spends nothing).
         let spent = self.master_cycles - run.grid;
         self.frame_cycle_overshoot = spent.saturating_sub(u64::from(budget)) as u32;
-
-        // Top up YM2612 for remaining scanline cycles
-        if run.ym_clocked < budget {
-            hooks.chip_start("YM2612");
-            self.bus.ym2612_mut().clock(budget - run.ym_clocked);
-            hooks.chip_finish(0);
-        }
 
         // I/O clocking
         self.bus.io_mut().clock(budget);
