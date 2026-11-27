@@ -13,9 +13,11 @@ use retro_core::frame::{Flow, StepHooks, Stepped};
 use retro_core::*;
 
 impl GenesisEmulator {
-    /// Step the Z80 CPU one instruction (debug path, 68K frozen). A frame in
-    /// progress gives the Z80 its line's whole share when it goes on,
-    /// whatever was stepped here.
+    /// Step the Z80 CPU one instruction (debug path, 68K frozen): the Z80
+    /// runs ahead of the present by the instruction's cycles, which its
+    /// clock keeps as its lead, so the frame's steps pay them back when it
+    /// goes on. The YM2612 keeps up with the Z80; the PSG keeps to the
+    /// master clock.
     pub(super) fn step_z80(&mut self) -> StepResult {
         self.release_z80_reset();
 
@@ -64,10 +66,12 @@ impl GenesisEmulator {
         let cycles = self.z80.step(&mut z80_bus);
         total_cycles += cycles;
 
-        // Clock YM2612 and PSG proportionally
+        // The YM2612 kept up with the Z80
         let ym_cycles = total_cycles * 15 / 7;
         z80_bus.clock_ym2612(ym_cycles);
-        z80_bus.clock_psg(total_cycles);
+        self.line.ym_clocked += ym_cycles;
+        self.line.z80_clock.ran(total_cycles);
+        self.line.z80_executed += total_cycles;
 
         // Record Z80 instruction history using pre-execution PC and disassembly
         if let Some(instruction) = disasm_text {
@@ -251,10 +255,6 @@ impl GenesisEmulator {
         self.last_step_cycles = total;
         hooks.raised(self, Self::video_event_hit);
 
-        // The PSG has the step's time at once, so a register write lands on
-        // the output sample of its own time.
-        self.psg_time_passes(run, hooks);
-
         // Update HBLANK approximation based on 68K cycle position
         let spent = (self.master_cycles - run.grid) as u32;
         self.bus.vdp_mut().set_hblank_approx(spent, run.budget);
@@ -275,21 +275,13 @@ impl GenesisEmulator {
         // Snapshot YM2612 progress before Z80 interleaving
         let ym_before_z80 = run.ym_clocked;
 
-        // Accumulate absolute Z80 target when bus is free (fractional)
-        if !self.bus.is_z80_reset() && !self.bus.is_z80_bus_requested() {
-            run.z80_credit += total * 7;
-            run.z80_target += run.z80_credit / 15;
-            run.z80_credit %= 15;
-        }
-
-        // Run Z80 burst when target is sufficiently ahead of executed.
-        // Using absolute target means overshoot from previous bursts
-        // naturally prevents the Z80 from running until the target catches up.
-        if run.z80_target > run.z80_executed + 3
-            && !self.bus.is_z80_reset()
-            && !self.bus.is_z80_bus_requested()
-        {
-            self.run_z80(run.z80_target, run, hooks);
+        // The step's time on the sound clock: the PSG has it at once, so a
+        // register write lands on the output sample of its own time, and
+        // the Z80 owes it. Once the Z80 owes more than 3 cycles it runs to
+        // the present, its last instruction's overshoot kept as its lead,
+        // which the next steps pay back.
+        if self.sound_time_passes(run, hooks) && run.z80_clock.owes_more_than(3) {
+            self.catch_up_z80(run, hooks);
         }
 
         // Ensure YM2612 is clocked by at least the 68K instruction's cycle count
@@ -312,32 +304,37 @@ impl GenesisEmulator {
         })
     }
 
-    /// Master time passes to the present for the PSG: every whole clock of
-    /// its clock since the last pass, which it runs at once. The PSG clocks
-    /// at master/15 whether or not the Z80 has its bus.
+    /// Master time passes to the present on the sound clock: the PSG runs
+    /// every whole clock of it at once, at master/15 whether or not the Z80
+    /// has its bus, and the Z80 owes them, unless it is held (in reset, off
+    /// its bus, or with no cartridge to run), when it owes nothing. Returns
+    /// whether the Z80 runs.
     #[inline(always)]
-    pub(super) fn psg_time_passes<H: StepHooks<Self>>(&mut self, run: &mut LineRun, hooks: &mut H) {
-        let clocks = run.psg_clock.pass_to(self.master_cycles) as u32;
-        run.psg_clock.ran(clocks);
+    pub(super) fn sound_time_passes<H: StepHooks<Self>>(
+        &mut self,
+        run: &mut LineRun,
+        hooks: &mut H,
+    ) -> bool {
+        let clocks = run.z80_clock.pass_to(self.master_cycles) as u32;
         if clocks > 0 {
             hooks.chip_start("PSG");
             self.bus.psg_mut().clock(clocks);
             hooks.chip_finish(0);
             run.psg_clocked += clocks;
         }
+        let runs = run.has_rom && !self.bus.is_z80_reset() && !self.bus.is_z80_bus_requested();
+        if !runs {
+            run.z80_clock.hold();
+        }
+        runs
     }
 
-    /// Run the Z80 until its count for the line reaches `until`: its
+    /// Run the Z80 to the present, the cycles its clock says it owes: its
     /// interrupt line, its trace while it is traced, its coverage, and the
     /// YM2612 clocked by its time, capped at the line's budget. The Z80's
-    /// work after a 68000 instruction and at the line's end.
+    /// work after a 68000 instruction and at a line's start and end.
     #[inline(always)]
-    pub(super) fn run_z80<H: StepHooks<Self>>(
-        &mut self,
-        until: u32,
-        run: &mut LineRun,
-        hooks: &mut H,
-    ) {
+    pub(super) fn catch_up_z80<H: StepHooks<Self>>(&mut self, run: &mut LineRun, hooks: &mut H) {
         let budget = run.budget;
         let tracing = run.z80_tracing;
         // Only the trace reads the line; the run never crosses one.
@@ -347,13 +344,14 @@ impl GenesisEmulator {
             0
         };
         let mut irq = run.z80_irq;
+        let mut clock = run.z80_clock;
         let mut executed = run.z80_executed;
         let mut ym_clocked = run.ym_clocked;
         let mut instructions = 0u32;
         hooks.chip_start("Z80");
         {
             let mut z80_bus = self.bus.create_z80_bus();
-            while executed < until {
+            while clock.owes() {
                 if tracing {
                     let raw_bytes = z80_bus.instruction_bytes(self.z80.pc);
                     record_z80_trace(&mut self.debugger, &self.z80, scanline, raw_bytes);
@@ -362,6 +360,7 @@ impl GenesisEmulator {
                 if processed {
                     irq = false;
                     executed += irq_cycles;
+                    clock.ran(irq_cycles);
                     let ym_c = (irq_cycles * 15 / 7).min(budget.saturating_sub(ym_clocked));
                     z80_bus.clock_ym2612(ym_c);
                     ym_clocked += ym_c;
@@ -370,6 +369,7 @@ impl GenesisEmulator {
                     .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                 let zc = self.z80.step(&mut z80_bus);
                 executed += zc;
+                clock.ran(zc);
                 let ym_c = (zc * 15 / 7).min(budget.saturating_sub(ym_clocked));
                 z80_bus.clock_ym2612(ym_c);
                 ym_clocked += ym_c;
@@ -378,6 +378,7 @@ impl GenesisEmulator {
         }
         hooks.chip_finish(instructions);
         run.z80_irq = irq;
+        run.z80_clock = clock;
         run.z80_executed = executed;
         run.ym_clocked = ym_clocked;
     }

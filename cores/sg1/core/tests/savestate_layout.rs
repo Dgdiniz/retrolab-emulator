@@ -255,13 +255,16 @@ fn stopped_holding_the_extension() -> GenesisEmulator {
     emu
 }
 
-/// What a load holds of `extension`, less what it derives from the master
-/// clock instead of reading: the credit of the PSG's clock in the frame
-/// stopped part of the way through. A build that counted the credit within
-/// the line wrote its own.
+/// What a load holds of `extension`, less what it does not read back as
+/// written: in the frame stopped part of the way through, the credits of
+/// the sound clock, which a load derives from the master clock, and the
+/// Z80's target, which this build writes as the cycles the Z80 ran. A
+/// build that counted them within the line wrote its own.
 fn less_what_a_load_derives(mut extension: GenesisExtension) -> GenesisExtension {
     if let Some(frame) = extension.frame.as_mut() {
         frame.psg_credit = 0;
+        frame.z80_credit = 0;
+        frame.z80_target = 0;
     }
     extension
 }
@@ -316,10 +319,21 @@ fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
             .unwrap_or_else(|e| panic!("{name} no longer loads: {e}"));
         let held = emu.savestate_extension();
         let master_cycles = payload.timing.master_cycles;
+        let credit = Some((master_cycles * 7 % 15) as u32);
         assert_eq!(
             held.frame.as_ref().map(|frame| frame.psg_credit),
-            Some((master_cycles * 7 % 15) as u32),
+            credit,
             "{name}: the PSG's credit, derived from the master clock"
+        );
+        assert_eq!(
+            held.frame.as_ref().map(|frame| frame.z80_credit),
+            credit,
+            "{name}: the Z80's credit, the same clock's"
+        );
+        assert_eq!(
+            held.frame.as_ref().map(|frame| frame.z80_target),
+            held.frame.as_ref().map(|frame| frame.z80_executed),
+            "{name}: the Z80's target, the cycles it ran"
         );
         assert_eq!(
             less_what_a_load_derives(held),

@@ -602,10 +602,38 @@ pub struct GenesisExtension {
     pub z80_bus_grant: u64,
     /// A frame stopped part of the way through: where it stands.
     pub frame: Option<GenesisFrameState>,
+    /// The cycles the Z80 ran past the present, which the time after pays
+    /// back (below 0, the cycles it owes): its clock's lead.
+    pub z80_lead: i64,
 }
 
 impl retro_core::savestate::SavestateExtension for GenesisExtension {
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
+
+    /// Version 1, written before the Z80's lead: the Z80 at the present.
+    fn read_older(version: u32, bytes: &[u8]) -> Result<Self, String> {
+        if version != 1 {
+            return Err(format!(
+                "savestate extension version {version} is not read by this build"
+            ));
+        }
+        let (vdp, ym2612, psg, z80_bus_grant, frame) =
+            retro_core::savestate::read_extension_part::<(
+                VdpExtension,
+                Ym2612Extension,
+                PsgExtension,
+                u64,
+                Option<GenesisFrameState>,
+            )>(bytes)?;
+        Ok(Self {
+            vdp,
+            ym2612,
+            psg,
+            z80_bus_grant,
+            frame,
+            z80_lead: 0,
+        })
+    }
 }
 
 /// The VDP's part of [`GenesisExtension`].
@@ -692,10 +720,10 @@ pub struct GenesisFrameState {
     /// The line's counters once its start ran (all 0 before): the clock
     /// less the 68000 cycles the line has spent, the line's 68000 budget,
     /// the PSG's credit and its clocks given in the line, the Z80's target,
-    /// credit and cycles run, the YM2612's clocks given. The PSG's credit is
-    /// its clock's, which a load derives from the master clock; a build
-    /// that counted the credit and the clocks within the line reads them as
-    /// its own.
+    /// credit and cycles run in the line, the YM2612's clocks given. The
+    /// credits are the sound clock's, which a load derives from the master
+    /// clock, and the target is the cycles run; a build that counted them
+    /// within the line reads them as its own.
     pub grid: u64,
     pub budget: u32,
     pub psg_credit: u32,

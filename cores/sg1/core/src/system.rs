@@ -325,7 +325,7 @@ impl GenesisEmulator {
             capture_recording: CaptureRecording::default(),
         };
         // The sound clock at the power-on's master cycles.
-        emulator.derive_sound_clocks();
+        emulator.derive_sound_clocks(0);
         emulator
     }
 
@@ -720,7 +720,7 @@ impl EmulatorCore for GenesisEmulator {
         self.last_step_cycles = 0;
         self.z80_irq_pending = false;
         self.running = true;
-        self.derive_sound_clocks();
+        self.derive_sound_clocks(0);
 
         // Drop any queued samples (this is a real reset, not
         // mid-stream: the host is expected to drain after) and

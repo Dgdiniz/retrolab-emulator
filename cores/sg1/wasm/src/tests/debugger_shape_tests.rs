@@ -131,7 +131,7 @@ fn lines_of(text: &str) -> Vec<(String, JsValue)> {
 
 /// The Z80's state after the steps is the one its own last step wrote:
 /// each step a host asks for writes the states, the two Z80 steps, which
-/// ran the NOPs at $27 and $28, as well as the 68000's.
+/// ran the NOPs at $00 and $01, as well as the 68000's.
 #[wasm_bindgen_test]
 fn what_the_cpu_states_hold() {
     let mut stopped = stopped_at_count();
@@ -153,11 +153,11 @@ fn what_the_cpu_states_hold() {
                          {name: \"A2\", value: 0}, {name: \"A3\", value: 0}, {name: \"A4\", \
                          value: 0}, {name: \"A5\", value: 0}, {name: \"A6\", value: 0}, \
                          {name: \"A7\", value: 4294967292}, {name: \"PC\", value: 1280}, \
-                         {name: \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 26, \
+                         {name: \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 52, \
                          registers: [{name: \"A\", value: 0}, {name: \"F\", value: 0}, {name: \
                          \"B\", value: 0}, {name: \"C\", value: 0}, {name: \"D\", value: 0}, \
                          {name: \"E\", value: 0}, {name: \"H\", value: 0}, {name: \"L\", \
-                         value: 0}, {name: \"PC\", value: 26}, {name: \"SP\", value: 65535}, \
+                         value: 0}, {name: \"PC\", value: 52}, {name: \"SP\", value: 65535}, \
                          {name: \"IX\", value: 0}, {name: \"IY\", value: 0}]}]",
             ),
             (
@@ -170,11 +170,11 @@ fn what_the_cpu_states_hold() {
                          {name: \"A2\", value: 0}, {name: \"A3\", value: 0}, {name: \"A4\", \
                          value: 0}, {name: \"A5\", value: 0}, {name: \"A6\", value: 0}, \
                          {name: \"A7\", value: 0}, {name: \"PC\", value: 1094}, {name: \
-                         \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 41, registers: \
+                         \"SR\", value: 9984}]}, {cpu_id: 1, flags: 0, pc: 2, registers: \
                          [{name: \"A\", value: 0}, {name: \"F\", value: 0}, {name: \"B\", \
                          value: 0}, {name: \"C\", value: 0}, {name: \"D\", value: 0}, {name: \
                          \"E\", value: 0}, {name: \"H\", value: 0}, {name: \"L\", value: 0}, \
-                         {name: \"PC\", value: 41}, {name: \"SP\", value: 65535}, {name: \
+                         {name: \"PC\", value: 2}, {name: \"SP\", value: 65535}, {name: \
                          \"IX\", value: 0}, {name: \"IY\", value: 0}]}]",
             ),
         ],
@@ -388,8 +388,8 @@ fn what_the_instruction_history_holds() {
             ("68000 after the steps, 0", "[]"),
             (
                 "Z80 after the steps",
-                "[{address: 40, cycle_count: 4, instruction: \"NOP\", \
-                         registers_before: []}, {address: 39, cycle_count: 4, instruction: \
+                "[{address: 1, cycle_count: 4, instruction: \"NOP\", \
+                         registers_before: []}, {address: 0, cycle_count: 4, instruction: \
                          \"NOP\", registers_before: []}]",
             ),
             ("CPU 2", "[]"),
@@ -860,8 +860,8 @@ fn what_turning_z80_tracing_on_and_off_does() {
     assert_shapes(
         &found,
         &[
-            ("on, a frame run: bytes", "556624"),
-            ("off, a frame run: bytes", "556624"),
+            ("on, a frame run: bytes", "550240"),
+            ("off, a frame run: bytes", "550240"),
             ("on again: bytes", "0"),
             ("on again: flag", "true"),
         ],
@@ -896,7 +896,7 @@ fn what_the_z80_trace_flush_data_holds() {
     assert_shapes(
         &chunk_head(&data, sg1_core::debugger::Z80_TRACE_ENTRY_SIZE),
         &[
-            ("length", "557308"),
+            ("length", "550886"),
             (
                 "first entry",
                 "\"0000000000000000000000000000ffff00000000000000000000000000000000000000000000\"",

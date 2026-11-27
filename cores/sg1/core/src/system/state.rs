@@ -140,6 +140,7 @@ impl GenesisEmulator {
             psg: self.bus.psg().extension(),
             z80_bus_grant: self.bus.z80_bus_grant(self.master_cycles),
             frame: self.frame_open.then(|| self.frame_state()),
+            z80_lead: self.line.z80_clock.lead(),
         }
     }
 
@@ -159,10 +160,13 @@ impl GenesisEmulator {
             line_started: self.line_started,
             grid: run.grid,
             budget: run.budget,
-            psg_credit: run.psg_clock.credit(),
+            psg_credit: run.z80_clock.credit(),
             psg_clocked: run.psg_clocked,
-            z80_target: run.z80_target,
-            z80_credit: run.z80_credit,
+            // The Z80's target as what it ran: a build that runs the Z80
+            // until it reaches its target goes on from here without
+            // pausing it for part of the line.
+            z80_target: run.z80_executed,
+            z80_credit: run.z80_clock.credit(),
             z80_executed: run.z80_executed,
             ym_clocked: run.ym_clocked,
             stopped_step: run.resume.then_some(self.interrupt_cycles),
@@ -194,8 +198,9 @@ impl GenesisEmulator {
     /// it, so a state with nothing after its payload leaves no fill, no
     /// busy time and no frame in progress, whatever the loading machine
     /// had. The sound clock is derived from the master clock, as a reset
-    /// derives it.
+    /// derives it, the Z80's lead taken from the extension.
     pub(super) fn restore_extension(&mut self, extension: GenesisExtension) {
+        let z80_lead = extension.z80_lead;
         let line_end = self.line_end_beam();
         self.bus
             .vdp_mut()
@@ -211,8 +216,6 @@ impl GenesisEmulator {
                 grid: frame.grid,
                 budget: frame.budget,
                 psg_clocked: frame.psg_clocked,
-                z80_target: frame.z80_target,
-                z80_credit: frame.z80_credit,
                 z80_executed: frame.z80_executed,
                 ym_clocked: frame.ym_clocked,
                 z80_irq: self.z80_irq_pending,
@@ -225,7 +228,7 @@ impl GenesisEmulator {
                 .vdp_mut()
                 .set_frame_being_drawn(self.frame_count + 1);
         }
-        self.derive_sound_clocks();
+        self.derive_sound_clocks(z80_lead);
     }
 
     /// Build the full machine snapshot shared by [`EmulatorCore::save_state`]

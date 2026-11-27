@@ -31,17 +31,15 @@ pub struct LineRun {
     pub(super) grid: u64,
     /// The line's 68000 cycles, 488 or 489 (the 4/7 carry).
     pub(super) budget: u32,
-    /// The PSG's clock against the 68000's, which goes on from line to
-    /// line: the PSG runs at once for every whole clock of it, so it never
-    /// stands past the present.
-    pub(super) psg_clock: SubClock<Z80Ratio>,
-    /// The PSG's clocks given in the line, which a frame stopped part of
-    /// the way through keeps for a build that tops the PSG up at the
-    /// line's end.
+    /// The Z80's clock against the 68000's, which goes on from line to
+    /// line and frame to frame: the Z80 runs the cycles it owes in bursts,
+    /// its last instruction's overshoot past the present kept as its lead.
+    /// The PSG, on the same clock, runs at once for every whole clock of it.
+    pub(super) z80_clock: SubClock<Z80Ratio>,
+    /// The PSG's and the Z80's clocks given in the line, which a frame
+    /// stopped part of the way through keeps for a build that gives them
+    /// the rest of their line at its end.
     pub(super) psg_clocked: u32,
-    /// The Z80's target, its credit in fifteenths, and its cycles run.
-    pub(super) z80_target: u32,
-    pub(super) z80_credit: u32,
     pub(super) z80_executed: u32,
     /// The YM2612's clocks given.
     pub(super) ym_clocked: u32,
@@ -82,16 +80,13 @@ impl GenesisEmulator {
         }
     }
 
-    /// The Z80's clocks in a line: the master clocks of a line over 15.
-    pub(super) fn z80_line_cycles(&self) -> u32 {
-        self.region.master_clocks_per_scanline() / 15
-    }
-
     /// The sound clock a reset and a load start from: in step with the
     /// master clock since the machine's power-on, so neither keeps a
-    /// credit of its own.
-    pub(super) fn derive_sound_clocks(&mut self) {
-        self.line.psg_clock = SubClock::at(Z80Ratio::default(), self.master_cycles);
+    /// credit of its own; the Z80 `z80_lead` cycles past the present, as
+    /// a savestate keeps it (0 at a reset).
+    pub(super) fn derive_sound_clocks(&mut self, z80_lead: i64) {
+        self.line.z80_clock =
+            SubClock::at(Z80Ratio::default(), self.master_cycles).with_lead(z80_lead);
     }
 
     /// Advance every cartridge coprocessor to the current master cycle. Run
@@ -128,10 +123,10 @@ impl GenesisEmulator {
     /// line's 68000 budget is drawn, the interrupts it raises are requested
     /// and the one the 68000's mask lets through is taken, the line's
     /// events are raised for the debugger, and up to a line of a transfer's
-    /// stall is charged before the first step, the PSG clocked through the
-    /// interrupt and the stall. The line's counters start from zero (the
-    /// PSG's clock goes on), and the beam's count from what the start took,
-    /// so the line's first instruction sees its own line.
+    /// stall is charged before the first step, the PSG clocked and the Z80
+    /// run through the interrupt and the stall. The line's counters start
+    /// from zero (the sound clock goes on), and the beam's count from what
+    /// the start took, so the line's first instruction sees its own line.
     fn start_line<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
         let line = self.frame_line;
         hooks.chip_start("VDP");
@@ -192,17 +187,22 @@ impl GenesisEmulator {
         // A pending 68k-bus DMA freezes the CPU: up to one line of it comes
         // out of this line's budget, so the transfer meters line by line.
         self.drain_dma_stall_for_line();
-        let mut run = LineRun {
+        self.line = LineRun {
             // The overshoot the previous line ran past its budget comes out
             // of this line's.
             grid: line_start.saturating_sub(u64::from(self.frame_cycle_overshoot)),
             budget,
-            psg_clock: self.line.psg_clock,
+            z80_clock: self.line.z80_clock,
             ..LineRun::default()
         };
-        // The interrupt's entry and the transfer's stall are the PSG's time
-        // too.
-        self.psg_time_passes(&mut run, hooks);
+        // The interrupt's entry and the transfer's stall are the sound
+        // clock's time too, and the Z80 runs through them (the 68000 is the
+        // one held), so its writes there land in their time.
+        let mut run = self.run_cursor();
+        if self.sound_time_passes(&mut run, hooks) && run.z80_clock.owes() {
+            self.catch_up_z80(&mut run, hooks);
+        }
+        self.z80_irq_pending = run.z80_irq;
         self.line = run;
         // The beam counts the line from its start: the cycles the line
         // before ran past its end, the interrupt's entry and the transfer's
@@ -212,24 +212,23 @@ impl GenesisEmulator {
         self.bus.vdp_mut().set_hblank_approx(spent, budget);
     }
 
-    /// The end of the line: the Z80 run to its line's share, the 68000's
+    /// The end of the line: the Z80 run to the present, the 68000's
     /// overshoot carried into the next line, the YM2612 given the rest of
     /// its line, and the I/O clocked by the line. The PSG has had its time
     /// at each step.
     fn end_line<H: StepHooks<Self>>(&mut self, hooks: &mut H) {
         let mut run = self.run_cursor();
         let budget = run.budget;
-        let z80_line = self.z80_line_cycles();
 
-        // Top up Z80 to the scanline's proportional target.
-        // z80_target from the accumulator may be slightly under the line's
-        // share due to fractional rounding; the share is the true max.
-        if !self.bus.is_z80_reset()
+        // The Z80 run to the present, which the 68000's last instruction may
+        // have taken past the line's end, so the next line's start finds it
+        // there. A held Z80 owes nothing.
+        if run.has_rom
+            && !self.bus.is_z80_reset()
             && !self.bus.is_z80_bus_requested()
-            && run.has_rom
-            && run.z80_executed < z80_line
+            && run.z80_clock.owes()
         {
-            self.run_z80(z80_line, &mut run, hooks);
+            self.catch_up_z80(&mut run, hooks);
         }
         self.z80_irq_pending = run.z80_irq;
 
