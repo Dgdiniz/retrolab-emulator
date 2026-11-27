@@ -156,8 +156,9 @@ impl NoiseChannel {
     /// # Returns
     /// Sample value in range [-1.0, 1.0], or 0.0 if muted
     pub fn clock(&mut self) -> f32 {
-        // Decrement counter based on shift rate
-        if self.counter == 0 {
+        // The counter counts down; the clock that takes it past 1 flips
+        // the polarity and reloads it, so a flip comes every period
+        if self.counter <= 1 {
             self.counter = self.get_period();
             // Toggle polarity on each counter expiration
             self.polarity = !self.polarity;

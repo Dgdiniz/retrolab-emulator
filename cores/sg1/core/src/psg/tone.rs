@@ -128,8 +128,10 @@ impl ToneChannel {
 
     /// Clock the channel one cycle, returns output sample
     ///
-    /// The counter counts down from the frequency value. When it reaches
-    /// zero, it reloads and the polarity flips, creating a square wave.
+    /// The counter counts down from the frequency value. The clock that
+    /// finds it at 1 (or at 0, where a write may leave it) reloads it and
+    /// flips the polarity, so each half of the square wave lasts
+    /// `frequency` clocks.
     ///
     /// # Returns
     /// Sample value in range [-1.0, 1.0], or 0.0 if muted
@@ -141,8 +143,8 @@ impl ToneChannel {
             return self.get_output();
         }
 
-        // Counter counts down
-        if self.counter == 0 {
+        // Counter counts down; the clock that takes it past 1 flips
+        if self.counter <= 1 {
             // Reload counter
             self.counter = self.frequency;
             // Flip polarity
@@ -326,21 +328,22 @@ mod tests {
         channel.set_frequency(4);
         channel.set_attenuation(0); // Max volume
 
-        // Clock 4 times: the counter runs down to 0, the polarity holds
+        // Clock 3 times: the counter runs down to 1, the polarity holds
         let out1 = channel.clock();
         let out2 = channel.clock();
         let out3 = channel.clock();
-        let out4 = channel.clock();
-
-        // All should be same polarity
         assert_eq!(out1, out2);
         assert_eq!(out2, out3);
-        assert_eq!(out3, out4);
 
-        // The fifth clock finds the counter at 0: it reloads and flips
-        let out5 = channel.clock();
-        assert_ne!(out4, out5);
-        assert_eq!(out5, -out4);
+        // The fourth clock finds the counter at 1: it reloads and flips
+        let out4 = channel.clock();
+        assert_eq!(out4, -out3);
+
+        // Every half period lasts 4 clocks
+        for _ in 0..3 {
+            assert_eq!(channel.clock(), out4);
+        }
+        assert_eq!(channel.clock(), -out4);
     }
 
     #[test]
