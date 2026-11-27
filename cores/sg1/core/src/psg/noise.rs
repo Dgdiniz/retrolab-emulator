@@ -136,13 +136,10 @@ impl NoiseChannel {
             NoiseShiftRate::N512 => 0x10,
             NoiseShiftRate::N1024 => 0x20,
             NoiseShiftRate::N2048 => 0x40,
-            NoiseShiftRate::Tone3 => {
-                if self.tone3_frequency == 0 {
-                    1024
-                } else {
-                    self.tone3_frequency
-                }
-            }
+            // The Sega PSG reads a tone-3 period of 0 as 1, so the noise
+            // shifts every other clock: a bright hiss, where the 1024 the
+            // discrete chips read would make a low rumble.
+            NoiseShiftRate::Tone3 => self.tone3_frequency.max(1),
         }
     }
 
@@ -538,5 +535,27 @@ mod tests {
         channel.set_control(0x03);
         channel.set_tone3_frequency(123);
         assert_eq!(channel.get_period(), 123);
+
+        // A tone-3 period of 0 is 1, as the Sega PSG reads it
+        channel.set_tone3_frequency(0);
+        assert_eq!(channel.get_period(), 1);
+    }
+
+    #[test]
+    fn the_noise_on_tone_3_at_period_0_shifts_every_other_clock() {
+        let mut channel = NoiseChannel::new(TEST_CLOCK);
+        channel.set_control(0x07); // White noise on tone 3's rate
+        channel.set_tone3_frequency(0);
+        channel.set_attenuation(0);
+        let mut shifts = 0;
+        let mut lfsr = channel.lfsr;
+        for _ in 0..64 {
+            channel.clock();
+            if channel.lfsr != lfsr {
+                shifts += 1;
+                lfsr = channel.lfsr;
+            }
+        }
+        assert_eq!(shifts, 32);
     }
 }
