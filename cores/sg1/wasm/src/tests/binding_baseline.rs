@@ -438,17 +438,17 @@ getAudioInfo => {bits_per_sample: 16, channels: 2, sample_rate: 44100}
 ring, new => {available: 0, enabled: true, overflows: 0n}
 ring, a frame with audio off => {available: 0, enabled: false, overflows: 0n}
 ring, five frames => {available: 5880, enabled: true, overflows: 1480n}
-getAudioSamplesN(64) => Float32Array(len 64, fnv1a64 0x6aacd6184676bb35)
+getAudioSamplesN(64) => Float32Array(len 64, fnv1a64 0xc403d8d35bd55205)
 ring, 64 taken => {available: 5816, enabled: true, overflows: 1480n}
 ring, clearAudioBuffer => {available: 5816, enabled: true, overflows: 1480n}
 ring, discardPendingAudio => {available: 5816, enabled: true, overflows: 1480n}
-getAudioSamples => Float32Array(len 5816, fnv1a64 0x46319aa8ed66bb41)
+getAudioSamples => Float32Array(len 5816, fnv1a64 0xe23494cbce93e409)
 ring, drained => {available: 0, enabled: true, overflows: 1480n}
 getAudioSamplesN(64), drained => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
 getAudioSamples, drained => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
 ring, a headless frame => {available: 0, enabled: true, overflows: 1480n}
 ring, discarded, then a frame => {available: 1472, enabled: true, overflows: 1480n}
-getAudioSamplesN(100000) => Float32Array(len 1472, fnv1a64 0x1f0d35d327042b91)
+getAudioSamplesN(100000) => Float32Array(len 1472, fnv1a64 0xdf839bb9fe8cd04d)
 "#,
     );
 }
@@ -520,10 +520,10 @@ fn what_the_sound_chips_readers_answer() {
 getAudioChips()[1] => {channel_types: ["Tone", "Tone", "Tone", "Noise"], channels: 4, manufacturer: "Texas Instruments", name: "SN76489", sample_rate: 44100, stereo: false}
 getAudioChips()[1].channels => 4
 getAudioChips()[0].channels => 6
-getAudioChipChannels(1)[0] => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
-getAudioChipWaveform(1, 0, 32) => Float32Array(len 32, fnv1a64 0xd41626e6a7e46725)
+getAudioChipChannels(1)[0] => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: -1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
+getAudioChipWaveform(1, 0, 32) => Float32Array(len 32, fnv1a64 0xec27e76405feafa5)
 getAudioChipChannels(0)[0] => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.1068115234375, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
-getAudioOutputWaveform(32) => Float32Array(len 32, fnv1a64 0x8cbe0043c5603ea0)
+getAudioOutputWaveform(32) => Float32Array(len 32, fnv1a64 0x8c635b720d442cb5)
 getAudioChipChannels(1)[3] => {attenuation: 15, channel_id: 3, channel_type: "Noise", current_output: -0, enabled: false, envelope: undefined, frequency: 0, frequency_raw: 0, muted: false, noise_params: {lfsr_state: 2, mode: "Periodic", shift_rate: "N512"}, pan: 0, period: 512, volume: 0}
 getAudioChipChannels(1).length => 4
 getAudioChipChannels(2) => null
@@ -535,7 +535,7 @@ getAudioChipChannels(1)[0], muted => {attenuation: 0, channel_id: 0, channel_typ
 getAudioChipWaveform(1, 0, 32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioChipChannels(0)[0], muted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.95263671875, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: true, noise_params: undefined, pan: 0, period: 0, volume: 1}
 getAudioOutputWaveform(32), muted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
-getAudioChipChannels(1)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: -1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
+getAudioChipChannels(1)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "Tone", current_output: 1, enabled: true, envelope: undefined, frequency: 440.39678955078125, frequency_raw: 254, muted: false, noise_params: undefined, pan: 0, period: 8128, volume: 1}
 getAudioChipWaveform(1, 0, 32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)
 getAudioChipChannels(0)[0], unmuted => {attenuation: 0, channel_id: 0, channel_type: "FM", current_output: -0.95263671875, enabled: true, envelope: {attack: 1, current_phase: "Sustain", decay: 0, release: 1, sustain: 1}, frequency: 250.745849609375, frequency_raw: 617, muted: false, noise_params: undefined, pan: 0, period: 0, volume: 1}
 getAudioOutputWaveform(32), unmuted => Float32Array(len 32, fnv1a64 0x8421ae126c7ced25)

@@ -460,7 +460,10 @@ impl Psg {
     ///   - Bits 6-5: Channel select (00-10 = tone 0-2, 11 = noise)
     ///   - Bit 4: Type (0 = tone/noise data, 1 = volume)
     ///   - Bits 3-0: Data (low 4 bits of frequency or volume)
-    /// - Bit 7 = 0: Data byte (high 6 bits of frequency)
+    /// - Bit 7 = 0: Data byte, for the register latched last, which stays
+    ///   latched: a tone's period takes its low 6 bits as the period's
+    ///   upper 6, a volume its low 4 bits, the noise channel's control its
+    ///   low 3 (as a latch byte's)
     ///
     /// # Arguments
     /// * `data` - 8-bit data to write
@@ -507,11 +510,23 @@ impl Psg {
                 _ => {} // Unreachable due to masking
             }
         } else {
-            // Data byte (high 6 bits of frequency for tone channels)
-            if self.latched_channel < 3 && self.latched_type == LatchType::Tone {
-                let ch = &mut self.tone_channels[self.latched_channel as usize];
-                let freq = (ch.get_frequency() & 0x00F) | ((data as u16 & 0x3F) << 4);
-                ch.set_frequency(freq);
+            // A data byte: the register latched last takes it.
+            match (self.latched_channel, self.latched_type) {
+                (0..=2, LatchType::Tone) => {
+                    let ch = &mut self.tone_channels[self.latched_channel as usize];
+                    let freq = (ch.get_frequency() & 0x00F) | ((data as u16 & 0x3F) << 4);
+                    ch.set_frequency(freq);
+                }
+                (0..=2, LatchType::Volume) => {
+                    self.tone_channels[self.latched_channel as usize].set_attenuation(data & 0x0F);
+                }
+                (3, LatchType::Tone) => {
+                    self.noise_channel.set_control(data & 0x07);
+                }
+                (3, LatchType::Volume) => {
+                    self.noise_channel.set_attenuation(data & 0x0F);
+                }
+                _ => {} // Unreachable due to masking
             }
         }
 
@@ -931,6 +946,43 @@ mod tests {
             retro_core::audio::NoiseShiftRate::Tone3
         ));
         assert!(matches!(params.mode, retro_core::audio::NoiseMode::White));
+    }
+
+    /// A data byte goes to the register latched last, which stays latched:
+    /// after a volume latch it is the volume's low 4 bits, after the noise
+    /// channel's control latch the control's low 3 (restarting the shift
+    /// register, as the latch byte does), after the noise's volume latch
+    /// that volume.
+    #[test]
+    fn a_data_byte_goes_to_the_volume_or_noise_register_latched() {
+        let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
+        psg.write(0xB5); // latch channel 1's volume: 5
+        psg.write(0x0A); // a data byte: 10
+        assert_eq!(psg.get_channel_state(1).unwrap().attenuation, 0x0A);
+        psg.write(0x73); // another: 3 (its upper bits are not the volume's)
+        assert_eq!(psg.get_channel_state(1).unwrap().attenuation, 0x03);
+        assert_eq!(psg.get_channel_state(1).unwrap().frequency_raw, 0);
+
+        psg.write(0xE0); // latch the noise's control: periodic, N512
+        psg.clock(CLOCKS_PER_TICK * 200);
+        psg.write(0x07); // a data byte: white, tone 3's rate
+        let params = psg.get_channel_state(3).unwrap().noise_params.unwrap();
+        assert!(matches!(params.mode, retro_core::audio::NoiseMode::White));
+        assert!(matches!(
+            params.shift_rate,
+            retro_core::audio::NoiseShiftRate::Tone3
+        ));
+        let mut fresh = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
+        fresh.write(0xE7);
+        assert_eq!(
+            psg.noise_channel.lfsr(),
+            fresh.noise_channel.lfsr(),
+            "the control written restarts the shift register"
+        );
+
+        psg.write(0xF2); // latch the noise's volume: 2
+        psg.write(0x0C); // a data byte: 12
+        assert_eq!(psg.get_channel_state(3).unwrap().attenuation, 0x0C);
     }
 
     #[test]

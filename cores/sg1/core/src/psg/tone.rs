@@ -14,8 +14,8 @@ use retro_core::audio::{ChannelState, ChannelType};
 pub struct ToneChannel {
     /// Tone frequency (10-bit value, 0-1023)
     /// Actual frequency = Clock / (32 * frequency_value)
-    /// frequency_value = 0 is a constant DC output in `clock()`; only the
-    /// debugger's Hz and period read it as 1024
+    /// frequency_value = 0 runs as 1, as the Mega Drive's PSG runs it: the
+    /// output flips at every clock
     frequency: u16,
 
     /// Attenuation (4-bit value, 0-15)
@@ -57,10 +57,15 @@ impl ToneChannel {
     /// * `freq` - 10-bit frequency value (masked to 0x3FF)
     pub fn set_frequency(&mut self, freq: u16) {
         self.frequency = freq & 0x3FF;
-        // If counter is 0, reload immediately (freq 0 = DC, no reload needed)
-        if self.counter == 0 && self.frequency != 0 {
-            self.counter = self.frequency;
+        // If counter is 0, reload immediately
+        if self.counter == 0 {
+            self.counter = self.period();
         }
+    }
+
+    /// The period the channel counts: its frequency value, 0 read as 1.
+    fn period(&self) -> u16 {
+        self.frequency.max(1)
     }
 
     /// Get frequency register value
@@ -77,12 +82,7 @@ impl ToneChannel {
     ///
     /// Formula: Clock / (32 * frequency_value)
     pub fn get_frequency_hz(&self) -> f32 {
-        let freq_val = if self.frequency == 0 {
-            1024
-        } else {
-            self.frequency
-        };
-        self.clock_freq as f32 / (32.0 * freq_val as f32)
+        self.clock_freq as f32 / (32.0 * f32::from(self.period()))
     }
 
     /// Set attenuation (4-bit value, 0-15)
@@ -131,22 +131,16 @@ impl ToneChannel {
     /// The counter counts down from the frequency value. The clock that
     /// finds it at 1 (or at 0, where a write may leave it) reloads it and
     /// flips the polarity, so each half of the square wave lasts
-    /// `frequency` clocks.
+    /// `frequency` clocks. The Mega Drive's PSG runs a frequency value of
+    /// 0 as 1: the output flips at every clock.
     ///
     /// # Returns
     /// Sample value in range [-1.0, 1.0], or 0.0 if muted
     pub fn clock(&mut self) -> f32 {
-        // On the Genesis (SN76496 integrated PSG), frequency register 0
-        // produces a constant DC output (high). The counter doesn't toggle.
-        if self.frequency == 0 {
-            self.polarity = true;
-            return self.get_output();
-        }
-
         // Counter counts down; the clock that takes it past 1 flips
         if self.counter <= 1 {
             // Reload counter
-            self.counter = self.frequency;
+            self.counter = self.period();
             // Flip polarity
             self.polarity = !self.polarity;
         } else {
@@ -191,11 +185,7 @@ impl ToneChannel {
 
     /// Get current state for debugging
     pub fn get_state(&self, channel_id: u32) -> ChannelState {
-        let freq_val = if self.frequency == 0 {
-            1024
-        } else {
-            self.frequency
-        };
+        let freq_val = self.period();
 
         ChannelState {
             channel_id,
@@ -276,13 +266,22 @@ mod tests {
         assert!((freq_hz - 441.9).abs() < 1.0);
     }
 
+    /// A frequency value of 0 runs as 1: the output flips at every clock,
+    /// and the debugger shows the frequency of a period of 1.
     #[test]
-    fn test_frequency_zero_treated_as_1024() {
+    fn a_frequency_of_0_runs_as_1() {
         let mut channel = ToneChannel::new(TEST_CLOCK);
-
         channel.set_frequency(0);
-        let expected_hz = TEST_CLOCK as f32 / (32.0 * 1024.0);
-        assert!((channel.get_frequency_hz() - expected_hz).abs() < 0.1);
+        channel.set_attenuation(0);
+        let mut last = channel.get_output();
+        for clock in 0..8 {
+            let out = channel.clock();
+            assert_eq!(out, -last, "clock {clock}: the output flips");
+            last = out;
+        }
+        let expected_hz = TEST_CLOCK as f32 / 32.0;
+        assert!((channel.get_frequency_hz() - expected_hz).abs() < 1.0);
+        assert_eq!(channel.get_state(0).period, 32);
     }
 
     #[test]

@@ -144,7 +144,27 @@ impl Operator {
 
         // Step 1: the note's base increment.
         let base = ((self.freq_number as u32) << self.block) >> 1;
+        self.phase_increment = self.detuned_and_multiplied(base);
+    }
 
+    /// The phase's step a chip sample under the LFO's vibrato, `offset`
+    /// added to the F-number: the chip counts the F-number in halves (12
+    /// bits, wrapping) as it adds the offset, then raises it by the block,
+    /// halved, and takes the detune and the multiple as for the step
+    /// without vibrato (ymfm's `compute_phase_step`, the reference for the
+    /// table the offset comes from). So the depth is a share of the note,
+    /// the same on every multiple.
+    fn vibrato_increment(&self, offset: i32) -> u32 {
+        if self.freq_number == 0 {
+            return 0;
+        }
+        let halves = ((i32::from(self.freq_number) << 1) + offset) as u32 & 0xFFF;
+        self.detuned_and_multiplied((halves << self.block) >> 2)
+    }
+
+    /// A base increment (the F-number raised by the block and halved) with
+    /// the detune added or taken away, then the multiple.
+    fn detuned_and_multiplied(&self, base: u32) -> u32 {
         // Step 2: DT1 detune, applied before the multiplication.
         // DT1 register: bits 1-0 = detune magnitude (0-3), bit 2 = sign
         let magnitude = (self.detune & 0x03) as usize;
@@ -167,7 +187,7 @@ impl Operator {
         };
 
         // The chip's increment, a chip sample's step of the phase.
-        self.phase_increment = (detuned * halves) >> 1;
+        (detuned * halves) >> 1
     }
 
     /// Clock the operator once, generating one sample
@@ -188,19 +208,7 @@ impl Operator {
 
     /// Clock with AM modulation applied
     pub fn clock_with_am(&mut self, modulation: i16, am_attenuation: u16) -> i16 {
-        self.clock_with_am_and_phase_adj(modulation, am_attenuation, 0)
-    }
-
-    /// Clock with AM modulation and phase increment adjustment (for LFO PM)
-    /// pm_phase_adj is added to the phase increment for this clock cycle only,
-    /// implementing pitch modulation by temporarily changing the frequency.
-    pub fn clock_with_am_and_phase_adj(
-        &mut self,
-        modulation: i16,
-        am_attenuation: u16,
-        pm_phase_adj: i32,
-    ) -> i16 {
-        self.clock_full(modulation, am_attenuation, pm_phase_adj, true)
+        self.clock_full(modulation, am_attenuation, None, true)
     }
 
     /// Full clock with optional envelope advancement.
@@ -209,11 +217,14 @@ impl Operator {
     /// internal samples), while phase and output are computed at the internal
     /// rate. When `advance_eg` is false, the phase still advances and output
     /// is computed, but the envelope state is frozen for this cycle.
+    /// `vibrato` is the LFO's offset to the F-number for this sample, none
+    /// while the channel's PMS is 0 (the step is then the one the registers
+    /// gave).
     pub fn clock_full(
         &mut self,
         modulation: i16,
         am_attenuation: u16,
-        pm_phase_adj: i32,
+        vibrato: Option<i32>,
         advance_eg: bool,
     ) -> i16 {
         // Clock envelope only when EG tick is due
@@ -229,9 +240,12 @@ impl Operator {
             self.envelope.ssg_phase_reset = false;
         }
 
-        // Advance phase with PM adjustment
-        let adjusted_inc = (self.phase_increment as i32 + pm_phase_adj).max(0) as u32;
-        self.phase = self.phase.wrapping_add(adjusted_inc);
+        // Advance the phase, by the step the vibrato moves while it runs
+        let increment = match vibrato {
+            None => self.phase_increment,
+            Some(offset) => self.vibrato_increment(offset),
+        };
+        self.phase = self.phase.wrapping_add(increment);
 
         // Get envelope attenuation level (0-1023) + AM
         let env_level = (self.envelope.get_level() + am_attenuation).min(1023);
@@ -448,6 +462,53 @@ impl Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ym2612::tables::compute_lfo_pm_offset;
+
+    /// The vibrato's depth at its peak, the LFO's step 7, is the chip
+    /// manual's for each PMS, in shares of a halftone: 3.4, 6.7, 10, 14,
+    /// 20, 40 and 80 cents (to within 0.7 cent: the chip's offset at an
+    /// F-number of 0x400 is 4, 8, 12, 16, 24, 48 and 96 of the 2,048
+    /// halves the F-number counts); and it is the same on every multiple.
+    #[test]
+    fn the_vibrato_s_depth_is_the_manual_s_on_every_multiple() {
+        const MANUAL_CENTS: [f64; 8] = [0.0, 3.4, 6.7, 10.0, 14.0, 20.0, 40.0, 80.0];
+        let mut depths = Vec::new();
+        for multiple in [0, 1, 3, 15] {
+            let mut op = Operator::new(7_670_454);
+            op.set_frequency(0x400, 4, multiple);
+            let plain = f64::from(op.phase_increment());
+            for pms in 1..=7u8 {
+                let offset = compute_lfo_pm_offset(0x400, pms, 7);
+                let peak = f64::from(op.vibrato_increment(offset));
+                let cents = 1200.0 * (peak / plain).log2();
+                let manual = MANUAL_CENTS[usize::from(pms)];
+                assert!(
+                    (cents - manual).abs() < 0.7,
+                    "MUL {multiple}, PMS {pms}: {cents:.2} cents, the manual's {manual}"
+                );
+                depths.push((pms, cents));
+            }
+        }
+        for &(pms, cents) in &depths {
+            let first = depths.iter().find(|d| d.0 == pms).unwrap().1;
+            assert!(
+                (cents - first).abs() < 1e-9,
+                "PMS {pms}: the depth moves with the multiple"
+            );
+        }
+    }
+
+    /// Without the vibrato, the step is the one the registers gave.
+    #[test]
+    fn no_vibrato_is_the_step_the_registers_gave() {
+        let mut op = Operator::new(7_670_454);
+        op.set_frequency(0x269, 4, 3);
+        let step = op.phase_increment();
+        assert_eq!(op.vibrato_increment(0), step);
+        let phase = op.phase;
+        op.clock_full(0, 0, None, true);
+        assert_eq!(op.phase.wrapping_sub(phase), step);
+    }
 
     #[test]
     fn test_operator_creation() {

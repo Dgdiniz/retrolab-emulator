@@ -275,27 +275,22 @@ impl Channel {
             0
         };
 
-        // Calculate PM (pitch modulation) as a phase increment adjustment
-        // Hardware-accurate: uses LFO_PM_OUTPUT indexed by F-number bits, PMS, and LFO step
-        // The table gives an F-number offset, which we convert to a phase increment delta
-        //
-        // In CH3 special mode, each operator uses its own fnum/block for PM calculation.
-        let pm_phase_adj: [i32; 4] = if self.pms > 0 {
+        // The LFO's vibrato: an offset to the F-number, from its upper seven
+        // bits, the PMS and the LFO's step (the table of LFO_PM_OUTPUT),
+        // which each operator adds to its F-number ahead of its block, its
+        // detune and its multiple, so the depth is a share of the note on
+        // every operator. None while the PMS is 0. In CH3 special mode each
+        // operator's offset comes from its own F-number.
+        let vibrato_fnum: [Option<i32>; 4] = if self.pms > 0 {
             if self.ch3_special {
-                // CH3 special: per-operator PM using each operator's own frequency
-                [
-                    Self::calc_pm(self.op_fnum[0], self.op_block[0], self.pms, pm_step),
-                    Self::calc_pm(self.op_fnum[1], self.op_block[1], self.pms, pm_step),
-                    Self::calc_pm(self.op_fnum[2], self.op_block[2], self.pms, pm_step),
-                    Self::calc_pm(self.op_fnum[3], self.op_block[3], self.pms, pm_step),
-                ]
+                self.op_fnum
+                    .map(|fnum| Some(compute_lfo_pm_offset(fnum, self.pms, pm_step)))
             } else {
                 // Normal mode: all operators share channel-wide fnum/block
-                let adj = Self::calc_pm(self.fnum, self.block, self.pms, pm_step);
-                [adj, adj, adj, adj]
+                [Some(compute_lfo_pm_offset(self.fnum, self.pms, pm_step)); 4]
             }
         } else {
-            [0, 0, 0, 0]
+            [None; 4]
         };
 
         // Calculate per-operator AM attenuation
@@ -349,7 +344,7 @@ impl Channel {
         const C2: usize = 3;
 
         // Clock operators per algorithm with correct routing
-        // Outside CH3 special mode all operators receive the same pm_phase_adj
+        // Outside CH3 special mode all operators receive the same vibrato
         // (LFO PM modifies all equally); in it each operator has its own.
         //
         // IMPORTANT: the two kinds of operator take their modulation differently:
@@ -371,25 +366,25 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
                 let c1 = self.operators[C1].clock_full(
                     m1 >> 1,
                     am_attenuation[C1],
-                    pm_phase_adj[C1],
+                    vibrato_fnum[C1],
                     eg,
                 );
                 let m2 = self.operators[M2].clock_full(
                     c1 >> 1,
                     am_attenuation[M2],
-                    pm_phase_adj[M2],
+                    vibrato_fnum[M2],
                     eg,
                 );
                 let c2 = self.operators[C2].clock_full(
                     m2 >> 1,
                     am_attenuation[C2],
-                    pm_phase_adj[C2],
+                    vibrato_fnum[C2],
                     eg,
                 );
                 self.op1_prev = [m1, self.op1_prev[0]];
@@ -400,21 +395,21 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
-                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], pm_phase_adj[C1], eg);
+                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], vibrato_fnum[C1], eg);
                 let sum = (m1 as i32 + c1 as i32).clamp(-32768, 32767) as i16;
                 let m2 = self.operators[M2].clock_full(
                     sum >> 1,
                     am_attenuation[M2],
-                    pm_phase_adj[M2],
+                    vibrato_fnum[M2],
                     eg,
                 );
                 let c2 = self.operators[C2].clock_full(
                     m2 >> 1,
                     am_attenuation[C2],
-                    pm_phase_adj[C2],
+                    vibrato_fnum[C2],
                     eg,
                 );
                 self.op1_prev = [m1, self.op1_prev[0]];
@@ -425,21 +420,21 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
-                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], pm_phase_adj[C1], eg);
+                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], vibrato_fnum[C1], eg);
                 let m2 = self.operators[M2].clock_full(
                     c1 >> 1,
                     am_attenuation[M2],
-                    pm_phase_adj[M2],
+                    vibrato_fnum[M2],
                     eg,
                 );
                 let sum = (m1 as i32 + m2 as i32).clamp(-32768, 32767) as i16;
                 let c2 = self.operators[C2].clock_full(
                     sum >> 1,
                     am_attenuation[C2],
-                    pm_phase_adj[C2],
+                    vibrato_fnum[C2],
                     eg,
                 );
                 self.op1_prev = [m1, self.op1_prev[0]];
@@ -450,21 +445,21 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
                 let c1 = self.operators[C1].clock_full(
                     m1 >> 1,
                     am_attenuation[C1],
-                    pm_phase_adj[C1],
+                    vibrato_fnum[C1],
                     eg,
                 );
-                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], pm_phase_adj[M2], eg);
+                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], vibrato_fnum[M2], eg);
                 let sum = (c1 as i32 + m2 as i32).clamp(-32768, 32767) as i16;
                 let c2 = self.operators[C2].clock_full(
                     sum >> 1,
                     am_attenuation[C2],
-                    pm_phase_adj[C2],
+                    vibrato_fnum[C2],
                     eg,
                 );
                 self.op1_prev = [m1, self.op1_prev[0]];
@@ -475,20 +470,20 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
                 let c1 = self.operators[C1].clock_full(
                     m1 >> 1,
                     am_attenuation[C1],
-                    pm_phase_adj[C1],
+                    vibrato_fnum[C1],
                     eg,
                 );
-                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], pm_phase_adj[M2], eg);
+                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], vibrato_fnum[M2], eg);
                 let c2 = self.operators[C2].clock_full(
                     m2 >> 1,
                     am_attenuation[C2],
-                    pm_phase_adj[C2],
+                    vibrato_fnum[C2],
                     eg,
                 );
                 self.op1_prev = [m1, self.op1_prev[0]];
@@ -499,16 +494,16 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
                 let m1_mod = m1 >> 1; // halved for non-feedback modulation
                 let c1 =
-                    self.operators[C1].clock_full(m1_mod, am_attenuation[C1], pm_phase_adj[C1], eg);
+                    self.operators[C1].clock_full(m1_mod, am_attenuation[C1], vibrato_fnum[C1], eg);
                 let m2 =
-                    self.operators[M2].clock_full(m1_mod, am_attenuation[M2], pm_phase_adj[M2], eg);
+                    self.operators[M2].clock_full(m1_mod, am_attenuation[M2], vibrato_fnum[M2], eg);
                 let c2 =
-                    self.operators[C2].clock_full(m1_mod, am_attenuation[C2], pm_phase_adj[C2], eg);
+                    self.operators[C2].clock_full(m1_mod, am_attenuation[C2], vibrato_fnum[C2], eg);
                 self.op1_prev = [m1, self.op1_prev[0]];
                 (c1 as i32 + m2 as i32 + c2 as i32).clamp(-32768, 32767) as i16
             }
@@ -517,17 +512,17 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
                 let c1 = self.operators[C1].clock_full(
                     m1 >> 1,
                     am_attenuation[C1],
-                    pm_phase_adj[C1],
+                    vibrato_fnum[C1],
                     eg,
                 );
-                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], pm_phase_adj[M2], eg);
-                let c2 = self.operators[C2].clock_full(0, am_attenuation[C2], pm_phase_adj[C2], eg);
+                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], vibrato_fnum[M2], eg);
+                let c2 = self.operators[C2].clock_full(0, am_attenuation[C2], vibrato_fnum[C2], eg);
                 self.op1_prev = [m1, self.op1_prev[0]];
                 (c1 as i32 + m2 as i32 + c2 as i32).clamp(-32768, 32767) as i16
             }
@@ -536,12 +531,12 @@ impl Channel {
                 let m1 = self.operators[M1].clock_full(
                     fb_with_pm,
                     am_attenuation[M1],
-                    pm_phase_adj[M1],
+                    vibrato_fnum[M1],
                     eg,
                 );
-                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], pm_phase_adj[C1], eg);
-                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], pm_phase_adj[M2], eg);
-                let c2 = self.operators[C2].clock_full(0, am_attenuation[C2], pm_phase_adj[C2], eg);
+                let c1 = self.operators[C1].clock_full(0, am_attenuation[C1], vibrato_fnum[C1], eg);
+                let m2 = self.operators[M2].clock_full(0, am_attenuation[M2], vibrato_fnum[M2], eg);
+                let c2 = self.operators[C2].clock_full(0, am_attenuation[C2], vibrato_fnum[C2], eg);
                 self.op1_prev = [m1, self.op1_prev[0]];
                 (m1 as i32 + c1 as i32 + m2 as i32 + c2 as i32).clamp(-32768, 32767) as i16
             }
@@ -559,16 +554,6 @@ impl Channel {
         let right = if self.stereo.right { output } else { 0 };
 
         (left, right)
-    }
-
-    /// Calculate PM phase adjustment for a given fnum/block/pms/lfo_step.
-    fn calc_pm(fnum: u16, block: u8, pms: u8, pm_step: u8) -> i32 {
-        let fn_offset = compute_lfo_pm_offset(fnum, pms, pm_step);
-        if fn_offset != 0 {
-            fn_offset << (block as i32)
-        } else {
-            0
-        }
     }
 
     /// Calculate AM attenuation for an operator based on LFO AM value and operator AMS
