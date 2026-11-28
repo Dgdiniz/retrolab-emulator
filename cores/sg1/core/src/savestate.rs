@@ -621,6 +621,26 @@ pub struct GenesisExtension {
 impl retro_core::savestate::SavestateExtension for GenesisExtension {
     const VERSION: u32 = 4;
 
+    /// The state hash reads what the machine holds, not the chips' records
+    /// of the frame so far: they are the frame's sound, which a load plays
+    /// on, made as the host's settings (a channel's mute, the YM2612's
+    /// DAC) shape it; the chips' clocks and registers are in the state.
+    fn hashed(&self) -> Option<Self> {
+        if self.psg_output.is_empty() && self.ym2612_output.is_empty() {
+            return None;
+        }
+        Some(Self {
+            vdp: self.vdp.clone(),
+            ym2612: self.ym2612.clone(),
+            psg: self.psg.clone(),
+            z80_bus_grant: self.z80_bus_grant,
+            frame: self.frame.clone(),
+            z80_lead: self.z80_lead,
+            psg_output: Vec::new(),
+            ym2612_output: Vec::new(),
+        })
+    }
+
     /// Version 1, written before the Z80's lead (the Z80 at the present),
     /// version 2, before the PSG's record, and version 3, before the
     /// YM2612's. The samples their `psg.samples` and `ym2612.samples` hold,

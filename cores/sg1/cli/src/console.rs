@@ -1,5 +1,5 @@
 //! What the Mega Drive gives the shared commands of `retro-cli`: its CPUs
-//! and the parsers of their MAME-format lines, its start-up flag, the
+//! and the parsers of their MAME-format lines, its start-up flags, the
 //! 68000's optional timing columns, its `screenshot` flags (a pixel's
 //! composition logged, VRAM patched) and its priority views, and the lines
 //! of its profile.
@@ -16,6 +16,7 @@ use retro_core::{CpuArchitecture, EmulatorCore};
 use sg1_core::debugger::{TraceEntryBinary, MAIN_CPU, SOUND_CPU, TRACE_ENTRY_SIZE};
 use sg1_core::golden::SIX_BUTTON;
 use sg1_core::vdp::RenderLayerMode;
+use sg1_core::ym2612::FmDacModel;
 use sg1_core::GenesisEmulator;
 
 use crate::trace_ref;
@@ -24,13 +25,23 @@ use crate::trace_ref;
 #[derive(Debug)]
 pub struct Genesis;
 
-/// The flag every command of the tool that loads a ROM takes.
+/// The flags every command of the tool that loads a ROM takes.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct GenesisBoot {
     /// Connect 6-button pads so `x`/`y`/`z`/`mode` reach the game (the
     /// default is 3-button, matching MAME).
     #[arg(long)]
     pub six_button: bool,
+    /// The YM2612's DAC: `discrete`, the YM2612 of the first consoles,
+    /// whose levels either side of zero lie apart, or `integrated`, the
+    /// YM3438 of the later ones; both take each channel as 9 bits.
+    #[arg(long, value_name = "MODEL", default_value = "discrete", value_parser = parse_fm_dac)]
+    pub fm_dac: FmDacModel,
+}
+
+/// An `--fm-dac` model: `discrete` or `integrated`.
+fn parse_fm_dac(name: &str) -> std::result::Result<FmDacModel, String> {
+    FmDacModel::from_name(name).ok_or_else(|| "expected `discrete` or `integrated`".to_string())
 }
 
 /// The flags only the Mega Drive's `screenshot` takes.
@@ -215,7 +226,9 @@ impl Console for Genesis {
     const PRESS_EXAMPLE: &'static str = "";
     const RESET_EXAMPLE: &'static str = "";
 
-    fn stage(_: &mut GenesisEmulator, _: &[u8], _: &GenesisBoot, _: bool) -> Result<()> {
+    /// `--fm-dac` chooses the YM2612's DAC, which a ROM's load keeps.
+    fn stage(emu: &mut GenesisEmulator, _: &[u8], boot: &GenesisBoot, _: bool) -> Result<()> {
+        emu.set_fm_dac_model(boot.fm_dac);
         Ok(())
     }
 
@@ -389,10 +402,34 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            Genesis::golden_flags(&GenesisBoot { six_button: true }),
+            Genesis::golden_flags(&GenesisBoot {
+                six_button: true,
+                ..GenesisBoot::default()
+            }),
             vec![SIX_BUTTON]
         );
         assert!(Genesis::golden_flags(&GenesisBoot::default()).is_empty());
+    }
+
+    /// `--fm-dac` takes the two models by name, the discrete chip's by
+    /// default, and refuses any other word; the machine staged with it
+    /// keeps it across the ROM's load.
+    #[test]
+    fn the_fm_dac_flag_names_the_two_chips() {
+        assert_eq!(parse_fm_dac("discrete"), Ok(FmDacModel::Discrete));
+        assert_eq!(parse_fm_dac("integrated"), Ok(FmDacModel::Integrated));
+        assert!(parse_fm_dac("ym3438").is_err());
+        assert_eq!(GenesisBoot::default().fm_dac, FmDacModel::Discrete);
+        let mut emu = GenesisEmulator::new();
+        let boot = GenesisBoot {
+            fm_dac: FmDacModel::Integrated,
+            ..GenesisBoot::default()
+        };
+        Genesis::stage(&mut emu, &[], &boot, false).unwrap();
+        let mut rom = vec![0u8; 0x400];
+        rom[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
+        emu.load_rom(&rom).unwrap();
+        assert_eq!(emu.fm_dac_model(), FmDacModel::Integrated);
     }
 
     #[test]

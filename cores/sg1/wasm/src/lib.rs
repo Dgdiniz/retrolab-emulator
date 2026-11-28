@@ -7,6 +7,7 @@ use retro_core::video::VideoMemoryId;
 use retro_core::*;
 use retro_wasm::js::{set_property, to_js, uint16_array};
 use sg1_core::system::GenesisSnapshotConsole;
+use sg1_core::ym2612::FmDacModel;
 use sg1_core::GenesisEmulator;
 use wasm_bindgen::prelude::*;
 
@@ -128,6 +129,30 @@ impl RetroEmulator {
     #[wasm_bindgen(js_name = getYm2612DacState)]
     pub fn get_ym2612_dac_state(&self) -> JsValue {
         to_js(&self.genesis.get_ym2612_dac_state())
+    }
+
+    /// Make the YM2612's channels reach the output through the DAC of
+    /// `model`: `"discrete"`, the YM2612 of the first consoles, whose levels
+    /// either side of zero lie apart (the default), or `"integrated"`, the
+    /// YM3438 of the later ones. Any other word changes nothing and answers
+    /// false. A host setting: in no savestate and no state hash, and kept
+    /// across a ROM's load, the resets and a savestate's load.
+    #[wasm_bindgen(js_name = setFmDacModel)]
+    pub fn set_fm_dac_model(&mut self, model: &str) -> bool {
+        match FmDacModel::from_name(model) {
+            Some(model) => {
+                self.genesis.set_fm_dac_model(model);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The DAC the YM2612's channels reach the output through:
+    /// `"discrete"` or `"integrated"`.
+    #[wasm_bindgen(js_name = getFmDacModel)]
+    pub fn get_fm_dac_model(&self) -> String {
+        self.genesis.fm_dac_model().name().to_string()
     }
 
     /// Get YM2612 Timer A state.

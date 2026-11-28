@@ -17,6 +17,7 @@
 
 pub mod algorithms;
 pub mod channel;
+mod dac;
 mod debug;
 pub mod envelope;
 pub mod lfo;
@@ -32,6 +33,7 @@ pub mod timers;
 // Re-exports
 pub use algorithms::Algorithm;
 pub use channel::{Channel, StereoFlags};
+pub use dac::FmDacModel;
 pub use debug::{DacStatus, FmOperator, FmPatch, LfoStatus, TimerStatus};
 pub use envelope::{EnvelopeGenerator, EnvelopeState};
 pub use lfo::Lfo;
@@ -155,6 +157,10 @@ pub struct Ym2612 {
     /// leaves its output out. A host setting, not saved; a reset keeps it.
     mute_flags: [bool; 6],
 
+    /// The DAC the channels reach the output through: which chip the
+    /// console has. A host setting, not saved; a reset keeps it.
+    dac_model: FmDacModel,
+
     /// Output level for visualization
     output_level: f32,
 
@@ -273,6 +279,7 @@ impl Ym2612 {
             address_latch_part0: 0,
             address_latch_part1: 0,
             mute_flags: [false; 6],
+            dac_model: FmDacModel::default(),
             output_level: 0.0,
             waveform_buffer: VecDeque::with_capacity(1024),
             max_waveform_samples: 1024,
@@ -475,6 +482,17 @@ impl Ym2612 {
         for ch in &mut self.channels {
             ch.set_clock_freq(clock_freq);
         }
+    }
+
+    /// Reach the output through the DAC of `model`'s chip, from the next
+    /// sample on.
+    pub fn set_dac_model(&mut self, model: FmDacModel) {
+        self.dac_model = model;
+    }
+
+    /// The DAC the channels reach the output through.
+    pub fn dac_model(&self) -> FmDacModel {
+        self.dac_model
     }
 
     /// Get a reference to a channel

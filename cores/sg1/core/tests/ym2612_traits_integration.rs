@@ -5,7 +5,7 @@
 
 use retro_core::audio::{AudioChip, AudioChipInfo, AudioDebugger, ChannelType, EnvelopePhase};
 use retro_core::cpu::Clockable;
-use sg1_core::ym2612::Ym2612;
+use sg1_core::ym2612::{FmDacModel, Ym2612};
 
 /// Helper: Clock YM2612 before generating samples
 fn clock_and_generate(ym: &mut Ym2612, output: &mut [f32], sample_rate: u32) -> usize {
@@ -302,6 +302,9 @@ fn test_reset_via_trait() {
 #[test]
 fn test_full_integration_flow() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
 
     // 1. Get chip info
     let info = ym.get_info();

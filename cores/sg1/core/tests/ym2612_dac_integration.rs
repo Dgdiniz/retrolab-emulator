@@ -8,7 +8,7 @@
 
 use retro_core::audio::{AudioChip, AudioDebugger, ChannelType};
 use retro_core::cpu::Clockable;
-use sg1_core::ym2612::Ym2612;
+use sg1_core::ym2612::{FmDacModel, Ym2612};
 
 /// Helper: Clock YM2612 before generating samples
 /// CRITICAL: generate_samples() only works if cycles have been accumulated via clock()
@@ -111,6 +111,9 @@ fn rms(samples: &[f32]) -> f32 {
 #[test]
 fn test_dac_vs_fm_channel6() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
 
     // Configure FM on channel 6: part 1, registers whose low two bits are 2
     // (the part's third channel). Algorithm 7 adds the four operators; OP1
@@ -289,6 +292,9 @@ fn test_dac_stereo_output() {
 #[test]
 fn test_dac_mute() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
 
     // Enable DAC
     ym.write_register(0, 0x2B, 0x80);
@@ -502,6 +508,9 @@ fn test_dac_rapid_value_changes() {
 #[test]
 fn test_dac_zero_value() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
     ym.write_register(0, 0x2B, 0x80); // Enable DAC
     ym.write_register(0, 0x2A, 0x80); // Zero (center value)
 

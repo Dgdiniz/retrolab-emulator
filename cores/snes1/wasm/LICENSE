@@ -104,8 +104,9 @@ or in connection with the use or performance of this software.
 
 ------------------------------------------------------------------------
 
-ares, in cores/snes1/core/src/cartridge/chips/sa1/, cpus/superfx-gsu/
-and cpus/upd7725/
+ares, in cores/sg1/core/src/ym2612/dac.rs,
+cores/snes1/core/src/cartridge/chips/sa1/, cpus/superfx-gsu/ and
+cpus/upd7725/
 https://github.com/ares-emulator/ares
 
 ares

@@ -440,8 +440,10 @@ impl GenesisEmulator {
     fn rebuild_volatile_hardware(&mut self) {
         // What the old chips logged goes onto the log before they go.
         self.pause_sound_log();
-        // The channels the host muted, which the new chips keep.
+        // The channels the host muted, and the YM2612's DAC it chose, which
+        // the new chips keep.
         let mutes = ChannelMutes::of(self);
+        let fm_dac = self.bus.ym2612().dac_model();
         let cartridge = self.bus.take_cartridge();
 
         let mut bus = AddressBus::with_region(self.region);
@@ -464,6 +466,7 @@ impl GenesisEmulator {
         // keep its scanline timing in lockstep (a no-op on NTSC).
         self.apply_region(self.region);
         mutes.apply(self);
+        self.bus.ym2612_mut().set_dac_model(fm_dac);
         // And stage what the host's stems take.
         self.set_stem_taps(self.stems.is_armed());
         // The new VDP records what the host asked the old one to.

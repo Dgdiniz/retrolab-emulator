@@ -9,6 +9,7 @@ use retro_core::audio::{
     SoundCore, SoundEvent, SoundLogContents, SoundLogEntry, SoundSamples, StemLayout, StemTake,
 };
 use retro_core::{EmulatorCore, ExecutionMode};
+use sg1_core::ym2612::FmDacModel;
 use sg1_core::GenesisEmulator;
 
 mod helpers;
@@ -116,7 +117,14 @@ retro_core::sound_conformance_tests!(mega_drive());
 
 /// A machine past the sound moment with every stem armed.
 fn armed() -> (GenesisEmulator, StemLayout) {
+    armed_through(FmDacModel::default())
+}
+
+/// [`armed`], the YM2612's channels through the DAC of `model` from the
+/// start.
+fn armed_through(model: FmDacModel) -> (GenesisEmulator, StemLayout) {
     let mut emu = build();
+    emu.set_fm_dac_model(model);
     for _ in 0..4 {
         emu.run_frame();
     }
@@ -135,7 +143,9 @@ fn stem<'a>(take: &'a StemTake, layout: &StemLayout, name: &str) -> &'a [f32] {
 }
 
 /// The master is the mix the host hears before the limiter: below the
-/// limiter's threshold, the host's very samples, and none departs.
+/// limiter's threshold, the host's very samples, and none departs past
+/// the stems' first span: they start from silence, where the master holds
+/// the YM2612's silence, which the discrete chip's DAC sits 4 steps above.
 #[test]
 fn the_master_is_the_host_s_sound_below_the_limiter() {
     let (mut emu, _) = armed();
@@ -146,7 +156,13 @@ fn the_master_is_the_host_s_sound_below_the_limiter() {
         take.master,
         SoundSamples::F32(emu.get_audio_samples().to_vec())
     );
-    assert!(take.departures.is_empty(), "{:?}", take.departures);
+    assert!(
+        take.departures
+            .iter()
+            .all(|span| span.start + span.frames <= STAGE_SPAN as u32),
+        "{:?}",
+        take.departures
+    );
     assert!(
         take.frames > 700,
         "a frame's sample frames: {}",
@@ -156,9 +172,11 @@ fn the_master_is_the_host_s_sound_below_the_limiter() {
 
 /// A muted channel's stem is its sound still, and its samples depart from
 /// the master, which leaves it out; the scope shows the channel too.
+/// Through the integrated chip's DAC, whose silence is 0, the master is
+/// then the PSG's tone alone.
 #[test]
 fn a_muted_channel_keeps_its_stem_and_its_samples_depart() {
-    let (mut emu, layout) = armed();
+    let (mut emu, layout) = armed_through(FmDacModel::Integrated);
     emu.audio_debugger(0)
         .expect("the YM2612")
         .mute_channel(0, true);
@@ -205,7 +223,7 @@ fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
     }
     emu.render_frame();
     let take = emu.take_stems().expect("armed");
-    let level = ((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
+    let level = FmDacModel::Discrete.output((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
     // A stereo stem: two values a sample frame.
     let dac = stem(&take, &layout, "dac");
     assert!(dac[2 * STAGE_SPAN..].iter().all(|&s| s == level));
@@ -419,4 +437,90 @@ fn each_chip_s_writes_sit_on_the_master_clock_in_their_frame() {
             "pair {pair}: the DAC write at {dac}, the PSG write after it at {psg}"
         );
     }
+}
+
+// -- The YM2612's DAC, a host setting ------------------------------------
+
+/// A Z80 program: the DAC on, then a loop that reads a byte through the
+/// bank window and writes it as the DAC's data, so the YM2612 follows the
+/// Z80 and makes samples past a frame's end as the Z80 runs past it.
+#[rustfmt::skip]
+const Z80_DAC_LOOP: [u8; 23] = [
+    0x3E, 0x2B, 0x32, 0x00, 0x40, // LD A,$2B; LD ($4000),A: the DAC's register
+    0x3E, 0x80, 0x32, 0x01, 0x40, // LD A,$80; LD ($4001),A: the DAC on
+    0x3E, 0x2A, 0x32, 0x00, 0x40, // LD A,$2A; LD ($4000),A: the DAC's data
+    0x3A, 0x00, 0x80,             // loop: LD A,($8000), through the bank window
+    0x32, 0x01, 0x40,             // LD ($4001),A
+    0x18, 0xF8,                   // JR loop
+];
+
+/// The program running with the Z80 running [`Z80_DAC_LOOP`], put in its
+/// RAM by the host with the Z80's bus held.
+fn z80_dac_playing() -> GenesisEmulator {
+    let mut emu = build();
+    emu.run_frame();
+    emu.write_memory_debug(0xA1_1100, &[0x01]);
+    emu.write_memory_debug(0xA0_0000, &Z80_DAC_LOOP);
+    emu.write_memory_debug(0xA1_1200, &[0x01]);
+    emu.write_memory_debug(0xA1_1100, &[0x00]);
+    emu
+}
+
+/// The DAC's model and the channels' mutes are the host's: with the Z80
+/// driving the YM2612's DAC, a machine through the integrated chip's DAC
+/// and one with every FM channel muted hold the state of a machine with
+/// neither, after every frame, the frames whose YM2612 made samples past
+/// their end among them; and the integrated chip's DAC plays something
+/// else. Set on a new machine, the model lasts a ROM's load, the reset
+/// button, a power cycle and a savestate's load.
+#[test]
+fn the_dac_s_model_and_the_mutes_change_no_state() {
+    let mut plain = z80_dac_playing();
+    let mut integrated = z80_dac_playing();
+    integrated.set_fm_dac_model(FmDacModel::Integrated);
+    let mut muted = z80_dac_playing();
+    for channel in 0..6 {
+        muted.mute_ym2612_channel(channel, true);
+    }
+    let (mut past_the_end, mut heard_apart) = (0, false);
+    for frame in 1..=60 {
+        for emu in [&mut plain, &mut integrated, &mut muted] {
+            emu.run_frame();
+        }
+        past_the_end += usize::from(plain.savestate_extension().ym2612_output.len() > 1);
+        assert_eq!(
+            integrated.state_hash(),
+            plain.state_hash(),
+            "frame {frame}: the DAC's model"
+        );
+        assert_eq!(
+            muted.state_hash(),
+            plain.state_hash(),
+            "frame {frame}: the mutes"
+        );
+        heard_apart |= integrated.get_audio_samples() != plain.get_audio_samples();
+        let _ = muted.get_audio_samples();
+    }
+    assert!(
+        past_the_end > 0,
+        "no frame's end found a YM2612 sample past it"
+    );
+    assert!(heard_apart, "the two DACs play alike");
+
+    let mut emu = GenesisEmulator::new();
+    assert_eq!(emu.fm_dac_model(), FmDacModel::Discrete, "the default");
+    emu.set_fm_dac_model(FmDacModel::Integrated);
+    emu.load_rom(&rom()).expect("the program loads");
+    emu.run_frame();
+    let state = emu.save_state();
+    emu.reset();
+    emu.power_cycle();
+    emu.load_rom(&other_rom()).expect("the other program loads");
+    emu.load_state(&state, retro_core::RomCheck::AnyRom)
+        .expect("the state loads");
+    assert_eq!(
+        emu.fm_dac_model(),
+        FmDacModel::Integrated,
+        "kept throughout"
+    );
 }

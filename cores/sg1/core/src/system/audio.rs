@@ -17,7 +17,7 @@ use retro_core::{EmulatorCore, ExecutionTier};
 use super::GenesisEmulator;
 use crate::psg::{PsgLevels, PSG_STEM_VALUES};
 use crate::timing::GenesisTiming;
-use crate::ym2612::{DacStatus, LfoStatus, TimerStatus, YmLevels, YM_STEM_VALUES};
+use crate::ym2612::{DacStatus, FmDacModel, LfoStatus, TimerStatus, YmLevels, YM_STEM_VALUES};
 
 /// The PSG's share of the mix, and the YM2612's: the PSG at full scale is
 /// about a third of the FM at full scale (0.34, the ratio Genesis Plus
@@ -547,6 +547,21 @@ impl GenesisEmulator {
     pub fn mute_ym2612_channel(&mut self, channel: u32, muted: bool) {
         use retro_core::audio::AudioDebugger;
         self.ym2612_mut().mute_channel(channel, muted);
+    }
+
+    /// Make the YM2612's channels reach the output through the DAC of
+    /// `model`'s chip: the discrete YM2612 of the first consoles, the
+    /// default, or the YM3438 the later ones integrate. A host setting, as
+    /// a channel's mute is: no state the machine holds changes, the
+    /// savestate holds nothing of it and the state hash reads nothing of
+    /// it, and a ROM's load, the resets and a savestate's load keep it.
+    pub fn set_fm_dac_model(&mut self, model: FmDacModel) {
+        self.bus.ym2612_mut().set_dac_model(model);
+    }
+
+    /// The DAC the YM2612's channels reach the output through.
+    pub fn fm_dac_model(&self) -> FmDacModel {
+        self.bus.ym2612().dac_model()
     }
 
     /// The YM2612's LFO: `{ enabled, frequency }`.

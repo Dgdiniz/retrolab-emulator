@@ -349,7 +349,8 @@ macro_rules! savestate_codec {
 /// the state as if the extension were not there. Fields are only ever
 /// appended, and `VERSION` counts the sets appended; a build reads a newer
 /// set as far as it knows it, and an older set through
-/// [`SavestateExtension::read_older`].
+/// [`SavestateExtension::read_older`]. The state hash reads it as
+/// [`SavestateExtension::hashed`] gives it.
 pub trait SavestateExtension: Serialize + DeserializeOwned + Default + PartialEq {
     /// The sets of fields this build knows; 0 for a console with none.
     const VERSION: u32;
@@ -367,6 +368,16 @@ pub trait SavestateExtension: Serialize + DeserializeOwned + Default + PartialEq
         Err(format!(
             "savestate extension version {version} is not read by this build"
         ))
+    }
+
+    /// The extension as the state hash reads it ([`state_hash_of`],
+    /// [`extension_hash`]), when that is not the extension itself: without
+    /// what it carries for the host's sake alone, such as the sound a frame
+    /// made so far, which a load plays on and the host's own settings
+    /// shape. The savestate holds the whole extension. `None`, the
+    /// default, reads the extension as it is.
+    fn hashed(&self) -> Option<Self> {
+        None
     }
 }
 
@@ -563,7 +574,8 @@ pub fn open<P: SavestatePayload>(
 /// the extension's when it is not the default.
 pub fn state_hash_of<P: SavestatePayload>(payload: &P, extension: &P::Extension) -> u64 {
     let mut bytes = bincode::serialize(payload).unwrap_or_default();
-    bytes.extend(extension_bytes(extension).unwrap_or_default());
+    let hashed = extension.hashed();
+    bytes.extend(extension_bytes(hashed.as_ref().unwrap_or(extension)).unwrap_or_default());
     crate::fnv1a64(&bytes)
 }
 
@@ -575,6 +587,8 @@ pub fn part_hash<T: Serialize + ?Sized>(part: &T) -> u64 {
 /// The hash of an extension as a part of the state ([`part_hash`]), `None`
 /// for the default, which a state does not hold.
 pub fn extension_hash<P: SavestatePayload>(extension: &P::Extension) -> Option<u64> {
+    let hashed = extension.hashed();
+    let extension = hashed.as_ref().unwrap_or(extension);
     (*extension != P::Extension::default()).then(|| part_hash(extension))
 }
 
@@ -1147,6 +1161,80 @@ mod tests {
             }
         );
         assert!(read_header(b"nope").is_err());
+    }
+
+    /// An extension that carries a part for the host alone.
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+    struct HostPartExtension {
+        busy: u32,
+        heard: Vec<u8>,
+    }
+
+    impl SavestateExtension for HostPartExtension {
+        const VERSION: u32 = 1;
+
+        fn hashed(&self) -> Option<Self> {
+            (!self.heard.is_empty()).then(|| Self {
+                busy: self.busy,
+                heard: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct HostPartPayload {
+        cycles: u64,
+    }
+
+    impl SavestatePayload for HostPartPayload {
+        crate::savestate_codec!();
+
+        const FORMAT: SavestateFormat = SavestateFormat {
+            core_id: "host-part",
+            version: 1,
+        };
+        type Extension = HostPartExtension;
+        fn validate(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn hash_parts(&self) -> Vec<(&'static str, u64)> {
+            vec![("cycles", part_hash(&self.cycles))]
+        }
+    }
+
+    /// The state hash reads an extension as its `hashed` gives it: a part
+    /// for the host alone moves no hash, and an extension that holds
+    /// nothing else is no part of the state; the savestate holds it whole.
+    #[test]
+    fn the_state_hash_reads_the_extension_as_hashed() {
+        let payload = HostPartPayload { cycles: 7 };
+        let extension = |busy, heard: &[u8]| HostPartExtension {
+            busy,
+            heard: heard.to_vec(),
+        };
+        let hash = |e: &HostPartExtension| state_hash_of(&payload, e);
+        assert_eq!(hash(&extension(1, &[4, 5])), hash(&extension(1, &[])));
+        assert_ne!(hash(&extension(1, &[4, 5])), hash(&extension(2, &[4, 5])));
+        assert_eq!(
+            hash(&extension(0, &[9])),
+            hash(&HostPartExtension::default())
+        );
+        assert_eq!(
+            extension_hash::<HostPartPayload>(&extension(0, &[9])),
+            None,
+            "nothing but the host's part"
+        );
+        assert_eq!(
+            extension_hash::<HostPartPayload>(&extension(3, &[9])),
+            extension_hash::<HostPartPayload>(&extension(3, &[]))
+        );
+        let sealed = payload.seal(&extension(1, &[4, 5]), "", 0).unwrap();
+        let (_, opened) = HostPartPayload::open(&sealed, None, RomCheck::AnyRom).unwrap();
+        assert_eq!(
+            opened,
+            extension(1, &[4, 5]),
+            "the savestate holds it whole"
+        );
     }
 
     #[test]

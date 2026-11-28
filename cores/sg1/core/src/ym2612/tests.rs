@@ -385,6 +385,29 @@ fn test_csm_mode() {
     assert!(!ym.timers().is_csm_mode());
 }
 
+// The discrete chip's DAC sits 4 of its 9-bit steps above zero for a
+// silent channel, on each side the channel is panned to and on no other;
+// the integrated chip's is 0. Six silent channels, one panned left alone:
+// the left side holds 6 channels' steps, the right side 5.
+#[test]
+fn the_discrete_chip_s_silence_sits_4_steps_up_on_the_sides_panned_to() {
+    let step = 32.0 / 8192.0 / 6.0;
+    for (model, steps) in [(FmDacModel::Discrete, 4.0), (FmDacModel::Integrated, 0.0)] {
+        let mut ym = Ym2612::new(7_670_454, 44100);
+        ym.set_dac_model(model);
+        ym.write_port(0, 0xB4);
+        ym.write_port(1, 0x80); // channel 1: left only
+        let mut out = vec![0.0f32; 2 * 64];
+        ym.clock(clocks_for_samples(64));
+        let made = ym.generate_samples(&mut out, 44100);
+        assert!(made > 0);
+        for pair in out[2..made].chunks(2) {
+            assert_eq!(pair[0], (6.0 * steps * step) as f32, "{model:?}: left");
+            assert_eq!(pair[1], (5.0 * steps * step) as f32, "{model:?}: right");
+        }
+    }
+}
+
 // A channel the debugger mutes runs as an unmuted one: its operators'
 // phases and envelopes move alike, so the chip holds the same state, and
 // only the mix leaves the channel out.
@@ -406,6 +429,10 @@ fn a_muted_channel_runs_as_an_unmuted_one() {
     };
     let mut heard = Ym2612::new(7_670_454, 44100);
     let mut muted = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    heard.set_dac_model(FmDacModel::Integrated);
+    muted.set_dac_model(FmDacModel::Integrated);
     note(&mut heard);
     note(&mut muted);
     muted.mute_channel(0, true);
@@ -453,6 +480,9 @@ fn generate_samples_holds_the_chip_s_level_through_every_sample_the_clocks_came_
     ym.write_port(0, 0x2A);
     ym.write_port(1, 0xFF); // hold the DAC at a non-zero level
     let level = f32::from(ym.get_dac_value() << 6) / 8192.0 / 6.0;
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
 
     let mut clocks = 0u64;
     let mut handed = 0usize;
@@ -501,6 +531,9 @@ fn generate_samples_does_not_run_ahead_of_the_machine_for_a_large_buffer() {
 #[test]
 fn test_catchup_dac_write_only_affects_samples_after_its_position() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
     // dac_value defaults to 0, so the first half of the frame renders silent.
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
@@ -532,6 +565,9 @@ fn test_catchup_dac_write_only_affects_samples_after_its_position() {
 #[test]
 fn test_catchup_two_dac_writes_in_one_frame_both_render() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
 
@@ -570,6 +606,9 @@ fn test_catchup_two_dac_writes_in_one_frame_both_render() {
 #[test]
 fn test_catchup_fm_key_on_sounds_only_after_write() {
     let mut ym = Ym2612::new(7_670_454, 44100);
+    // Through the integrated chip's DAC, whose silence is 0: the discrete
+    // chip's sits 4 steps above it.
+    ym.set_dac_model(FmDacModel::Integrated);
 
     // Minimal audible patch on channel 0: algorithm 7 (all four operators are
     // carriers), max level, instant attack, no decay, both speakers.
