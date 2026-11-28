@@ -133,7 +133,8 @@ impl RetroEmulator {
 
     /// Make the YM2612's channels reach the output through the DAC of
     /// `model`: `"discrete"`, the YM2612 of the first consoles, whose levels
-    /// either side of zero lie apart (the default), or `"integrated"`, the
+    /// either side of zero lie apart and which puts a channel's sign on a
+    /// side it is not panned to (the default), or `"integrated"`, the
     /// YM3438 of the later ones. Any other word changes nothing and answers
     /// false. A host setting: in no savestate and no state hash, and kept
     /// across a ROM's load, the resets and a savestate's load.

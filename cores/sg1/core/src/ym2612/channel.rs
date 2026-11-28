@@ -4,7 +4,7 @@
 // - 4 operators (configurable via registers)
 // - 1 algorithm selection (0-7)
 // - Feedback for operator 1 (0-7)
-// - Stereo output (L/R enable flags)
+// - Its pan (L/R enable flags), which the chip's DAC reads for each side
 // - Per-operator frequency and envelope settings
 
 use super::algorithms::Algorithm;
@@ -241,12 +241,12 @@ impl Channel {
     }
 
     /// Clock the channel once with no LFO: `clock_with_lfo(0, 0)`.
-    pub fn clock(&mut self) -> (i16, i16) {
+    pub fn clock(&mut self) -> i16 {
         self.clock_with_lfo(0, 0)
     }
 
     /// Clock the channel once, generating one sample with LFO modulation
-    pub fn clock_with_lfo(&mut self, pm_step: u8, am_value: u8) -> (i16, i16) {
+    pub fn clock_with_lfo(&mut self, pm_step: u8, am_value: u8) -> i16 {
         self.clock_with_lfo_eg(pm_step, am_value, true)
     }
 
@@ -264,8 +264,9 @@ impl Channel {
     /// * `advance_eg` - Whether to advance the envelope generator this cycle
     ///
     /// # Returns
-    /// Tuple of (left_sample, right_sample)
-    pub fn clock_with_lfo_eg(&mut self, pm_step: u8, am_value: u8, advance_eg: bool) -> (i16, i16) {
+    /// The channel's 14-bit output, whatever its pan: the chip's DAC gives
+    /// each side its level from it, with the pan's flags (`get_stereo`).
+    pub fn clock_with_lfo_eg(&mut self, pm_step: u8, am_value: u8, advance_eg: bool) -> i16 {
         // Calculate feedback modulation for OP1
         // Real YM2612 uses average of last two OP1 outputs
         let fb_mod = if self.feedback > 0 {
@@ -547,13 +548,7 @@ impl Channel {
         // On real YM2612, each channel's DAC output is 14-bit, so it cannot
         // exceed -8192..8191 regardless of algorithm. Multi-carrier algorithms
         // (5, 6, 7) can sum 3-4 operators exceeding this range without clamping.
-        let output = output.clamp(-8192, 8191);
-
-        // Apply stereo panning
-        let left = if self.stereo.left { output } else { 0 };
-        let right = if self.stereo.right { output } else { 0 };
-
-        (left, right)
+        output.clamp(-8192, 8191)
     }
 
     /// Calculate AM attenuation for an operator based on LFO AM value and operator AMS
@@ -745,51 +740,36 @@ mod tests {
         assert_eq!(muted.to_register(), 0x00);
     }
 
+    /// The pan leaves the channel's output alone: the chip's DAC reads it
+    /// to give each side its level.
     #[test]
-    fn test_channel_stereo_panning() {
-        let mut channel = Channel::new(7_670_454);
-
-        // Setup operators for sound
-        for i in 0..4 {
-            channel.operator_mut(i).set_frequency(0x2CE, 4, 1);
-            channel.operator_mut(i).total_level = 0;
-            channel.operator_mut(i).envelope_mut().attack_rate = 31;
-            channel.operator_mut(i).key_on();
-        }
-
-        // Clock to build up volume
+    fn the_pan_leaves_the_channel_s_output_alone() {
+        let tone = |stereo: StereoFlags| {
+            let mut channel = Channel::new(7_670_454);
+            for i in 0..4 {
+                channel.operator_mut(i).set_frequency(0x2CE, 4, 1);
+                channel.operator_mut(i).total_level = 0;
+                channel.operator_mut(i).envelope_mut().attack_rate = 31;
+                channel.operator_mut(i).key_on();
+            }
+            channel.set_stereo(stereo);
+            channel
+        };
+        let mut centred = tone(StereoFlags::both());
+        let mut panned = [
+            tone(StereoFlags::left_only()),
+            tone(StereoFlags::right_only()),
+            tone(StereoFlags::muted()),
+        ];
+        let mut heard = false;
         for _ in 0..1000 {
-            channel.clock();
+            let output = centred.clock();
+            heard |= output != 0;
+            for channel in &mut panned {
+                assert_eq!(channel.clock(), output);
+            }
         }
-
-        // Both channels enabled
-        channel.set_stereo(StereoFlags::both());
-        let (left, right) = channel.clock();
-        println!("Both: L={}, R={}", left, right);
-        assert_ne!(left, 0);
-        assert_ne!(right, 0);
-        assert_eq!(left, right); // Should be equal
-
-        // Left only
-        channel.set_stereo(StereoFlags::left_only());
-        let (left, right) = channel.clock();
-        println!("Left: L={}, R={}", left, right);
-        assert_ne!(left, 0);
-        assert_eq!(right, 0);
-
-        // Right only
-        channel.set_stereo(StereoFlags::right_only());
-        let (left, right) = channel.clock();
-        println!("Right: L={}, R={}", left, right);
-        assert_eq!(left, 0);
-        assert_ne!(right, 0);
-
-        // Muted
-        channel.set_stereo(StereoFlags::muted());
-        let (left, right) = channel.clock();
-        println!("Muted: L={}, R={}", left, right);
-        assert_eq!(left, 0);
-        assert_eq!(right, 0);
+        assert!(heard, "the tone plays");
     }
 
     #[test]
@@ -865,12 +845,12 @@ mod tests {
         }
 
         // Should have output (additive synthesis)
-        let (left, right) = channel.clock();
-        println!("Algorithm 7 output: L={}, R={}", left, right);
+        let output = channel.clock();
+        println!("Algorithm 7 output: {}", output);
 
         // With 4 operators, should have significant output
         assert!(
-            left.abs() > 100,
+            output.abs() > 100,
             "Should have output from additive synthesis"
         );
     }

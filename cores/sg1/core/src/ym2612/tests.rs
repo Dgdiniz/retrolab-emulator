@@ -386,11 +386,11 @@ fn test_csm_mode() {
 }
 
 // The discrete chip's DAC sits 4 of its 9-bit steps above zero for a
-// silent channel, on each side the channel is panned to and on no other;
-// the integrated chip's is 0. Six silent channels, one panned left alone:
-// the left side holds 6 channels' steps, the right side 5.
+// silent channel on every side, panned to or not; the integrated chip's is
+// 0. Six silent channels, one panned left alone: each side holds 6
+// channels' steps.
 #[test]
-fn the_discrete_chip_s_silence_sits_4_steps_up_on_the_sides_panned_to() {
+fn the_discrete_chip_s_silence_sits_4_steps_up_on_every_side() {
     let step = 32.0 / 8192.0 / 6.0;
     for (model, steps) in [(FmDacModel::Discrete, 4.0), (FmDacModel::Integrated, 0.0)] {
         let mut ym = Ym2612::new(7_670_454, 44100);
@@ -403,8 +403,61 @@ fn the_discrete_chip_s_silence_sits_4_steps_up_on_the_sides_panned_to() {
         assert!(made > 0);
         for pair in out[2..made].chunks(2) {
             assert_eq!(pair[0], (6.0 * steps * step) as f32, "{model:?}: left");
-            assert_eq!(pair[1], (5.0 * steps * step) as f32, "{model:?}: right");
+            assert_eq!(pair[1], (6.0 * steps * step) as f32, "{model:?}: right");
         }
+    }
+}
+
+// A channel panned to one side leaves the level of its sign on the other
+// through the discrete chip's DAC, 4 steps down while its output is below
+// zero and 4 up while it is not, and nothing through the integrated
+// chip's; each sample's stems still add up to the chip's output. A tone on
+// channel 1, panned left alone; the five other channels silent.
+#[test]
+fn a_channel_panned_to_one_side_leaves_its_sign_on_the_other() {
+    let sign_level = 4.0 * 32.0 / 8192.0;
+    for model in [FmDacModel::Discrete, FmDacModel::Integrated] {
+        let mut ym = Ym2612::new(7_670_454, 44100);
+        ym.set_dac_model(model);
+        ym.set_stem_tap(true);
+        for (register, value) in [
+            (0x40, 0x00),
+            (0x50, 0x1F),
+            (0xB0, 0x07),
+            (0xB4, 0x80), // left alone
+            (0xA4, 0x22),
+            (0xA0, 0x69),
+            (0x28, 0xF0),
+        ] {
+            ym.write_port(0, register);
+            ym.write_port(1, value);
+        }
+        ym.clock(144 * 2000);
+        let (mut record, mut stems) = (Vec::new(), Vec::new());
+        ym.take_output(u64::MAX, &mut record, &mut stems);
+        assert_eq!(stems.len(), record.len() * YM_STEM_VALUES);
+        let (mut below, mut above) = (0, 0);
+        for (entry, row) in record.iter().zip(stems.chunks(YM_STEM_VALUES)).skip(1) {
+            let (own_side, other_side) = (row[0], row[1]);
+            match model {
+                FmDacModel::Discrete if own_side < 0.0 => {
+                    assert_eq!(other_side, -sign_level);
+                    below += 1;
+                }
+                FmDacModel::Discrete => {
+                    assert_eq!(other_side, sign_level);
+                    above += 1;
+                }
+                FmDacModel::Integrated => {
+                    assert_eq!(other_side, 0.0);
+                    below += usize::from(own_side < 0.0);
+                    above += usize::from(own_side > 0.0);
+                }
+            }
+            let side = |first: usize| row.iter().skip(first).step_by(2).sum::<f32>() / 6.0;
+            assert_eq!([side(0), side(1)], entry.1, "{model:?}: the stems' sum");
+        }
+        assert!(below > 0 && above > 0, "{model:?}: the tone swings");
     }
 }
 

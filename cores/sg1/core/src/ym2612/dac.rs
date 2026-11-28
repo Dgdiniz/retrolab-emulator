@@ -1,4 +1,4 @@
-//! The chip's DAC: what each channel reaches the output as.
+//! The chip's DAC: what each channel reaches each side of the output as.
 //!
 //! Both chips hand each channel to the DAC as a 9-bit number, the
 //! operator's 14-bit result with its 5 low bits cleared, so a channel
@@ -8,24 +8,33 @@
 //! negative ones 3 of its steps lower and the others 4 higher (the
 //! levels of a channel output one chip cycle in four, the rest of its
 //! slot held at the level of its sign, averaged over the slot). A quiet
-//! channel keeps a floor it toggles about, and silence sits 4 steps up.
-//! The YM3438 the later consoles integrate takes the 9-bit steps alone.
+//! channel keeps a floor it toggles about.
 //!
-//! The form, the 9-bit mask and the levels either side of zero, follows
-//! ares (`component/audio/ym2612/ym2612.cpp`, its `outMask` and the
-//! "crossover distortion" offset), ISC, the notice is at the end of
-//! `LICENSE`.
+//! The pan only says which sides take the channel's own cycle. A side
+//! the channel is not panned to takes the level of its sign for the
+//! whole slot on the discrete chip, 4 steps down below zero and 4 up
+//! from zero on: a channel panned to one side leaves a faint square of
+//! its sign on the other, and a silent one sits 4 steps up on every
+//! side. The YM3438 the later consoles integrate takes the 9-bit steps
+//! alone, and puts nothing on a side a channel is not panned to.
+//!
+//! The form, the 9-bit mask and the levels either side of zero on both
+//! sides, follows ares (`component/audio/ym2612/ym2612.cpp`, its
+//! `outMask` and the "crossover distortion" offset), ISC, the notice is
+//! at the end of `LICENSE`.
 
 /// The DAC a channel's output goes through: which chip the console has.
 /// A host setting: it changes no state the machine holds, and the
 /// savestate and the state hash read nothing of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FmDacModel {
-    /// The discrete YM2612 (the first consoles): the 9-bit steps, and the
-    /// gap at zero.
+    /// The discrete YM2612 (the first consoles): the 9-bit steps, the gap
+    /// at zero, and the level of a channel's sign on a side it is not
+    /// panned to.
     #[default]
     Discrete,
-    /// The YM3438 the later consoles integrate: the 9-bit steps alone.
+    /// The YM3438 the later consoles integrate: the 9-bit steps alone, and
+    /// nothing on a side a channel is not panned to.
     Integrated,
 }
 
@@ -50,15 +59,28 @@ impl FmDacModel {
         }
     }
 
-    /// A channel's 14-bit output as the DAC gives it, on a side the channel
-    /// is panned to, in the same units.
+    /// A channel's 14-bit output as the DAC gives it to one side, in the
+    /// same units; `panned`: whether the channel is panned to that side.
     #[inline]
-    pub fn output(self, value: i32) -> i32 {
+    pub fn output(self, value: i32, panned: bool) -> i32 {
         let nine_bits = value & -STEP;
         match self {
-            FmDacModel::Integrated => nine_bits,
-            FmDacModel::Discrete if nine_bits < 0 => nine_bits + STEP - 4 * STEP,
-            FmDacModel::Discrete => nine_bits + 4 * STEP,
+            FmDacModel::Integrated if panned => nine_bits,
+            FmDacModel::Integrated => 0,
+            FmDacModel::Discrete => {
+                // Every side takes the level of the channel's sign, a side
+                // it is panned to its 9 bits too, one step up below zero.
+                let (value_level, sign_level) = if nine_bits < 0 {
+                    (nine_bits + STEP, -4 * STEP)
+                } else {
+                    (nine_bits, 4 * STEP)
+                };
+                if panned {
+                    value_level + sign_level
+                } else {
+                    sign_level
+                }
+            }
         }
     }
 }
@@ -83,13 +105,14 @@ mod tests {
             (-33, -64),
             (-8192, -8192),
         ] {
-            assert_eq!(integrated.output(value), nine_bits, "{value}");
+            assert_eq!(integrated.output(value, true), nine_bits, "{value}");
         }
     }
 
-    /// The discrete chip's levels: 4 steps up from zero on, 3 steps down
-    /// below it, so the levels either side of zero, -4 and +4 steps, lie
-    /// 8 steps apart, where every other two neighbours lie one apart.
+    /// The discrete chip's levels on a side the channel is panned to: 4
+    /// steps up from zero on, 3 steps down below it, so the levels either
+    /// side of zero, -4 and +4 steps, lie 8 steps apart, where every other
+    /// two neighbours lie one apart.
     #[test]
     fn the_discrete_chip_misses_its_zero() {
         let discrete = FmDacModel::Discrete;
@@ -103,10 +126,10 @@ mod tests {
             (8191, 8160 + 4 * STEP),
             (-8192, -8192 - 3 * STEP),
         ] {
-            assert_eq!(discrete.output(value), level, "{value}");
+            assert_eq!(discrete.output(value, true), level, "{value}");
         }
         let steps: Vec<i32> = (-3..=3)
-            .map(|step| discrete.output(step * STEP) / STEP)
+            .map(|step| discrete.output(step * STEP, true) / STEP)
             .collect();
         assert_eq!(steps, [-6, -5, -4, 4, 5, 6, 7]);
     }
@@ -116,7 +139,7 @@ mod tests {
     /// integrated chip, four and a half on the discrete.
     #[test]
     fn the_dac_register_s_middle_on_each_chip() {
-        let at = |model: FmDacModel, register: i32| model.output((register - 0x80) << 6);
+        let at = |model: FmDacModel, register: i32| model.output((register - 0x80) << 6, true);
         let dac_step = 2 * STEP;
         let jump = |model| at(model, 0x80) - at(model, 0x7F);
         assert_eq!(jump(FmDacModel::Integrated), dac_step);
@@ -125,6 +148,26 @@ mod tests {
             at(FmDacModel::Discrete, 0x81) - at(FmDacModel::Discrete, 0x80),
             dac_step
         );
+    }
+
+    /// A side the channel is not panned to: nothing on the integrated chip;
+    /// on the discrete one the level of the channel's sign whatever its
+    /// size, 4 steps down below zero and 4 up from zero on, which a side
+    /// it is panned to carries too, beneath its 9 bits.
+    #[test]
+    fn the_side_a_channel_is_not_panned_to() {
+        let (discrete, integrated) = (FmDacModel::Discrete, FmDacModel::Integrated);
+        for value in [0, 31, 32, 8191, -1, -32, -33, -8192] {
+            let sign_level = if value < 0 { -4 * STEP } else { 4 * STEP };
+            assert_eq!(discrete.output(value, false), sign_level, "{value}");
+            assert_eq!(integrated.output(value, false), 0, "{value}");
+            let value_level = integrated.output(value, true) + if value < 0 { STEP } else { 0 };
+            assert_eq!(
+                discrete.output(value, true),
+                value_level + sign_level,
+                "{value}"
+            );
+        }
     }
 
     #[test]

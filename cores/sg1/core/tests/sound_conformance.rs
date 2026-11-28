@@ -223,12 +223,47 @@ fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
     }
     emu.render_frame();
     let take = emu.take_stems().expect("armed");
-    let level = FmDacModel::Discrete.output((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
+    let level = FmDacModel::Discrete.output((0xF0 - 128) << 6, true) as f32 / 8192.0 * 0.75 / 6.0;
     // A stereo stem: two values a sample frame.
     let dac = stem(&take, &layout, "dac");
     assert!(dac[2 * STAGE_SPAN..].iter().all(|&s| s == level));
     assert!(dac[..2 * STAGE_SPAN].iter().any(|&s| s != level));
     assert!(stem(&take, &layout, "fm6").iter().all(|&s| s == 0.0));
+}
+
+/// A channel panned to one side keeps in its stem what the DAC gives the
+/// other: the level of its sign through the discrete chip's DAC, nothing
+/// through the integrated chip's; and through either the stems add up to
+/// the master past their first span.
+#[test]
+fn a_channel_panned_to_one_side_keeps_its_other_side_in_its_stem() {
+    for model in [FmDacModel::Discrete, FmDacModel::Integrated] {
+        let (mut emu, layout) = armed_through(model);
+        let ym = emu.ym2612_mut();
+        ym.write_port(0, 0xB4);
+        ym.write_port(1, 0x80); // channel 1: left alone
+        let _ = emu.get_audio_samples();
+        emu.render_frame();
+        let take = emu.take_stems().expect("armed");
+        assert!(
+            take.departures
+                .iter()
+                .all(|span| span.start + span.frames <= STAGE_SPAN as u32),
+            "{model:?}: {:?}",
+            take.departures
+        );
+        // A stereo stem: the left side's value, then the right's.
+        let fm1 = stem(&take, &layout, "fm1");
+        let mut other_side = fm1.iter().skip(1).step_by(2);
+        match model {
+            FmDacModel::Discrete => assert!(other_side.any(|&s| s != 0.0), "the sign's level"),
+            FmDacModel::Integrated => assert!(other_side.all(|&s| s == 0.0), "nothing"),
+        }
+        assert!(
+            fm1.iter().step_by(2).any(|&s| s != 0.0),
+            "{model:?}: the tone"
+        );
+    }
 }
 
 // -- The Mega Drive's sound log -------------------------------------------
@@ -455,10 +490,15 @@ const Z80_DAC_LOOP: [u8; 23] = [
 ];
 
 /// The program running with the Z80 running [`Z80_DAC_LOOP`], put in its
-/// RAM by the host with the Z80's bus held.
+/// RAM by the host with the Z80's bus held; channel 6, which the DAC plays
+/// in, panned to the left alone, so the discrete chip's DAC and the
+/// integrated chip's part on the side it is not panned to as well.
 fn z80_dac_playing() -> GenesisEmulator {
     let mut emu = build();
     emu.run_frame();
+    let ym = emu.ym2612_mut();
+    ym.write_port(2, 0xB6);
+    ym.write_port(3, 0x80);
     emu.write_memory_debug(0xA1_1100, &[0x01]);
     emu.write_memory_debug(0xA0_0000, &Z80_DAC_LOOP);
     emu.write_memory_debug(0xA1_1200, &[0x01]);

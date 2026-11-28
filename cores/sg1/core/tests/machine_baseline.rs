@@ -418,9 +418,9 @@ const RECORDED: &[(&str, &str)] = &[
     // and the polarity its channel had at period 0, which moves the sound
     // (not its counts).
     // The YM2612's channels reach the output through the discrete chip's
-    // DAC, whose silence sits 4 of its 9-bit steps above zero on each side
-    // a channel is panned to: the YM2612's silence is a level, which moves
-    // the sound (not its counts).
+    // DAC, whose silence sits 4 of its 9-bit steps above zero on every
+    // side: the YM2612's silence is a level, which moves the sound (not
+    // its counts).
     ("frame 1: state hash", "9012bb8b604db7e6"),
     ("frame 1: parts", "cpu68k=6b077e1553b1b732 z80=d833438a3ed05bdb vdp=83f41ad2b93b85bb psg=b6e927f44eef2f3c ym2612=e647675781dc0bdd io=3c6fedfeb6914524 bus=93dce42ef61c1e7c timing=f49acf6a880a28eb ram=9c59a697fe657b9c z80_ram=2b549268bfc71525 cartridge=a8c7f832281a39c5 frame_count=0000000000000001"),
     ("frame 60: state hash", "9a7af7d4b871b4a4"),

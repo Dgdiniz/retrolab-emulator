@@ -174,25 +174,20 @@ impl Ym2612 {
         let dac = self.dac_model;
 
         // Every channel runs whatever its mute: a mute is the mix's, which
-        // leaves the channel's output out of the sum. Each side the channel
-        // is panned to takes its 14-bit output through the DAC; the DAC
-        // register plays in channel 6's place, its 8 bits raised to the
-        // 14, through the same DAC.
+        // leaves the channel's output out of the sum. The DAC gives each
+        // side its level from the channel's 14-bit output, whether the
+        // channel is panned to that side or not; the DAC register plays in
+        // channel 6's place, its 8 bits raised to the 14, through the same
+        // DAC.
         for i in 0..6 {
             let stereo = self.channels[i].get_stereo();
-            let (left, right) = if i == 5 && self.dac_enabled {
-                let value = i32::from(self.dac_value) << 6;
-                (value, value)
+            let value = if i == 5 && self.dac_enabled {
+                i32::from(self.dac_value) << 6
             } else {
-                let (left, right) =
-                    self.channels[i].clock_with_lfo_eg(pm_step, am_value, advance_eg);
-                (i32::from(left), i32::from(right))
+                i32::from(self.channels[i].clock_with_lfo_eg(pm_step, am_value, advance_eg))
             };
-            let side = |value: i32, panned: bool| match panned {
-                true => dac.output(value) as f32 / 8192.0,
-                false => 0.0,
-            };
-            let output = (side(left, stereo.left), side(right, stereo.right));
+            let side = |panned: bool| dac.output(value, panned) as f32 / 8192.0;
+            let output = (side(stereo.left), side(stereo.right));
             self.channel_outputs[i] = output;
             if !self.mute_flags[i] {
                 left_sum += output.0;

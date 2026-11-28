@@ -28,11 +28,10 @@ fn test_channel_algorithm0_series() {
     }
 
     // Should produce sound (only OP4 outputs in Algorithm 0)
-    let (left, right) = channel.clock();
-    println!("Algorithm 0: L={}, R={}", left, right);
+    let output = channel.clock();
+    println!("Algorithm 0: {}", output);
 
-    assert!(left.abs() > 10, "Should have output");
-    assert_eq!(left, right, "Stereo should be equal");
+    assert!(output.abs() > 10, "Should have output");
 }
 
 #[test]
@@ -60,54 +59,47 @@ fn test_channel_algorithm7_additive() {
     }
 
     // Should have strong output (all 4 operators contributing)
-    let (left, right) = channel.clock();
-    println!("Algorithm 7: L={}, R={}", left, right);
+    let output = channel.clock();
+    println!("Algorithm 7: {}", output);
 
-    assert!(left.abs() > 100, "Should have strong additive output");
+    assert!(output.abs() > 100, "Should have strong additive output");
 }
 
+/// The pan leaves the channel's output alone: the chip's DAC reads the pan
+/// to give each side its level.
 #[test]
-fn test_channel_stereo_separation() {
-    let mut channel = Channel::new(7_670_454);
-    channel.set_algorithm(7); // All parallel for clarity
-
-    // Setup operators
-    for i in 0..4 {
-        channel.operator_mut(i).set_frequency(0x2CE, 4, 1);
-        channel.operator_mut(i).total_level = 0;
-        channel.operator_mut(i).envelope_mut().attack_rate = 31;
-    }
-    channel.key_on_all();
+fn test_channel_output_whatever_its_pan() {
+    let tone = || {
+        let mut channel = Channel::new(7_670_454);
+        channel.set_algorithm(7); // All parallel for clarity
+        for i in 0..4 {
+            channel.operator_mut(i).set_frequency(0x2CE, 4, 1);
+            channel.operator_mut(i).total_level = 0;
+            channel.operator_mut(i).envelope_mut().attack_rate = 31;
+        }
+        channel.key_on_all();
+        channel
+    };
+    let (mut centred, mut panned) = (tone(), tone());
 
     // Build up volume
     for _ in 0..5000 {
-        channel.clock();
+        assert_eq!(panned.clock(), centred.clock());
     }
 
-    // Test left only
-    channel.set_stereo(StereoFlags::left_only());
-    let (left, right) = channel.clock();
-    assert_ne!(left, 0, "Left should have sound");
-    assert_eq!(right, 0, "Right should be muted");
-
-    // Test right only
-    channel.set_stereo(StereoFlags::right_only());
-    let (left, right) = channel.clock();
-    assert_eq!(left, 0, "Left should be muted");
-    assert_ne!(right, 0, "Right should have sound");
-
-    // Test both
-    channel.set_stereo(StereoFlags::both());
-    let (left, right) = channel.clock();
-    assert_ne!(left, 0, "Left should have sound");
-    assert_ne!(right, 0, "Right should have sound");
-    assert_eq!(left, right, "Should be identical");
-
-    // Test muted
-    channel.set_stereo(StereoFlags::muted());
-    let (left, right) = channel.clock();
-    assert_eq!(left, 0, "Left should be muted");
-    assert_eq!(right, 0, "Right should be muted");
+    let mut heard = false;
+    for stereo in [
+        StereoFlags::left_only(),
+        StereoFlags::right_only(),
+        StereoFlags::muted(),
+        StereoFlags::both(),
+    ] {
+        panned.set_stereo(stereo);
+        let output = centred.clock();
+        heard |= output != 0;
+        assert_eq!(panned.clock(), output, "{stereo:?}");
+    }
+    assert!(heard, "the channel plays");
 }
 
 #[test]
@@ -135,8 +127,7 @@ fn test_channel_feedback() {
 
     let mut samples_no_fb = Vec::new();
     for _ in 0..100 {
-        let (left, _) = channel.clock();
-        samples_no_fb.push(left);
+        samples_no_fb.push(channel.clock());
     }
 
     // Reset and test with feedback
@@ -157,8 +148,7 @@ fn test_channel_feedback() {
 
     let mut samples_with_fb = Vec::new();
     for _ in 0..100 {
-        let (left, _) = channel.clock();
-        samples_with_fb.push(left);
+        samples_with_fb.push(channel.clock());
     }
 
     println!(
@@ -197,8 +187,7 @@ fn test_channel_envelope_control() {
     // Attack phase - volume should increase
     let mut max_during_attack = 0i16;
     for _ in 0..5000 {
-        let (left, _) = channel.clock();
-        max_during_attack = max_during_attack.max(left.abs());
+        max_during_attack = max_during_attack.max(channel.clock().abs());
     }
 
     println!("Max during attack: {}", max_during_attack);
@@ -214,8 +203,7 @@ fn test_channel_envelope_control() {
 
     let mut max_after_release = 0i16;
     for _ in 0..100 {
-        let (left, _) = channel.clock();
-        max_after_release = max_after_release.max(left.abs());
+        max_after_release = max_after_release.max(channel.clock().abs());
     }
 
     println!("Max after release: {}", max_after_release);
@@ -247,7 +235,7 @@ fn test_channel_selective_key_on() {
         channel.clock();
     }
 
-    let (left_partial, _) = channel.clock();
+    let partial = channel.clock();
 
     // Now key on all
     channel.reset();
@@ -265,19 +253,19 @@ fn test_channel_selective_key_on() {
         channel.clock();
     }
 
-    let (left_all, _) = channel.clock();
+    let all = channel.clock();
 
     println!(
         "Partial key on: {}, All key on: {}",
-        left_partial.abs(),
-        left_all.abs()
+        partial.abs(),
+        all.abs()
     );
 
     // All operators should produce louder sound (or at least comparable)
     // Note: Due to timing and envelope state, might not always be strictly louder
     // Just verify both produce sound
-    assert!(left_partial.abs() > 100, "Partial should produce sound");
-    assert!(left_all.abs() > 100, "All should produce sound");
+    assert!(partial.abs() > 100, "Partial should produce sound");
+    assert!(all.abs() > 100, "All should produce sound");
 }
 
 #[test]
@@ -309,8 +297,7 @@ fn test_channel_algorithm_comparison() {
         // Measure average amplitude over 100 samples
         let mut sum = 0i64;
         for _ in 0..100 {
-            let (left, _) = channel.clock();
-            sum += left.abs() as i64;
+            sum += channel.clock().abs() as i64;
         }
         let avg = (sum / 100) as i16;
 
@@ -361,17 +348,17 @@ fn test_multiple_channels_independent() {
     }
 
     // Get samples
-    let (left1, right1) = ch1.clock();
-    let (left2, right2) = ch2.clock();
+    let output1 = ch1.clock();
+    let output2 = ch2.clock();
 
-    println!("Ch1: L={}, R={}", left1, right1);
-    println!("Ch2: L={}, R={}", left2, right2);
+    println!("Ch1: {}", output1);
+    println!("Ch2: {}", output2);
 
     // Both should produce sound
-    assert!(left1.abs() > 10);
-    assert!(left2.abs() > 10);
+    assert!(output1.abs() > 10);
+    assert!(output2.abs() > 10);
 
     // They should be different (different frequencies/algorithms)
     // (might be same by coincidence, but unlikely)
-    println!("Difference: {}", (left1 - left2).abs());
+    println!("Difference: {}", (output1 - output2).abs());
 }

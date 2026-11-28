@@ -33,7 +33,8 @@ pub struct GenesisBoot {
     #[arg(long)]
     pub six_button: bool,
     /// The YM2612's DAC: `discrete`, the YM2612 of the first consoles,
-    /// whose levels either side of zero lie apart, or `integrated`, the
+    /// whose levels either side of zero lie apart and which puts a
+    /// channel's sign on a side it is not panned to, or `integrated`, the
     /// YM3438 of the later ones; both take each channel as 9 bits.
     #[arg(long, value_name = "MODEL", default_value = "discrete", value_parser = parse_fm_dac)]
     pub fm_dac: FmDacModel,
