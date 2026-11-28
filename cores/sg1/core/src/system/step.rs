@@ -193,9 +193,12 @@ impl GenesisEmulator {
         }
         run.resume = false;
 
-        // Reset bus cycles and VDP wait state
+        // Reset bus cycles and the stalls the instruction charges: a stall
+        // counted before it (a host's write through the 68000's bus, between
+        // two steps) is no instruction's.
         self.bus.cycles_executed = 0;
         self.bus.vdp_wait_cycles = 0;
+        self.bus.z80_bus_wait_cycles = 0;
 
         // Set YM2612 CPU cycle for timestamp-based busy flag. The stamp is
         // the time before the instruction, its interrupt not counted yet.

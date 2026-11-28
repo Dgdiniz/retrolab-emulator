@@ -411,6 +411,53 @@ fn a_save_mid_frame_keeps_the_samples_the_sound_chips_made() {
     }
 }
 
+/// A host's write into the Z80's area between frames (a YM2612 key-on
+/// through the 68000's bus, the Z80's bus held), then a load: the machine
+/// goes on as one that loaded the same state with no write before it, its
+/// sound too. The 68000 stalls for its own accesses to the Z80's bus, and a
+/// host's write is none of them.
+#[test]
+fn a_host_write_before_a_load_leaves_nothing_the_next_frames_read() {
+    let rom = sound_program();
+    let mut saver = booted(&rom);
+    saver.set_audio_enabled(true);
+    for _ in 0..20 {
+        saver.run_frame();
+    }
+    let state = saver.save_state();
+    let mut plain = booted(&rom);
+    plain
+        .load_state(&state, RomCheck::SameRom)
+        .expect("the state loads");
+    let mut written = booted(&rom);
+    for (address, value) in [
+        (0xA1_1100, 0x01),
+        (0xA1_1200, 0x01),
+        (0xA0_4000, 0x28),
+        (0xA0_4001, 0xF0),
+    ] {
+        written.write_memory_debug(address, &[value]);
+    }
+    written
+        .load_state(&state, RomCheck::SameRom)
+        .expect("the state loads");
+    assert_eq!(written.state_hash(), plain.state_hash(), "the loaded state");
+    for frame in 1..=3 {
+        plain.run_frame();
+        written.run_frame();
+        assert_eq!(
+            written.state_hash(),
+            plain.state_hash(),
+            "{frame} frames after the load"
+        );
+        assert_eq!(
+            written.get_audio_samples(),
+            plain.get_audio_samples(),
+            "the sound {frame} frames after the load"
+        );
+    }
+}
+
 /// The 68000 reads the HV counter in a loop and adds what it reads into
 /// work RAM.
 fn beam_program() -> Vec<u8> {
