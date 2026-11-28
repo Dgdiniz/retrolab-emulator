@@ -13,7 +13,11 @@
 //! The first check holds the sound moment to its word: every chip makes
 //! sound after it, so that no other check passes for want of anything to
 //! hear. A mute, the rules say, is the host's mix's alone: it changes
-//! nothing the machine holds, and it lasts until the host lifts it. Stems
+//! nothing the machine holds, and it lasts until the host lifts it. The
+//! sound switch keeps the sound out of the host's ring and nothing else:
+//! with it off the machine runs as with it on, and the stems and the log
+//! come as they come with it on; switched back on, the next frame queues
+//! that frame's sound, not what the frames before made. Stems
 //! only read: armed, they change nothing the machine holds or the host
 //! hears; they hold whole frames, every stem as many sample frames as the
 //! master; and they add up to the master by the layout's rule wherever the
@@ -97,6 +101,8 @@ macro_rules! sound_conformance_tests {
             the_render_runs_the_player_s_loop,
             a_mute_is_the_mixer_s,
             a_mute_is_the_host_s,
+            the_sound_switch_keeps_only_the_host_s_copy,
+            the_sound_switched_back_on_queues_one_frame,
             stems_change_nothing,
             stems_cover_whole_frames,
             stems_sum_to_the_master,
@@ -342,6 +348,110 @@ pub fn a_mute_is_the_host_s<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
     emu.run_frame();
     mute_all_but(&mut emu, None, false);
     assert_all_muted(&mut emu, false, "the host lifted them");
+}
+
+/// The sound switch keeps the sound out of the host's ring and nothing
+/// else: two machines, one with the sound switched off before the sound
+/// moment, each with every stem armed and everything logged from that
+/// moment, give the same stems (and master) and the same log after every
+/// frame, sample for sample and entry for entry, while the one switched off
+/// queues nothing for its host; and switched back on, its state is the
+/// other's: its chips ran on.
+pub fn the_sound_switch_keeps_only_the_host_s_copy<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut heard = (core.build)();
+    let mut silent = (core.build)();
+    for _ in 0..WARM_UP {
+        heard.run_frame();
+        silent.run_frame();
+    }
+    let _ = heard.get_audio_samples();
+    let _ = silent.get_audio_samples();
+    silent.set_audio_enabled(false);
+    let layout = layout_of(&heard);
+    for emu in [&mut heard, &mut silent] {
+        emu.arm_stems(layout.all());
+        emu.start_sound_log(EVERYTHING);
+        (core.sound_moment)(emu);
+    }
+    let mut peak = 0.0f32;
+    for frame in 1..=FRAMES {
+        heard.render_frame();
+        silent.render_frame();
+        peak = peak.max(host_peak(&mut heard));
+        assert!(
+            silent.get_audio_samples().is_empty(),
+            "frame {frame}: the host got sound from the machine whose sound is off"
+        );
+        let stems = heard.take_stems().expect("stems armed");
+        assert!(stems.frames > 0, "frame {frame}: the stems took the frame");
+        assert_eq!(
+            silent.take_stems(),
+            Some(stems),
+            "frame {frame}: the stems with the sound off are not the ones with it on"
+        );
+        assert_eq!(
+            silent.take_sound_log(),
+            heard.take_sound_log(),
+            "frame {frame}: the log with the sound off is not the one with it on"
+        );
+    }
+    assert!(
+        peak >= SOUND_PEAK,
+        "the machine with the sound on made no sound (peak {peak})"
+    );
+    silent.set_audio_enabled(true);
+    assert_eq!(
+        silent.state_hash(),
+        heard.state_hash(),
+        "switched back on, the machine is not the one that kept its sound on"
+    );
+}
+
+/// The sound switched back on queues one frame of sound at the next
+/// frame's end, not what the frames run with it off made: as many samples
+/// as the same frame queues on a machine that kept its sound on, within a
+/// sample frame, and the sound plays.
+pub fn the_sound_switched_back_on_queues_one_frame<E: SoundCore>(core: &SoundCoreUnderTest<E>) {
+    let mut kept = core.playing();
+    let mut switched = core.playing();
+    let _ = kept.get_audio_samples();
+    let _ = switched.get_audio_samples();
+    switched.set_audio_enabled(false);
+    for frame in 1..=30 {
+        kept.render_frame();
+        switched.render_frame();
+        let _ = kept.get_audio_samples();
+        assert!(
+            switched.get_audio_samples().is_empty(),
+            "frame {frame}: the host got sound with the sound off"
+        );
+    }
+    switched.set_audio_enabled(true);
+    kept.render_frame();
+    switched.render_frame();
+    let channels = switched.get_audio_info().channels as usize;
+    let one_frame = kept.get_audio_samples().len();
+    let queued = switched.get_audio_samples().to_vec();
+    assert!(
+        one_frame > 0,
+        "the machine that kept its sound queued a frame"
+    );
+    assert!(
+        queued.len().abs_diff(one_frame) <= channels,
+        "{} samples queued, the frame is {one_frame}",
+        queued.len()
+    );
+    let mut peak = queued
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    for _ in 0..FRAMES {
+        switched.render_frame();
+        peak = peak.max(host_peak(&mut switched));
+    }
+    assert!(
+        peak >= SOUND_PEAK,
+        "switched back on, the machine made no sound (peak {peak})"
+    );
 }
 
 /// Stems change nothing: with every stem armed and taken after each frame,

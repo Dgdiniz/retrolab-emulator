@@ -8,12 +8,18 @@
 //! input clocks not yet made into samples are written where their count
 //! was, and the samples since the envelopes last stepped where theirs was.
 
-use super::{Ym2612, SAMPLES_PER_ENVELOPE_STEP};
+use super::{Ym2612, CLOCKS_PER_SAMPLE, SAMPLES_PER_ENVELOPE_STEP};
 use crate::savestate::{Ym2612Extension, Ym2612State};
 
 /// The host's rate older builds made the chip's samples at, the rate the
 /// increments a savestate holds are scaled for.
 const SAVED_INCREMENT_RATE: u64 = 44_100;
+
+/// The most input clocks not yet made into samples a savestate can hold for
+/// a chip that ran: about seven frames' (a frame gives the chip at most
+/// about 153,000). A state that holds more was saved by a build that kept
+/// counting clocks it never made into samples.
+const MAX_SAVED_UNSAMPLED: u32 = 1 << 20;
 
 /// The scale an older build applies to the chip's own increment on a clock
 /// of `clock_freq`, in 16.16 fixed point: the chip's samples in one of the
@@ -80,9 +86,12 @@ impl Ym2612 {
     /// Make the chip the state's, the state made on a chip clocked at
     /// `state_clock` (the YM2612's clock of the state's region), which its
     /// increments are scaled on. A count an older build kept below 0 after
-    /// it made a sample ahead reads as 0. The record starts afresh from the
-    /// level the chip held ([`Self::restore_frame_output`] then gives it
-    /// the state's).
+    /// it made a sample ahead reads as 0; one past what a frame leaves (a
+    /// build that held its chips still while the sound was off counted
+    /// every clock since its last write there, and never made them into
+    /// samples) keeps only its place in a sample. The record starts afresh
+    /// from the level the chip held ([`Self::restore_frame_output`] then
+    /// gives it the state's).
     pub fn from_savestate(&mut self, s: &Ym2612State, state_clock: u32) {
         let scale = increment_scale(state_clock);
         for (channel, saved) in self.channels.iter_mut().zip(&s.channels) {
@@ -98,7 +107,12 @@ impl Ym2612 {
         self.dac_enabled = s.dac_enabled;
         self.dac_value = s.dac_value;
         self.dac_start_value = s.dac_start_value;
-        self.unsampled = s.clock_accumulator.max(0.0) as u32;
+        let unsampled = s.clock_accumulator.max(0.0) as u32;
+        self.unsampled = if unsampled > MAX_SAVED_UNSAMPLED {
+            unsampled % CLOCKS_PER_SAMPLE
+        } else {
+            unsampled
+        };
         self.timer_accumulator = s.timer_accumulator;
         self.ch3_mode = s.ch3_mode;
         self.ch3_fnum = s.ch3_fnum;

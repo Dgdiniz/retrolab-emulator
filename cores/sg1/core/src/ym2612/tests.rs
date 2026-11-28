@@ -391,7 +391,6 @@ fn test_csm_mode() {
 #[test]
 fn a_muted_channel_runs_as_an_unmuted_one() {
     let note = |ym: &mut Ym2612| {
-        ym.set_rendering_enabled(true);
         for (register, value) in [
             (0x40, 0x00),
             (0x50, 0x1F),
@@ -449,7 +448,6 @@ fn host_samples_for_clocks(clocks: u64) -> usize {
 #[test]
 fn generate_samples_holds_the_chip_s_level_through_every_sample_the_clocks_came_to() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
     ym.write_port(0, 0x2A);
@@ -481,7 +479,6 @@ fn generate_samples_holds_the_chip_s_level_through_every_sample_the_clocks_came_
 #[test]
 fn generate_samples_does_not_run_ahead_of_the_machine_for_a_large_buffer() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
 
     let clocks = clocks_for_samples(100);
     ym.clock(clocks);
@@ -504,7 +501,6 @@ fn generate_samples_does_not_run_ahead_of_the_machine_for_a_large_buffer() {
 #[test]
 fn test_catchup_dac_write_only_affects_samples_after_its_position() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
     // dac_value defaults to 0, so the first half of the frame renders silent.
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
@@ -536,7 +532,6 @@ fn test_catchup_dac_write_only_affects_samples_after_its_position() {
 #[test]
 fn test_catchup_two_dac_writes_in_one_frame_both_render() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
 
@@ -575,7 +570,6 @@ fn test_catchup_two_dac_writes_in_one_frame_both_render() {
 #[test]
 fn test_catchup_fm_key_on_sounds_only_after_write() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
 
     // Minimal audible patch on channel 0: algorithm 7 (all four operators are
     // carriers), max level, instant attack, no decay, both speakers.
@@ -648,23 +642,6 @@ fn test_ic_reset_silences_fm_chip() {
     }
 }
 
-// With rendering gated off (emulator audio disabled), `catch_up` must not
-// synthesize anything, yet the accumulator stays bounded so re-enabling audio
-// doesn't replay a giant backlog.
-#[test]
-fn test_rendering_disabled_produces_no_samples() {
-    let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(false);
-    ym.write_register(0, 0x2B, 0x80);
-    ym.set_dac_value(120);
-
-    ym.clock(clocks_for_samples(500));
-
-    let mut buf = vec![0.0f32; 256];
-    let n = ym.generate_samples(&mut buf, 44100);
-    assert_eq!(n, 0, "no samples should be produced while rendering is off");
-}
-
 // The optional sound-write log records each FM *data* write (latches are
 // not synthesis events) tagged with the in-frame sample offset where it
 // takes effect, the same sub-frame placement the catch-up model renders,
@@ -672,7 +649,6 @@ fn test_rendering_disabled_produces_no_samples() {
 #[test]
 fn test_write_log_captures_part_register_and_sample_position() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
     ym.enable_write_log();
 
     // Data write at frame start (nothing clocked yet) -> sample_pos 0.
@@ -709,7 +685,6 @@ fn test_write_log_captures_part_register_and_sample_position() {
 #[test]
 fn test_write_log_disabled_by_default() {
     let mut ym = Ym2612::new(7_670_454, 44100);
-    ym.set_rendering_enabled(true);
     ym.write_port(0, 0x28);
     ym.write_port(1, 0xF0);
     assert!(ym.take_write_log().is_empty());

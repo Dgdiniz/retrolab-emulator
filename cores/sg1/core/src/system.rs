@@ -106,7 +106,10 @@ pub struct GenesisEmulator {
     /// counts CPU cycles rather than raw master clocks.
     audio_rate_converter: retro_core::IntegerRateConverter,
 
-    // Audio control: enabled by default, can be disabled via API
+    /// The sound switch, on by default: whether each frame's sound goes
+    /// into the host's ring, what the speakers play. The chips, their
+    /// records, the stems and the sound log run whatever it says. Kept in
+    /// the savestate and the state hash, as the SNES keeps its own.
     audio_enabled: bool,
 
     // Pre-allocated audio mixing buffers (no Vec allocs per frame): the
@@ -460,11 +463,6 @@ impl GenesisEmulator {
         // is constructed at its NTSC default, so re-apply the system region to
         // keep its scanline timing in lockstep (a no-op on NTSC).
         self.apply_region(self.region);
-        // The new chips render as the audio switch says.
-        self.bus
-            .ym2612_mut()
-            .set_rendering_enabled(self.audio_enabled);
-        self.bus.psg_mut().set_rendering_enabled(self.audio_enabled);
         mutes.apply(self);
         // And stage what the host's stems take.
         self.set_stem_taps(self.stems.is_armed());
@@ -1127,12 +1125,11 @@ impl EmulatorCore for GenesisEmulator {
         &self.system_info.audio
     }
 
+    /// The sound switch. Off, a frame's sound is not copied into the host's
+    /// ring, and what the ring held is dropped; the chips run on as with it
+    /// on. On again, the next frame's end queues that frame's sound.
     fn set_audio_enabled(&mut self, enabled: bool) {
         self.audio_enabled = enabled;
-        // The chips render incrementally (before each register write); gate
-        // that catch-up synthesis too, so disabling audio saves its cost.
-        self.bus.ym2612_mut().set_rendering_enabled(enabled);
-        self.bus.psg_mut().set_rendering_enabled(enabled);
         if !enabled {
             self.host_audio.clear();
         }

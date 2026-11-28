@@ -133,12 +133,6 @@ impl Ym2612 {
     /// register write (so the write's effect starts at the right sample)
     /// and when the record is taken.
     pub(super) fn catch_up(&mut self) {
-        if !self.rendering_enabled {
-            // Audio off: no synthesis, only the place among a sample's clocks.
-            self.unsampled %= CLOCKS_PER_SAMPLE;
-            return;
-        }
-
         while self.unsampled >= CLOCKS_PER_SAMPLE {
             self.unsampled -= CLOCKS_PER_SAMPLE;
             let (left, right) = self.generate_one_sample();
@@ -343,10 +337,6 @@ impl AudioChip for Ym2612 {
         let mut record = Vec::new();
         let mut stems = Vec::new();
         self.take_output(self.position, &mut record, &mut stems);
-        if !self.rendering_enabled {
-            self.sampler = None;
-            return 0;
-        }
         let start = record.first().map_or(self.position, |entry| entry.0);
         let sampler = self.sampler.get_or_insert_with(|| {
             let mut sampler =

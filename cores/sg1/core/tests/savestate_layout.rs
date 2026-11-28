@@ -362,3 +362,69 @@ fn every_extension_written_keeps_loading_and_older_builds_read_past_it() {
         assert!(filled(&emu) > before, "{name}: the fill went on");
     }
 }
+
+/// The samples the host gets from the frame after `bytes` are loaded into a
+/// machine holding the program, its sound on.
+fn one_frame_after_loading(bytes: &[u8]) -> usize {
+    let mut emu = emulator_with_program();
+    emu.load_state(bytes, RomCheck::AnyRom)
+        .expect("the state loads");
+    emu.set_audio_enabled(true);
+    let _ = emu.get_audio_samples();
+    run_frame_on(&mut emu, ExecutionTier::Play);
+    emu.get_audio_samples().len()
+}
+
+/// A state an older build saved after its sound had been off a while. Such
+/// a build held its chips and its sample converter still while the sound
+/// was off: the state holds the converter where the sound went off, and
+/// each chip counting every input clock it received since its last write.
+/// Loaded, the chips keep only their place in a tick or a sample, and the
+/// frame after queues one frame of sound, as from the state this build
+/// saves.
+#[test]
+fn a_state_an_older_build_saved_with_the_sound_off_queues_one_frame() {
+    let mut saver = emulator_with_program();
+    for _ in 0..20 {
+        run_frame_on(&mut saver, ExecutionTier::Play);
+    }
+    let bytes = saver.save_state();
+    let (mut payload, extension) =
+        SystemSaveState::open(&bytes, None, RomCheck::AnyRom).expect("the state opens");
+    let master = payload.timing.master_cycles;
+    payload.timing.audio_enabled = false;
+    payload.timing.audio_rate_converter.reference_cycles = master - 2_000_000;
+    payload.ym2612.clock_accumulator = 2_000_000.0;
+    payload.psg.clock_accumulator = 1_500_000.0;
+    payload.psg.internal_clock_accumulator = 3.0;
+    let older = payload.seal(&extension, "", 0).expect("the state seals");
+
+    let mut loaded = emulator_with_program();
+    loaded
+        .load_state(&older, RomCheck::AnyRom)
+        .expect("the state loads");
+    let (held, _) = SystemSaveState::open(&loaded.save_state(), None, RomCheck::AnyRom)
+        .expect("the state opens");
+    assert!(
+        held.ym2612.clock_accumulator < 144.0,
+        "the YM2612's clocks not made into samples: {}",
+        held.ym2612.clock_accumulator
+    );
+    assert!(
+        held.psg.internal_clock_accumulator < 16.0,
+        "the PSG's clocks not ticked: {}",
+        held.psg.internal_clock_accumulator
+    );
+    assert_eq!(
+        held.timing.audio_rate_converter.reference_cycles, master,
+        "the converter goes on from the state's present"
+    );
+
+    let one_frame = one_frame_after_loading(&bytes);
+    let after_older = one_frame_after_loading(&older);
+    assert!(one_frame > 0);
+    assert!(
+        after_older.abs_diff(one_frame) <= 2,
+        "{after_older} samples after the older state, {one_frame} after this build's"
+    );
+}

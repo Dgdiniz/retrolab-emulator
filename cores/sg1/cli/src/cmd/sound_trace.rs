@@ -58,8 +58,9 @@ pub fn run(args: SoundTraceArgs<GenesisBoot>) -> Result<()> {
     // `run_frame`), so the game executes its sound driver, same reason
     // `screenshot`/`fingerprint` set this.
     emu.debugger().set_execution_mode(ExecutionMode::Running);
-    // The chips make no record when audio is disabled, and the sample
-    // offsets count from the start of each chip's record.
+    // The sound on, as a new machine has it. The sample offsets do not
+    // depend on it: they count from the start of each chip's record, which
+    // every frame's end takes, the sound on or off.
     emu.set_audio_enabled(true);
 
     let want_fm = !args.psg_only;

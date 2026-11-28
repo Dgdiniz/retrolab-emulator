@@ -116,8 +116,9 @@ impl SnesEmulator {
     /// audio ring. Called once per frame after the APU catch-up.
     ///
     /// Skipped entirely when audio is disabled; the APU's own 32 kHz ring
-    /// then fills and bounds-overflows its oldest samples (benign), and
-    /// resampling resumes from the live ring once audio is re-enabled.
+    /// then fills and bounds-overflows its oldest samples (benign), and the
+    /// switch turned on again drops it, so resampling resumes from the
+    /// samples made after.
     pub(super) fn drain_apu_to_host_audio(&mut self) {
         if !self.audio_enabled {
             return;

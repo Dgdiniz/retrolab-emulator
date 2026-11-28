@@ -195,13 +195,6 @@ pub struct Ym2612 {
     /// `get_status` (see busy_counter).
     pub current_cpu_cycle: u64,
 
-    /// When false (host audio disabled), `catch_up()` skips FM synthesis and
-    /// keeps no record, only its place among the 144 clocks of a sample, so
-    /// disabling audio saves the time FM synthesis takes. Timers keep
-    /// running via `clock()`, so Timer A/B IRQ timing is unaffected. Not
-    /// serialized: re-applied via `set_rendering_enabled`.
-    rendering_enabled: bool,
-
     /// Optional capture of every FM *data-port* write, tagged with the
     /// in-frame output-sample offset at which it takes effect. `None` =
     /// disabled (zero overhead, no allocation). Transient diagnostic for the
@@ -290,7 +283,6 @@ impl Ym2612 {
             busy_counter: 0,
             busy_end_cycle: 0,
             current_cpu_cycle: 0,
-            rendering_enabled: true,
             sound_write_log: None,
             stems: None,
             input_clocks: 0,
@@ -485,17 +477,6 @@ impl Ym2612 {
         }
     }
 
-    /// Enable or disable audio rendering. When disabled (host audio off),
-    /// `catch_up()` skips FM synthesis, so disabling audio saves the time
-    /// synthesis takes. Timer clocking is unaffected. Enabled again, the
-    /// record starts afresh from the level the chip held.
-    pub fn set_rendering_enabled(&mut self, enabled: bool) {
-        if enabled && !self.rendering_enabled {
-            self.restart_output();
-        }
-        self.rendering_enabled = enabled;
-    }
-
     /// Get a reference to a channel
     pub fn channel(&self, index: usize) -> Option<&Channel> {
         self.channels.get(index)
@@ -547,8 +528,8 @@ impl Ym2612 {
     ///     doesn't retroactively silence sound that already played this frame),
     ///   - clears FM synthesis + timer state, and
     ///   - preserves the record (`output`), the clocks towards the next sample
-    ///     (`unsampled`), debugger mutes (`mute_flags`), the host render gate
-    ///     (`rendering_enabled`), and the sample-rate config.
+    ///     (`unsampled`), debugger mutes (`mute_flags`), and the sample-rate
+    ///     config.
     pub fn ic_reset(&mut self) {
         self.catch_up();
         // The notes sounding end with the reset.

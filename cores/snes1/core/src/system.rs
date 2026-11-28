@@ -1156,7 +1156,15 @@ impl EmulatorCore for SnesEmulator {
         &self.system_info.audio
     }
 
+    /// The sound switch. Off, the frames' sound stays out of the host's
+    /// ring; the APU runs on and its ring keeps the S-DSP's latest samples
+    /// for the debugger's output waveform. On again, what that ring holds
+    /// is dropped, so the next frame's end queues that frame's sound, not
+    /// the sound made while the switch was off.
     fn set_audio_enabled(&mut self, enabled: bool) {
+        if enabled && !self.audio_enabled {
+            self.bus.apu_mut().discard_pending_audio();
+        }
         self.audio_enabled = enabled;
     }
 

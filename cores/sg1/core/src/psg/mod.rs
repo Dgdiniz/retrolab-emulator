@@ -38,6 +38,12 @@ const MAX_OUTPUT_CHANGES: usize = 16384;
 /// about 0.36 ms, so its 1,024 values span about 0.37 s.
 const TICKS_PER_SCOPE_VALUE: u32 = 81;
 
+/// The most clocks not yet ticked a savestate can hold for a chip that ran:
+/// about fifteen frames' (a frame gives the chip at most about 71,400). A
+/// state that holds more was saved by a build that kept counting clocks it
+/// never ticked.
+const MAX_SAVED_UNTICKED: u32 = 1 << 20;
+
 /// The four channels' outputs at a moment, muted or not: tone channels 1
 /// to 3, then the noise channel.
 pub type PsgLevels = [f32; PSG_STEM_VALUES];
@@ -109,12 +115,6 @@ pub struct Psg {
     /// The ticks left before the next value of the waveforms.
     scope_countdown: u32,
 
-    /// When false (host audio disabled), `catch_up()` does not tick the
-    /// channels and keeps no record, only the divider's place, so no CPU is
-    /// spent on audio nobody hears. Not serialized: it is a host setting
-    /// re-applied via `set_rendering_enabled`.
-    rendering_enabled: bool,
-
     /// Optional capture of every byte written to the PSG, tagged with the
     /// in-frame output-sample offset at which it takes effect. `None` =
     /// disabled (zero overhead). Transient diagnostic for `sg1-cli
@@ -183,7 +183,6 @@ impl Psg {
             mixed_waveform: std::collections::VecDeque::with_capacity(1024),
             max_waveform_samples: 1024,
             scope_countdown: 0,
-            rendering_enabled: true,
             sound_write_log: None,
             input_clocks: 0,
             sound_log: None,
@@ -384,30 +383,12 @@ impl Psg {
         image
     }
 
-    /// Enable or disable audio rendering. When disabled (host audio off),
-    /// `catch_up()` neither ticks the channels nor keeps a record, so
-    /// disabling audio buys back what they cost. The tone and noise
-    /// generators hold still meanwhile, their counters, polarities and LFSR
-    /// (in savestates and the state hash) as they were; the divider keeps
-    /// its place among the 16 clocks of a tick. Enabled again, the record
-    /// starts afresh from the outputs as they are.
-    pub fn set_rendering_enabled(&mut self, enabled: bool) {
-        if enabled && !self.rendering_enabled {
-            self.restart_output();
-        }
-        self.rendering_enabled = enabled;
-    }
-
     /// Tick the channels once for every 16 input clocks received since the
     /// last tick, each tick at the input clock its 16th clock came, keeping
     /// each change of their outputs in the record. Called before each
     /// register write, so the write lands after every tick of its time,
     /// and when the record is taken.
     fn catch_up(&mut self) {
-        if !self.rendering_enabled {
-            self.unticked %= CLOCKS_PER_TICK;
-            return;
-        }
         let first = self.position.saturating_sub(u64::from(self.unticked));
         let ticks = self.unticked / CLOCKS_PER_TICK;
         for tick in 1..=ticks {
@@ -541,9 +522,7 @@ impl Psg {
         }
 
         // A volume or a noise control moves the output at the write's time.
-        if self.rendering_enabled {
-            self.note_outputs(self.position);
-        }
+        self.note_outputs(self.position);
     }
 
     /// Clock all channels one cycle
@@ -642,10 +621,6 @@ impl AudioChip for Psg {
         }
         let mut record = Vec::new();
         self.take_output(&mut record);
-        if !self.rendering_enabled {
-            self.sampler = None;
-            return 0;
-        }
         let start = record.first().map_or(self.position, |e| e.0);
         let sampler = self.sampler.get_or_insert_with(|| {
             let mut sampler =
@@ -855,9 +830,17 @@ impl Psg {
         // its samples at the host's rate counted towards its next sample,
         // which it had not given its divider yet, and the divider's own
         // (all of them in this build's states). A borrowed sample left the
-        // first below 0.
+        // first below 0. A build that held its chips still while the sound
+        // was off counted every clock since its last write there and never
+        // ticked them: past what a frame leaves, the clocks keep only their
+        // place in a tick.
         let unticked = state.clock_accumulator.max(0.0) + state.internal_clock_accumulator.max(0.0);
-        self.unticked = unticked.floor() as u32;
+        let unticked = unticked.floor() as u32;
+        self.unticked = if unticked > MAX_SAVED_UNTICKED {
+            unticked % CLOCKS_PER_TICK
+        } else {
+            unticked
+        };
         // The record goes on from the savestate's extension, or starts where
         // the system sets the chip's position.
         self.output.clear();
@@ -1123,7 +1106,6 @@ mod tests {
     #[test]
     fn test_catchup_volume_change_only_affects_samples_after_its_position() {
         let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
-        psg.set_rendering_enabled(true);
 
         // Channel 0 tone with an audible period, but attenuated to silence.
         psg.write(0x8D); // latch ch0 tone, freq low nibble
@@ -1148,28 +1130,11 @@ mod tests {
         assert!(late_max > 0.02, "post-write region not audible: {late_max}");
     }
 
-    // Audio gated off must not synthesize, but the accumulator stays bounded.
-    #[test]
-    fn test_rendering_disabled_produces_no_samples() {
-        let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
-        psg.set_rendering_enabled(false);
-        psg.write(0x8D);
-        psg.write(0x01);
-        psg.write(0x90);
-
-        psg.clock(((TEST_CLOCK as f32 / TEST_SAMPLE_RATE as f32) * 500.0) as u32);
-
-        let mut buf = vec![0.0f32; 256];
-        let n = psg.generate_samples(&mut buf, TEST_SAMPLE_RATE);
-        assert_eq!(n, 0, "no samples should be produced while rendering is off");
-    }
-
     // The optional sound-write log (the cross-core probe) records every PSG
     // byte tagged with the in-frame sample offset where it takes effect.
     #[test]
     fn test_write_log_captures_bytes_and_sample_position() {
         let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
-        psg.set_rendering_enabled(true);
         psg.enable_write_log();
 
         // Two bytes before any clocking -> sample_pos 0.
@@ -1243,7 +1208,6 @@ mod tests {
     #[test]
     fn test_write_log_disabled_by_default() {
         let mut psg = Psg::new(TEST_CLOCK, TEST_SAMPLE_RATE);
-        psg.set_rendering_enabled(true);
         psg.write(0x90);
         assert!(psg.take_write_log().is_empty());
     }

@@ -603,25 +603,28 @@ impl GenesisEmulator {
     /// The first half (advancing `audio_rate_converter` and taking the
     /// chips' records of the frame) mutates *serialized machine state*,
     /// state the netplay desync hash (`state_hash`) covers, so it MUST run
-    /// on every frame, audible or headless. If a headless rollback/catch-up
-    /// frame skipped it, a re-simulated span would leave the converter and
-    /// the chips' records where a live audible run moved them on, the two
-    /// peers' hashes for that frame would differ, and the netplay desync
-    /// check would fire a spurious full resync. The second half (the
-    /// records through the host's stage, the limiter, the
-    /// waveform-visualization ring, and the host audio ring) is pure
-    /// presentation (none of it is serialized), so a headless frame skips
-    /// it: audio is generated but not rendered, exactly as rollback netcode
-    /// requires. So a headless frame queues nothing, and after a rollback's
-    /// frames there is nothing pending to discard (the trait's
-    /// `discard_pending_audio` does nothing here): clearing the host ring
-    /// instead would throw away sound presented and still on its way. The
-    /// stage steps to the chips' levels at the next frame presented.
+    /// on every frame, audible or headless, the sound on or off. If a
+    /// headless rollback/catch-up frame skipped it, a re-simulated span
+    /// would leave the converter and the chips' records where a live
+    /// audible run moved them on, the two peers' hashes for that frame
+    /// would differ, and the netplay desync check would fire a spurious
+    /// full resync. The second half (the records through the host's stage,
+    /// the limiter, the waveform-visualization ring, the stems and the host
+    /// audio ring) is pure presentation (none of it is serialized), so a
+    /// headless frame skips it: audio is generated but not rendered,
+    /// exactly as rollback netcode requires. So a headless frame queues
+    /// nothing, and after a rollback's frames there is nothing pending to
+    /// discard (the trait's `discard_pending_audio` does nothing here):
+    /// clearing the host ring instead would throw away sound presented and
+    /// still on its way. The stage steps to the chips' levels at the next
+    /// frame presented.
+    ///
+    /// The sound switch keeps the frame out of the host's ring and nothing
+    /// else: a frame shown with the sound off and stems armed goes through
+    /// the stage and makes its stems as with the sound on; one with nothing
+    /// armed leaves the stage where it stands, as a headless frame does, so
+    /// the frame that brings the sound back queues that frame's sound alone.
     pub(super) fn generate_and_mix_audio(&mut self, present: bool) {
-        if !self.audio_enabled {
-            return;
-        }
-
         // Drift-free cycles->samples mapping. The converter is anchored
         // on `master_cycles`, so the delta between the previous
         // anchor's cumulative count and this frame's tells us exactly
@@ -647,8 +650,11 @@ impl GenesisEmulator {
             .take_output(self.master_cycles, &mut ym_record, &mut ym_stem_rows);
 
         // A paused / stepped emulator may report 0 delta (no cycle advance
-        // since last call): no samples to render.
-        if present && samples_per_frame > 0 {
+        // since last call): no samples to render. With the sound off and
+        // nothing armed, nobody takes them.
+        let staged =
+            present && samples_per_frame > 0 && (self.audio_enabled || self.stems.is_armed());
+        if staged {
             self.stage_chips(&psg_record, &ym_record, &ym_stem_rows, samples_per_frame);
         }
 
@@ -665,11 +671,11 @@ impl GenesisEmulator {
         // Everything above advanced serialized machine state (the converter
         // and the chips' records), so it ran on this frame regardless of
         // presentation. A headless frame stops here: the limiter, the
-        // waveform ring, and the host audio ring below are
+        // waveform ring, the stems and the host audio ring below are
         // presentation-only and never enter the netplay desync hash. See
         // the fn doc for why this ordering is load-bearing for rollback
         // determinism.
-        if !present || samples_per_frame == 0 {
+        if !staged {
             return;
         }
 
@@ -699,9 +705,11 @@ impl GenesisEmulator {
         // The ring is bounded; if the host is way behind (debugger
         // paused, tab backgrounded) `push_slice` quietly drops the
         // oldest samples and counts them, which `host_audio().overflows()`
-        // reports.
-        self.host_audio
-            .push_slice(&self.mix_sample_buf[..mix_count * 2]);
+        // reports. The sound switch keeps the frame out of it.
+        if self.audio_enabled {
+            self.host_audio
+                .push_slice(&self.mix_sample_buf[..mix_count * 2]);
+        }
 
         if self.stems.is_armed() {
             self.record_stems(mix_count);

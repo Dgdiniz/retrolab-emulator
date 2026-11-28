@@ -9,6 +9,11 @@ use crate::timing::{GenesisTiming, VideoRegion};
 use retro_core::cartridge::Cartridge;
 use retro_core::EmulatorCore;
 
+/// The most 68000 cycles a state's converter can stand behind its master
+/// clock when the machine that saved it moved its converter every frame:
+/// about seven frames' (a frame holds at most about 153,000).
+const MAX_CONVERTER_LAG: u64 = 1 << 20;
+
 /// Self-contained cartridge-only savestate payload: the battery-SRAM image
 /// plus every coprocessor's typed state (keyed by `chip_id`). Serialized by
 /// [`GenesisEmulator::get_cartridge_save_state`].
@@ -97,10 +102,22 @@ impl GenesisEmulator {
                 conv_state,
             );
         }
+        // A build that held its chips still while the sound was off kept its
+        // converter where the sound went off, which a state saved with the
+        // sound still off holds: this build would count every sample since
+        // as the next frame's. Those samples were never made; the converter
+        // goes on from the state's present. A state this build saves holds
+        // its converter within a frame of it.
+        let lag = self
+            .master_cycles
+            .saturating_sub(self.audio_rate_converter.reference_cycles());
+        if lag > MAX_CONVERTER_LAG {
+            let made = self
+                .audio_rate_converter
+                .cycles_to_samples(self.master_cycles);
+            self.audio_rate_converter.advance(self.master_cycles, made);
+        }
         self.audio_enabled = t.audio_enabled;
-        // Re-apply the host audio gate to the chips (it is not part of chip state).
-        self.bus.ym2612_mut().set_rendering_enabled(t.audio_enabled);
-        self.bus.psg_mut().set_rendering_enabled(t.audio_enabled);
         self.last_step_cycles = t.last_step_cycles;
         self.z80_irq_pending = t.z80_irq_pending;
         self.step_z80_target = t.step_z80_target;
