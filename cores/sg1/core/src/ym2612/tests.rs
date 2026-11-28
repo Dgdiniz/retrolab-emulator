@@ -56,36 +56,48 @@ fn test_lfo_register_write() {
     assert_eq!(ym.lfo().get_frequency(), 3);
 }
 
+// A savestate holds each operator's increment scaled for 44.1 kHz, as
+// builds that made the chip's samples at the host's rate hold it: every
+// increment the chip can work out comes back exactly on both consoles'
+// clocks, and the scale is the one those builds applied.
 #[test]
-fn the_lfo_cycles_at_the_chip_s_own_rate_whatever_the_output_rate() {
+fn a_saved_increment_reads_back_as_the_chip_s_own() {
+    for clock in [53_693_175 / 7, 53_203_424 / 7] {
+        let scale = state::increment_scale(clock);
+        assert_eq!(scale, (u64::from(clock) << 16) / (144 * 44_100));
+        for increment in 0..(1u32 << 22) {
+            let saved = state::saved_increment(increment, scale);
+            assert_eq!(
+                state::own_increment(saved, scale),
+                increment,
+                "{increment} on {clock} Hz"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_lfo_cycles_in_steps_of_the_chip_s_own_samples() {
     // A cycle is 128 steps, at rate 0 of 108 of the chip's own samples
-    // each, and the chip makes one sample each 144 input clocks: the
-    // output samples a cycle lasts follow from that, not from the count.
-    let (clock, rate) = (7_670_454_u32, 44_100_u32);
-    let mut ym = Ym2612::new(clock, rate);
+    // each, and the chip makes one sample each 144 input clocks.
+    let mut ym = Ym2612::new(7_670_454, 44_100);
     ym.write_register(0, 0x22, 0x08); // LFO on, rate 0
 
     let mut samples = 0u32;
     let mut steps = 0u32;
     let mut phase = ym.lfo().get_phase();
     while steps < 128 {
-        // Fewer input clocks than an output sample takes: at most one
-        // sample a call, so the phase is read after each.
-        ym.clock(16);
+        // A sample's clocks a call, so the phase is read after each.
+        ym.clock(CLOCKS_PER_SAMPLE);
         ym.catch_up();
-        samples += (ym.frame_samples.len() / 2) as u32;
-        ym.frame_samples.clear();
+        samples += 1;
         if ym.lfo().get_phase() != phase {
             phase = ym.lfo().get_phase();
             steps += 1;
         }
     }
 
-    let expected = 128.0 * 108.0 * 144.0 * f64::from(rate) / f64::from(clock);
-    assert!(
-        (f64::from(samples) - expected).abs() <= 1.0,
-        "a cycle took {samples} output samples, the chip's rate gives {expected:.2}"
-    );
+    assert_eq!(samples, 128 * 108, "the chip's samples a cycle takes");
 }
 
 #[test]
@@ -424,57 +436,63 @@ fn clocks_for_samples(samples: u32) -> u32 {
     ((7_670_454f32 / 44100f32) * samples as f32) as u32
 }
 
-// The system's cycles->samples converter decides how many stereo pairs a
-// frame owes. This chip's accumulator is a second quantisation of the same
-// elapsed time, so it can land a pair short -- and a short return would
-// leave the caller's pre-zeroed tail as silence, which a listener hears as
-// a tick. Ask for one pair more than the chip has earned: the buffer must
-// still come back full, and the last pair must carry signal.
+// The host's samples a run of input clocks comes to at 44.1 kHz on the
+// chip's clock, counted from the chip's first input clock.
+fn host_samples_for_clocks(clocks: u64) -> usize {
+    (clocks * 44_100 / 7_670_454) as usize
+}
+
+// The sample-and-hold hands out every host sample the input clocks received
+// came to, each the chip's sample in force at its time: a DAC held at a
+// level fills them all, over calls of any size, with nothing to borrow and
+// no silence at a call's end.
 #[test]
-fn generate_samples_fills_a_one_pair_shortfall_instead_of_leaving_silence() {
+fn generate_samples_holds_the_chip_s_level_through_every_sample_the_clocks_came_to() {
     let mut ym = Ym2612::new(7_670_454, 44100);
     ym.set_rendering_enabled(true);
     ym.write_register(0, 0x2B, 0x80); // DAC enable
     ym.write_register(1, 0xB6, 0xC0); // channel 6 (DAC) stereo L+R
     ym.write_port(0, 0x2A);
     ym.write_port(1, 0xFF); // hold the DAC at a non-zero level
+    let level = f32::from(ym.get_dac_value() << 6) / 8192.0 / 6.0;
 
-    ym.clock(clocks_for_samples(400));
-    ym.catch_up();
-    let earned = ym.frame_samples.len() / 2;
-    assert!(earned > 0, "test setup produced no samples");
-
-    let want = (earned + 1) * 2;
-    let mut buf = vec![0.0f32; want];
-    let n = ym.generate_samples(&mut buf, 44100);
-
-    assert_eq!(
-        n, want,
-        "the chip must fill every pair the system asked for"
-    );
-    assert!(
-        buf[want - 2] != 0.0 && buf[want - 1] != 0.0,
-        "the borrowed pair reached the mixer as silence"
-    );
+    let mut clocks = 0u64;
+    let mut handed = 0usize;
+    for run in [clocks_for_samples(400), 1_000, 7, clocks_for_samples(3)] {
+        ym.clock(run);
+        clocks += u64::from(run);
+        let mut buf = vec![0.0f32; 4096];
+        let n = ym.generate_samples(&mut buf, 44100);
+        handed += n / 2;
+        assert_eq!(
+            handed,
+            host_samples_for_clocks(clocks),
+            "the samples the clocks came to"
+        );
+        assert!(
+            buf[..n].iter().all(|&s| s == level),
+            "every sample at the DAC's level"
+        );
+    }
 }
 
-// The borrow is bounded: an oversized scratch buffer must not make the chip
-// render audio the machine has not reached.
+// An oversized scratch buffer must not make the chip hand out sound the
+// machine has not reached.
 #[test]
 fn generate_samples_does_not_run_ahead_of_the_machine_for_a_large_buffer() {
     let mut ym = Ym2612::new(7_670_454, 44100);
     ym.set_rendering_enabled(true);
 
-    ym.clock(clocks_for_samples(100));
-    ym.catch_up();
-    let earned = ym.frame_samples.len() / 2;
+    let clocks = clocks_for_samples(100);
+    ym.clock(clocks);
 
     let mut buf = vec![0.0f32; 4096];
     let n = ym.generate_samples(&mut buf, 44100);
 
-    assert!(
-        n <= (earned + MAX_BORROWED_PAIRS) * 2,
-        "rendered {n} slots for {earned} earned pairs -- the borrow is unbounded"
+    assert_eq!(
+        n,
+        2 * host_samples_for_clocks(u64::from(clocks)),
+        "the pairs the clocks came to, and no more"
     );
 }
 

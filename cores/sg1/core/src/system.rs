@@ -109,21 +109,25 @@ pub struct GenesisEmulator {
     // Audio control: enabled by default, can be disabled via API
     audio_enabled: bool,
 
-    // Pre-allocated audio mixing buffers (avoids 3 Vec allocs per frame)
-    psg_sample_buf: Vec<f32>,
-    ym_sample_buf: Vec<f32>,
+    // Pre-allocated audio mixing buffers (no Vec allocs per frame): the
+    // master the stage renders and the mix after the limiter, both stereo
+    // interleaved.
+    master_sample_buf: Vec<f32>,
     mix_sample_buf: Vec<f32>,
 
     /// The kernel every stage of the host's sound shares
     /// ([`audio::host_kernel`]).
     stage_kernel: std::sync::Arc<SincKernel>,
-    /// The PSG's part of the master: its record of each frame band-limited
-    /// onto the host's samples. Host state, not saved: a load keeps it, so
-    /// the sound goes on without a click, and a reset clears it.
-    psg_stage: BandLimitedSteps<1>,
-    /// The PSG's record of the frame, taken at its end (a buffer kept from
-    /// frame to frame).
+    /// The master: the chips' records of each frame band-limited onto the
+    /// host's samples, the PSG's at its share on both sides and the
+    /// YM2612's at its own. Host state, not saved: a load keeps it, so the
+    /// sound goes on without a click, and a reset clears it.
+    master_stage: BandLimitedSteps<2>,
+    /// The chips' records of the frame, taken at its end, and the stems the
+    /// YM2612 staged beside its own (buffers kept from frame to frame).
     psg_record: Vec<(u64, crate::psg::PsgLevels)>,
+    ym_record: Vec<(u64, crate::ym2612::YmLevels)>,
+    ym_stem_rows: Vec<f32>,
     /// The stems' own stages while the host takes stems. Host state.
     stem_stages: Option<Box<audio::StemStages>>,
 
@@ -306,12 +310,13 @@ impl GenesisEmulator {
             audio_enabled: true,
 
             // Pre-allocated audio mixing buffers (~735 samples/frame at 44.1kHz/60fps)
-            psg_sample_buf: vec![0.0; 1024],
-            ym_sample_buf: vec![0.0; 2048],
+            master_sample_buf: vec![0.0; 2048],
             mix_sample_buf: vec![0.0; 2048],
             stage_kernel: stage_kernel.clone(),
-            psg_stage: BandLimitedSteps::new(stage_kernel),
+            master_stage: BandLimitedSteps::new(stage_kernel),
             psg_record: Vec::with_capacity(4096),
+            ym_record: Vec::with_capacity(2048),
+            ym_stem_rows: Vec::new(),
             stem_stages: None,
             mixed_waveform_buffer: std::collections::VecDeque::with_capacity(2048),
             stems: audio::stem_recorder(44100),

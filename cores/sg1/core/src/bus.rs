@@ -202,7 +202,7 @@ impl AddressBus {
     /// The clocks a console of `region` gives its sound chips, in Hz: the
     /// PSG runs on the Z80's clock (the master clock over 15), the YM2612
     /// on the 68000's (over 7).
-    fn sound_clocks(region: VideoRegion) -> (u32, u32) {
+    pub(crate) fn sound_clocks(region: VideoRegion) -> (u32, u32) {
         let master = region.master_clock();
         ((master / 15) as u32, (master / 7) as u32)
     }

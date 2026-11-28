@@ -75,34 +75,14 @@ pub struct Operator {
     // ===== Clock =====
     /// Chip clock frequency (typically 7,670,454 Hz for Genesis)
     clock_freq: u32,
-
-    /// Phase increment scale factor (16.16 fixed point).
-    /// Converts raw hardware phase increment (for internal rate = clock/144)
-    /// to the actual output sample rate.
-    /// scale = (clock_freq << 16) / (144 * sample_rate)
-    phase_scale: u32,
 }
 
 impl Operator {
-    /// Create a new operator
+    /// Create a new operator, its phase stepping once a chip sample (one
+    /// each 144 input clocks).
     pub fn new(clock_freq: u32) -> Self {
-        Self::with_sample_rate(clock_freq, 53267) // Default to internal rate
-    }
-
-    /// Create a new operator with explicit sample rate for phase scaling
-    pub fn with_sample_rate(clock_freq: u32, sample_rate: u32) -> Self {
         // Ensure sine table is initialized
         init_sine_table();
-
-        // Calculate phase scale factor (16.16 fixed point)
-        // scale = clock_freq / (144 * sample_rate)
-        // This converts the hardware phase increment (designed for internal rate
-        // = clock/144 ~ 53,267 Hz) to the actual output sample rate.
-        let phase_scale = if sample_rate > 0 {
-            ((clock_freq as u64) << 16) / (144u64 * sample_rate as u64)
-        } else {
-            1u64 << 16 // 1.0 in fixed point
-        } as u32;
 
         Self {
             freq_number: 0,
@@ -119,26 +99,27 @@ impl Operator {
             envelope: EnvelopeGenerator::new(),
             output: 0,
             clock_freq,
-            phase_scale,
         }
     }
 
-    /// Update sample rate (recalculates phase scale factor)
-    pub fn set_sample_rate(&mut self, sample_rate: u32) {
-        self.phase_scale = if sample_rate > 0 {
-            ((self.clock_freq as u64) << 16) / (144u64 * sample_rate as u64)
-        } else {
-            1u64 << 16
-        } as u32;
-        // Recalculate phase increment with new scale
-        self.update_phase_increment();
+    /// Run on another clock: the frequency in Hz the debugger shows follows
+    /// it. The phase increment, the phase's step a chip sample, is the
+    /// registers' and stays as it is.
+    pub fn set_clock_freq(&mut self, clock_freq: u32) {
+        self.clock_freq = clock_freq;
     }
 
-    /// Run on another clock: the phase scale and the phase increment follow
-    /// it, as they follow the sample rate.
-    pub fn set_clock_freq(&mut self, clock_freq: u32, sample_rate: u32) {
-        self.clock_freq = clock_freq;
-        self.set_sample_rate(sample_rate);
+    /// The phase's step a chip sample.
+    pub fn phase_increment(&self) -> u32 {
+        self.phase_increment
+    }
+
+    /// Make the phase's step a chip sample `increment`, as a savestate
+    /// holds it: the registers' increment as the chip last worked it out,
+    /// which working it out again could move (a frequency write works its
+    /// increment out before it updates the key code the detune reads).
+    pub(super) fn set_phase_increment(&mut self, increment: u32) {
+        self.phase_increment = increment;
     }
 
     /// Calculate and update phase increment from frequency parameters
@@ -149,8 +130,7 @@ impl Operator {
     /// Phase increment per internal sample (Clock / 144), on a 2^20 cycle:
     /// phase_inc = (F-Number x 2^Block / 2 + detune) x Multiple
     ///
-    /// The phase advances once per output sample, so `phase_scale` converts
-    /// the increment from the internal sample rate to the output rate.
+    /// The phase advances once per chip sample, by this increment as it is.
     pub fn update_phase_increment(&mut self) {
         if self.freq_number == 0 {
             self.phase_increment = 0;
@@ -186,12 +166,8 @@ impl Operator {
             self.multiple as u32 * 2
         };
 
-        // Raw hardware increment (correct for internal rate = clock/144 ~ 53 kHz)
-        let raw_inc = (detuned * halves) >> 1;
-
-        // Scale for actual output sample rate using 16.16 fixed-point factor
-        // This ensures correct frequencies regardless of output sample rate
-        self.phase_increment = ((raw_inc as u64 * self.phase_scale as u64) >> 16) as u32;
+        // The chip's increment, a chip sample's step of the phase.
+        self.phase_increment = (detuned * halves) >> 1;
     }
 
     /// Clock the operator once, generating one sample

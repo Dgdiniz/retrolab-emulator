@@ -30,7 +30,16 @@ impl GenesisEmulator {
         self.z80.from_savestate(&state.z80);
         self.bus.vdp_mut().from_savestate(&state.vdp);
         self.bus.psg_mut().from_savestate(&state.psg);
-        self.bus.ym2612_mut().from_savestate(&state.ym2612);
+        // The YM2612's increments are scaled on the clock of the state's
+        // region, which the state's region below gives the chip after.
+        let state_region = match state.vdp.timing.region {
+            0 => VideoRegion::Ntsc,
+            _ => VideoRegion::Pal,
+        };
+        let state_clock = crate::bus::AddressBus::sound_clocks(state_region).1;
+        self.bus
+            .ym2612_mut()
+            .from_savestate(&state.ym2612, state_clock);
         self.bus.io_mut().from_savestate(&state.io);
         self.bus.from_savestate(&state.bus);
 
@@ -51,10 +60,7 @@ impl GenesisEmulator {
         }
 
         // The state's region, before the clocks restored against it.
-        self.apply_region(match state.vdp.timing.region {
-            0 => VideoRegion::Ntsc,
-            _ => VideoRegion::Pal,
-        });
+        self.apply_region(state_region);
 
         // Restore composable cartridge state: battery SRAM + typed
         // coprocessor states (rebinding chip clocks to the region master
@@ -142,6 +148,7 @@ impl GenesisEmulator {
             frame: self.frame_open.then(|| self.frame_state()),
             z80_lead: self.line.z80_clock.lead(),
             psg_output: self.bus.psg().frame_output(),
+            ym2612_output: self.bus.ym2612().frame_output(),
         }
     }
 
@@ -199,8 +206,8 @@ impl GenesisEmulator {
     /// it, so a state with nothing after its payload leaves no fill, no
     /// busy time and no frame in progress, whatever the loading machine
     /// had. The sound clock is derived from the master clock, as a reset
-    /// derives it, the Z80's lead taken from the extension; the PSG's
-    /// record of the frame so far comes back from it (an older extension's
+    /// derives it, the Z80's lead taken from the extension; the chips'
+    /// records of the frame so far come back from it (an older extension's
     /// samples made at the host's rate are not read).
     pub(super) fn restore_extension(&mut self, extension: GenesisExtension) {
         let z80_lead = extension.z80_lead;
@@ -209,6 +216,9 @@ impl GenesisEmulator {
             .vdp_mut()
             .restore_extension(extension.vdp, line_end);
         self.bus.ym2612_mut().restore_extension(extension.ym2612);
+        self.bus
+            .ym2612_mut()
+            .restore_frame_output(&extension.ym2612_output);
         self.bus
             .psg_mut()
             .restore_frame_output(&extension.psg_output);

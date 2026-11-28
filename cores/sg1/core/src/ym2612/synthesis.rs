@@ -1,43 +1,44 @@
-//! The synthesis: the output samples owed for the input clocks received,
-//! one sample through the six channels, the timers, and the chip as the
-//! system's mix pulls it; and the stems' tap on each sample's channels.
+//! The synthesis: the chip's own samples owed for the input clocks
+//! received, one sample through the six channels, the timers, and the chip
+//! read alone by a sample-and-hold; and the stems' tap on each sample's
+//! channels.
 
-use retro_core::audio::{AudioChip, AudioChipInfo, ChannelType, ScopeRing};
+use retro_core::audio::{AudioChip, AudioChipInfo, ChannelType, IntegerRateConverter, ScopeRing};
 use retro_core::cpu::Clockable;
 
-use super::{Ym2612, MAX_BORROWED_PAIRS, MAX_FRAME_SAMPLES, MAX_TIMER_ACCUMULATOR};
+use super::{
+    lfo, Ym2612, YmLevels, CLOCKS_PER_SAMPLE, MAX_OUTPUT_SAMPLES, MAX_TIMER_ACCUMULATOR,
+    SAMPLES_PER_ENVELOPE_STEP,
+};
 
 /// The values a sample stages for the stems: FM channels 1 to 6, then the
 /// DAC, each left and right.
 pub const YM_STEM_VALUES: usize = 14;
 
 /// The stems' tap: each sample's channel outputs as `channel_outputs` holds
-/// them, muted or not, staged beside `frame_samples` (one entry a sample,
-/// trimmed and dropped with them) until the system's mix takes the frame;
+/// them, muted or not, staged beside the record (one row a record entry,
+/// taken and dropped with them) until the system's mix takes the frame;
 /// and each channel's last samples for its waveform.
 pub(super) struct YmStems {
-    /// [`YM_STEM_VALUES`] a sample: channel 6 in its FM slot while it plays
-    /// FM, in the DAC's while the DAC replaces it.
+    /// [`YM_STEM_VALUES`] a row, a row an entry of the record: the first the
+    /// values the record started from, then each sample's. Channel 6 sits in
+    /// its FM slot while it plays FM, in the DAC's while the DAC replaces
+    /// it.
     staged: Vec<f32>,
-    /// A sample: whether the chip's clamp or a muted channel that sounds
-    /// moved its sum away from the channels'.
-    departs: Vec<bool>,
     scopes: [ScopeRing; 6],
 }
 
 impl YmStems {
     fn new() -> Self {
         Self {
-            staged: Vec::with_capacity(2048 * YM_STEM_VALUES / 2),
-            departs: Vec::with_capacity(2048),
+            staged: Vec::with_capacity(1024 * YM_STEM_VALUES),
             scopes: std::array::from_fn(|_| ScopeRing::new()),
         }
     }
 
     /// One sample's channels.
     #[inline]
-    fn record(&mut self, outputs: &[(f32, f32); 6], dac: bool, muted: &[bool; 6], clamped: bool) {
-        let mut departs = clamped;
+    fn record(&mut self, outputs: &[(f32, f32); 6], dac: bool) {
         for (channel, &(left, right)) in outputs.iter().enumerate() {
             let (fm_left, fm_right) = if channel == 5 && dac {
                 (0.0, 0.0)
@@ -46,30 +47,44 @@ impl YmStems {
             };
             self.staged.push(fm_left);
             self.staged.push(fm_right);
-            departs |= muted[channel] && (left != 0.0 || right != 0.0);
             self.scopes[channel].push((left + right) * 0.5);
         }
         let (dac_left, dac_right) = if dac { outputs[5] } else { (0.0, 0.0) };
         self.staged.push(dac_left);
         self.staged.push(dac_right);
-        self.departs.push(departs);
     }
 
-    /// Staged samples standing for `samples` samples the chip made with no
-    /// tap (a frame restored from a savestate): silence, each a departure.
-    pub(super) fn align(&mut self, samples: usize) {
+    /// Rows standing for `entries` entries of a record the chip made with
+    /// no tap (a frame restored from a savestate, a tap just started):
+    /// silence.
+    pub(super) fn align(&mut self, entries: usize) {
         self.staged.clear();
-        self.staged.resize(samples * YM_STEM_VALUES, 0.0);
-        self.departs.clear();
-        self.departs.resize(samples, true);
+        self.staged.resize(entries * YM_STEM_VALUES, 0.0);
     }
 
-    /// Drop the oldest `samples` staged samples, as `frame_samples` drops
-    /// them.
-    fn drop_oldest(&mut self, samples: usize) {
-        let samples = samples.min(self.departs.len());
-        self.staged.drain(..samples * YM_STEM_VALUES);
-        self.departs.drain(..samples);
+    /// The record starts again: its first row the last one staged.
+    pub(super) fn restart(&mut self) {
+        let rows = self.staged.len() / YM_STEM_VALUES;
+        if rows == 0 {
+            self.staged.resize(YM_STEM_VALUES, 0.0);
+        } else {
+            self.staged.drain(..(rows - 1) * YM_STEM_VALUES);
+        }
+    }
+
+    /// The first `rows` rows into `into`; the record goes on from the last
+    /// of them.
+    pub(super) fn take(&mut self, rows: usize, into: &mut Vec<f32>) {
+        let rows = rows.min(self.staged.len() / YM_STEM_VALUES).max(1);
+        into.extend_from_slice(&self.staged[..rows * YM_STEM_VALUES]);
+        self.staged.drain(..(rows - 1) * YM_STEM_VALUES);
+    }
+
+    /// Drop the oldest `rows` rows but the record's first, as the record
+    /// drops its oldest samples: the first becomes the last row dropped.
+    fn drop_oldest(&mut self, rows: usize) {
+        let rows = rows.min((self.staged.len() / YM_STEM_VALUES).saturating_sub(1));
+        self.staged.drain(..rows * YM_STEM_VALUES);
     }
 
     /// Channel `channel`'s last `samples`, oldest first.
@@ -88,7 +103,7 @@ impl Ym2612 {
         match (on, self.stems.is_some()) {
             (true, false) => {
                 let mut stems = Box::new(YmStems::new());
-                stems.align(self.frame_samples.len() / 2);
+                stems.align(self.output.len());
                 self.stems = Some(stems);
             }
             (false, true) => self.stems = None,
@@ -96,76 +111,61 @@ impl Ym2612 {
         }
     }
 
-    /// The samples staged for the stems, one per sample `frame_samples`
-    /// holds: [`YM_STEM_VALUES`] values each, and whether each departs;
-    /// `None` while the tap is off.
-    pub fn staged_stems(&self) -> Option<(&[f32], &[bool])> {
-        self.stems
-            .as_deref()
-            .map(|stems| (&stems.staged[..], &stems.departs[..]))
+    /// Whether the stems' tap is on.
+    pub fn stem_tap(&self) -> bool {
+        self.stems.is_some()
     }
 
-    /// Drop the samples staged for the stems, as the mix drops the frame's
-    /// samples once it has taken them.
-    pub fn clear_staged_stems(&mut self) {
-        if let Some(stems) = self.stems.as_deref_mut() {
-            stems.align(0);
-        }
-    }
-
-    /// Stage, for the samples `frame_samples` holds, samples that stand for
-    /// them: after a load replaced them.
+    /// Stage, for the entries the record holds, rows that stand for them:
+    /// after a load replaced it.
     pub(super) fn align_stems(&mut self) {
-        let samples = self.frame_samples.len() / 2;
+        let entries = self.output.len();
         if let Some(stems) = self.stems.as_deref_mut() {
-            stems.align(samples);
+            stems.align(entries);
         }
     }
 }
 
 impl Ym2612 {
-    /// Render every whole output sample owed for the clocks accumulated since the
-    /// last render point, appending them to `frame_samples` using the chip's
-    /// current register state. Called before each register write (so the write's
-    /// effect starts at the right sample) and once more at frame end by
-    /// `generate_samples()`.
+    /// Make every sample the input clocks received since the last one come
+    /// to, one each 144, with the chip's current register state, each kept
+    /// in the record at the input clock it was made at. Called before each
+    /// register write (so the write's effect starts at the right sample)
+    /// and when the record is taken.
     pub(super) fn catch_up(&mut self) {
         if !self.rendering_enabled {
-            // Audio off: don't synthesize, just keep the accumulator bounded.
-            if self.clock_accumulator >= self.clocks_per_sample {
-                self.clock_accumulator %= self.clocks_per_sample;
-            }
+            // Audio off: no synthesis, only the place among a sample's clocks.
+            self.unsampled %= CLOCKS_PER_SAMPLE;
             return;
         }
 
-        while self.clock_accumulator >= self.clocks_per_sample {
-            self.clock_accumulator -= self.clocks_per_sample;
+        while self.unsampled >= CLOCKS_PER_SAMPLE {
+            self.unsampled -= CLOCKS_PER_SAMPLE;
             let (left, right) = self.generate_one_sample();
-            self.frame_samples.push(left);
-            self.frame_samples.push(right);
+            let time = self.position.saturating_sub(u64::from(self.unsampled));
+            self.output.push((time, [left, right]));
         }
-        // Bound the buffer if the host stops draining it, so it can't grow without limit.
-        if self.frame_samples.len() > MAX_FRAME_SAMPLES {
-            let excess = self.frame_samples.len() - MAX_FRAME_SAMPLES;
-            self.frame_samples.drain(..excess);
+        // Bound the record if nothing takes it: the oldest samples fold into
+        // the level it starts from.
+        if self.output.len() > MAX_OUTPUT_SAMPLES {
+            let dropped = self.output.len() - MAX_OUTPUT_SAMPLES / 2;
+            self.output.drain(..dropped);
             if let Some(stems) = self.stems.as_deref_mut() {
-                stems.drop_oldest(excess / 2);
+                stems.drop_oldest(dropped);
             }
         }
     }
 
-    /// Generate one output sample by running the full FM pipeline once.
+    /// Make one of the chip's samples by running the full FM pipeline once.
     /// Returns (left, right) in [-1.0, 1.0].
-    /// Called ~735 times per frame (at 44.1 kHz / 60 fps) instead of ~128K times.
     fn generate_one_sample(&mut self) -> (f32, f32) {
-        self.lfo.clock(self.chip_samples_per_sample);
+        self.lfo.clock(lfo::CHIP_SAMPLE);
 
-        // EG advance: hardware rate = clock_freq / 432 ~ 17.8 kHz.
-        // eg_samples_per_tick = sample_rate / (clock_freq / 432) ~ 2.48
-        self.eg_accumulator += 1.0;
-        let advance_eg = self.eg_accumulator >= self.eg_samples_per_tick;
+        // The envelopes step every third sample (clock / 144 / 3 ~ 17.8 kHz).
+        self.eg_samples += 1;
+        let advance_eg = self.eg_samples == SAMPLES_PER_ENVELOPE_STEP;
         if advance_eg {
-            self.eg_accumulator -= self.eg_samples_per_tick;
+            self.eg_samples = 0;
             self.eg_counter += 1;
             if self.eg_counter >= 4096 {
                 self.eg_counter = 1;
@@ -207,13 +207,7 @@ impl Ym2612 {
         let right_sample = right_sum.clamp(-1.0, 1.0);
 
         if let Some(stems) = self.stems.as_deref_mut() {
-            let clamped = left_sample != left_sum || right_sample != right_sum;
-            stems.record(
-                &self.channel_outputs,
-                self.dac_enabled,
-                &self.mute_flags,
-                clamped,
-            );
+            stems.record(&self.channel_outputs, self.dac_enabled);
         }
 
         let abs_l = left_sample.abs();
@@ -282,13 +276,14 @@ impl Ym2612 {
 
 impl Clockable for Ym2612 {
     fn clock(&mut self, cycles: u32) -> u32 {
-        // Accumulate input clocks and run timers. Audio is rendered incrementally
-        // by `catch_up()` at each register write and flushed by `generate_samples()`,
-        // so register changes land at their true sub-frame sample position.
+        // Count the input clocks and run the timers. The samples are made by
+        // `catch_up()` at each register write and when the record is taken,
+        // so register changes land on their own sample.
         self.busy_counter = self.busy_counter.saturating_sub(cycles);
         self.input_clocks += u64::from(cycles);
+        self.position += u64::from(cycles);
         self.clock_timers(cycles);
-        self.clock_accumulator += cycles as f32;
+        self.unsampled += cycles;
         cycles
     }
 }
@@ -333,61 +328,55 @@ impl AudioChip for Ym2612 {
         self.read_port(address & 0x03)
     }
 
+    /// The chip's output read by a sample-and-hold at `sample_rate`: each
+    /// output sample, interleaved left and right, the chip's sample held at
+    /// its time, from the record, which this takes; as many as the input
+    /// clocks received since the last call came to, the first
+    /// `output.len() / 2` of them written. For a tool or a test reading the
+    /// chip alone: the machine's sound goes through its band-limited host
+    /// stage instead, which takes the record itself.
     fn generate_samples(&mut self, output: &mut [f32], sample_rate: u32) -> usize {
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;
-            self.retime();
-            for ch in &mut self.channels {
-                ch.set_sample_rate(sample_rate);
-            }
+            self.sampler = None;
         }
-
-        // Flush the samples owed for the clocks accumulated since the last write
-        // (rendered at the current register state), then hand the caller what it
-        // asked for. The drift-free sample *count* over time is owned by the
-        // system's cycles->samples converter (see `system/audio.rs`), not by this buffer,
-        // so any whole samples beyond what the caller drains are a sub-sample
-        // rounding tail that must NOT persist: carrying them would replay stale
-        // audio on the next call after a register write has since changed the chip
-        // state. Drop the remainder so every `generate_samples` reflects state up
-        // to *now*. Sub-frame accuracy is provided by `catch_up()` running at each
-        // `write_port`, not by cross-call buffering.
-        self.catch_up();
-
-        let want = output.len() & !1; // copy whole stereo pairs only
-
-        // Fill a one-pair shortfall rather than letting it reach the mixer as
-        // silence. The system's cycles->samples converter owns the frame's
-        // sample count, and this chip's `clock_accumulator` is a second,
-        // floating-point quantisation of the same elapsed time -- so on a few
-        // frames in a hundred it lands exactly one stereo pair short of what
-        // the caller asked for. The caller's buffer is pre-zeroed, so an unfilled
-        // pair would reach the mixer as a sample of silence in the middle of a
-        // sustained note: an audible tick a few times a second, loudest where
-        // the waveform sits furthest from zero.
-        //
-        // Each borrowed pair is charged to the accumulator, so the chip gives
-        // the time back on a later frame and its long-run rate is unchanged.
-        // The borrow is capped because two quantisations of one elapsed time
-        // can only disagree by about a pair: a caller handing over an oversized
-        // scratch buffer is asking for audio the machine has not lived through
-        // yet, and that must not drag the chip ahead of it.
-        if self.rendering_enabled {
-            let mut borrowed = 0;
-            while self.frame_samples.len() < want && borrowed < MAX_BORROWED_PAIRS {
-                self.clock_accumulator -= self.clocks_per_sample;
-                let (left, right) = self.generate_one_sample();
-                self.frame_samples.push(left);
-                self.frame_samples.push(right);
-                borrowed += 1;
-            }
+        let mut record = Vec::new();
+        let mut stems = Vec::new();
+        self.take_output(self.position, &mut record, &mut stems);
+        if !self.rendering_enabled {
+            self.sampler = None;
+            return 0;
         }
-
-        let n = want.min(self.frame_samples.len() & !1);
-        output[..n].copy_from_slice(&self.frame_samples[..n]);
-        self.frame_samples.clear();
-
-        n
+        let start = record.first().map_or(self.position, |entry| entry.0);
+        let sampler = self.sampler.get_or_insert_with(|| {
+            let mut sampler =
+                IntegerRateConverter::new(u64::from(sample_rate), u64::from(self.clock_freq));
+            sampler.reset(start);
+            sampler
+        });
+        let cumulative = sampler.cycles_to_samples(self.position);
+        let samples = (cumulative - sampler.samples_at_reference()) as usize;
+        let mut level: YmLevels = record.first().map_or([0.0; 2], |entry| entry.1);
+        let mut next = 1;
+        let written = samples.min(output.len() / 2);
+        for (j, pair) in output[..2 * written]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            // A sample made before this output sample's time is held for it.
+            while let Some(&(time, made)) = record.get(next) {
+                if sampler.position(time, 1).sample >= j as i64 {
+                    break;
+                }
+                level = made;
+                next += 1;
+            }
+            pair.copy_from_slice(&level);
+        }
+        sampler.advance(self.position, cumulative);
+        2 * written
     }
 
     fn reset(&mut self) {

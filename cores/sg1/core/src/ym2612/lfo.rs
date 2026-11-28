@@ -18,9 +18,8 @@
 //! - 7: 72.2 Hz
 
 /// One of the chip's own samples, in the units of the LFO's counter: the
-/// counter keeps fractions of a sample, 1/65536ths, since this core's output
-/// samples each last a fraction more than one of the chip's (see
-/// [`Lfo::clock`]).
+/// counter keeps fractions of a sample, 1/65536ths, the units a savestate
+/// holds it in (see [`Lfo::clock`]).
 pub const CHIP_SAMPLE: u32 = 1 << 16;
 
 /// LFO (Low Frequency Oscillator)
@@ -115,14 +114,13 @@ impl Lfo {
     /// Run the LFO for `chip_samples` of the chip's own samples, in
     /// [`CHIP_SAMPLE`]ths.
     ///
-    /// The dividers count the chip's samples (one each 144 input clocks),
-    /// and this core makes output samples at the host's rate, each of which
-    /// lasts a fraction more than one of the chip's: about 1.2079 of them at
-    /// 44.1 kHz on an NTSC Mega Drive. `Ym2612::generate_one_sample` calls
-    /// this once per output sample with that figure. The phase steps each
-    /// time the count reaches the rate's divider, and the count keeps what
-    /// goes past it, so each step comes the divider's count of the chip's
-    /// samples after the one before, as on the chip.
+    /// The dividers count the chip's samples (one each 144 input clocks):
+    /// `Ym2612::generate_one_sample` calls this once a sample with one
+    /// [`CHIP_SAMPLE`]. The phase steps each time the count reaches the
+    /// rate's divider, and the count keeps what goes past it, so each step
+    /// comes the divider's count of the chip's samples after the one
+    /// before, as on the chip, whatever share of a sample each call
+    /// brings.
     pub fn clock(&mut self, chip_samples: u32) {
         if !self.enabled {
             return;

@@ -95,7 +95,8 @@ impl GenesisEmulator {
     /// a savestate keeps it (0 at a reset), and the YM2612 where the Z80
     /// took it, or at the present. The PSG stands at every whole clock of
     /// the Z80's passed since master clock 0, as the Z80's clock gives it
-    /// at every step: the input clock its record's times count from.
+    /// at every step, and the YM2612 at the 68000's cycles since then and
+    /// its lead: the input clocks their records' times count from.
     pub(super) fn derive_sound_clocks(&mut self, z80_lead: i64) {
         self.line.z80_clock =
             SubClock::at(Z80Ratio::default(), self.master_cycles).with_lead(z80_lead);
@@ -105,6 +106,9 @@ impl GenesisEmulator {
         let ratio = Z80Ratio::default();
         let psg_position = self.master_cycles * u64::from(ratio.num()) / u64::from(ratio.den());
         self.bus.psg_mut().set_position(psg_position);
+        self.bus
+            .ym2612_mut()
+            .set_position(self.master_cycles + ym_lead as u64);
     }
 
     /// Advance every cartridge coprocessor to the current master cycle. Run

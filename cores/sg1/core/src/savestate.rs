@@ -610,16 +610,45 @@ pub struct GenesisExtension {
     /// clock it started at, then each change at its own (the chip's record,
     /// which the frame's end takes); empty when it holds no change.
     pub psg_output: Vec<(u64, crate::psg::PsgLevels)>,
+    /// The YM2612's output so far in a frame stopped part of the way
+    /// through: the level the frame started from and the input clock it
+    /// started at, then each sample at the input clock it was made at (the
+    /// chip's record, which the frame's end takes); empty when it holds no
+    /// sample.
+    pub ym2612_output: Vec<(u64, crate::ym2612::YmLevels)>,
 }
 
 impl retro_core::savestate::SavestateExtension for GenesisExtension {
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
 
     /// Version 1, written before the Z80's lead (the Z80 at the present),
-    /// and version 2, before the PSG's record. Their `psg.samples`, the
-    /// PSG's samples made at the host's rate, are not read: a frame stopped
-    /// part of the way through plays its PSG from the load.
+    /// version 2, before the PSG's record, and version 3, before the
+    /// YM2612's. The samples their `psg.samples` and `ym2612.samples` hold,
+    /// made at the host's rate, are not read: a frame stopped part of the
+    /// way through plays a chip whose record the state lacks from the load.
     fn read_older(version: u32, bytes: &[u8]) -> Result<Self, String> {
+        if version == 3 {
+            let (vdp, ym2612, psg, z80_bus_grant, frame, z80_lead, psg_output) =
+                retro_core::savestate::read_extension_part::<(
+                    VdpExtension,
+                    Ym2612Extension,
+                    PsgExtension,
+                    u64,
+                    Option<GenesisFrameState>,
+                    i64,
+                    Vec<(u64, crate::psg::PsgLevels)>,
+                )>(bytes)?;
+            return Ok(Self {
+                vdp,
+                ym2612,
+                psg,
+                z80_bus_grant,
+                frame,
+                z80_lead,
+                psg_output,
+                ym2612_output: Vec::new(),
+            });
+        }
         let (vdp, ym2612, psg, z80_bus_grant, frame, z80_lead) = match version {
             1 => {
                 let (vdp, ym2612, psg, z80_bus_grant, frame) =
@@ -654,6 +683,7 @@ impl retro_core::savestate::SavestateExtension for GenesisExtension {
             frame,
             z80_lead,
             psg_output: Vec::new(),
+            ym2612_output: Vec::new(),
         })
     }
 }
@@ -722,7 +752,9 @@ pub struct VdpSpriteState {
 pub struct Ym2612Extension {
     /// The busy time left after a write, in the chip's input clocks.
     pub busy: u32,
-    /// The samples made so far in the frame, which its end takes.
+    /// The samples made at the host's rate so far in the frame, which a
+    /// build that makes them reads; written empty (the YM2612's record is
+    /// in [`GenesisExtension::ym2612_output`]).
     pub samples: Vec<f32>,
 }
 

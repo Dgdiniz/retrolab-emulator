@@ -212,11 +212,12 @@ fn test_audio_debugger_mute_channel() {
     let state = ym.get_channel_state(0).unwrap();
     assert!(state.muted);
 
-    // Generate samples after mute
+    // Generate samples after mute. The first stereo pair can come before
+    // the chip's first sample after the mute, and holds its last before.
     output.fill(0.0);
     clock_and_generate(&mut ym, &mut output, 44100);
 
-    let max_after = output.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    let max_after = output[2..].iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
 
     // After muting, output should be much quieter (other channels might still produce sound)
     eprintln!("max_before: {}, max_after: {}", max_before, max_after);

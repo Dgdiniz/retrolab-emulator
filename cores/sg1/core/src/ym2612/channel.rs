@@ -133,17 +133,12 @@ pub struct Channel {
 impl Channel {
     /// Create a new channel
     pub fn new(clock_freq: u32) -> Self {
-        Self::with_sample_rate(clock_freq, 53267) // Default to internal rate
-    }
-
-    /// Create a new channel with explicit sample rate for phase scaling
-    pub fn with_sample_rate(clock_freq: u32, sample_rate: u32) -> Self {
         Self {
             operators: [
-                Operator::with_sample_rate(clock_freq, sample_rate),
-                Operator::with_sample_rate(clock_freq, sample_rate),
-                Operator::with_sample_rate(clock_freq, sample_rate),
-                Operator::with_sample_rate(clock_freq, sample_rate),
+                Operator::new(clock_freq),
+                Operator::new(clock_freq),
+                Operator::new(clock_freq),
+                Operator::new(clock_freq),
             ],
             algorithm: Algorithm::Algorithm0,
             feedback: 0,
@@ -159,17 +154,10 @@ impl Channel {
         }
     }
 
-    /// Update sample rate for all operators
-    pub fn set_sample_rate(&mut self, sample_rate: u32) {
-        for op in &mut self.operators {
-            op.set_sample_rate(sample_rate);
-        }
-    }
-
     /// Run every operator on another clock ([`Operator::set_clock_freq`]).
-    pub fn set_clock_freq(&mut self, clock_freq: u32, sample_rate: u32) {
+    pub fn set_clock_freq(&mut self, clock_freq: u32) {
         for op in &mut self.operators {
-            op.set_clock_freq(clock_freq, sample_rate);
+            op.set_clock_freq(clock_freq);
         }
     }
 

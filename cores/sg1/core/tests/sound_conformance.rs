@@ -188,8 +188,13 @@ fn a_muted_channel_keeps_its_stem_and_its_samples_depart() {
     );
 }
 
+/// The samples the host's band-limited stage takes to reach a level it
+/// steps to: the kernel's 32 samples each side of the step.
+const STAGE_SPAN: usize = 64;
+
 /// While the DAC plays in channel 6's place the `dac` stem holds it, as
-/// it enters the master, and channel 6's FM stem is silent.
+/// it enters the master, from the stage's span on, which its step from
+/// silence takes; and channel 6's FM stem is silent.
 #[test]
 fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
     let (mut emu, layout) = armed();
@@ -201,7 +206,10 @@ fn the_dac_stem_holds_channel_6_while_the_dac_plays() {
     emu.render_frame();
     let take = emu.take_stems().expect("armed");
     let level = ((0xF0 - 128) << 6) as f32 / 8192.0 * 0.75 / 6.0;
-    assert!(stem(&take, &layout, "dac").iter().all(|&s| s == level));
+    // A stereo stem: two values a sample frame.
+    let dac = stem(&take, &layout, "dac");
+    assert!(dac[2 * STAGE_SPAN..].iter().all(|&s| s == level));
+    assert!(dac[..2 * STAGE_SPAN].iter().any(|&s| s != level));
     assert!(stem(&take, &layout, "fm6").iter().all(|&s| s == 0.0));
 }
 

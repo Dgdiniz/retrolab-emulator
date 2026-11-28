@@ -8,6 +8,12 @@
 // - LFO (vibrato/tremolo)
 // - DAC mode (channel 6 can play PCM samples)
 // - Stereo output (L/R panning)
+//
+// It runs at its own rate: one sample each 144 input clocks, its envelope
+// stepping every third, its LFO one chip sample a sample, each operator's
+// phase by the chip's own increment. Each sample is kept with the input
+// clock it was made at, the chip's output as levels at times, which the
+// system's host stage holds from sample to sample and band-limits.
 
 pub mod algorithms;
 pub mod channel;
@@ -36,23 +42,26 @@ pub use timers::Timers;
 
 use std::collections::VecDeque;
 
-use retro_core::audio::{SoundEvent, SoundLogContents};
+use retro_core::audio::{IntegerRateConverter, SoundEvent, SoundLogContents};
 
 /// Cap on `timer_accumulator`, in input clocks: eight timer ticks' worth.
 /// It bounds the timer work of one `clock()` call; a longer call runs eight
 /// ticks and drops the rest.
 const MAX_TIMER_ACCUMULATOR: f32 = 144.0 * 8.0;
 
-/// Upper bound on buffered, undrained stereo samples (L+R interleaved). If the
-/// host stops consuming audio (disabled, debugger paused, tab backgrounded),
-/// `catch_up()` trims the oldest samples instead of growing without bound.
-const MAX_FRAME_SAMPLES: usize = 8192;
+/// The input clocks of one of the chip's samples.
+const CLOCKS_PER_SAMPLE: u32 = 144;
 
-/// How many stereo pairs `generate_samples` may render ahead of this chip's own
-/// clock accumulator to satisfy the count the system's converter asked for.
-/// Two quantisations of the same elapsed time disagree by about a pair; beyond
-/// that the caller is asking for audio the machine has not reached.
-const MAX_BORROWED_PAIRS: usize = 2;
+/// The chip's samples between two steps of its envelopes.
+const SAMPLES_PER_ENVELOPE_STEP: u32 = 3;
+
+/// The most samples the record keeps while nothing takes it (a frame that
+/// does not end, a host that takes no sound): past it the oldest are
+/// folded into the level the record starts from.
+const MAX_OUTPUT_SAMPLES: usize = 16384;
+
+/// The chip's left and right output at a moment, each in [-1, 1].
+pub type YmLevels = [f32; 2];
 
 /// YM2612 FM Synthesis Chip
 ///
@@ -74,7 +83,9 @@ pub struct Ym2612 {
     /// Chip clock frequency (typically 7,670,454 Hz for Genesis)
     clock_freq: u32,
 
-    /// Sample rate for audio output
+    /// The host's sample rate: what the chip's information reports, the
+    /// rate [`retro_core::audio::AudioChip::generate_samples`] last read
+    /// at, and the unit of the write log's sample offsets.
     sample_rate: u32,
 
     /// Global LFO (Low Frequency Oscillator)
@@ -89,21 +100,31 @@ pub struct Ym2612 {
     /// DAC value (9-bit signed)
     dac_value: i16,
 
-    /// Clocks per output sample = clock_freq / sample_rate (~174 for typical values).
-    clocks_per_sample: f32,
+    /// The input clocks received since the chip's last sample, which the
+    /// next samples take, 144 a sample. Machine state.
+    unsampled: u32,
 
-    /// The chip's own samples (one each 144 input clocks) an output sample
-    /// lasts, in the LFO counter's units (`lfo::CHIP_SAMPLE` a sample):
-    /// the LFO counts the chip's samples, not this core's output samples.
-    chip_samples_per_sample: u32,
+    /// Where the chip stands: its input clocks since master clock 0, as the
+    /// system sets them at a reset and a load and each `clock` adds, the
+    /// clock its samples are timed by. Not saved: derived.
+    position: u64,
 
-    /// Accumulated input clock cycles available for sample generation (pull model).
-    /// Cycles are added by clock() and consumed by generate_samples().
-    clock_accumulator: f32,
+    /// The chip's output since the record was last taken: first the level
+    /// it held as the record started (its last sample) and the input clock
+    /// the record started at, then each sample at the input clock it was
+    /// made at. Taken by the system's host stage at each frame's end; a
+    /// frame stopped part of the way through keeps it in the savestate's
+    /// extension.
+    output: Vec<(u64, YmLevels)>,
+
+    /// The sample-and-hold [`retro_core::audio::AudioChip::generate_samples`]
+    /// reads the record with: the host's samples it handed out, on the
+    /// chip's input clocks. Built at its first call. Not saved.
+    sampler: Option<IntegerRateConverter>,
 
     /// Timer accumulator: ticks timers at the internal FM rate (clock / 144 ~ 53,267 Hz).
-    /// Separate from clock_accumulator because timers must run at the hardware
-    /// internal rate, not the output sample rate (44,100 Hz).
+    /// Separate from `unsampled`: the timers run whether the chip makes
+    /// samples or not.
     timer_accumulator: f32,
 
     // ===== CH3 Special Mode =====
@@ -146,28 +167,14 @@ pub struct Ym2612 {
     /// Last output samples (left, right) for each channel, muted or not
     channel_outputs: [(f32, f32); 6],
 
-    // ===== Incremental Rendering (timestamp catch-up) =====
-    /// Stereo samples (L, R interleaved) already rendered this frame by
-    /// `catch_up()`. The chip renders the audio produced *before* each register
-    /// write using the state in effect at that moment, so sub-frame register
-    /// changes (key-on/off, frequency, total level, DAC) land at their correct
-    /// sample position instead of collapsing to end-of-frame state. Drained by
-    /// `generate_samples()`; never serialized (transient per frame).
-    frame_samples: Vec<f32>,
     /// Retained only for savestate-format compatibility. DAC continuity
     /// lives in `dac_value`, which is rendered live through `catch_up()`.
     dac_start_value: i16,
 
     // ===== Envelope Generator Timing =====
-    /// EG timer, counting output samples. In real hardware, the EG updates every 3
-    /// internal samples (clock/144/3 ~ 17,756 Hz).
-    /// Since we generate samples at the output rate (not internal rate),
-    /// we use a fractional accumulator to match the hardware EG rate.
-    eg_accumulator: f32,
-
-    /// How many output samples between EG ticks.
-    /// = sample_rate / (clock_freq / 432)
-    eg_samples_per_tick: f32,
+    /// The chip's samples since its envelopes last stepped, 0 to 2: they
+    /// step every third sample (clock/144/3 ~ 17,756 Hz). Machine state.
+    eg_samples: u32,
 
     /// Global EG counter (12-bit, 1-4095: it skips zero when it wraps).
     /// Advanced, reset and saved, but the EG never uses it: each envelope keeps its own
@@ -188,10 +195,11 @@ pub struct Ym2612 {
     /// `get_status` (see busy_counter).
     pub current_cpu_cycle: u64,
 
-    /// When false (host audio disabled), `catch_up()` skips FM synthesis and just
-    /// keeps the clock accumulator bounded, so disabling audio saves the time FM
-    /// synthesis takes. Timers keep running via `clock()`, so Timer A/B IRQ timing
-    /// is unaffected. Not serialized: re-applied via `set_rendering_enabled`.
+    /// When false (host audio disabled), `catch_up()` skips FM synthesis and
+    /// keeps no record, only its place among the 144 clocks of a sample, so
+    /// disabling audio saves the time FM synthesis takes. Timers keep
+    /// running via `clock()`, so Timer A/B IRQ timing is unaffected. Not
+    /// serialized: re-applied via `set_rendering_enabled`.
     rendering_enabled: bool,
 
     /// Optional capture of every FM *data-port* write, tagged with the
@@ -201,7 +209,7 @@ pub struct Ym2612 {
     sound_write_log: Option<Vec<FmWrite>>,
 
     /// The stems' tap while the host takes stems (`synthesis::YmStems`):
-    /// each sample's channels staged beside `frame_samples`. Not saved.
+    /// each sample's channels staged beside the record. Not saved.
     stems: Option<Box<synthesis::YmStems>>,
 
     /// The input clocks the chip has received since it was built: the
@@ -217,22 +225,14 @@ pub struct Ym2612 {
     sound_log_contents: SoundLogContents,
 }
 
-/// The chip's own samples, one each 144 input clocks, that an output sample
-/// at `sample_rate` lasts on an input clock of `clock_freq`, in the LFO
-/// counter's units (`lfo::CHIP_SAMPLE` a sample), to the nearest unit.
-fn chip_samples_per_sample(clock_freq: u32, sample_rate: u32) -> u32 {
-    let per_output_sample = 144 * u64::from(sample_rate.max(1));
-    let units = u64::from(clock_freq) * u64::from(lfo::CHIP_SAMPLE);
-    ((units + per_output_sample / 2) / per_output_sample) as u32
-}
-
 /// A single YM2612 data-port write captured by the optional sound-write log.
 ///
-/// `sample_pos` is the output-sample offset *within the current frame* at
-/// which the write takes audible effect, i.e. how many stereo samples
-/// `catch_up()` had already rendered when the write arrived. It is exactly
-/// the sub-frame placement the per-write catch-up model exists to make
-/// accurate, so it is the right quantity to diff against a reference core.
+/// `sample_pos` is the host's output-sample offset at which the write takes
+/// audible effect, counted from the start of the chip's record, which the
+/// system takes at each frame's end: the input clocks since then at the
+/// host's sample rate, rounded down. It is the sub-frame placement the
+/// per-write catch-up model exists to make accurate, so it is the right
+/// quantity to diff against a reference core.
 /// `part` is the port pair (0 = part I / channels 1-3, 1 = part II /
 /// channels 4-6); `register`/`value` are the latched address and data byte.
 /// `clock` is the chip's input clocks received when the write arrived,
@@ -251,16 +251,16 @@ impl Ym2612 {
     ///
     /// # Arguments
     /// * `clock_freq` - Chip clock frequency (typically 7,670,454 Hz)
-    /// * `sample_rate` - Audio output sample rate (typically 44,100 Hz)
+    /// * `sample_rate` - The host's sample rate (typically 44,100 Hz)
     pub fn new(clock_freq: u32, sample_rate: u32) -> Self {
-        Self {
+        let mut ym = Self {
             channels: [
-                Channel::with_sample_rate(clock_freq, sample_rate),
-                Channel::with_sample_rate(clock_freq, sample_rate),
-                Channel::with_sample_rate(clock_freq, sample_rate),
-                Channel::with_sample_rate(clock_freq, sample_rate),
-                Channel::with_sample_rate(clock_freq, sample_rate),
-                Channel::with_sample_rate(clock_freq, sample_rate),
+                Channel::new(clock_freq),
+                Channel::new(clock_freq),
+                Channel::new(clock_freq),
+                Channel::new(clock_freq),
+                Channel::new(clock_freq),
+                Channel::new(clock_freq),
             ],
             clock_freq,
             sample_rate,
@@ -268,9 +268,10 @@ impl Ym2612 {
             timers: Timers::new(),
             dac_enabled: false,
             dac_value: 0,
-            clocks_per_sample: clock_freq as f32 / sample_rate as f32,
-            chip_samples_per_sample: chip_samples_per_sample(clock_freq, sample_rate),
-            clock_accumulator: 0.0,
+            unsampled: 0,
+            position: 0,
+            output: Vec::with_capacity(2048),
+            sampler: None,
             timer_accumulator: 0.0,
             ch3_mode: 0,
             ch3_fnum: [0; 4],
@@ -283,10 +284,8 @@ impl Ym2612 {
             waveform_buffer: VecDeque::with_capacity(1024),
             max_waveform_samples: 1024,
             channel_outputs: [(0.0, 0.0); 6],
-            frame_samples: Vec::with_capacity(2048),
             dac_start_value: 0,
-            eg_accumulator: 0.0,
-            eg_samples_per_tick: sample_rate as f32 / (clock_freq as f32 / 432.0),
+            eg_samples: 0,
             eg_counter: 0,
             busy_counter: 0,
             busy_end_cycle: 0,
@@ -297,7 +296,88 @@ impl Ym2612 {
             input_clocks: 0,
             sound_log: None,
             sound_log_contents: SoundLogContents::default(),
+        };
+        ym.restart_output();
+        ym
+    }
+
+    /// The record starts afresh where the chip stands, from the level it
+    /// holds: its last sample, or silence when it has made none.
+    fn restart_output(&mut self) {
+        let held = self.output.last().map_or([0.0; 2], |entry| entry.1);
+        self.output.clear();
+        self.output.push((self.position, held));
+        if let Some(stems) = self.stems.as_deref_mut() {
+            stems.restart();
         }
+    }
+
+    /// Stand at input clock `position`, counted from master clock 0, with
+    /// nothing changed: a reset and a load derive it from the master clock.
+    /// A record that holds no sample starts again here; one a savestate
+    /// brought back keeps its times.
+    pub fn set_position(&mut self, position: u64) {
+        self.position = position;
+        if self.output.len() <= 1 {
+            self.restart_output();
+        }
+    }
+
+    /// Where the chip stands: its input clocks since master clock 0.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// The chip's output up to input clock `until` into `into`, emptied
+    /// first: the level the record started from and its input clock, then
+    /// each sample made by then at its own (every sample the clocks
+    /// received came to made first). A sample made after `until` (the chip
+    /// follows the Z80, which can run past the frame's end) stays, for the
+    /// record that goes on from `until` with the level the last one taken
+    /// left. The stems staged for the samples taken go into `stems`.
+    pub fn take_output(
+        &mut self,
+        until: u64,
+        into: &mut Vec<(u64, YmLevels)>,
+        stems: &mut Vec<f32>,
+    ) {
+        self.catch_up();
+        into.clear();
+        let taken = self.output.partition_point(|entry| entry.0 <= until).max(1);
+        into.extend_from_slice(&self.output[..taken]);
+        let held = into.last().map_or([0.0; 2], |entry| entry.1);
+        self.output.drain(..taken);
+        self.output.insert(0, (until.max(into[0].0), held));
+        stems.clear();
+        if let Some(staged) = self.stems.as_deref_mut() {
+            staged.take(taken, stems);
+        }
+    }
+
+    /// The record of a frame in progress, for the savestate's extension:
+    /// empty when it holds nothing but the level it started from, which a
+    /// load derives.
+    pub fn frame_output(&self) -> Vec<(u64, YmLevels)> {
+        if self.output.len() > 1 {
+            self.output.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Make the record a savestate's (after [`Self::from_savestate`]). With
+    /// none, the record starts afresh, where the system next sets the
+    /// chip's position, from the level the chip last held (silence for a
+    /// chip that made none): a load cannot know the level of the chip's
+    /// next sample before it is made.
+    pub fn restore_frame_output(&mut self, output: &[(u64, YmLevels)]) {
+        if output.is_empty() {
+            self.restart_output();
+        } else {
+            self.output.clear();
+            self.output.extend_from_slice(output);
+        }
+        self.align_stems();
     }
 
     /// Begin capturing FM data-port writes (see [`FmWrite`]), discarding any
@@ -320,10 +400,11 @@ impl Ym2612 {
     /// position, and in the sound log when it logs writes. No-op unless a
     /// log is on.
     fn log_fm_write(&mut self, part: u8, register: u8, value: u8) {
-        // Snapshot the position before the borrow so this stays a disjoint
-        // field access (the log borrows `sound_write_log`, the position reads
-        // `frame_samples`).
-        let sample_pos = (self.frame_samples.len() / 2) as u32;
+        let since_start = self
+            .position
+            .saturating_sub(self.output.first().map_or(0, |e| e.0));
+        let sample_pos = (u128::from(since_start) * u128::from(self.sample_rate)
+            / u128::from(self.clock_freq.max(1))) as u32;
         let clock = self.input_clocks;
         if let Some(log) = self.sound_write_log.as_mut() {
             log.push(FmWrite {
@@ -385,41 +466,33 @@ impl Ym2612 {
     }
 
     /// Run on another input clock, as a console of another region gives it
-    /// (the Mega Drive's YM2612 runs on the 68000's clock). What the chip
-    /// works out from its clock follows: the input clocks an output sample
-    /// takes, the output samples between envelope steps, each operator's
-    /// phase increment. What it holds is kept: the registers, the phases
-    /// and envelopes, the timers (which count input clocks), the clocks
-    /// counted towards the next sample and the samples made. The same clock
-    /// changes nothing: a state loaded onto the clock it was made on keeps
-    /// the phase increments it holds, which working them out again could
-    /// move (a frequency write works its increment out before it updates
-    /// the key code the detune reads).
+    /// (the Mega Drive's YM2612 runs on the 68000's clock). The chip makes
+    /// a sample each 144 of its clocks whatever they are, so what follows
+    /// the clock is only what is shown or read in Hz: the operators'
+    /// frequencies the debugger shows and the sample-and-hold's rate. What
+    /// the chip holds is kept: the registers, the phases, their increments
+    /// (the chip's own, which no clock changes) and envelopes, the timers
+    /// (which count input clocks), the clocks received towards the next
+    /// sample and the record. The same clock changes nothing.
     pub fn set_clock_freq(&mut self, clock_freq: u32) {
         if clock_freq == self.clock_freq {
             return;
         }
         self.clock_freq = clock_freq;
-        self.retime();
-        let sample_rate = self.sample_rate;
+        self.sampler = None;
         for ch in &mut self.channels {
-            ch.set_clock_freq(clock_freq, sample_rate);
+            ch.set_clock_freq(clock_freq);
         }
-    }
-
-    /// The input clocks an output sample takes, the chip's samples it
-    /// lasts and the output samples between envelope steps, from the clock
-    /// and the sample rate.
-    pub(super) fn retime(&mut self) {
-        self.clocks_per_sample = self.clock_freq as f32 / self.sample_rate as f32;
-        self.chip_samples_per_sample = chip_samples_per_sample(self.clock_freq, self.sample_rate);
-        self.eg_samples_per_tick = self.sample_rate as f32 / (self.clock_freq as f32 / 432.0);
     }
 
     /// Enable or disable audio rendering. When disabled (host audio off),
     /// `catch_up()` skips FM synthesis, so disabling audio saves the time
-    /// synthesis takes. Timer clocking is unaffected.
+    /// synthesis takes. Timer clocking is unaffected. Enabled again, the
+    /// record starts afresh from the level the chip held.
     pub fn set_rendering_enabled(&mut self, enabled: bool) {
+        if enabled && !self.rendering_enabled {
+            self.restart_output();
+        }
         self.rendering_enabled = enabled;
     }
 
@@ -443,21 +516,22 @@ impl Ym2612 {
         self.timers.reset();
         self.dac_enabled = false;
         self.dac_value = 0;
-        self.clock_accumulator = 0.0;
+        self.unsampled = 0;
         self.timer_accumulator = 0.0;
         self.address_latch_part0 = 0;
         self.address_latch_part1 = 0;
         self.output_level = 0.0;
         self.waveform_buffer.clear();
         self.channel_outputs = [(0.0, 0.0); 6];
-        self.eg_accumulator = 0.0;
+        self.eg_samples = 0;
         self.eg_counter = 0;
         self.busy_counter = 0;
         self.busy_end_cycle = 0;
-        self.frame_samples.clear();
-        if let Some(stems) = self.stems.as_deref_mut() {
-            stems.align(0);
-        }
+        // The record starts again from silence, where the chip stands.
+        self.output.clear();
+        self.restart_output();
+        self.align_stems();
+        self.sampler = None;
         self.dac_start_value = 0;
         self.ch3_mode = 0;
         self.ch3_fnum = [0; 4];
@@ -469,12 +543,12 @@ impl Ym2612 {
     /// pin follows ZRES, so the FM chip is held cleared while the Z80 is in reset
     /// (as Genesis Plus GX and PicoDrive both do on that line). Unlike the
     /// full power-on [`reset`](Self::reset), this:
-    ///   - first renders audio produced up to this moment (so the reset doesn't
-    ///     retroactively silence sound that already played this frame),
+    ///   - first makes the samples produced up to this moment (so the reset
+    ///     doesn't retroactively silence sound that already played this frame),
     ///   - clears FM synthesis + timer state, and
-    ///   - preserves the transient output buffer (`frame_samples`), the sub-sample
-    ///     clock phase (`clock_accumulator`), debugger mutes (`mute_flags`), the
-    ///     host render gate (`rendering_enabled`), and the sample-rate config.
+    ///   - preserves the record (`output`), the clocks towards the next sample
+    ///     (`unsampled`), debugger mutes (`mute_flags`), the host render gate
+    ///     (`rendering_enabled`), and the sample-rate config.
     pub fn ic_reset(&mut self) {
         self.catch_up();
         // The notes sounding end with the reset.
@@ -498,7 +572,7 @@ impl Ym2612 {
         self.csm_key_state = 0;
         self.address_latch_part0 = 0;
         self.address_latch_part1 = 0;
-        self.eg_accumulator = 0.0;
+        self.eg_samples = 0;
         self.eg_counter = 0;
         self.busy_counter = 0;
         self.busy_end_cycle = 0;
@@ -558,10 +632,10 @@ impl Ym2612 {
     /// - Port 2 (0x4002): Address latch Part 1
     /// - Port 3 (0x4003): Data Part 1
     pub fn write_port(&mut self, port: u8, value: u8) {
-        // Render the audio produced up to this write using the current register
-        // state, so the write's effect begins at the correct sample position.
-        // (Genesis Plus GX and PicoDrive run the chip to the write's time the
-        // same way before they apply a register change.)
+        // Make the samples produced up to this write with the current register
+        // state, so the write's effect begins at the correct sample. (Genesis
+        // Plus GX and PicoDrive run the chip to the write's time the same way
+        // before they apply a register change.)
         self.catch_up();
         match port {
             0 => {
