@@ -28,7 +28,7 @@ use crate::timing::{GenesisTiming, VideoRegion};
 use crate::z80::Z80;
 use descriptors::{genesis_button_layout, genesis_cpus};
 use frame::LineRun;
-use retro_core::audio::ChannelMutes;
+use retro_core::audio::{BandLimitedSteps, ChannelMutes, SincKernel};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cpu::Addressable;
 use retro_core::debug::{trace_to_text, AccessLog};
@@ -113,6 +113,19 @@ pub struct GenesisEmulator {
     psg_sample_buf: Vec<f32>,
     ym_sample_buf: Vec<f32>,
     mix_sample_buf: Vec<f32>,
+
+    /// The kernel every stage of the host's sound shares
+    /// ([`audio::host_kernel`]).
+    stage_kernel: std::sync::Arc<SincKernel>,
+    /// The PSG's part of the master: its record of each frame band-limited
+    /// onto the host's samples. Host state, not saved: a load keeps it, so
+    /// the sound goes on without a click, and a reset clears it.
+    psg_stage: BandLimitedSteps<1>,
+    /// The PSG's record of the frame, taken at its end (a buffer kept from
+    /// frame to frame).
+    psg_record: Vec<(u64, crate::psg::PsgLevels)>,
+    /// The stems' own stages while the host takes stems. Host state.
+    stem_stages: Option<Box<audio::StemStages>>,
 
     /// Mixed waveform ring buffer for visualization (mono, last N samples)
     mixed_waveform_buffer: std::collections::VecDeque<f32>,
@@ -247,6 +260,7 @@ impl GenesisEmulator {
             .port_mut(1)
             .unwrap()
             .connect_device(Box::new(Genesis3ButtonDevice::new()));
+        let stage_kernel = audio::host_kernel();
 
         let mut emulator = Self {
             debugger: genesis_debugger(system_info.clone()),
@@ -295,6 +309,10 @@ impl GenesisEmulator {
             psg_sample_buf: vec![0.0; 1024],
             ym_sample_buf: vec![0.0; 2048],
             mix_sample_buf: vec![0.0; 2048],
+            stage_kernel: stage_kernel.clone(),
+            psg_stage: BandLimitedSteps::new(stage_kernel),
+            psg_record: Vec::with_capacity(4096),
+            stem_stages: None,
             mixed_waveform_buffer: std::collections::VecDeque::with_capacity(2048),
             stems: audio::stem_recorder(44100),
             sound_log: audio::SoundLogState::default(),
@@ -729,6 +747,7 @@ impl EmulatorCore for GenesisEmulator {
         self.host_audio.clear();
         self.host_audio.reset_counters();
         self.audio_rate_converter.reset(self.master_cycles);
+        self.clear_stages();
 
         // Leave the reset state in the debugger, so a host that reads it
         // before the first step or frame (the platform opens its debugger

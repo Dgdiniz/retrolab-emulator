@@ -116,6 +116,12 @@ fn first_difference(a: &[Vec<f32>], b: &[Vec<f32>]) -> Option<usize> {
     (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i))
 }
 
+/// The samples the host's band-limited stage takes to reach a level it
+/// steps to: a machine whose stage starts from silence (a new machine that
+/// loads a state) sounds as the machine that saved it from this sample of
+/// its first frame on.
+const STAGE_SPAN: usize = 64;
+
 fn assert_clocks(emu: &GenesisEmulator, region: VideoRegion, path: &str) {
     assert_eq!(emu.region(), region, "{path}: the region");
     assert_eq!(
@@ -215,12 +221,18 @@ fn a_state_plays_on_as_the_machine_that_saved_it_whatever_clocks_the_loader_had(
         let mut loader = loaded(&rom);
         loader.set_region(other).unwrap();
         loader.load_state(&state, RomCheck::SameRom).unwrap();
-        let heard = listen(&mut loader, 60);
+        let mut heard = listen(&mut loader, 60);
         let header = String::from_utf8_lossy(regions);
+        // The host's stage is the machine's own, not the state's: the
+        // loader's starts from silence and steps to the chips' level over
+        // its span, where the saver's went on.
+        assert_eq!(heard[0].len(), expected[0].len(), "the first frame's count");
+        assert_ne!(heard[0][..2 * STAGE_SPAN], expected[0][..2 * STAGE_SPAN]);
+        heard[0][..2 * STAGE_SPAN].copy_from_slice(&expected[0][..2 * STAGE_SPAN]);
         assert_eq!(
             first_difference(&heard, &expected),
             None,
-            "a \"{header}\" state: the first frame whose sound differs"
+            "a \"{header}\" state: the first frame whose sound differs past the stage's span"
         );
         assert_eq!(
             loader.state_hash(),

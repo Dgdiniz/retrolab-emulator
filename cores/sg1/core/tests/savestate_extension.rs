@@ -351,9 +351,9 @@ fn sound_program() -> Vec<u8> {
 
 /// A machine that loads the state it saved part of the way through a frame
 /// goes on as its twin that never saved, the frame's sound included: the
-/// samples the YM2612 and the PSG made before the stop are in the state,
-/// and the frame's end, which takes them (and makes up a short count from
-/// the YM2612, which moves it), finds them.
+/// samples the YM2612 made before the stop and the PSG's record of the
+/// frame are in the state, and the frame's end, which takes them (and
+/// makes up a short count from the YM2612, which moves it), finds them.
 #[test]
 fn a_save_mid_frame_keeps_the_samples_the_sound_chips_made() {
     let rom = sound_program();
@@ -370,7 +370,11 @@ fn a_save_mid_frame_keeps_the_samples_the_sound_chips_made() {
     }
     let extension = loading.savestate_extension();
     assert!(!extension.ym2612.samples.is_empty(), "the YM2612's samples");
-    assert!(!extension.psg.samples.is_empty(), "the PSG's samples");
+    assert!(
+        extension.psg_output.len() > 1,
+        "the PSG's record of the frame"
+    );
+    assert!(extension.psg.samples.is_empty(), "none at the host's rate");
     let state = loading.save_state();
     loading
         .load_state(&state, RomCheck::SameRom)

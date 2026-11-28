@@ -11,7 +11,7 @@ use retro_core::capture::CaptureCore;
 use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Clockable;
 use retro_core::frame::{Due, FrameMachine, StepHooks, Stepped};
-use retro_core::sub_clock::{FixedRatio, SubClock};
+use retro_core::sub_clock::{ClockRatio, FixedRatio, SubClock};
 
 /// The Z80's clock against the 68000's: the Z80 runs at a fifteenth of the
 /// master clock and the 68000 at a seventh, so 7 Z80 cycles in each 15 of
@@ -93,13 +93,18 @@ impl GenesisEmulator {
     /// master clock since the machine's power-on, so neither keeps a
     /// credit of its own; the Z80 `z80_lead` cycles past the present, as
     /// a savestate keeps it (0 at a reset), and the YM2612 where the Z80
-    /// took it, or at the present.
+    /// took it, or at the present. The PSG stands at every whole clock of
+    /// the Z80's passed since master clock 0, as the Z80's clock gives it
+    /// at every step: the input clock its record's times count from.
     pub(super) fn derive_sound_clocks(&mut self, z80_lead: i64) {
         self.line.z80_clock =
             SubClock::at(Z80Ratio::default(), self.master_cycles).with_lead(z80_lead);
         let ym_lead = self.line.z80_clock.master_lead().max(0);
         self.line.ym_clock =
             SubClock::at(YmRatio::default(), self.master_cycles).with_lead(ym_lead);
+        let ratio = Z80Ratio::default();
+        let psg_position = self.master_cycles * u64::from(ratio.num()) / u64::from(ratio.den());
+        self.bus.psg_mut().set_position(psg_position);
     }
 
     /// Advance every cartridge coprocessor to the current master cycle. Run

@@ -141,6 +141,7 @@ impl GenesisEmulator {
             z80_bus_grant: self.bus.z80_bus_grant(self.master_cycles),
             frame: self.frame_open.then(|| self.frame_state()),
             z80_lead: self.line.z80_clock.lead(),
+            psg_output: self.bus.psg().frame_output(),
         }
     }
 
@@ -198,7 +199,9 @@ impl GenesisEmulator {
     /// it, so a state with nothing after its payload leaves no fill, no
     /// busy time and no frame in progress, whatever the loading machine
     /// had. The sound clock is derived from the master clock, as a reset
-    /// derives it, the Z80's lead taken from the extension.
+    /// derives it, the Z80's lead taken from the extension; the PSG's
+    /// record of the frame so far comes back from it (an older extension's
+    /// samples made at the host's rate are not read).
     pub(super) fn restore_extension(&mut self, extension: GenesisExtension) {
         let z80_lead = extension.z80_lead;
         let line_end = self.line_end_beam();
@@ -206,7 +209,9 @@ impl GenesisEmulator {
             .vdp_mut()
             .restore_extension(extension.vdp, line_end);
         self.bus.ym2612_mut().restore_extension(extension.ym2612);
-        self.bus.psg_mut().restore_extension(extension.psg);
+        self.bus
+            .psg_mut()
+            .restore_frame_output(&extension.psg_output);
         self.bus.restore_z80_bus_grant(extension.z80_bus_grant);
         if let Some(frame) = extension.frame {
             self.frame_open = true;

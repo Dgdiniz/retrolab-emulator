@@ -7,6 +7,11 @@
 //! - 4-bit attenuation per channel (16 volume levels)
 //!
 //! The PSG is clocked at Master Clock / 15 (~3.58 MHz on Genesis).
+//!
+//! It runs at its own rate: the channels tick once every 16 input clocks,
+//! and each change of a channel's output is kept with the input clock it
+//! happened at. That record, the chip's output as levels at times, is what
+//! the system's host stage makes into the host's band-limited samples.
 
 pub mod noise;
 pub mod tone;
@@ -15,20 +20,27 @@ use noise::NoiseChannel;
 use tone::ToneChannel;
 
 use retro_core::audio::{
-    AudioChip, AudioChipInfo, AudioDebugger, ChannelState, ChannelType, SoundEvent,
+    AudioChip, AudioChipInfo, AudioDebugger, ChannelState, ChannelType, IntegerRateConverter,
+    SoundEvent,
 };
 use retro_core::cpu::Clockable;
 
-/// Upper bound on buffered, undrained mono samples. If the host stops consuming
-/// audio (disabled, debugger paused, tab backgrounded), `catch_up()` trims the
-/// oldest samples instead of growing without bound.
-const MAX_PSG_FRAME_SAMPLES: usize = 8192;
+/// The input clocks between two ticks of the channels: the chip divides its
+/// input clock by 16 (about 223.7 kHz on the Mega Drive).
+const CLOCKS_PER_TICK: u32 = 16;
 
-/// How many samples `generate_samples` may render ahead of this chip's own
-/// clock accumulator to give the count the system's converter asked for:
-/// two quantisations of the same time disagree by about a sample, and past
-/// that the caller is asking for sound the machine has not reached.
-const MAX_BORROWED_SAMPLES: usize = 2;
+/// The most changes the record keeps while nothing takes it (a frame that
+/// does not end, a host that takes no sound): past it the oldest are
+/// folded into the level the record starts from.
+const MAX_OUTPUT_CHANGES: usize = 16384;
+
+/// The ticks between two values of a channel's waveform for the debugger:
+/// about 0.36 ms, so its 1,024 values span about 0.37 s.
+const TICKS_PER_SCOPE_VALUE: u32 = 81;
+
+/// The four channels' outputs at a moment, muted or not: tone channels 1
+/// to 3, then the noise channel.
+pub type PsgLevels = [f32; PSG_STEM_VALUES];
 
 /// Latch type for the SN76489 register write protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +64,32 @@ pub struct Psg {
     /// Master clock frequency
     clock_freq: u32,
 
-    /// Sample rate for audio generation
+    /// The host's sample rate: what the chip's information reports, the
+    /// rate [`AudioChip::generate_samples`] last read at, and the unit of
+    /// the write log's sample offsets.
     sample_rate: u32,
 
-    /// Accumulated clock cycles (for sample generation timing)
-    clock_accumulator: f32,
+    /// The input clocks received since the channels last ticked: the
+    /// divider's progress, which the next ticks take, 16 a tick. Machine
+    /// state.
+    unticked: u32,
 
-    /// Cycles per sample
-    cycles_per_sample: f32,
+    /// Where the chip stands: the input clocks since master clock 0, as
+    /// the system sets them at a reset and a load and each `clock` adds,
+    /// the clock a change of its output is timed by. Not saved: derived.
+    position: u64,
+
+    /// The chip's output since the record was last taken: first the four
+    /// outputs it started from and the input clock it started at, then
+    /// each change, at the input clock it happened at. Taken by the
+    /// system's host stage at each frame's end. A frame stopped part of
+    /// the way through keeps it in the savestate's extension.
+    output: Vec<(u64, PsgLevels)>,
+
+    /// The sample-and-hold [`AudioChip::generate_samples`] reads the
+    /// record with: the host's samples it handed out, on the chip's input
+    /// clocks. Built at its first call. Not saved.
+    sampler: Option<IntegerRateConverter>,
 
     /// Latched channel (0-3: tone 0-2, noise)
     latched_channel: u8,
@@ -76,26 +106,13 @@ pub struct Psg {
     /// Maximum waveform samples to store
     max_waveform_samples: usize,
 
-    /// Internal clock accumulator for the /16 divider.
-    /// The SN76489 divides its input clock by 16 for the internal tone/noise generators.
-    /// Channels should be clocked at ~223.7 kHz (PSG_clock / 16), not at the output sample rate.
-    internal_clock_accumulator: f32,
+    /// The ticks left before the next value of the waveforms.
+    scope_countdown: u32,
 
-    /// Mono samples already rendered this frame by `catch_up()`. The chip renders
-    /// the audio produced *before* each register write using the state in effect
-    /// at that moment, so sub-frame frequency/volume/noise changes land at their
-    /// correct sample position instead of collapsing to the frame's final state.
-    /// Drained by `generate_samples()`; never serialized (transient per frame).
-    frame_samples: Vec<f32>,
-
-    /// Running sample counter used to decimate `store_waveform_sample()` to every
-    /// 16th sample, keeping the visualization ring buffer covering ~0.4 s of audio
-    /// even though `catch_up()` renders across many calls per frame.
-    waveform_decimation: u32,
-
-    /// When false (host audio disabled), `catch_up()` skips synthesis and just
-    /// keeps the accumulator bounded, so no CPU is spent on audio nobody hears.
-    /// Not serialized: it is a host setting re-applied via `set_rendering_enabled`.
+    /// When false (host audio disabled), `catch_up()` does not tick the
+    /// channels and keeps no record, only the divider's place, so no CPU is
+    /// spent on audio nobody hears. Not serialized: it is a host setting
+    /// re-applied via `set_rendering_enabled`.
     rendering_enabled: bool,
 
     /// Optional capture of every byte written to the PSG, tagged with the
@@ -103,13 +120,6 @@ pub struct Psg {
     /// disabled (zero overhead). Transient diagnostic for `sg1-cli
     /// sound-trace`; never serialized.
     sound_write_log: Option<Vec<PsgWrite>>,
-
-    /// The stems' tap while the host takes stems: each sample's four
-    /// channel outputs, muted or not, staged beside `frame_samples`
-    /// ([`PSG_STEM_VALUES`] a sample) until the system's mix takes the
-    /// frame, with whether a muted channel that sounds moved the sample.
-    /// Not saved.
-    stems: Option<Box<(Vec<f32>, Vec<bool>)>>,
 
     /// The input clocks the chip has received since it was built: the
     /// clock the sound log and the write log stamp a byte with. Never
@@ -127,9 +137,10 @@ pub const PSG_STEM_VALUES: usize = 4;
 
 /// A single SN76489 byte write captured by the optional sound-write log.
 ///
-/// `sample_pos` is the (mono) output-sample offset within the current frame
-/// at which the write takes effect, how many samples `catch_up()` had
-/// already rendered when the byte arrived. `data` is the raw command byte;
+/// `sample_pos` is the host's output-sample offset at which the write takes
+/// effect, counted from the start of the chip's record, which the system
+/// takes at each frame's end: the input clocks since then at the host's
+/// sample rate, rounded down. `data` is the raw command byte;
 /// the SN76489 latch/data encoding (channel, tone/volume, data nibble) lives
 /// in the byte itself, so the log stays a faithful record of the wire bytes.
 /// `clock` is the chip's input clocks received when the byte arrived,
@@ -148,9 +159,7 @@ impl Psg {
     /// * `clock_freq` - PSG clock frequency (Genesis: Master/15 = ~3.58 MHz)
     /// * `sample_rate` - Audio sample rate (typically 44100 Hz)
     pub fn new(clock_freq: u32, sample_rate: u32) -> Self {
-        let cycles_per_sample = clock_freq as f32 / sample_rate as f32;
-
-        Self {
+        let mut psg = Self {
             tone_channels: [
                 ToneChannel::new(clock_freq),
                 ToneChannel::new(clock_freq),
@@ -159,8 +168,10 @@ impl Psg {
             noise_channel: NoiseChannel::new(clock_freq),
             clock_freq,
             sample_rate,
-            clock_accumulator: 0.0,
-            cycles_per_sample,
+            unticked: 0,
+            position: 0,
+            output: Vec::with_capacity(4096),
+            sampler: None,
             latched_channel: 0,
             latched_type: LatchType::Tone,
             waveform_buffer: [
@@ -171,15 +182,22 @@ impl Psg {
             ],
             mixed_waveform: std::collections::VecDeque::with_capacity(1024),
             max_waveform_samples: 1024,
-            internal_clock_accumulator: 0.0,
-            frame_samples: Vec::with_capacity(2048),
-            waveform_decimation: 0,
+            scope_countdown: 0,
             rendering_enabled: true,
             sound_write_log: None,
-            stems: None,
             input_clocks: 0,
             sound_log: None,
-        }
+        };
+        psg.restart_output();
+        psg
+    }
+
+    /// The record starts afresh where the chip stands, from its outputs as
+    /// they are.
+    fn restart_output(&mut self) {
+        self.output.clear();
+        let outputs = self.outputs();
+        self.output.push((self.position, outputs));
     }
 
     /// The input clock, in Hz.
@@ -188,21 +206,86 @@ impl Psg {
     }
 
     /// Run on another input clock, as a console of another region gives it
-    /// (the Mega Drive's PSG runs on the Z80's clock): the input clocks an
-    /// output sample takes follow it, and so do the tone channels'
-    /// frequencies in Hz the debugger shows. What the chip holds is kept:
-    /// the registers, the counters, the clocks counted towards the next
-    /// sample and the samples made. The noise channel reads no clock. The
-    /// same clock changes nothing.
+    /// (the Mega Drive's PSG runs on the Z80's clock): the tone channels'
+    /// frequencies in Hz the debugger shows follow it, and so does the
+    /// sample-and-hold's rate. What the chip holds is kept: the registers,
+    /// the counters, the divider's place and the record. The noise channel
+    /// reads no clock. The same clock changes nothing.
     pub fn set_clock_freq(&mut self, clock_freq: u32) {
         if clock_freq == self.clock_freq {
             return;
         }
         self.clock_freq = clock_freq;
-        self.cycles_per_sample = clock_freq as f32 / self.sample_rate as f32;
+        self.sampler = None;
         for channel in &mut self.tone_channels {
             channel.set_clock_freq(clock_freq);
         }
+    }
+
+    /// Stand at input clock `position`, counted from master clock 0, with
+    /// nothing changed: a reset and a load derive it from the master clock.
+    /// A record that holds no change starts again here, from the outputs as
+    /// they are; one a savestate brought back keeps its times.
+    pub fn set_position(&mut self, position: u64) {
+        self.position = position;
+        if self.output.len() <= 1 {
+            self.restart_output();
+        }
+    }
+
+    /// Where the chip stands: its input clocks since master clock 0.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// The four channels' outputs, muted or not.
+    pub fn outputs(&self) -> PsgLevels {
+        [
+            self.tone_channels[0].raw_output(),
+            self.tone_channels[1].raw_output(),
+            self.tone_channels[2].raw_output(),
+            self.noise_channel.raw_output(),
+        ]
+    }
+
+    /// Which of the four channels the debugger muted: the mix leaves them
+    /// out, their stems keep them.
+    pub fn channel_mutes(&self) -> [bool; PSG_STEM_VALUES] {
+        [
+            self.tone_channels[0].muted,
+            self.tone_channels[1].muted,
+            self.tone_channels[2].muted,
+            self.noise_channel.muted,
+        ]
+    }
+
+    /// The chip's output up to now into `into`, emptied first: the outputs
+    /// it started from and their input clock, then each change at its own
+    /// (every channel ticked through the clocks received). The record goes
+    /// on from here, from the outputs as they are.
+    pub fn take_output(&mut self, into: &mut Vec<(u64, PsgLevels)>) {
+        self.catch_up();
+        into.clear();
+        std::mem::swap(&mut self.output, into);
+        self.restart_output();
+    }
+
+    /// The record of a frame in progress, for the savestate's extension:
+    /// empty when it holds nothing but the outputs it started from, which
+    /// a load derives.
+    pub fn frame_output(&self) -> Vec<(u64, PsgLevels)> {
+        if self.output.len() > 1 {
+            self.output.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Make the record a savestate's (after [`Self::from_savestate`]); an
+    /// empty one starts where the system next sets the chip's position.
+    pub fn restore_frame_output(&mut self, output: &[(u64, PsgLevels)]) {
+        self.output.clear();
+        self.output.extend_from_slice(output);
     }
 
     /// Begin capturing PSG byte writes (see [`PsgWrite`]), discarding any
@@ -224,8 +307,12 @@ impl Psg {
     /// Record one PSG byte at its current in-frame sample position, and in
     /// the sound log. No-op unless a log is on.
     fn log_psg_write(&mut self, data: u8) {
-        let sample_pos = self.frame_samples.len() as u32;
         let clock = self.input_clocks;
+        let since_start = self
+            .position
+            .saturating_sub(self.output.first().map_or(0, |e| e.0));
+        let sample_pos = (u128::from(since_start) * u128::from(self.sample_rate)
+            / u128::from(self.clock_freq.max(1))) as u32;
         if let Some(log) = self.sound_write_log.as_mut() {
             log.push(PsgWrite {
                 sample_pos,
@@ -298,123 +385,62 @@ impl Psg {
     }
 
     /// Enable or disable audio rendering. When disabled (host audio off),
-    /// `catch_up()` skips synthesis, so disabling audio buys back the FPS synthesis
-    /// costs. The tone and noise generators are not clocked meanwhile, so their
-    /// counters, polarities and LFSR (in savestates and the state hash) hold still.
+    /// `catch_up()` neither ticks the channels nor keeps a record, so
+    /// disabling audio buys back what they cost. The tone and noise
+    /// generators hold still meanwhile, their counters, polarities and LFSR
+    /// (in savestates and the state hash) as they were; the divider keeps
+    /// its place among the 16 clocks of a tick. Enabled again, the record
+    /// starts afresh from the outputs as they are.
     pub fn set_rendering_enabled(&mut self, enabled: bool) {
+        if enabled && !self.rendering_enabled {
+            self.restart_output();
+        }
         self.rendering_enabled = enabled;
     }
 
-    /// Render every whole output sample owed for the clocks accumulated since the
-    /// last render point, appending them to `frame_samples` using the chip's
-    /// current register state. Called before each register write (so the write's
-    /// effect starts at the right sample) and once more at frame end by
-    /// `generate_samples()`.
+    /// Tick the channels once for every 16 input clocks received since the
+    /// last tick, each tick at the input clock its 16th clock came, keeping
+    /// each change of their outputs in the record. Called before each
+    /// register write, so the write lands after every tick of its time,
+    /// and when the record is taken.
     fn catch_up(&mut self) {
         if !self.rendering_enabled {
-            // Audio off: don't synthesize, just keep the accumulator bounded.
-            if self.clock_accumulator >= self.cycles_per_sample {
-                self.clock_accumulator %= self.cycles_per_sample;
-            }
+            self.unticked %= CLOCKS_PER_TICK;
             return;
         }
-
-        while self.clock_accumulator >= self.cycles_per_sample {
-            self.clock_accumulator -= self.cycles_per_sample;
-            self.render_sample();
+        let first = self.position.saturating_sub(u64::from(self.unticked));
+        let ticks = self.unticked / CLOCKS_PER_TICK;
+        for tick in 1..=ticks {
+            self.tick(first + u64::from(tick * CLOCKS_PER_TICK));
         }
-
-        // Bound the buffer if the host stops draining it.
-        if self.frame_samples.len() > MAX_PSG_FRAME_SAMPLES {
-            let excess = self.frame_samples.len() - MAX_PSG_FRAME_SAMPLES;
-            self.frame_samples.drain(..excess);
-            if let Some(stems) = self.stems.as_deref_mut() {
-                stems.0.drain(..excess * PSG_STEM_VALUES);
-                stems.1.drain(..excess);
-            }
-        }
+        self.unticked %= CLOCKS_PER_TICK;
     }
 
-    /// One output sample, its input clocks already taken from the
-    /// accumulator: the channels clocked through them, and the sample staged
-    /// with its stems and its waveform.
-    fn render_sample(&mut self) {
-        // The SN76489 divides its input clock by 16 for the internal
-        // tone/noise generators (~223.7 kHz on Genesis). Advance the divider
-        // and clock channels for every 16 input clocks consumed this sample.
-        self.internal_clock_accumulator += self.cycles_per_sample;
-        while self.internal_clock_accumulator >= 16.0 {
-            self.clock_channels();
-            self.internal_clock_accumulator -= 16.0;
-        }
-
-        self.frame_samples.push(self.get_mixed_output());
-        if let Some(stems) = self.stems.as_deref_mut() {
-            let outputs = [
-                self.tone_channels[0].raw_output(),
-                self.tone_channels[1].raw_output(),
-                self.tone_channels[2].raw_output(),
-                self.noise_channel.raw_output(),
-            ];
-            let muted = [
-                self.tone_channels[0].muted,
-                self.tone_channels[1].muted,
-                self.tone_channels[2].muted,
-                self.noise_channel.muted,
-            ];
-            stems.0.extend_from_slice(&outputs);
-            stems
-                .1
-                .push(outputs.iter().zip(muted).any(|(&out, m)| m && out != 0.0));
-        }
-
-        if self.waveform_decimation.is_multiple_of(16) {
+    /// One tick of the channels at input clock `time`: a change of their
+    /// outputs goes into the record, and every 81st tick into the
+    /// waveforms.
+    fn tick(&mut self, time: u64) {
+        self.clock_channels();
+        self.note_outputs(time);
+        if self.scope_countdown == 0 {
+            self.scope_countdown = TICKS_PER_SCOPE_VALUE;
             self.store_waveform_sample();
         }
-        self.waveform_decimation = self.waveform_decimation.wrapping_add(1);
+        self.scope_countdown -= 1;
     }
 
-    /// Stage each sample's channels for the stems from now on (`true`), or
-    /// stop. A host setting, not saved.
-    pub fn set_stem_tap(&mut self, on: bool) {
-        match (on, self.stems.is_some()) {
-            (true, false) => {
-                self.stems = Some(Box::default());
-                self.align_stems();
-            }
-            (false, true) => self.stems = None,
-            _ => {}
+    /// The outputs as they stand at input clock `time`, into the record if
+    /// they changed.
+    fn note_outputs(&mut self, time: u64) {
+        let outputs = self.outputs();
+        if self.output.last().is_some_and(|last| last.1 == outputs) {
+            return;
         }
-    }
-
-    /// The samples staged for the stems, one per sample `frame_samples`
-    /// holds: [`PSG_STEM_VALUES`] values each, and whether each departs;
-    /// `None` while the tap is off.
-    pub fn staged_stems(&self) -> Option<(&[f32], &[bool])> {
-        self.stems
-            .as_deref()
-            .map(|(values, departs)| (&values[..], &departs[..]))
-    }
-
-    /// Drop the samples staged for the stems, as the mix drops the frame's
-    /// samples once it has taken them.
-    pub fn clear_staged_stems(&mut self) {
-        if let Some(stems) = self.stems.as_deref_mut() {
-            stems.0.clear();
-            stems.1.clear();
-        }
-    }
-
-    /// Stage, for the samples `frame_samples` holds, samples that stand for
-    /// them (silence, each a departure): after a load replaced them, or
-    /// when the tap starts.
-    fn align_stems(&mut self) {
-        let samples = self.frame_samples.len();
-        if let Some(stems) = self.stems.as_deref_mut() {
-            stems.0.clear();
-            stems.0.resize(samples * PSG_STEM_VALUES, 0.0);
-            stems.1.clear();
-            stems.1.resize(samples, true);
+        self.output.push((time, outputs));
+        if self.output.len() > MAX_OUTPUT_CHANGES {
+            // The oldest changes fold into the level the record starts from.
+            let cut = self.output.len() - MAX_OUTPUT_CHANGES / 2;
+            self.output.drain(..cut);
         }
     }
 
@@ -430,14 +456,14 @@ impl Psg {
         self.noise_channel.set_control(0);
         self.noise_channel.set_attenuation(15);
 
-        // Reset internal state
-        self.clock_accumulator = 0.0;
-        self.internal_clock_accumulator = 0.0;
+        // Reset internal state; the record starts again from the reset's
+        // outputs.
+        self.unticked = 0;
         self.latched_channel = 0;
         self.latched_type = LatchType::Tone;
-        self.frame_samples.clear();
-        self.align_stems();
-        self.waveform_decimation = 0;
+        self.restart_output();
+        self.sampler = None;
+        self.scope_countdown = 0;
 
         // Clear waveform buffers
         for buffer in &mut self.waveform_buffer {
@@ -458,10 +484,9 @@ impl Psg {
     /// # Arguments
     /// * `data` - 8-bit data to write
     pub fn write(&mut self, data: u8) {
-        // Render the audio produced up to this write using the current register
-        // state, so the write's effect begins at the correct sample position
-        // (Genesis Plus GX and PicoDrive run the PSG to the write's time the
-        // same way).
+        // Every tick of the clocks before this write first, so the write's
+        // effect starts at its own time (Genesis Plus GX and PicoDrive run
+        // the PSG to the write's time the same way).
         self.catch_up();
         self.log_psg_write(data);
 
@@ -513,6 +538,11 @@ impl Psg {
         if self.latched_channel == 2 && self.latched_type == LatchType::Tone {
             self.noise_channel
                 .set_tone3_frequency(self.tone_channels[2].get_frequency());
+        }
+
+        // A volume or a noise control moves the output at the write's time.
+        if self.rendering_enabled {
+            self.note_outputs(self.position);
         }
     }
 
@@ -598,46 +628,63 @@ impl AudioChip for Psg {
         0xFF
     }
 
+    /// The chip's output read by a sample-and-hold at `sample_rate`: each
+    /// output sample the mixed level (the channels' outputs, the muted left
+    /// out, over 4) in force at its time, from the record, which this
+    /// takes; as many as the input clocks received since the last call
+    /// came to, the first `output.len()` of them written. For a tool or a
+    /// test reading the chip alone: the machine's sound goes through its
+    /// band-limited host stage instead, which takes the record itself.
     fn generate_samples(&mut self, output: &mut [f32], sample_rate: u32) -> usize {
-        // Update cycles_per_sample if sample rate changed
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;
-            self.cycles_per_sample = self.clock_freq as f32 / sample_rate as f32;
+            self.sampler = None;
         }
-
-        // Flush the samples owed for the clocks accumulated since the last write
-        // (rendered at the current register state), then hand the caller what it
-        // asked for. The drift-free sample *count* over time is owned by the
-        // system's cycles->samples converter, not by this buffer, so any samples
-        // beyond what the caller drains are a sub-sample rounding tail that must
-        // NOT persist: carrying them would replay stale audio after a later
-        // register write changed the chip state. Drop the remainder so each call
-        // reflects state up to *now*; sub-frame accuracy comes from `catch_up()`
-        // at each `write`.
-        self.catch_up();
-
-        // A sample short of the count asked for is rendered on time borrowed
-        // from the next frame, as the YM2612's are: the converter owns the
-        // frame's count, and this chip's accumulator is a second,
-        // floating-point quantisation of the same time, so on some frames it
-        // lands a sample short, which would reach the mixer as a sample of
-        // silence inside a tone. Each borrowed sample is charged to the
-        // accumulator, so the chip gives the time back on a later frame and
-        // its rate is unchanged.
-        if self.rendering_enabled {
-            let mut borrowed = 0;
-            while self.frame_samples.len() < output.len() && borrowed < MAX_BORROWED_SAMPLES {
-                self.clock_accumulator -= self.cycles_per_sample;
-                self.render_sample();
-                borrowed += 1;
+        let mut record = Vec::new();
+        self.take_output(&mut record);
+        if !self.rendering_enabled {
+            self.sampler = None;
+            return 0;
+        }
+        let start = record.first().map_or(self.position, |e| e.0);
+        let sampler = self.sampler.get_or_insert_with(|| {
+            let mut sampler =
+                IntegerRateConverter::new(u64::from(sample_rate), u64::from(self.clock_freq));
+            sampler.reset(start);
+            sampler
+        });
+        let cumulative = sampler.cycles_to_samples(self.position);
+        let samples = (cumulative - sampler.samples_at_reference()) as usize;
+        let mutes = [
+            self.tone_channels[0].muted,
+            self.tone_channels[1].muted,
+            self.tone_channels[2].muted,
+            self.noise_channel.muted,
+        ];
+        let mixed = |levels: &PsgLevels| {
+            let sum: f32 = levels
+                .iter()
+                .zip(mutes)
+                .map(|(&level, muted)| if muted { 0.0 } else { level })
+                .sum();
+            sum / 4.0
+        };
+        let mut level = record.first().map_or(0.0, |e| mixed(&e.1));
+        let mut next = 1;
+        let written = samples.min(output.len());
+        for (j, slot) in output[..written].iter_mut().enumerate() {
+            // A change at a time before this sample's is in force for it.
+            while let Some(&(time, ref levels)) = record.get(next) {
+                if sampler.position(time, 1).sample >= j as i64 {
+                    break;
+                }
+                level = mixed(levels);
+                next += 1;
             }
+            *slot = level;
         }
-
-        let n = output.len().min(self.frame_samples.len());
-        output[..n].copy_from_slice(&self.frame_samples[..n]);
-        self.frame_samples.clear();
-
-        n
+        sampler.advance(self.position, cumulative);
+        written
     }
 
     fn reset(&mut self) {
@@ -646,13 +693,12 @@ impl AudioChip for Psg {
         }
         self.noise_channel.reset();
 
-        self.clock_accumulator = 0.0;
-        self.internal_clock_accumulator = 0.0;
+        self.unticked = 0;
         self.latched_channel = 0;
         self.latched_type = LatchType::Tone;
-        self.frame_samples.clear();
-        self.align_stems();
-        self.waveform_decimation = 0;
+        self.restart_output();
+        self.sampler = None;
+        self.scope_countdown = 0;
 
         // Clear waveform buffers
         for buf in &mut self.waveform_buffer {
@@ -723,11 +769,12 @@ impl AudioDebugger for Psg {
 
 impl Clockable for Psg {
     fn clock(&mut self, cycles: u32) -> u32 {
-        // Accumulate cycles for sample generation
-        // DON'T clock channels here - catch_up() does, before each register
-        // write and from generate_samples()
+        // The clocks are counted; the channels tick through them in
+        // catch_up(), before each register write and when the record is
+        // taken.
         self.input_clocks += u64::from(cycles);
-        self.clock_accumulator += cycles as f32;
+        self.position += u64::from(cycles);
+        self.unticked += cycles;
         cycles
     }
 }
@@ -772,8 +819,11 @@ impl Psg {
                 LatchType::Tone => 0,
                 LatchType::Volume => 1,
             },
-            clock_accumulator: self.clock_accumulator,
-            internal_clock_accumulator: self.internal_clock_accumulator,
+            // As a build that makes its samples at the host's rate reads
+            // them: no clocks towards a host sample, and the clocks
+            // received since the last tick as its divider's progress.
+            clock_accumulator: 0.0,
+            internal_clock_accumulator: self.unticked as f32,
         }
     }
 
@@ -801,27 +851,29 @@ impl Psg {
         } else {
             LatchType::Volume
         };
-        self.clock_accumulator = state.clock_accumulator;
-        self.internal_clock_accumulator = state.internal_clock_accumulator;
-        self.frame_samples.clear();
-        self.align_stems();
+        // The clocks received and not yet ticked: those a build that makes
+        // its samples at the host's rate counted towards its next sample,
+        // which it had not given its divider yet, and the divider's own
+        // (all of them in this build's states). A borrowed sample left the
+        // first below 0.
+        let unticked = state.clock_accumulator.max(0.0) + state.internal_clock_accumulator.max(0.0);
+        self.unticked = unticked.floor() as u32;
+        // The record goes on from the savestate's extension, or starts where
+        // the system sets the chip's position.
+        self.output.clear();
+        self.sampler = None;
     }
 
-    /// What the chip holds that the layout has no field for: the samples
-    /// made so far in the frame, which the frame's end takes.
+    /// The part of the savestate's extension the layout gave the PSG: the
+    /// samples made at the host's rate so far in a frame, which a build
+    /// that makes them reads. Written empty: the chip makes none (its
+    /// record goes into the extension's own part, [`Self::frame_output`]),
+    /// so such a build loading a state saved part of the way through a
+    /// frame plays that frame from the load.
     pub fn extension(&self) -> PsgExtension {
         PsgExtension {
-            samples: self.frame_samples.clone(),
+            samples: Vec::new(),
         }
-    }
-
-    /// Make the frame's samples `extension`'s, after
-    /// [`Self::from_savestate`]. The samples are copied into the buffer the
-    /// chip has, which keeps its capacity across a load.
-    pub fn restore_extension(&mut self, extension: PsgExtension) {
-        self.frame_samples.clear();
-        self.frame_samples.extend_from_slice(&extension.samples);
-        self.align_stems();
     }
 }
 

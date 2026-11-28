@@ -258,14 +258,18 @@ fn stopped_holding_the_extension() -> GenesisEmulator {
 /// What a load holds of `extension`, less what it does not read back as
 /// written: in the frame stopped part of the way through, the credits of
 /// the sound clock, which a load derives from the master clock, and the
-/// Z80's target, which this build writes as the cycles the Z80 ran. A
-/// build that counted them within the line wrote its own.
+/// Z80's target, which this build writes as the cycles the Z80 ran (a
+/// build that counted them within the line wrote its own); and the PSG's
+/// samples made at the host's rate, which a build that made them wrote and
+/// this one, which keeps the PSG's record of the frame instead, does not
+/// read.
 fn less_what_a_load_derives(mut extension: GenesisExtension) -> GenesisExtension {
     if let Some(frame) = extension.frame.as_mut() {
         frame.psg_credit = 0;
         frame.z80_credit = 0;
         frame.z80_target = 0;
     }
+    extension.psg.samples.clear();
     extension
 }
 

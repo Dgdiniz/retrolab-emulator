@@ -605,33 +605,55 @@ pub struct GenesisExtension {
     /// The cycles the Z80 ran past the present, which the time after pays
     /// back (below 0, the cycles it owes): its clock's lead.
     pub z80_lead: i64,
+    /// The PSG's output so far in a frame stopped part of the way through:
+    /// the four channels' outputs the frame started from and the input
+    /// clock it started at, then each change at its own (the chip's record,
+    /// which the frame's end takes); empty when it holds no change.
+    pub psg_output: Vec<(u64, crate::psg::PsgLevels)>,
 }
 
 impl retro_core::savestate::SavestateExtension for GenesisExtension {
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 
-    /// Version 1, written before the Z80's lead: the Z80 at the present.
+    /// Version 1, written before the Z80's lead (the Z80 at the present),
+    /// and version 2, before the PSG's record. Their `psg.samples`, the
+    /// PSG's samples made at the host's rate, are not read: a frame stopped
+    /// part of the way through plays its PSG from the load.
     fn read_older(version: u32, bytes: &[u8]) -> Result<Self, String> {
-        if version != 1 {
-            return Err(format!(
-                "savestate extension version {version} is not read by this build"
-            ));
-        }
-        let (vdp, ym2612, psg, z80_bus_grant, frame) =
-            retro_core::savestate::read_extension_part::<(
+        let (vdp, ym2612, psg, z80_bus_grant, frame, z80_lead) = match version {
+            1 => {
+                let (vdp, ym2612, psg, z80_bus_grant, frame) =
+                    retro_core::savestate::read_extension_part::<(
+                        VdpExtension,
+                        Ym2612Extension,
+                        PsgExtension,
+                        u64,
+                        Option<GenesisFrameState>,
+                    )>(bytes)?;
+                (vdp, ym2612, psg, z80_bus_grant, frame, 0)
+            }
+            2 => retro_core::savestate::read_extension_part::<(
                 VdpExtension,
                 Ym2612Extension,
                 PsgExtension,
                 u64,
                 Option<GenesisFrameState>,
-            )>(bytes)?;
+                i64,
+            )>(bytes)?,
+            _ => {
+                return Err(format!(
+                    "savestate extension version {version} is not read by this build"
+                ))
+            }
+        };
         Ok(Self {
             vdp,
             ym2612,
             psg,
             z80_bus_grant,
             frame,
-            z80_lead: 0,
+            z80_lead,
+            psg_output: Vec::new(),
         })
     }
 }
@@ -704,10 +726,13 @@ pub struct Ym2612Extension {
     pub samples: Vec<f32>,
 }
 
-/// The PSG's part of [`GenesisExtension`].
+/// The PSG's part of [`GenesisExtension`] as its first version laid it
+/// out.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PsgExtension {
-    /// The samples made so far in the frame, which its end takes.
+    /// The samples made at the host's rate so far in the frame, which a
+    /// build that makes them reads; written empty (the PSG's record is in
+    /// [`GenesisExtension::psg_output`]).
     pub samples: Vec<f32>,
 }
 

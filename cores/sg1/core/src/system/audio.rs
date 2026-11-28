@@ -1,16 +1,20 @@
 //! Audio: the YM2612 and the PSG mixed at a frame's end into the host's
-//! ring, the sound hooks a host calls (`SoundCore`), the stems the mix
+//! ring, the PSG's record through the host's band-limited stage on the
+//! way, the sound hooks a host calls (`SoundCore`), the stems the mix
 //! takes, and the sound chips' debugger readers.
 
+use std::sync::Arc;
+
 use retro_core::audio::{
-    merge_by_time, SampleKind, SoundChipKind, SoundCore, SoundEvent, SoundLog, SoundLogContents,
-    SoundLogEntry, SoundLogger, StemChannel, StemLayout, StemRecorder, StemSet, StemSum, StemTake,
+    merge_by_time, BandLimitedSteps, IntegerRateConverter, SampleKind, SampleTime, SincKernel,
+    SoundChipKind, SoundCore, SoundEvent, SoundLog, SoundLogContents, SoundLogEntry, SoundLogger,
+    StemChannel, StemLayout, StemRecorder, StemSet, StemSum, StemTake,
 };
 use retro_core::frame::run_frame_on;
 use retro_core::{EmulatorCore, ExecutionTier};
 
 use super::GenesisEmulator;
-use crate::psg::PSG_STEM_VALUES;
+use crate::psg::{PsgLevels, PSG_STEM_VALUES};
 use crate::timing::GenesisTiming;
 use crate::ym2612::{DacStatus, LfoStatus, TimerStatus, YM_STEM_VALUES};
 
@@ -27,6 +31,90 @@ const FM_SHARE: f32 = 0.75;
 /// the scaling is exact.
 const FM_STEM_SCALE: f32 = FM_SHARE / 6.0;
 const PSG_STEM_SCALE: f32 = PSG_SHARE / 4.0;
+
+/// The master clocks in one of the PSG's input clocks: it runs on the Z80's
+/// clock, a fifteenth of the master clock.
+const PSG_MASTER_CLOCKS: u64 = 15;
+
+/// How far past the samples rendered so far a change may lie before the
+/// samples up to it are rendered first, so the stage's buffers never reach
+/// further ahead than this.
+const STAGE_RENDER_AHEAD: usize = 4096;
+
+/// The kernel of the host's band-limited stage: a Kaiser-windowed sinc
+/// spanning 32 of the host's samples each side, its cutoff at 0.92 of the
+/// host's Nyquist frequency (20.3 kHz at 44.1 kHz) and its stopband 80 dB
+/// down from the Nyquist frequency on, so what lies past half the host's
+/// rate is gone before it can fold back into what is heard.
+pub(super) fn host_kernel() -> Arc<SincKernel> {
+    Arc::new(SincKernel::new(32, 0.92, 80.0, 128))
+}
+
+/// The stems' own stages while the host takes stems: each of the PSG's
+/// channels band-limited by a stage of its own, as the master's PSG part
+/// is, so the stems add up to the master but for the rounding of the two
+/// sums. Made from silence when the stems are armed (their first span
+/// departs from the master, whose stage was running), dropped when they
+/// are not.
+pub(super) struct StemStages {
+    psg: [BandLimitedSteps<1>; PSG_STEM_VALUES],
+    /// Each PSG stem's samples of the frame.
+    samples: [Vec<f32>; PSG_STEM_VALUES],
+}
+
+impl StemStages {
+    fn new(kernel: &Arc<SincKernel>) -> Self {
+        Self {
+            psg: std::array::from_fn(|_| BandLimitedSteps::new(kernel.clone())),
+            samples: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+}
+
+/// The PSG's part of the master from its four outputs: their sum, the
+/// muted left out, at the PSG's share of the mix and over its 4 channels
+/// (exact in f64: four values of an f32's precision and a power of two).
+fn psg_master_level(levels: &PsgLevels, mutes: [bool; PSG_STEM_VALUES]) -> f64 {
+    let sum: f64 = levels
+        .iter()
+        .zip(mutes)
+        .map(|(&level, muted)| if muted { 0.0 } else { f64::from(level) })
+        .sum();
+    sum * f64::from(PSG_STEM_SCALE)
+}
+
+/// Levels at times, in order, set on `steps` and the frame's `frames`
+/// samples rendered into `out` (`N` interleaved values each). A change far
+/// past the samples rendered so far has the samples before it rendered
+/// first, so the stage's buffers stay short in a frame of any length.
+fn stage_frame<const N: usize>(
+    steps: &mut BandLimitedSteps<N>,
+    levels: impl Iterator<Item = (SampleTime, [f64; N])>,
+    frames: usize,
+    out: &mut [f32],
+) {
+    let mut rendered = 0usize;
+    for (at, level) in levels {
+        let ready = ((at.sample + 1).max(0) as usize).min(frames);
+        if ready > rendered + STAGE_RENDER_AHEAD {
+            steps.render(ready - rendered, &mut out[N * rendered..N * ready]);
+            rendered = ready;
+        }
+        let at = SampleTime {
+            sample: at.sample - rendered as i64,
+            fraction: at.fraction,
+        };
+        steps.set_level(at, level);
+    }
+    steps.render(frames - rendered, &mut out[N * rendered..N * frames]);
+}
+
+/// Where the PSG's input clock `time` lands on the frame's samples, as
+/// `converter` counts them from the frame's start: 15 master clocks a
+/// clock, 7 (`cpu_divider`) to the converter's 68000 cycle.
+fn psg_place(converter: &IntegerRateConverter, time: u64, cpu_divider: u64) -> SampleTime {
+    converter.position(PSG_MASTER_CLOCKS * time, cpu_divider)
+}
 
 /// The stems, in index order: the YM2612's six channels and its DAC, which
 /// plays in place of channel 6 (whose FM stem is then silent), the PSG's
@@ -141,10 +229,11 @@ pub(super) fn stem_recorder(rate: u32) -> StemRecorder<f32> {
 }
 
 /// One side of a sample of the mix, before the limiter: the master the
-/// stems sum to.
+/// stems sum to. `psg` is the PSG's part from its stage, already at its
+/// share; `ym` the YM2612's sample, which takes its share here.
 #[inline]
 fn mix_sample(psg: f32, ym: f32) -> f32 {
-    psg * PSG_SHARE + ym * FM_SHARE
+    psg + ym * FM_SHARE
 }
 
 /// The mix's limiter: below 0.8 the signal passes through linearly, above
@@ -440,21 +529,24 @@ impl GenesisEmulator {
     /// push the samples to the output ring. Uses pre-allocated buffers to avoid
     /// per-frame heap allocations.
     ///
-    /// The first half (advancing `audio_rate_converter` and pulling each chip's
-    /// samples, which drains its `clock_accumulator`) mutates *serialized
-    /// machine state*, state the netplay desync hash (`state_hash`) covers, so
-    /// it MUST run on every frame, audible or headless. If a headless
-    /// rollback/catch-up frame skipped it, a re-simulated span would leave the
-    /// converter + chip phase frozen where a live audible run advanced them, the
-    /// two peers' hashes for that frame would differ, and the netplay desync
-    /// check would fire a spurious full resync. The second half (the mix, the
+    /// The first half (advancing `audio_rate_converter`, taking the PSG's
+    /// record of the frame and pulling the YM2612's samples, which drains
+    /// its `clock_accumulator`) mutates *serialized machine state*, state
+    /// the netplay desync hash (`state_hash`) covers, so it MUST run on
+    /// every frame, audible or headless. If a headless rollback/catch-up
+    /// frame skipped it, a re-simulated span would leave the converter and
+    /// the chips' sample phase frozen where a live audible run advanced
+    /// them, the two peers' hashes for that frame would differ, and the
+    /// netplay desync check would fire a spurious full resync. The second
+    /// half (the PSG's record through the host's stage, the mix, the
     /// waveform-visualization ring, and the host audio ring) is pure
-    /// presentation (none of it is serialized), so a headless frame returns
-    /// before it: audio is generated but not rendered, exactly as rollback
-    /// netcode requires. So a headless frame queues nothing, and after a
+    /// presentation (none of it is serialized), so a headless frame skips
+    /// it: audio is generated but not rendered, exactly as rollback netcode
+    /// requires. So a headless frame queues nothing, and after a
     /// rollback's frames there is nothing pending to discard (the trait's
     /// `discard_pending_audio` does nothing here): clearing the host ring
-    /// instead would throw away sound presented and still on its way.
+    /// instead would throw away sound presented and still on its way. The
+    /// stage steps to the PSG's level at the next frame presented.
     pub(super) fn generate_and_mix_audio(&mut self, present: bool) {
         if !self.audio_enabled {
             return;
@@ -464,80 +556,75 @@ impl GenesisEmulator {
         // on `master_cycles`, so the delta between the previous
         // anchor's cumulative count and this frame's tells us exactly
         // how many stereo pairs to emit, bit-for-bit identical to a
-        // single big-int compute done at the end of the session.
+        // single big-int compute done at the end of the session. Its
+        // anchor is the frame's start, which the PSG's times are placed
+        // from before it moves on.
         let cumulative = self
             .audio_rate_converter
             .cycles_to_samples(self.master_cycles);
         let prev = self.audio_rate_converter.samples_at_reference();
         let samples_per_frame = cumulative.saturating_sub(prev) as usize;
-        // Re-anchor immediately. `cumulative` already includes the
-        // fractional remainder; carrying it forward inside `advance`
-        // keeps the next frame's computation drift-free.
+
+        // The PSG's record of the frame, taken whether it is heard or not.
+        let mut record = std::mem::take(&mut self.psg_record);
+        self.bus.psg_mut().take_output(&mut record);
+
+        // A paused / stepped emulator may report 0 delta (no cycle advance
+        // since last call): no samples, and nothing for the YM2612 to make.
+        if samples_per_frame > 0 {
+            if self.psg_sample_buf.len() < samples_per_frame {
+                self.psg_sample_buf.resize(samples_per_frame, 0.0);
+            }
+            if self.ym_sample_buf.len() < samples_per_frame * 2 {
+                self.ym_sample_buf.resize(samples_per_frame * 2, 0.0);
+            }
+            if self.mix_sample_buf.len() < samples_per_frame * 2 {
+                self.mix_sample_buf.resize(samples_per_frame * 2, 0.0);
+            }
+            // The buffer is pre-zeroed, so any samples beyond what the chip
+            // produces are already silence (0.0).
+            for v in &mut self.ym_sample_buf[..samples_per_frame * 2] {
+                *v = 0.0;
+            }
+            use retro_core::audio::AudioChip;
+            let ym_count = self.bus.ym2612_mut().generate_samples(
+                &mut self.ym_sample_buf[..samples_per_frame * 2],
+                self.audio_sample_rate,
+            );
+            let _ym_stereo_count = ym_count / 2;
+            if present {
+                self.stage_psg(&record, samples_per_frame);
+            }
+        }
+
+        // Re-anchor: the next frame's count and times start here.
+        // `cumulative` already includes the fractional remainder; carrying
+        // it forward inside `advance` keeps the next frame's computation
+        // drift-free.
         self.audio_rate_converter
             .advance(self.master_cycles, cumulative);
+        self.psg_record = record;
 
-        // Edge case: a paused / stepped emulator may report 0 delta
-        // (no cycle advance since last call). Skip the heavy mix path
-        // entirely: pushing an empty slice would be harmless but
-        // wastes the chip generation work below.
-        if samples_per_frame == 0 {
-            return;
-        }
-
-        // Ensure pre-allocated buffers are large enough (resize only if needed)
-        if self.psg_sample_buf.len() < samples_per_frame {
-            self.psg_sample_buf.resize(samples_per_frame, 0.0);
-        }
-        if self.ym_sample_buf.len() < samples_per_frame * 2 {
-            self.ym_sample_buf.resize(samples_per_frame * 2, 0.0);
-        }
-        if self.mix_sample_buf.len() < samples_per_frame * 2 {
-            self.mix_sample_buf.resize(samples_per_frame * 2, 0.0);
-        }
-
-        // Zero the used portion of buffers
-        for v in &mut self.psg_sample_buf[..samples_per_frame] {
-            *v = 0.0;
-        }
-        for v in &mut self.ym_sample_buf[..samples_per_frame * 2] {
-            *v = 0.0;
-        }
-
-        // Generate samples from PSG and YM2612.
-        // Both buffers were pre-zeroed so any samples beyond what each chip
-        // produces are already silence (0.0).
-        use retro_core::audio::AudioChip;
-        let _psg_count = self.bus.psg_mut().generate_samples(
-            &mut self.psg_sample_buf[..samples_per_frame],
-            self.audio_sample_rate,
-        );
-
-        let ym_count = self.bus.ym2612_mut().generate_samples(
-            &mut self.ym_sample_buf[..samples_per_frame * 2],
-            self.audio_sample_rate,
-        );
-        let _ym_stereo_count = ym_count / 2;
-
-        // Everything above advanced serialized machine state (the converter and
-        // each chip's `clock_accumulator`), so it ran on this frame regardless of
-        // presentation. A headless frame stops here: the mix, the waveform ring,
-        // and the host audio ring below are presentation-only and never enter the
-        // netplay desync hash. See the fn doc for why this ordering is
-        // load-bearing for rollback determinism. The stems follow the host:
-        // what the chips staged for them goes with the frame.
-        if !present {
+        // Everything above advanced serialized machine state (the converter,
+        // the PSG's ticks and each chip's accumulator), so it ran on this
+        // frame regardless of presentation. A headless frame stops here: the
+        // mix, the waveform ring, and the host audio ring below are
+        // presentation-only and never enter the netplay desync hash. See the
+        // fn doc for why this ordering is load-bearing for rollback
+        // determinism. The stems follow the host: what the chips staged for
+        // them goes with the frame.
+        if !present || samples_per_frame == 0 {
             self.clear_staged_stems();
             return;
         }
 
         // Mix PSG + YM2612 (stereo interleaved: L, R, L, R, ...)
         // Always output exactly samples_per_frame to keep the audio buffer fill
-        // rate matched to the video frame rate. Both sample buffers are pre-zeroed,
-        // so if either chip produced slightly fewer samples, the tail is silence.
+        // rate matched to the video frame rate.
         let mix_count = samples_per_frame;
 
         for i in 0..mix_count {
-            // PSG is mono - duplicate to L and R
+            // The PSG's part, mono, on both sides.
             let psg = self.psg_sample_buf[i];
 
             // YM2612 is stereo interleaved
@@ -573,19 +660,56 @@ impl GenesisEmulator {
         self.clear_staged_stems();
     }
 
-    /// The frame's stems from what the chips staged, one sample frame for
-    /// each the mix made, as they enter the master; the master is the mix
-    /// before its limiter. A sample frame departs where the YM2612's clamp,
-    /// the limiter or a muted channel that sounds moved what the host hears
-    /// away from the stems' sum, and where a chip handed the mix a sample
-    /// it staged none for.
+    /// The PSG's record of the frame through the host's stage onto its
+    /// `frames` samples, into `psg_sample_buf`: the master's part (the
+    /// channels the debugger did not mute) and, while the stems are armed,
+    /// each channel's stem. The converter still stands at the frame's
+    /// start.
+    fn stage_psg(&mut self, record: &[(u64, PsgLevels)], frames: usize) {
+        let mutes = self.bus.psg().channel_mutes();
+        let divider = u64::from(self.region.cpu_divider());
+        let converter = &self.audio_rate_converter;
+        let master = record.iter().map(|(time, levels)| {
+            let at = psg_place(converter, *time, divider);
+            (at, [psg_master_level(levels, mutes)])
+        });
+        stage_frame(
+            &mut self.psg_stage,
+            master,
+            frames,
+            &mut self.psg_sample_buf[..frames],
+        );
+        if let Some(stems) = self.stem_stages.as_deref_mut() {
+            for (channel, (steps, samples)) in
+                stems.psg.iter_mut().zip(&mut stems.samples).enumerate()
+            {
+                samples.resize(frames.max(samples.len()), 0.0);
+                let levels = record.iter().map(|(time, levels)| {
+                    let at = psg_place(converter, *time, divider);
+                    (at, [f64::from(levels[channel]) * f64::from(PSG_STEM_SCALE)])
+                });
+                stage_frame(steps, levels, frames, &mut samples[..frames]);
+            }
+        }
+    }
+
+    /// The frame's stems, one sample frame for each the mix made, as they
+    /// enter the master; the master is the mix before its limiter. The
+    /// YM2612's stems are what it staged; the PSG's, each channel through
+    /// its own stage. A sample frame departs where the limiter moved what
+    /// the host hears, and where the stems' sum parts from the master by
+    /// more than the layout's sum rule allows: the YM2612's clamp or a muted
+    /// channel that sounds (a mute is the mix's, which leaves the channel
+    /// out), a sample the YM2612 staged none for, and the span a stem's
+    /// stage takes to reach its channel after the stems are armed.
     fn record_stems(&mut self, frames: usize) {
-        let (Some((ym_values, ym_departs)), Some((psg_values, psg_departs))) = (
+        let (Some((ym_values, _)), Some(stages)) = (
             self.bus.ym2612().staged_stems(),
-            self.bus.psg().staged_stems(),
+            self.stem_stages.as_deref(),
         ) else {
             return;
         };
+        let tolerance = StemSum::Exact.tolerance(SampleKind::F32);
         let mut values = [0.0f32; YM_STEM_VALUES + PSG_STEM_VALUES];
         for i in 0..frames {
             let psg = self.psg_sample_buf[i];
@@ -599,24 +723,16 @@ impl GenesisEmulator {
                     for (stem, &value) in fm.iter_mut().zip(staged) {
                         *stem = value * FM_STEM_SCALE;
                     }
-                    departs |= ym_departs[i];
                 }
-                None => {
-                    fm.fill(0.0);
-                    departs |= ym_left != 0.0 || ym_right != 0.0;
-                }
+                None => fm.fill(0.0),
             }
-            match psg_values.get(i * PSG_STEM_VALUES..(i + 1) * PSG_STEM_VALUES) {
-                Some(staged) => {
-                    for (stem, &value) in rest.iter_mut().zip(staged) {
-                        *stem = value * PSG_STEM_SCALE;
-                    }
-                    departs |= psg_departs[i];
-                }
-                None => {
-                    rest.fill(0.0);
-                    departs |= psg != 0.0;
-                }
+            for (stem, samples) in rest.iter_mut().zip(&stages.samples) {
+                *stem = samples[i];
+            }
+            let psg_sum: f64 = rest.iter().map(|&v| f64::from(v)).sum();
+            for (side, &master) in master.iter().enumerate() {
+                let fm_sum: f64 = fm.iter().skip(side).step_by(2).map(|&v| f64::from(v)).sum();
+                departs |= (fm_sum + psg_sum - f64::from(master)).abs() > tolerance;
             }
             self.stems.push(&values, master, departs);
         }
@@ -625,13 +741,27 @@ impl GenesisEmulator {
     /// Drop what the chips staged for the stems: the frame's samples went.
     fn clear_staged_stems(&mut self) {
         self.bus.ym2612_mut().clear_staged_stems();
-        self.bus.psg_mut().clear_staged_stems();
     }
 
-    /// The chips stage each sample for the stems while they are armed.
+    /// The chips stage each sample for the stems while they are armed, and
+    /// the PSG's stems have stages of their own, made from silence.
     pub(super) fn set_stem_taps(&mut self, on: bool) {
         self.bus.ym2612_mut().set_stem_tap(on);
-        self.bus.psg_mut().set_stem_tap(on);
+        match (on, self.stem_stages.is_some()) {
+            (true, false) => {
+                self.stem_stages = Some(Box::new(StemStages::new(&self.stage_kernel)));
+            }
+            (false, true) => self.stem_stages = None,
+            _ => {}
+        }
+    }
+
+    /// The host's stages start again from silence: a reset.
+    pub(super) fn clear_stages(&mut self) {
+        self.psg_stage.clear();
+        if let Some(stems) = self.stem_stages.as_deref_mut() {
+            stems.psg.iter_mut().for_each(BandLimitedSteps::clear);
+        }
     }
 
     /// The end of a frame for the stems: a frame the host was not shown is
