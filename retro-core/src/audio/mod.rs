@@ -6,6 +6,7 @@
 use crate::cpu::Clockable;
 use serde::{Deserialize, Serialize};
 
+pub mod band_limit;
 pub mod buffer;
 #[cfg(feature = "sound-conformance")]
 pub mod conformance;
@@ -21,11 +22,12 @@ pub mod stems;
 pub mod vgm;
 pub mod wav;
 
+pub use band_limit::{BandLimitedSteps, OutputFilter, SincKernel, SincResampler};
 pub use buffer::ChipSampleBuffer;
 pub use host_ring::HostAudioRing;
 pub use limiter::{soft_clip, soft_clip_buffer};
 pub use mutes::ChannelMutes;
-pub use rate_converter::{IntegerRateConverter, RateConverterState};
+pub use rate_converter::{IntegerRateConverter, RateConverterState, SampleTime};
 pub use resample::LinearResampler;
 pub use ring_buffer::AudioRingBuffer;
 pub use sound_core::{render_frames, RenderReport, SoundCore};

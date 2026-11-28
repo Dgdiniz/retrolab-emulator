@@ -210,6 +210,37 @@ impl IntegerRateConverter {
         self.remainder
     }
 
+    /// Where `time` lands on the output's samples, counted from the anchor:
+    /// the sample it follows and the fraction of a sample past it.
+    /// `time` is counted in `per_cycle`ths of an input cycle (1 for the
+    /// cycles themselves; 7 for the Mega Drive's master clock against the
+    /// 68000's cycles it converts), at or after the anchor's cycle, and
+    /// within about `2^64 / num` cycles of it; a time before the anchor is
+    /// placed at the anchor.
+    ///
+    /// Output sample `j` after the anchor stands at position `j`: the
+    /// moment [`Self::cycles_to_samples`] reaches the count after it, so a
+    /// time at position `j` plus a fraction comes after sample `j` and
+    /// before sample `j + 1`, and the anchor itself lies before sample 0,
+    /// at -1 plus the remainder's fraction.
+    pub fn position(&self, time: u64, per_cycle: u64) -> SampleTime {
+        debug_assert!(per_cycle > 0, "a time counted in a positive unit");
+        let since = time.saturating_sub(per_cycle * self.reference_cycles);
+        let numerator = self.num * since + per_cycle * self.remainder;
+        let denominator = per_cycle * self.den;
+        let whole = numerator / denominator;
+        let rest = numerator % denominator;
+        let fraction = if denominator <= u64::from(u32::MAX) {
+            ((rest << 32) / denominator) as u32
+        } else {
+            ((u128::from(rest) << 32) / u128::from(denominator)) as u32
+        };
+        SampleTime {
+            sample: whole as i64 - 1,
+            fraction,
+        }
+    }
+
     /// What a savestate keeps of the converter: everything but the
     /// ratio, which the machine's region gives again on a load.
     pub fn state(&self) -> RateConverterState {
@@ -231,6 +262,17 @@ impl IntegerRateConverter {
             state.remainder,
         )
     }
+}
+
+/// A time on the samples an [`IntegerRateConverter`] counts
+/// ([`IntegerRateConverter::position`]): `sample`, the sample it follows,
+/// counted from the first after the converter's anchor (-1 for a time
+/// before that sample), and `fraction`, how far past it, in 1/2^32ths of a
+/// sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SampleTime {
+    pub sample: i64,
+    pub fraction: u32,
 }
 
 /// The part of an [`IntegerRateConverter`] a savestate holds: the anchor,
@@ -440,6 +482,80 @@ mod tests {
         // clamps silently to den-1; in debug, the debug_assert fires.
         let conv = IntegerRateConverter::with_state(7, 11, 100, 50, 999_999);
         assert!(conv.remainder() < conv.den());
+    }
+
+    /// The count at a time is the sample its position follows, plus one:
+    /// the converter and the positions agree on every sample's time.
+    #[test]
+    fn a_position_follows_the_sample_its_count_has_reached() {
+        let mut conv = IntegerRateConverter::new(44_100, 7_670_453);
+        conv.advance(123_457, conv.cycles_to_samples(123_457));
+        let before = conv.samples_at_reference();
+        for since in (0..3_000_000u64).step_by(9_973) {
+            let time = conv.reference_cycles() + since;
+            let position = conv.position(time, 1);
+            assert_eq!(
+                conv.cycles_to_samples(time) - before,
+                (position.sample + 1) as u64,
+                "at {since} cycles past the anchor"
+            );
+        }
+    }
+
+    /// A sample's own time stands at its index exactly; the anchor at -1
+    /// plus the remainder's fraction.
+    #[test]
+    fn a_sample_stands_at_its_index_and_the_anchor_before_the_first() {
+        // With no remainder the anchor stands just before sample 0.
+        let conv = IntegerRateConverter::with_state(4, 1, 100, 0, 0);
+        assert_eq!(
+            conv.position(100, 1),
+            SampleTime {
+                sample: -1,
+                fraction: 0
+            }
+        );
+        // A sample each 4 cycles, the anchor a quarter of a sample past the
+        // last one counted.
+        let conv = IntegerRateConverter::with_state(1, 4, 100, 7, 1);
+        assert_eq!(
+            conv.position(400, 4),
+            SampleTime {
+                sample: -1,
+                fraction: 1 << 30
+            },
+            "the anchor: a quarter of a sample into the next"
+        );
+        // Three cycles on, the count reaches the next sample: position 0.
+        assert_eq!(
+            conv.position(103 * 4, 4),
+            SampleTime {
+                sample: 0,
+                fraction: 0
+            }
+        );
+        // Half a cycle later, an eighth of a sample past it.
+        assert_eq!(
+            conv.position(103 * 4 + 2, 4),
+            SampleTime {
+                sample: 0,
+                fraction: 1 << 29
+            }
+        );
+    }
+
+    /// A time in finer units lands where the same time in cycles does, and
+    /// a time before the anchor at the anchor.
+    #[test]
+    fn a_time_in_a_finer_unit_lands_at_the_same_place() {
+        let mut conv = IntegerRateConverter::new(44_100, 7_670_453);
+        conv.advance(1_000_003, conv.cycles_to_samples(1_000_003));
+        for since in [0u64, 1, 173, 128_005, 999_999] {
+            let cycles = conv.reference_cycles() + since;
+            assert_eq!(conv.position(7 * cycles, 7), conv.position(cycles, 1));
+        }
+        let anchor = conv.position(conv.reference_cycles(), 1);
+        assert_eq!(conv.position(5, 1), anchor);
     }
 
     #[test]
