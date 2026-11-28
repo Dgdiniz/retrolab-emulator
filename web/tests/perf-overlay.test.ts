@@ -7,7 +7,7 @@ const registers = (pairs: Array<[string, number]>) => pairs.map(([name, value]) 
 
 // The CPU states `getCpuStates()` gives at the stop of the Mega Drive
 // binding's own test (`what_the_cpu_states_hold`): the 68000 at $500, the
-// Z80 at $1A.
+// Z80 at $34.
 const states = [
   {
     cpu_id: 0,
@@ -22,10 +22,10 @@ const states = [
   {
     cpu_id: 1,
     flags: 0,
-    pc: 0x1a,
+    pc: 0x34,
     registers: registers([
       ['A', 0], ['F', 0], ['B', 0], ['C', 0], ['D', 0], ['E', 0], ['H', 0], ['L', 0],
-      ['PC', 26], ['SP', 65535], ['IX', 0], ['IY', 0],
+      ['PC', 52], ['SP', 65535], ['IX', 0], ['IY', 0],
     ]),
   },
 ]
@@ -43,8 +43,8 @@ describe("the performance overlay's program counters", () => {
   })
 
   it("are each CPU's pc, found by its id, 0 for a CPU the states lack", () => {
-    expect(processorPcs(states)).toEqual([0x500, 0x1a])
-    expect(processorPcs([...states].reverse())).toEqual([0x500, 0x1a])
+    expect(processorPcs(states)).toEqual([0x500, 0x34])
+    expect(processorPcs([...states].reverse())).toEqual([0x500, 0x34])
     expect(processorPcs([states[0]])).toEqual([0x500, 0])
     expect(processorPcs(undefined)).toEqual([0, 0])
   })
@@ -79,7 +79,7 @@ describe("the performance overlay's program counters", () => {
       const perf = new PerformanceOverlay({ getCpuStates: () => states })
       perf.refreshProcessors()
       expect(elements['perf-pc-0'].textContent).toBe('000500')
-      expect(elements['perf-pc-1'].textContent).toBe('001A')
+      expect(elements['perf-pc-1'].textContent).toBe('0034')
     })
   })
 })
