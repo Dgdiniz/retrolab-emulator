@@ -7,7 +7,7 @@ use super::frame::{LineRun, YmRatio, Z80Ratio};
 use super::GenesisEmulator;
 use crate::debugger::{record_z80_trace, SOUND_CPU};
 use crate::timing::GenesisTiming;
-use crate::z80_bus::Z80Bus;
+use crate::z80_bus::{Z80Bus, BANK_HOLD_CYCLES, BANK_WAIT_CYCLES};
 use retro_core::cpu::Clockable;
 use retro_core::frame::{Flow, StepHooks, Stepped};
 use retro_core::sub_clock::SubClock;
@@ -19,7 +19,8 @@ impl GenesisEmulator {
     /// runs ahead of the present by the instruction's cycles, which its
     /// clock keeps as its lead, so the frame's steps pay them back when it
     /// goes on. The YM2612 keeps up with the Z80; the PSG keeps to the
-    /// master clock.
+    /// master clock. A read or write through the bank window waits as in a
+    /// frame; the 68000, which the host holds still, loses nothing to it.
     pub(super) fn step_z80(&mut self) -> StepResult {
         self.release_z80_reset();
 
@@ -66,7 +67,7 @@ impl GenesisEmulator {
 
         // Execute one Z80 instruction
         let cycles = self.z80.step(&mut z80_bus);
-        total_cycles += cycles;
+        total_cycles += cycles + z80_bus.take_bank_accesses() * BANK_WAIT_CYCLES;
 
         // The Z80 ran past the present, the YM2612 following it
         self.line.z80_clock.ran(total_cycles);
@@ -279,13 +280,14 @@ impl GenesisEmulator {
         // the present, its last instruction's overshoot kept as its lead,
         // which the next steps pay back; the YM2612 follows it, and then
         // has the rest of the step's time.
+        let mut held = 0;
         if self.sound_time_passes(run, hooks) && run.z80_clock.owes_more_than(3) {
-            self.catch_up_z80(run, hooks);
+            held = self.catch_up_z80(run, hooks);
         }
         self.ym_to_present(run, hooks);
 
         Some(Stepped {
-            elapsed: u64::from(total),
+            elapsed: u64::from(total + held),
             instruction,
         })
     }
@@ -352,9 +354,17 @@ impl GenesisEmulator {
     /// Run the Z80 to the present, the cycles its clock says it owes: its
     /// interrupt line, its trace while it is traced, its coverage, and the
     /// YM2612 brought along to its place. The Z80's work after a 68000
-    /// instruction and at a line's start and end.
+    /// instruction and at a line's start and end. Each read or write it
+    /// makes through the bank window waits for the 68000's bus, and holds
+    /// the 68000 off it: that time passes on the master clock once the
+    /// Z80 has run, the 68000 running none of it. Returns the 68000's
+    /// cycles held.
     #[inline(always)]
-    pub(super) fn catch_up_z80<H: StepHooks<Self>>(&mut self, run: &mut LineRun, hooks: &mut H) {
+    pub(super) fn catch_up_z80<H: StepHooks<Self>>(
+        &mut self,
+        run: &mut LineRun,
+        hooks: &mut H,
+    ) -> u32 {
         let tracing = run.z80_tracing;
         // Only the trace reads the line; the run never crosses one.
         let scanline = if tracing {
@@ -368,6 +378,7 @@ impl GenesisEmulator {
         let mut executed = run.z80_executed;
         let mut ym_clocked = run.ym_clocked;
         let mut instructions = 0u32;
+        let mut held = 0u32;
         hooks.chip_start("Z80");
         {
             let mut z80_bus = self.bus.create_z80_bus();
@@ -386,6 +397,11 @@ impl GenesisEmulator {
                 self.debugger
                     .record_coverage(SOUND_CPU, u32::from(self.z80.pc));
                 let zc = self.z80.step(&mut z80_bus);
+                // The reads and writes the instruction (and an interrupt
+                // it took) made through the bank window.
+                let banked = z80_bus.take_bank_accesses();
+                let zc = zc + banked * BANK_WAIT_CYCLES;
+                held += banked * BANK_HOLD_CYCLES;
                 executed += zc;
                 clock.ran(zc);
                 ym_clocked += Self::ym_follows_z80(&mut ym, &clock, &mut z80_bus);
@@ -398,6 +414,30 @@ impl GenesisEmulator {
         run.ym_clock = ym;
         run.z80_executed = executed;
         run.ym_clocked = ym_clocked;
+        if held > 0 {
+            // The held time is the sound clocks' too: the PSG has it at
+            // once and the Z80 owes it, as after any of the 68000's time,
+            // and the YM2612 is brought to the present it now stands
+            // behind, so a save between two steps finds every clock where
+            // a load derives it.
+            self.hold_68000(held);
+            self.sound_time_passes(run, hooks);
+            self.ym_to_present(run, hooks);
+        }
+        held
+    }
+
+    /// The 68000 held off its bus for `cycles` of its own: the time passes
+    /// as an instruction's would, on the master clock, the VDP's transfers
+    /// and interrupt delay and its FIFO, and the line's budget, with no
+    /// instruction run.
+    fn hold_68000(&mut self, cycles: u32) {
+        self.master_cycles += u64::from(cycles);
+        let mclks = u64::from(cycles) * u64::from(self.region.cpu_divider());
+        self.step_master_clocks_accumulated += mclks;
+        self.bus.vdp_mut().tick_dma(mclks);
+        self.bus.vdp_mut().tick_vint_delay(mclks);
+        self.last_step_cycles += cycles;
     }
 
     /// The Z80 let out of reset by the 68000: it starts at address 0, its

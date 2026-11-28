@@ -15,6 +15,17 @@ use crate::ym2612::Ym2612;
 use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
 
+/// The Z80's cycles each of its reads or writes through the bank window
+/// waits while the 68000's bus is taken from the 68000 and given back:
+/// about 3.3 on average on the consoles measured (2 to 5), a little under
+/// 3 on the last model; the Z80 waits whole cycles.
+pub const BANK_WAIT_CYCLES: u32 = 3;
+
+/// The 68000's cycles each read or write the Z80 makes through the bank
+/// window holds the 68000 off its bus: about 11 on average (9 to 11
+/// measured).
+pub const BANK_HOLD_CYCLES: u32 = 11;
+
 /// Z80 Address Bus
 ///
 /// Maps Z80 address space to appropriate components.
@@ -31,6 +42,9 @@ pub struct Z80Bus<'a> {
     cartridge: Option<&'a mut GenesisCartridge>,
     /// Genesis memory (includes Z80 RAM and 68K work RAM for bank reads)
     memory: &'a mut GenesisMemory,
+    /// The reads and writes made through the bank window since the last
+    /// take: each costs the Z80 a wait and the 68000 its bus.
+    bank_accesses: u32,
 }
 
 impl<'a> Z80Bus<'a> {
@@ -49,7 +63,14 @@ impl<'a> Z80Bus<'a> {
             bank_bit_count,
             cartridge,
             memory,
+            bank_accesses: 0,
         }
+    }
+
+    /// The reads and writes made through the bank window since the last
+    /// take, the count starting again.
+    pub fn take_bank_accesses(&mut self) -> u32 {
+        std::mem::take(&mut self.bank_accesses)
     }
 
     /// Clock the YM2612 for the given number of 68K cycles.
@@ -69,6 +90,7 @@ impl<'a> Z80Bus<'a> {
     /// Read from 68K address space via bank window
     /// Z80 address 0x8000-0xFFFF maps to 68K address: bank_register | (z80_addr & 0x7FFF)
     fn read_banked(&mut self, addr: u32) -> u8 {
+        self.bank_accesses += 1;
         let addr_68k = *self.bank_register | (addr & 0x7FFF);
 
         match addr_68k {
@@ -90,6 +112,7 @@ impl<'a> Z80Bus<'a> {
 
     /// Write to 68K address space via bank window
     fn write_banked(&mut self, addr: u32, value: u8) {
+        self.bank_accesses += 1;
         let addr_68k = *self.bank_register | (addr & 0x7FFF);
 
         match addr_68k {
