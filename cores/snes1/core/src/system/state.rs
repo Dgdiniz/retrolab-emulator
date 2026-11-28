@@ -75,9 +75,9 @@ impl SnesEmulator {
 
         // Host-side audio is not in the wire format: the ring is emptied so
         // no sample of the machine replaced is played, and the resampler
-        // keeps its phase and its last sample, so the host's sound goes on
-        // from what it played last instead of starting again from silence
-        // (a click on every load, a netplay rollback among them).
+        // keeps its place and the samples it carries, so the host's sound
+        // goes on from what it played last instead of starting again from
+        // silence (a click on every load, a netplay rollback among them).
         self.host_audio.clear();
         self.apu_drain_buf.clear();
         self.audio_resample_buf.clear();

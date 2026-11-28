@@ -470,17 +470,17 @@ getAudioInfo => {bits_per_sample: 32, channels: 2, sample_rate: 44100}
 ring, new => {available: 0, enabled: false, overflows: 0n}
 ring, a frame with audio off => {available: 0, enabled: false, overflows: 0n}
 ring, five frames => {available: 8192, enabled: true, overflows: 612n}
-getAudioSamplesN(64) => Float32Array(len 64, fnv1a64 0xef44c05101a0cb79)
+getAudioSamplesN(64) => Float32Array(len 64, fnv1a64 0xfae93fbbce471819)
 ring, 64 taken => {available: 8128, enabled: true, overflows: 612n}
 ring, clearAudioBuffer => {available: 8128, enabled: true, overflows: 612n}
 ring, discardPendingAudio => {available: 8128, enabled: true, overflows: 612n}
-getAudioSamples => Float32Array(len 8128, fnv1a64 0x386ed61906ab5db1)
+getAudioSamples => Float32Array(len 8128, fnv1a64 0xe6f2da08cbff71f9)
 ring, drained => {available: 0, enabled: true, overflows: 612n}
 getAudioSamplesN(64), drained => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
 getAudioSamples, drained => Float32Array(len 0, fnv1a64 0xcbf29ce484222325)
 ring, a headless frame => {available: 0, enabled: true, overflows: 612n}
 ring, discarded, then a frame => {available: 1466, enabled: true, overflows: 612n}
-getAudioSamplesN(100000) => Float32Array(len 1466, fnv1a64 0x8c5b1fbb20de3fed)
+getAudioSamplesN(100000) => Float32Array(len 1466, fnv1a64 0x0f975b1a1f02f62d)
 "#,
     );
 }

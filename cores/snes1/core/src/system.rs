@@ -39,7 +39,7 @@ pub use descriptors::destination_region_str;
 
 use std::collections::VecDeque;
 
-use retro_core::audio::{ChannelMutes, HostAudioRing, LinearResampler};
+use retro_core::audio::{ChannelMutes, HostAudioRing, SincResampler};
 use retro_core::capture::{CaptureCore, CaptureRecording};
 use retro_core::cartridge::Cartridge;
 use retro_core::cpu::Addressable;
@@ -135,10 +135,11 @@ pub struct SnesEmulator {
     /// Host-rate audio queue (44.1 kHz `f32`, interleaved L/R). Fed each
     /// frame from the APU's native 32 kHz `i16` ring through `resampler`.
     host_audio: HostAudioRing,
-    /// 32 kHz (S-DSP) -> 44.1 kHz (host) linear resampler. The ratio is
-    /// region-independent, so this instance lives for the emulator's
-    /// lifetime and is only `reset()`.
-    resampler: LinearResampler,
+    /// 32 kHz (S-DSP) -> 44.1 kHz (host) band-limited resampler
+    /// ([`Self::host_resampler`]). The ratio is region-independent, so
+    /// this instance lives for the emulator's lifetime and is only
+    /// `reset()`.
+    resampler: SincResampler,
     /// Scratch for one frame's worth of 32 kHz `i16` samples drained from
     /// the APU before resampling (reused to avoid per-frame allocation).
     apu_drain_buf: Vec<i16>,
@@ -344,7 +345,7 @@ impl SnesEmulator {
             master_cycles: 0,
             frame_base_cycle: 0,
             host_audio: HostAudioRing::with_capacity(AUDIO_RING_CAPACITY),
-            resampler: LinearResampler::new(32_000, 44_100),
+            resampler: Self::host_resampler(),
             apu_drain_buf: Vec::new(),
             audio_resample_buf: Vec::new(),
             audio_enabled: false,

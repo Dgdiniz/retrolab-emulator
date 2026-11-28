@@ -1,8 +1,11 @@
 //! Audio: the S-DSP's samples resampled at a frame's end into the host's
 //! ring, and the sound hooks a host calls (`SoundCore`).
 
+use std::sync::Arc;
+
 use retro_core::audio::{
-    SoundChipKind, SoundCore, SoundLog, SoundLogContents, StemLayout, StemSet, StemTake,
+    SincKernel, SincResampler, SoundChipKind, SoundCore, SoundLog, SoundLogContents, StemLayout,
+    StemSet, StemTake,
 };
 use retro_core::frame::run_frame_on;
 use retro_core::ExecutionTier;
@@ -52,6 +55,20 @@ impl SoundCore for SnesEmulator {
 }
 
 impl SnesEmulator {
+    /// The resampler the S-DSP's 32 kHz samples go through to the host's
+    /// 44.1 kHz, as a new machine builds it: band-limited interpolation of
+    /// the S-DSP's samples, read at the host's sample times, by a
+    /// Kaiser-windowed sinc spanning 32 of the S-DSP's samples each side,
+    /// its cutoff at 16 kHz, the Nyquist frequency of the S-DSP's rate,
+    /// its stopband 80 dB down. Read so, the top octave of what the S-DSP
+    /// makes keeps its level, and the images of its band, which a linear
+    /// blend between two samples puts into the host's band, stay far below
+    /// it.
+    pub fn host_resampler() -> SincResampler {
+        let kernel = SincKernel::new(32, 1.0, 80.0, 128);
+        SincResampler::new(Arc::new(kernel), 32_000, 44_100)
+    }
+
     /// The APU as an SPC file a player runs, tagged with `tag`: as it
     /// stands, which between two frames is the frame's end (within a frame
     /// the APU runs behind the CPU until it next catches up).

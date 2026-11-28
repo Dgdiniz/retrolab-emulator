@@ -463,10 +463,14 @@ const RECORDED: &[(&str, &str)] = &[
     ("power_on_reset: right after", "hash 79ae05a1c8502b20 | work RAM c74b47c8c74a2325 boots 0 NMIs 0 | save RAM b9d103fd6854a325 | mode Running | breakpoints 0 | region ntsc | frames 0"),
     // As the line above.
     ("power_on_reset: two frames later", "hash c99dae85623b1d15 | work RAM 633ef910c0af79fe boots 1 NMIs 2 | save RAM b9d103fd6854a325 | mode Running | breakpoints 0 | region ntsc | frames 2"),
-    ("sound, frame 1", "1468 samples befcaa57c36220d1"),
-    ("sound, frame 60", "1466 samples b9a5302e4f8cd725"),
-    ("sound, frame 300", "1466 samples d491114ab1f83ffd"),
-    ("sound, 300 frames", "440276 samples 0c76c78426a3645d loudest 0.4276"),
+    // The host's sound is the S-DSP's samples read by band-limited
+    // interpolation: the counts are the ratio's, the samples another
+    // reading of the same 32 kHz, whose square-edged tone now overshoots
+    // between its samples as its band-limited signal does.
+    ("sound, frame 1", "1468 samples 614cccf441b46c59"),
+    ("sound, frame 60", "1466 samples 2bfa0d7cacca5121"),
+    ("sound, frame 300", "1466 samples 813a4ade54bc6a05"),
+    ("sound, 300 frames", "440276 samples 423cf1a13f29ed51 loudest 0.4751"),
     // The display's grid says where the picture starts: `first_dot`, `first_line`.
     ("system info", "{\"name\":\"Super Nintendo Entertainment System\",\"short_name\":\"SNES\",\"manufacturer\":\"Nintendo\",\"year\":1990,\"cpus\":[{\"id\":0,\"name\":\"Ricoh 5A22 (WDC 65C816)\",\"architecture\":\"Mos65816\",\"clock_speed\":3580000,\"registers\":[],\"location\":\"Motherboard\",\"address_width\":24},{\"id\":1,\"name\":\"Sony SPC700\",\"architecture\":\"Spc700\",\"clock_speed\":1024000,\"registers\":[],\"location\":\"Motherboard\",\"address_width\":16}],\"display\":{\"width\":256,\"height\":224,\"aspect_ratio\":1.1428572,\"refresh_rate\":60.09847,\"pixel_format\":\"RGBA8888\",\"grid\":{\"columns_per_dot\":1,\"rows_per_line\":1,\"woven\":false,\"first_dot\":0,\"first_line\":0}},\"audio\":{\"sample_rate\":44100,\"channels\":2,\"bits_per_sample\":32},\"input\":{\"max_players\":2,\"button_layout\":[{\"name\":\"Up\",\"id\":0},{\"name\":\"Down\",\"id\":1},{\"name\":\"Left\",\"id\":2},{\"name\":\"Right\",\"id\":3},{\"name\":\"A\",\"id\":4},{\"name\":\"B\",\"id\":5},{\"name\":\"X\",\"id\":6},{\"name\":\"Y\",\"id\":7},{\"name\":\"L\",\"id\":8},{\"name\":\"R\",\"id\":9},{\"name\":\"Start\",\"id\":10},{\"name\":\"Select\",\"id\":11}]}}"),
     // Another region is a power cycle in it, which keeps the save (it

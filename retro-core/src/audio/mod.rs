@@ -14,7 +14,6 @@ pub mod host_ring;
 pub mod limiter;
 pub mod mutes;
 pub mod rate_converter;
-pub mod resample;
 pub mod ring_buffer;
 pub mod sound_core;
 pub mod sound_log;
@@ -28,7 +27,6 @@ pub use host_ring::HostAudioRing;
 pub use limiter::{soft_clip, soft_clip_buffer};
 pub use mutes::ChannelMutes;
 pub use rate_converter::{IntegerRateConverter, RateConverterState, SampleTime};
-pub use resample::LinearResampler;
 pub use ring_buffer::AudioRingBuffer;
 pub use sound_core::{render_frames, RenderReport, SoundCore};
 pub use sound_log::{

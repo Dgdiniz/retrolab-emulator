@@ -582,7 +582,7 @@ fn flg_echo_write_disable_leaves_aram_untouched() {
 // -------------------------------------------------------------
 //
 // `run_frame` catches the APU up to the frame boundary and then drains
-// the 32 kHz `i16` ring through the linear resampler into the host
+// the 32 kHz `i16` ring through the host's resampler into the host
 // 44.1 kHz `f32` ring, which `get_audio_samples` returns. These pin the
 // rate, range, and (crucially) that the resampler adds no drift on top
 // of the APU's already drift-free 32 kHz cadence.
